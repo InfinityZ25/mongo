@@ -65,9 +65,9 @@ Status OplogApplicationChecks::checkOperationAuthorization(OperationContext* opC
 
     if (oplogEntry.hasField("ui"_sd)) {
         // ns by UUID overrides the ns specified if they are different.
-        auto& catalog = CollectionCatalog::get(opCtx);
+        auto catalog = CollectionCatalog::get(opCtx);
         boost::optional<NamespaceString> uuidCollNS =
-            catalog.lookupNSSByUUID(opCtx, getUUIDFromOplogEntry(oplogEntry));
+            catalog->lookupNSSByUUID(opCtx, getUUIDFromOplogEntry(oplogEntry));
         if (uuidCollNS && *uuidCollNS != ns)
             ns = *uuidCollNS;
     }
@@ -119,7 +119,8 @@ Status OplogApplicationChecks::checkOperationAuthorization(OperationContext* opC
 
         const bool upsert = b || alwaysUpsert;
 
-        return authSession->checkAuthForUpdate(opCtx, ns, o, o2, upsert);
+        return authSession->checkAuthForUpdate(
+            opCtx, ns, o2, write_ops::UpdateModification::parseFromOplogEntry(o), upsert);
     } else if (opType == "d"_sd) {
 
         return authSession->checkAuthForDelete(opCtx, ns, o);
@@ -206,7 +207,7 @@ Status OplogApplicationChecks::checkAuthForCommand(OperationContext* opCtx,
     AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
     if (validity == OplogApplicationValidity::kNeedsSuperuser) {
         std::vector<Privilege> universalPrivileges;
-        RoleGraph::generateUniversalPrivileges(&universalPrivileges);
+        auth::generateUniversalPrivileges(&universalPrivileges);
         if (!authSession->isAuthorizedForPrivileges(universalPrivileges)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }

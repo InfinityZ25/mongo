@@ -26,14 +26,13 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/commands.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/rpc/metadata/client_metadata.h"
-#include "mongo/rpc/metadata/client_metadata_ismaster.h"
 
 namespace mongo {
 namespace {
@@ -68,29 +67,11 @@ public:
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
 
-        auto& clientMetadataIsMasterState = ClientMetadataIsMasterState::get(opCtx->getClient());
-        bool seenIsMaster = clientMetadataIsMasterState.hasSeenIsMaster();
-        if (!seenIsMaster) {
-            clientMetadataIsMasterState.setSeenIsMaster();
-        }
+        auto wireSpec = WireSpec::instance().get();
 
-        BSONElement element = cmdObj[kMetadataDocumentName];
-        if (!element.eoo()) {
-            if (seenIsMaster) {
-                uasserted(ErrorCodes::ClientMetadataCannotBeMutated,
-                          "The client metadata document may only be sent in the first isMaster");
-            }
-
-            auto swParseClientMetadata = ClientMetadata::parse(element);
-            uassertStatusOK(swParseClientMetadata.getStatus());
-
-            invariant(swParseClientMetadata.getValue());
-
-            swParseClientMetadata.getValue().get().logClientMetadata(opCtx->getClient());
-
-            clientMetadataIsMasterState.setClientMetadata(
-                opCtx->getClient(), std::move(swParseClientMetadata.getValue()));
-        }
+        auto metaElem = cmdObj[kMetadataDocumentName];
+        ClientMetadata::setFromMetadata(opCtx->getClient(), metaElem);
+        ClientMetadata::tryFinalize(opCtx->getClient());
 
         result.appendBool("ismaster", true);
 
@@ -101,8 +82,8 @@ public:
         result.append("logicalSessionTimeoutMinutes", localLogicalSessionTimeoutMinutes);
         result.appendNumber("connectionId", opCtx->getClient()->getConnectionId());
 
-        result.append("minWireVersion", WireSpec::instance().incomingExternalClient.minWireVersion);
-        result.append("maxWireVersion", WireSpec::instance().incomingExternalClient.maxWireVersion);
+        result.append("minWireVersion", wireSpec->incomingExternalClient.minWireVersion);
+        result.append("maxWireVersion", wireSpec->incomingExternalClient.maxWireVersion);
 
         result.append("readOnly", storageGlobalParams.readOnly);
 

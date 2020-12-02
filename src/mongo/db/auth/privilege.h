@@ -87,6 +87,8 @@ public:
     // Checks if the given actions are present in the Privilege.
     bool includesActions(const ActionSet& actions) const;
 
+    static Privilege fromBSON(const BSONElement obj);
+    static Privilege fromBSON(BSONObj obj);
     BSONObj toBSON() const;
 
 private:

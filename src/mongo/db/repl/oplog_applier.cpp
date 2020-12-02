@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -140,13 +140,25 @@ std::unique_ptr<ThreadPool> makeReplWriterPool() {
 }
 
 std::unique_ptr<ThreadPool> makeReplWriterPool(int threadCount) {
+    return makeReplWriterPool(threadCount, "ReplWriterWorker"_sd);
+}
+
+std::unique_ptr<ThreadPool> makeReplWriterPool(int threadCount,
+                                               StringData name,
+                                               bool isKillableByStepdown) {
     ThreadPool::Options options;
-    options.threadNamePrefix = "ReplWriterWorker-";
-    options.poolName = "ReplWriterWorkerThreadPool";
+    options.threadNamePrefix = name + "-";
+    options.poolName = name + "ThreadPool";
     options.maxThreads = options.minThreads = static_cast<size_t>(threadCount);
-    options.onCreateThread = [](const std::string&) {
+    options.onCreateThread = [isKillableByStepdown](const std::string&) {
         Client::initThread(getThreadName());
-        AuthorizationSession::get(cc())->grantInternalAuthorization(&cc());
+        auto client = Client::getCurrent();
+        AuthorizationSession::get(*client)->grantInternalAuthorization(client);
+
+        if (isKillableByStepdown) {
+            stdx::lock_guard<Client> lk(*client);
+            client->setSystemOperationKillableByStepdown(lk);
+        }
     };
     auto pool = std::make_unique<ThreadPool>(options);
     pool->startup();

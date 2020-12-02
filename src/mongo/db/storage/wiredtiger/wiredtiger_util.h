@@ -154,16 +154,22 @@ public:
                                     const std::vector<std::string>& filter);
 
     /**
+     * Creates an import configuration string suitable for the 'config' parameter in
+     * WT_SESSION::create() given the storage engines metadata retrieved during the export.
+     *
+     * Returns the FailedToParse status if the storage engine metadata object is malformed.
+     */
+    static StatusWith<std::string> generateImportString(const StringData& ident,
+                                                        const BSONObj& storageMetadata);
+
+    /**
      * Appends information about the storage engine's currently available snapshots and the settings
      * that affect that window of maintained history.
      *
      * "snapshot-window-settings" : {
-     *      "cache pressure percentage threshold" : <num>,
-     *      "current cache pressure percentage" : <num>,
      *      "total number of SnapshotTooOld errors" : <num>,
-     *      "max target available snapshots window size in seconds" : <num>,
-     *      "target available snapshots window size in seconds" : <num>,
-     *      "current available snapshots window size in seconds" : <num>,
+     *      "minimum target snapshot window size in seconds" : <num>,
+     *      "current available snapshot window size in seconds" : <num>,
      *      "latest majority snapshot timestamp available" : <num>,
      *      "oldest majority snapshot timestamp available" : <num>
      * }
@@ -223,6 +229,12 @@ public:
 
     static int64_t getIdentSize(WT_SESSION* s, const std::string& uri);
 
+    /**
+     * Returns the bytes available for reuse for an ident. This is the amount of allocated space on
+     * disk that is not storing any data.
+     */
+    static int64_t getIdentReuseSize(WT_SESSION* s, const std::string& uri);
+
 
     /**
      * Return amount of memory to use for the WiredTiger cache based on either the startup
@@ -256,6 +268,10 @@ public:
                            const std::string& uri,
                            std::vector<std::string>* errors = nullptr);
 
+    static void notifyStartupComplete();
+
+    static void resetTableLoggingInfo();
+
     static bool useTableLogging(NamespaceString ns, bool replEnabled);
 
     static Status setTableLogging(OperationContext* opCtx, const std::string& uri, bool on);
@@ -276,6 +292,18 @@ private:
      */
     template <typename T>
     static T _castStatisticsValue(uint64_t statisticsValue, T maximumResultType);
+
+    static Status _setTableLogging(WT_SESSION* session, const std::string& uri, bool on);
+
+    // Used to keep track of the table logging setting modifications during start up. The mutex must
+    // be held prior to accessing any of the member variables in the struct.
+    static Mutex _tableLoggingInfoMutex;
+    static struct TableLoggingInfo {
+        bool isInitializing = true;
+        bool isFirstTable = true;
+        bool changeTableLogging = false;
+        bool hasPreviouslyIncompleteTableChecks = false;
+    } _tableLoggingInfo;
 };
 
 class WiredTigerConfigParser {

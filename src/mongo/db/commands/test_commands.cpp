@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include <string>
 
@@ -81,8 +81,9 @@ public:
                            BSONObjBuilder& result) {
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
         LOGV2(20505,
-              "test only command godinsert invoked coll:{nss_coll}",
-              "nss_coll"_attr = nss.coll());
+              "Test-only command 'godinsert' invoked coll:{collection}",
+              "Test-only command 'godinsert' invoked",
+              "collection"_attr = nss.coll());
         BSONObj obj = cmdObj["obj"].embeddedObjectUserCheck();
 
         Lock::DBLock lk(opCtx, dbname, MODE_X);
@@ -91,8 +92,8 @@ public:
 
         WriteUnitOfWork wunit(opCtx);
         UnreplicatedWritesBlock unreplicatedWritesBlock(opCtx);
-        Collection* collection =
-            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
+        CollectionPtr collection =
+            CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss);
         if (!collection) {
             collection = db->createCollection(opCtx, nss);
             if (!collection) {
@@ -144,8 +145,7 @@ public:
         }
 
         // Lock the database in mode IX and lock the collection exclusively.
-        AutoGetCollection autoColl(opCtx, fullNs, MODE_X);
-        Collection* collection = autoColl.getCollection();
+        AutoGetCollection collection(opCtx, fullNs, MODE_X);
         if (!collection) {
             uasserted(ErrorCodes::NamespaceNotFound,
                       str::stream() << "collection " << fullNs.ns() << " does not exist");
@@ -160,8 +160,11 @@ public:
             // Scan backwards through the collection to find the document to start truncating from.
             // We will remove 'n' documents, so start truncating from the (n + 1)th document to the
             // end.
-            auto exec = InternalPlanner::collectionScan(
-                opCtx, fullNs.ns(), collection, PlanExecutor::NO_YIELD, InternalPlanner::BACKWARD);
+            auto exec = InternalPlanner::collectionScan(opCtx,
+                                                        fullNs.ns(),
+                                                        &collection.getCollection(),
+                                                        PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                                        InternalPlanner::BACKWARD);
 
             for (int i = 0; i < n + 1; ++i) {
                 PlanExecutor::ExecState state = exec->getNext(static_cast<BSONObj*>(nullptr), &end);
@@ -173,7 +176,6 @@ public:
             }
         }
 
-        BackgroundOperation::assertNoBgOpInProgForNs(fullNs.ns());
         IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(
             collection->uuid());
 

@@ -33,6 +33,7 @@
 
 #include <cstdint>
 
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/catalog/collection.h"
@@ -51,10 +52,12 @@
 #include "mongo/db/global_settings.h"
 #include "mongo/db/index/index_build_interceptor.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index/wildcard_access_method.h"
 #include "mongo/db/index_builds_coordinator.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/multi_key_path_tracker.h"
+#include "mongo/db/op_observer_impl.h"
 #include "mongo/db/op_observer_registry.h"
+#include "mongo/db/query/wildcard_multikey_paths.h"
 #include "mongo/db/repl/apply_ops.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/multiapplier.h"
@@ -63,6 +66,7 @@
 #include "mongo/db/repl/oplog_applier_impl.h"
 #include "mongo/db/repl/oplog_applier_impl_test_fixture.h"
 #include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/oplog_entry_test_helpers.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_consistency_markers_impl.h"
@@ -74,7 +78,6 @@
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/repl/timestamp_block.h"
 #include "mongo/db/s/collection_sharding_state_factory_shard.h"
-#include "mongo/db/s/op_observer_sharding_impl.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/session.h"
 #include "mongo/db/session_catalog_mongod.h"
@@ -82,10 +85,13 @@
 #include "mongo/db/storage/storage_engine_impl.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/db/transaction_participant_gen.h"
+#include "mongo/db/vector_clock_mutable.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/logv2/log.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/stdx/future.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/stacktrace.h"
 
 namespace mongo {
@@ -99,7 +105,7 @@ public:
     OneOffRead(OperationContext* opCtx, const Timestamp& ts) : _opCtx(opCtx) {
         _opCtx->recoveryUnit()->abandonSnapshot();
         if (ts.isNull()) {
-            _opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kUnset);
+            _opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
         } else {
             _opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kProvided, ts);
         }
@@ -107,7 +113,7 @@ public:
 
     ~OneOffRead() {
         _opCtx->recoveryUnit()->abandonSnapshot();
-        _opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kUnset);
+        _opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
     }
 
 private:
@@ -157,12 +163,12 @@ class StorageTimestampTest {
 public:
     ServiceContext::UniqueOperationContext _opCtxRaii = cc().makeOperationContext();
     OperationContext* _opCtx = _opCtxRaii.get();
-    LogicalClock* _clock = LogicalClock::get(_opCtx);
+    VectorClockMutable* _clock = VectorClockMutable::get(_opCtx);
 
     // Set up Timestamps in the past, present, and future.
-    const LogicalTime pastLt = _clock->reserveTicks(1);
+    const LogicalTime pastLt = _clock->tickClusterTime(1);
     const Timestamp pastTs = pastLt.asTimestamp();
-    const LogicalTime presentLt = _clock->reserveTicks(1);
+    const LogicalTime presentLt = _clock->tickClusterTime(1);
     const Timestamp presentTs = presentLt.asTimestamp();
     const LogicalTime futureLt = presentLt.addTicks(1);
     const Timestamp futureTs = futureLt.asTimestamp();
@@ -203,13 +209,12 @@ public:
         repl::ReplClientInfo::forClient(_opCtx->getClient()).clearLastOp_forTest();
 
         auto registry = std::make_unique<OpObserverRegistry>();
-        registry->addObserver(std::make_unique<OpObserverShardingImpl>());
+        registry->addObserver(std::make_unique<OpObserverImpl>());
         _opCtx->getServiceContext()->setOpObserver(std::move(registry));
 
-        repl::setOplogCollectionName(getGlobalServiceContext());
         repl::createOplog(_opCtx);
 
-        ASSERT_OK(_clock->advanceClusterTime(LogicalTime(Timestamp(1, 0))));
+        _clock->tickClusterTimeTo(LogicalTime(Timestamp(1, 0)));
 
         ASSERT_EQUALS(presentTs, pastLt.addTicks(1).asTimestamp());
         setReplCoordAppliedOpTime(repl::OpTime(presentTs, presentTerm));
@@ -230,16 +235,17 @@ public:
      */
     void reset(NamespaceString nss) const {
         ::mongo::writeConflictRetry(_opCtx, "deleteAll", nss.ns(), [&] {
-            _opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kUnset);
+            _opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
+            _opCtx->recoveryUnit()->abandonSnapshot();
             AutoGetCollection collRaii(_opCtx, nss, LockMode::MODE_X);
 
-            if (collRaii.getCollection()) {
+            if (collRaii) {
                 WriteUnitOfWork wunit(_opCtx);
-                invariant(collRaii.getCollection()->truncate(_opCtx).isOK());
+                invariant(collRaii.getWritableCollection()->truncate(_opCtx).isOK());
                 if (_opCtx->recoveryUnit()->getCommitTimestamp().isNull()) {
                     ASSERT_OK(_opCtx->recoveryUnit()->setTimestamp(Timestamp(1, 1)));
                 }
-                collRaii.getCollection()->getIndexCatalog()->dropAllIndexes(_opCtx, false);
+                collRaii.getWritableCollection()->getIndexCatalog()->dropAllIndexes(_opCtx, false);
                 wunit.commit();
                 return;
             }
@@ -254,14 +260,14 @@ public:
         });
     }
 
-    void insertDocument(Collection* coll, const InsertStatement& stmt) {
+    void insertDocument(const CollectionPtr& coll, const InsertStatement& stmt) {
         // Insert some documents.
         OpDebug* const nullOpDebug = nullptr;
         const bool fromMigrate = false;
         ASSERT_OK(coll->insertDocument(_opCtx, stmt, nullOpDebug, fromMigrate));
     }
 
-    void createIndex(Collection* coll, std::string indexName, const BSONObj& indexKey) {
+    void createIndex(CollectionWriter& coll, std::string indexName, const BSONObj& indexKey) {
 
         // Build an index.
         MultiIndexBlock indexer;
@@ -274,20 +280,20 @@ public:
                 indexer.init(_opCtx,
                              coll,
                              {BSON("v" << 2 << "name" << indexName << "key" << indexKey)},
-                             MultiIndexBlock::makeTimestampedIndexOnInitFn(_opCtx, coll));
+                             MultiIndexBlock::makeTimestampedIndexOnInitFn(_opCtx, coll.get()));
             ASSERT_OK(swIndexInfoObj.getStatus());
             indexInfoObj = std::move(swIndexInfoObj.getValue()[0]);
         }
 
-        ASSERT_OK(indexer.insertAllDocumentsInCollection(_opCtx, coll));
-        ASSERT_OK(indexer.checkConstraints(_opCtx));
+        ASSERT_OK(indexer.insertAllDocumentsInCollection(_opCtx, coll.get()));
+        ASSERT_OK(indexer.checkConstraints(_opCtx, coll.get()));
 
         {
             WriteUnitOfWork wuow(_opCtx);
             // Timestamping index completion. Primaries write an oplog entry.
             ASSERT_OK(
                 indexer.commit(_opCtx,
-                               coll,
+                               coll.getWritableCollection(),
                                [&](const BSONObj& indexSpec) {
                                    _opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
                                        _opCtx, coll->ns(), coll->uuid(), indexSpec, false);
@@ -300,7 +306,7 @@ public:
         abortOnExit.dismiss();
     }
 
-    std::int32_t itCount(Collection* coll) {
+    std::int32_t itCount(const CollectionPtr& coll) {
         std::uint64_t ret = 0;
         auto cursor = coll->getRecordStore()->getCursor(_opCtx);
         while (cursor->next() != boost::none) {
@@ -310,7 +316,7 @@ public:
         return ret;
     }
 
-    BSONObj findOne(Collection* coll) {
+    BSONObj findOne(const CollectionPtr& coll) {
         auto optRecord = coll->getRecordStore()->getCursor(_opCtx)->next();
         if (optRecord == boost::none) {
             // Print a stack trace to help disambiguate which `findOne` failed.
@@ -379,7 +385,7 @@ public:
                                            const Timestamp& ts,
                                            const repl::MinValidDocument& expectedDoc) {
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
-        Collection* coll = autoColl.getCollection();
+        const CollectionPtr& coll = autoColl.getCollection();
 
         OneOffRead oor(_opCtx, ts);
 
@@ -399,7 +405,7 @@ public:
             << ". Expected: " << expectedDoc.toBSON() << ". Found: " << doc.toBSON();
     }
 
-    void assertDocumentAtTimestamp(Collection* coll,
+    void assertDocumentAtTimestamp(const CollectionPtr& coll,
                                    const Timestamp& ts,
                                    const BSONObj& expectedDoc) {
         OneOffRead oor(_opCtx, ts);
@@ -415,7 +421,7 @@ public:
         }
     }
 
-    void assertFilteredDocumentAtTimestamp(Collection* coll,
+    void assertFilteredDocumentAtTimestamp(const CollectionPtr& coll,
                                            const BSONObj& query,
                                            const Timestamp& ts,
                                            boost::optional<const BSONObj&> expectedDoc) {
@@ -463,9 +469,9 @@ public:
     }
 
     void setReplCoordAppliedOpTime(const repl::OpTime& opTime, Date_t wallTime = Date_t()) {
-        repl::ReplicationCoordinator::get(getGlobalServiceContext())
+        repl::ReplicationCoordinator::get(_opCtx->getServiceContext())
             ->setMyLastAppliedOpTimeAndWallTime({opTime, wallTime});
-        ASSERT_OK(repl::ReplicationCoordinator::get(getGlobalServiceContext())
+        ASSERT_OK(repl::ReplicationCoordinator::get(_opCtx->getServiceContext())
                       ->updateTerm(_opCtx, opTime.getTerm()));
     }
 
@@ -650,9 +656,9 @@ public:
         std::stringstream ss;
 
         ss << "[ ";
-        for (const auto multikeyComponents : multikeyPaths) {
+        for (const auto& multikeyComponents : multikeyPaths) {
             ss << "[ ";
-            for (const auto multikeyComponent : multikeyComponents) {
+            for (const auto& multikeyComponent : multikeyComponents) {
                 ss << multikeyComponent << " ";
             }
             ss << "] ";
@@ -663,7 +669,7 @@ public:
     }
 
     void assertMultikeyPaths(OperationContext* opCtx,
-                             Collection* collection,
+                             const CollectionPtr& collection,
                              StringData indexName,
                              Timestamp ts,
                              bool shouldBeMultikey,
@@ -685,7 +691,8 @@ public:
 
         const bool match = (expectedMultikeyPaths == actualMultikeyPaths);
         if (!match) {
-            FAIL(str::stream() << "Expected: " << dumpMultikeyPaths(expectedMultikeyPaths)
+            FAIL(str::stream() << "TS: " << ts.toString()
+                               << ", Expected: " << dumpMultikeyPaths(expectedMultikeyPaths)
                                << ", Actual: " << dumpMultikeyPaths(actualMultikeyPaths));
         }
         ASSERT_TRUE(match);
@@ -713,7 +720,7 @@ public:
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
 
         const std::int32_t docsToInsert = 10;
-        const LogicalTime firstInsertTime = _clock->reserveTicks(docsToInsert);
+        const LogicalTime firstInsertTime = _clock->tickClusterTime(docsToInsert);
         for (std::int32_t idx = 0; idx < docsToInsert; ++idx) {
             BSONObjBuilder result;
             ASSERT_OK(applyOps(
@@ -762,7 +769,7 @@ public:
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
 
         const std::int32_t docsToInsert = 10;
-        const LogicalTime firstInsertTime = _clock->reserveTicks(docsToInsert);
+        const LogicalTime firstInsertTime = _clock->tickClusterTime(docsToInsert);
 
         BSONObjBuilder oplogCommonBuilder;
         oplogCommonBuilder << "v" << 2 << "op"
@@ -821,7 +828,7 @@ public:
 
         // Insert some documents.
         const std::int32_t docsToInsert = 10;
-        const LogicalTime firstInsertTime = _clock->reserveTicks(docsToInsert);
+        const LogicalTime firstInsertTime = _clock->tickClusterTime(docsToInsert);
         const LogicalTime lastInsertTime = firstInsertTime.addTicks(docsToInsert - 1);
         WriteUnitOfWork wunit(_opCtx);
         for (std::int32_t num = 0; num < docsToInsert; ++num) {
@@ -834,7 +841,7 @@ public:
         ASSERT_EQ(docsToInsert, itCount(autoColl.getCollection()));
 
         // Delete all documents one at a time.
-        const LogicalTime startDeleteTime = _clock->reserveTicks(docsToInsert);
+        const LogicalTime startDeleteTime = _clock->tickClusterTime(docsToInsert);
         for (std::int32_t num = 0; num < docsToInsert; ++num) {
             ASSERT_OK(doNonAtomicApplyOps(
                           nss.db().toString(),
@@ -868,7 +875,7 @@ public:
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
 
         // Insert one document that will go through a series of updates.
-        const LogicalTime insertTime = _clock->reserveTicks(1);
+        const LogicalTime insertTime = _clock->tickClusterTime(1);
         WriteUnitOfWork wunit(_opCtx);
         insertDocument(autoColl.getCollection(),
                        InsertStatement(BSON("_id" << 0), insertTime.asTimestamp(), 0LL));
@@ -893,7 +900,7 @@ public:
                                     << "theOtherSet")),
              BSON("_id" << 0 << "theMap" << BSON("val" << 1) << "theOtherSet" << BSONArray())}};
 
-        const LogicalTime firstUpdateTime = _clock->reserveTicks(updates.size());
+        const LogicalTime firstUpdateTime = _clock->tickClusterTime(updates.size());
         for (std::size_t idx = 0; idx < updates.size(); ++idx) {
             ASSERT_OK(doNonAtomicApplyOps(
                           nss.db().toString(),
@@ -930,7 +937,7 @@ public:
 
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
 
-        const LogicalTime insertTime = _clock->reserveTicks(2);
+        const LogicalTime insertTime = _clock->tickClusterTime(2);
 
         // This applyOps runs into an insert of `{_id: 0, field: 0}` followed by a second insert
         // on the same collection with `{_id: 0}`. It's expected for this second insert to be
@@ -982,7 +989,7 @@ public:
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
 
         // Reserve a timestamp before the inserts should happen.
-        const LogicalTime preInsertTimestamp = _clock->reserveTicks(1);
+        const LogicalTime preInsertTimestamp = _clock->tickClusterTime(1);
         auto swResult =
             doAtomicApplyOps(nss.db().toString(),
                              {BSON("op"
@@ -1034,7 +1041,7 @@ public:
 
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
 
-        const LogicalTime preInsertTimestamp = _clock->reserveTicks(1);
+        const LogicalTime preInsertTimestamp = _clock->tickClusterTime(1);
         auto swResult =
             doAtomicApplyOps(nss.db().toString(),
                              {BSON("op"
@@ -1200,10 +1207,10 @@ public:
 
         {
             AutoGetCollectionForReadCommand autoColl1(_opCtx, nss1);
-            auto coll1 = autoColl1.getCollection();
+            const auto& coll1 = autoColl1.getCollection();
             ASSERT(coll1);
             AutoGetCollectionForReadCommand autoColl2(_opCtx, nss2);
-            auto coll2 = autoColl2.getCollection();
+            const auto& coll2 = autoColl2.getCollection();
             ASSERT(coll2);
 
             assertDocumentAtTimestamp(coll1, pastTs, BSONObj());
@@ -1290,10 +1297,10 @@ public:
 
         _coordinatorMock->alwaysAllowWrites(false);
 
-        const LogicalTime pastTime = _clock->reserveTicks(1);
-        const LogicalTime insertTime0 = _clock->reserveTicks(1);
-        const LogicalTime insertTime1 = _clock->reserveTicks(1);
-        const LogicalTime insertTime2 = _clock->reserveTicks(1);
+        const LogicalTime pastTime = _clock->tickClusterTime(1);
+        const LogicalTime insertTime0 = _clock->tickClusterTime(1);
+        const LogicalTime insertTime1 = _clock->tickClusterTime(1);
+        const LogicalTime insertTime2 = _clock->tickClusterTime(1);
 
         BSONObj doc0 = BSON("_id" << 0 << "a" << 3);
         BSONObj doc1 = BSON("_id" << 1 << "a" << BSON_ARRAY(1 << 2));
@@ -1339,6 +1346,215 @@ public:
     }
 };
 
+class SecondarySetWildcardIndexMultikeyOnInsert : public StorageTimestampTest {
+
+public:
+    void run() {
+        // Pretend to be a secondary.
+        repl::UnreplicatedWritesBlock uwb(_opCtx);
+
+        NamespaceString nss("unittests.SecondarySetWildcardIndexMultikeyOnInsert");
+        // Use a capped collection to prevent the batch applier from grouping insert operations
+        // together in the same WUOW. This test attempts to apply operations out of order, but the
+        // storage engine does not allow an operation to set out-of-order timestamps in the same
+        // WUOW.
+        ASSERT_OK(createCollection(
+            _opCtx,
+            nss.db().toString(),
+            BSON("create" << nss.coll() << "capped" << true << "size" << 1 * 1024 * 1024)));
+        auto uuid = [&]() {
+            AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
+            return autoColl.getCollection()->uuid();
+        }();
+
+        auto indexName = "a_1";
+        auto indexSpec = BSON("name" << indexName << "key" << BSON("$**" << 1) << "v"
+                                     << static_cast<int>(kIndexVersion));
+        ASSERT_OK(dbtests::createIndexFromSpec(_opCtx, nss.ns(), indexSpec));
+
+        _coordinatorMock->alwaysAllowWrites(false);
+
+        const LogicalTime insertTime0 = _clock->tickClusterTime(1);
+        const LogicalTime insertTime1 = _clock->tickClusterTime(1);
+        const LogicalTime insertTime2 = _clock->tickClusterTime(1);
+
+        BSONObj doc0 = BSON("_id" << 0 << "a" << 3);
+        BSONObj doc1 = BSON("_id" << 1 << "a" << BSON_ARRAY(1 << 2));
+        BSONObj doc2 = BSON("_id" << 2 << "a" << BSON_ARRAY(1 << 2));
+        auto op0 = repl::OplogEntry(
+            BSON("ts" << insertTime0.asTimestamp() << "t" << 1LL << "v" << 2 << "op"
+                      << "i"
+                      << "ns" << nss.ns() << "ui" << uuid << "wall" << Date_t() << "o" << doc0));
+        auto op1 = repl::OplogEntry(
+            BSON("ts" << insertTime1.asTimestamp() << "t" << 1LL << "v" << 2 << "op"
+                      << "i"
+                      << "ns" << nss.ns() << "ui" << uuid << "wall" << Date_t() << "o" << doc1));
+        auto op2 = repl::OplogEntry(
+            BSON("ts" << insertTime2.asTimestamp() << "t" << 1LL << "v" << 2 << "op"
+                      << "i"
+                      << "ns" << nss.ns() << "ui" << uuid << "wall" << Date_t() << "o" << doc2));
+
+        // Coerce oplog application to apply op2 before op1. This does not guarantee the actual
+        // order of application however, because the oplog applier applies these operations in
+        // parallel across several threads. The test accepts the possibility of a false negative
+        // (test passes when it should fail) in favor of occasionally finding a true positive (test
+        // fails as intended).
+        std::vector<repl::OplogEntry> ops = {op0, op2, op1};
+
+        DoNothingOplogApplierObserver observer;
+        auto storageInterface = repl::StorageInterface::get(_opCtx);
+        auto writerPool = repl::makeReplWriterPool();
+        repl::OplogApplierImpl oplogApplier(
+            nullptr,  // task executor. not required for applyOplogBatch().
+            nullptr,  // oplog buffer. not required for applyOplogBatch().
+            &observer,
+            _coordinatorMock,
+            _consistencyMarkers,
+            storageInterface,
+            repl::OplogApplier::Options(repl::OplogApplication::Mode::kRecovering),
+            writerPool.get());
+
+        uassertStatusOK(oplogApplier.applyOplogBatch(_opCtx, ops));
+
+        AutoGetCollectionForRead autoColl(_opCtx, nss);
+        auto wildcardIndexDescriptor =
+            autoColl.getCollection()->getIndexCatalog()->findIndexByName(_opCtx, indexName);
+        const IndexAccessMethod* wildcardIndexAccessMethod = autoColl.getCollection()
+                                                                 ->getIndexCatalog()
+                                                                 ->getEntry(wildcardIndexDescriptor)
+                                                                 ->accessMethod();
+        {
+            // Verify that, even though op2 was applied first, the multikey state is observed in all
+            // WiredTiger transactions that can contain the data written by op1.
+            OneOffRead oor(_opCtx, insertTime1.asTimestamp());
+            const WildcardAccessMethod* wam =
+                dynamic_cast<const WildcardAccessMethod*>(wildcardIndexAccessMethod);
+            MultikeyMetadataAccessStats stats;
+            std::set<FieldRef> paths = getWildcardMultikeyPathSet(wam, _opCtx, &stats);
+            ASSERT_EQUALS(1, paths.size());
+            ASSERT_EQUALS("a", paths.begin()->dottedField());
+        }
+        {
+            // Oplog application conservatively uses the first optime in the batch, insertTime0, as
+            // the point at which the index became multikey, despite the fact that the earliest op
+            // which caused the index to become multikey did not occur until insertTime1. This works
+            // because if we construct a query plan that incorrectly believes a particular path to
+            // be multikey, the plan will still be correct (if possibly sub-optimal). Conversely, if
+            // we were to construct a query plan that incorrectly believes a path is NOT multikey,
+            // it could produce incorrect results.
+            OneOffRead oor(_opCtx, insertTime0.asTimestamp());
+            const WildcardAccessMethod* wam =
+                dynamic_cast<const WildcardAccessMethod*>(wildcardIndexAccessMethod);
+            MultikeyMetadataAccessStats stats;
+            std::set<FieldRef> paths = getWildcardMultikeyPathSet(wam, _opCtx, &stats);
+            ASSERT_EQUALS(1, paths.size());
+            ASSERT_EQUALS("a", paths.begin()->dottedField());
+        }
+    }
+};
+
+class SecondarySetWildcardIndexMultikeyOnUpdate : public StorageTimestampTest {
+
+public:
+    void run() {
+        // Pretend to be a secondary.
+        repl::UnreplicatedWritesBlock uwb(_opCtx);
+
+        NamespaceString nss("unittests.SecondarySetWildcardIndexMultikeyOnUpdate");
+        reset(nss);
+        UUID uuid = UUID::gen();
+        {
+            AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
+            uuid = autoColl.getCollection()->uuid();
+        }
+        auto indexName = "a_1";
+        auto indexSpec = BSON("name" << indexName << "key" << BSON("$**" << 1) << "v"
+                                     << static_cast<int>(kIndexVersion));
+        ASSERT_OK(dbtests::createIndexFromSpec(_opCtx, nss.ns(), indexSpec));
+
+        _coordinatorMock->alwaysAllowWrites(false);
+
+        const LogicalTime insertTime0 = _clock->tickClusterTime(1);
+        const LogicalTime updateTime1 = _clock->tickClusterTime(1);
+        const LogicalTime updateTime2 = _clock->tickClusterTime(1);
+
+        BSONObj doc0 = BSON("_id" << 0 << "a" << 3);
+        BSONObj doc1 = BSON("$v" << 1 << "$set" << BSON("a" << BSON_ARRAY(1 << 2)));
+        BSONObj doc2 = BSON("$v" << 1 << "$set" << BSON("a" << BSON_ARRAY(1 << 2)));
+        auto op0 = repl::OplogEntry(
+            BSON("ts" << insertTime0.asTimestamp() << "t" << 1LL << "v" << 2 << "op"
+                      << "i"
+                      << "ns" << nss.ns() << "ui" << uuid << "wall" << Date_t() << "o" << doc0));
+        auto op1 = repl::OplogEntry(
+            BSON("ts" << updateTime1.asTimestamp() << "t" << 1LL << "v" << 2 << "op"
+                      << "u"
+                      << "ns" << nss.ns() << "ui" << uuid << "wall" << Date_t() << "o" << doc1
+                      << "o2" << BSON("_id" << 0)));
+        auto op2 = repl::OplogEntry(
+            BSON("ts" << updateTime2.asTimestamp() << "t" << 1LL << "v" << 2 << "op"
+                      << "u"
+                      << "ns" << nss.ns() << "ui" << uuid << "wall" << Date_t() << "o" << doc2
+                      << "o2" << BSON("_id" << 0)));
+
+        // Coerce oplog application to apply op2 before op1. This does not guarantee the actual
+        // order of application however, because the oplog applier applies these operations in
+        // parallel across several threads. The test accepts the possibility of a false negative
+        // (test passes when it should fail) in favor of occasionally finding a true positive (test
+        // fails as intended).
+        std::vector<repl::OplogEntry> ops = {op0, op2, op1};
+
+        DoNothingOplogApplierObserver observer;
+        auto storageInterface = repl::StorageInterface::get(_opCtx);
+        auto writerPool = repl::makeReplWriterPool();
+        repl::OplogApplierImpl oplogApplier(
+            nullptr,  // task executor. not required for applyOplogBatch().
+            nullptr,  // oplog buffer. not required for applyOplogBatch().
+            &observer,
+            _coordinatorMock,
+            _consistencyMarkers,
+            storageInterface,
+            repl::OplogApplier::Options(repl::OplogApplication::Mode::kRecovering),
+            writerPool.get());
+
+        uassertStatusOK(oplogApplier.applyOplogBatch(_opCtx, ops));
+
+        AutoGetCollectionForRead autoColl(_opCtx, nss);
+        auto wildcardIndexDescriptor =
+            autoColl.getCollection()->getIndexCatalog()->findIndexByName(_opCtx, indexName);
+        const IndexAccessMethod* wildcardIndexAccessMethod = autoColl.getCollection()
+                                                                 ->getIndexCatalog()
+                                                                 ->getEntry(wildcardIndexDescriptor)
+                                                                 ->accessMethod();
+        {
+            // Verify that, even though op2 was applied first, the multikey state is observed in all
+            // WiredTiger transactions that can contain the data written by op1.
+            OneOffRead oor(_opCtx, updateTime1.asTimestamp());
+            const WildcardAccessMethod* wam =
+                dynamic_cast<const WildcardAccessMethod*>(wildcardIndexAccessMethod);
+            MultikeyMetadataAccessStats stats;
+            std::set<FieldRef> paths = getWildcardMultikeyPathSet(wam, _opCtx, &stats);
+            ASSERT_EQUALS(1, paths.size());
+            ASSERT_EQUALS("a", paths.begin()->dottedField());
+        }
+        {
+            // Oplog application conservatively uses the first optime in the batch, insertTime0, as
+            // the point at which the index became multikey, despite the fact that the earliest op
+            // which caused the index to become multikey did not occur until updateTime1. This works
+            // because if we construct a query plan that incorrectly believes a particular path to
+            // be multikey, the plan will still be correct (if possibly sub-optimal). Conversely, if
+            // we were to construct a query plan that incorrectly believes a path is NOT multikey,
+            // it could produce incorrect results.
+            OneOffRead oor(_opCtx, insertTime0.asTimestamp());
+            const WildcardAccessMethod* wam =
+                dynamic_cast<const WildcardAccessMethod*>(wildcardIndexAccessMethod);
+            MultikeyMetadataAccessStats stats;
+            std::set<FieldRef> paths = getWildcardMultikeyPathSet(wam, _opCtx, &stats);
+            ASSERT_EQUALS(1, paths.size());
+            ASSERT_EQUALS("a", paths.begin()->dottedField());
+        }
+    }
+};
+
 class InitialSyncSetIndexMultikeyOnInsert : public StorageTimestampTest {
 
 public:
@@ -1361,11 +1577,11 @@ public:
         _coordinatorMock->alwaysAllowWrites(false);
         ASSERT_OK(_coordinatorMock->setFollowerMode({repl::MemberState::MS::RS_STARTUP2}));
 
-        const LogicalTime pastTime = _clock->reserveTicks(1);
-        const LogicalTime insertTime0 = _clock->reserveTicks(1);
-        const LogicalTime indexBuildTime = _clock->reserveTicks(1);
-        const LogicalTime insertTime1 = _clock->reserveTicks(1);
-        const LogicalTime insertTime2 = _clock->reserveTicks(1);
+        const LogicalTime pastTime = _clock->tickClusterTime(1);
+        const LogicalTime insertTime0 = _clock->tickClusterTime(1);
+        const LogicalTime indexBuildTime = _clock->tickClusterTime(1);
+        const LogicalTime insertTime1 = _clock->tickClusterTime(1);
+        const LogicalTime insertTime2 = _clock->tickClusterTime(1);
 
         BSONObj doc0 = BSON("_id" << 0 << "a" << 3);
         BSONObj doc1 = BSON("_id" << 1 << "a" << BSON_ARRAY(1 << 2));
@@ -1417,9 +1633,8 @@ public:
 
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
 
-        // It is not valid to read the multikey state earlier than the 'minimumVisibleTimestamp',
-        // so at least assert that it has been updated due to the index creation.
-        ASSERT_GT(autoColl.getCollection()->getMinimumVisibleSnapshot().get(),
+        // Ensure minimumVisible has not been updated due to the index creation.
+        ASSERT_LT(autoColl.getCollection()->getMinimumVisibleSnapshot().get(),
                   pastTime.asTimestamp());
 
         // Reading the multikey state before 'insertTime0' is not valid or reliable to test. If the
@@ -1452,7 +1667,7 @@ public:
                                      << static_cast<int>(kIndexVersion));
         ASSERT_OK(dbtests::createIndexFromSpec(_opCtx, nss.ns(), indexSpec));
 
-        const LogicalTime pastTime = _clock->reserveTicks(1);
+        const LogicalTime pastTime = _clock->tickClusterTime(1);
         const LogicalTime insertTime = pastTime.addTicks(1);
 
         BSONObj doc = BSON("_id" << 1 << "a" << BSON_ARRAY(1 << 2));
@@ -1481,7 +1696,7 @@ public:
                                      << static_cast<int>(kIndexVersion));
         ASSERT_OK(dbtests::createIndexFromSpec(_opCtx, nss.ns(), indexSpec));
 
-        const LogicalTime pastTime = _clock->reserveTicks(1);
+        const LogicalTime pastTime = _clock->tickClusterTime(1);
         const LogicalTime insertTime = pastTime.addTicks(1);
 
         BSONObj doc = BSON("_id" << 1 << "a" << BSON_ARRAY(1 << 2));
@@ -1518,20 +1733,24 @@ public:
             ASSERT_OK(dbtests::createIndexFromSpec(_opCtx, nss.ns(), indexSpec));
         }
 
-        auto presentTs = _clock->getClusterTime().asTimestamp();
+        const auto currentTime = _clock->getTime();
+        const auto presentTs = currentTime.clusterTime().asTimestamp();
 
         // This test does not run a real ReplicationCoordinator, so must advance the snapshot
         // manager manually.
         auto storageEngine = cc().getServiceContext()->getStorageEngine();
-        storageEngine->getSnapshotManager()->setLocalSnapshot(presentTs);
+        storageEngine->getSnapshotManager()->setLastApplied(presentTs);
 
-        const auto beforeTxnTime = _clock->reserveTicks(1);
+        const auto beforeTxnTime = _clock->tickClusterTime(1);
         auto beforeTxnTs = beforeTxnTime.asTimestamp();
-        auto commitEntryTs = beforeTxnTime.addTicks(1).asTimestamp();
+        const auto multikeyNoopTime = beforeTxnTime.addTicks(1);
+        auto multikeyNoopTs = multikeyNoopTime.asTimestamp();
+        auto commitEntryTs = multikeyNoopTime.addTicks(1).asTimestamp();
 
-        LOGV2(22502, "Present TS: {presentTs}", "presentTs"_attr = presentTs);
-        LOGV2(22503, "Before transaction TS: {beforeTxnTs}", "beforeTxnTs"_attr = beforeTxnTs);
-        LOGV2(22504, "Commit entry TS: {commitEntryTs}", "commitEntryTs"_attr = commitEntryTs);
+        LOGV2(22502, "Present time", "timestamp"_attr = presentTs);
+        LOGV2(22503, "Before transaction time", "timestamp"_attr = beforeTxnTs);
+        LOGV2(4801000, "Multikey noop time", "timestamp"_attr = multikeyNoopTs);
+        LOGV2(22504, "Commit entry time", "timestamp"_attr = commitEntryTs);
 
         const auto sessionId = makeLogicalSessionIdForTest();
         _opCtx->setLogicalSessionId(sessionId);
@@ -1557,11 +1776,12 @@ public:
         txnParticipant.stashTransactionResources(_opCtx);
 
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
-        auto coll = autoColl.getCollection();
+        const auto& coll = autoColl.getCollection();
 
         // Make sure the transaction committed and its writes were timestamped correctly.
-        assertDocumentAtTimestamp(coll, beforeTxnTs, BSONObj());
         assertDocumentAtTimestamp(coll, presentTs, BSONObj());
+        assertDocumentAtTimestamp(coll, beforeTxnTs, BSONObj());
+        assertDocumentAtTimestamp(coll, multikeyNoopTs, BSONObj());
         assertDocumentAtTimestamp(coll, commitEntryTs, doc);
         assertDocumentAtTimestamp(coll, nullTs, doc);
 
@@ -1574,9 +1794,12 @@ public:
         // commit time.
         assertMultikeyPaths(_opCtx, coll, indexName, presentTs, false /* shouldBeMultikey */, {{}});
         assertMultikeyPaths(
-            _opCtx, coll, indexName, beforeTxnTs, true /* shouldBeMultikey */, {{0}});
+            _opCtx, coll, indexName, beforeTxnTs, false /* shouldBeMultikey */, {{}});
+        assertMultikeyPaths(
+            _opCtx, coll, indexName, multikeyNoopTs, true /* shouldBeMultikey */, {{0}});
         assertMultikeyPaths(
             _opCtx, coll, indexName, commitEntryTs, true /* shouldBeMultikey */, {{0}});
+        assertMultikeyPaths(_opCtx, coll, indexName, nullTs, true /* shouldBeMultikey */, {{0}});
     }
 };
 
@@ -1738,7 +1961,7 @@ public:
         auto durableCatalog = storageEngine->getCatalog();
 
         // Declare the database to be in a "synced" state, i.e: in steady-state replication.
-        Timestamp syncTime = _clock->reserveTicks(1).asTimestamp();
+        Timestamp syncTime = _clock->tickClusterTime(1).asTimestamp();
         invariant(!syncTime.isNull());
         storageEngine->setInitialDataTimestamp(syncTime);
 
@@ -1767,7 +1990,7 @@ public:
             // side-effect of not timestamping the collection creation.
             repl::UnreplicatedWritesBlock notReplicated(_opCtx);
             if (nss.isReplicated()) {
-                TimestampBlock tsBlock(_opCtx, _clock->reserveTicks(1).asTimestamp());
+                TimestampBlock tsBlock(_opCtx, _clock->tickClusterTime(1).asTimestamp());
                 reset(nss);
             } else {
                 reset(nss);
@@ -1791,7 +2014,7 @@ public:
 
         // Reserve a tick, this represents a time after the rename in which the `kvDropDatabase`
         // ident for `kvDropDatabase` still exists.
-        const Timestamp postRenameTime = _clock->reserveTicks(1).asTimestamp();
+        const Timestamp postRenameTime = _clock->tickClusterTime(1).asTimestamp();
 
         // If the storage engine is managing drops internally, the ident should not be visible after
         // a drop.
@@ -1802,7 +2025,7 @@ public:
             assertIdentsExistAtTimestamp(durableCatalog, collIdent, indexIdent, postRenameTime);
         }
 
-        const Timestamp dropTime = _clock->reserveTicks(1).asTimestamp();
+        const Timestamp dropTime = _clock->tickClusterTime(1).asTimestamp();
         if (SimulatePrimary) {
             ASSERT_OK(dropDatabaseForApplyOps(_opCtx, nss.db().toString()));
         } else {
@@ -1819,6 +2042,9 @@ public:
         // dropDatabase must not timestamp the final write. The collection and index should seem
         // to have never existed.
         assertIdentsMissingAtTimestamp(durableCatalog, collIdent, indexIdent, syncTime);
+
+        // Reset initial data timestamp to avoid unintended storage engine timestamp side effects.
+        storageEngine->setInitialDataTimestamp(Timestamp(0, 0));
     }
 };
 
@@ -1854,12 +2080,14 @@ public:
         reset(nss);
 
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_X);
+        CollectionWriter coll(autoColl);
+
         RecordId catalogId = autoColl.getCollection()->getCatalogId();
 
-        const LogicalTime insertTimestamp = _clock->reserveTicks(1);
+        const LogicalTime insertTimestamp = _clock->tickClusterTime(1);
         {
             WriteUnitOfWork wuow(_opCtx);
-            insertDocument(autoColl.getCollection(),
+            insertDocument(coll.get(),
                            InsertStatement(BSON("_id" << 0 << "a" << BSON_ARRAY(1 << 2)),
                                            insertTimestamp.asTimestamp(),
                                            presentTerm));
@@ -1873,11 +2101,9 @@ public:
 
         // Build an index on `{a: 1}`. This index will be multikey.
         MultiIndexBlock indexer;
-        auto abortOnExit = makeGuard([&] {
-            indexer.abortIndexBuild(
-                _opCtx, autoColl.getCollection(), MultiIndexBlock::kNoopOnCleanUpFn);
-        });
-        const LogicalTime beforeIndexBuild = _clock->reserveTicks(2);
+        auto abortOnExit = makeGuard(
+            [&] { indexer.abortIndexBuild(_opCtx, coll, MultiIndexBlock::kNoopOnCleanUpFn); });
+        const LogicalTime beforeIndexBuild = _clock->tickClusterTime(2);
         BSONObj indexInfoObj;
         {
             // Primaries do not have a wrapping `TimestampBlock`; secondaries do.
@@ -1894,7 +2120,7 @@ public:
 
             auto swIndexInfoObj = indexer.init(
                 _opCtx,
-                autoColl.getCollection(),
+                coll,
                 {BSON("v" << 2 << "unique" << true << "name"
                           << "a_1"
                           << "key" << BSON("a" << 1))},
@@ -1903,37 +2129,39 @@ public:
             indexInfoObj = std::move(swIndexInfoObj.getValue()[0]);
         }
 
-        const LogicalTime afterIndexInit = _clock->reserveTicks(2);
+        const LogicalTime afterIndexInit = _clock->tickClusterTime(2);
 
         // Inserting all the documents has the side-effect of setting internal state on the index
         // builder that the index is multikey.
         ASSERT_OK(indexer.insertAllDocumentsInCollection(_opCtx, autoColl.getCollection()));
-        ASSERT_OK(indexer.checkConstraints(_opCtx));
+        ASSERT_OK(indexer.checkConstraints(_opCtx, autoColl.getCollection()));
 
         {
             WriteUnitOfWork wuow(_opCtx);
             // All callers of `MultiIndexBlock::commit` are responsible for timestamping index
             // completion  Primaries write an oplog entry. Secondaries explicitly set a
             // timestamp.
-            ASSERT_OK(indexer.commit(
-                _opCtx,
-                autoColl.getCollection(),
-                [&](const BSONObj& indexSpec) {
-                    if (SimulatePrimary) {
-                        // The timestamping responsibility for each index is placed on the caller.
-                        _opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
-                            _opCtx, nss, autoColl.getCollection()->uuid(), indexSpec, false);
-                    } else {
-                        ASSERT_OK(_opCtx->recoveryUnit()->setTimestamp(
-                            _clock->getClusterTime().asTimestamp()));
-                    }
-                },
-                MultiIndexBlock::kNoopOnCommitFn));
+            ASSERT_OK(
+                indexer.commit(_opCtx,
+                               autoColl.getWritableCollection(),
+                               [&](const BSONObj& indexSpec) {
+                                   if (SimulatePrimary) {
+                                       // The timestamping responsibility for each index is placed
+                                       // on the caller.
+                                       _opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
+                                           _opCtx, nss, coll->uuid(), indexSpec, false);
+                                   } else {
+                                       const auto currentTime = _clock->getTime();
+                                       ASSERT_OK(_opCtx->recoveryUnit()->setTimestamp(
+                                           currentTime.clusterTime().asTimestamp()));
+                                   }
+                               },
+                               MultiIndexBlock::kNoopOnCommitFn));
             wuow.commit();
         }
         abortOnExit.dismiss();
 
-        const Timestamp afterIndexBuild = _clock->reserveTicks(1).asTimestamp();
+        const Timestamp afterIndexBuild = _clock->tickClusterTime(1).asTimestamp();
 
         const std::string indexIdent =
             getNewIndexIdentAtTime(durableCatalog, origIdents, Timestamp::min());
@@ -1983,14 +2211,14 @@ public:
         reset(nss);
 
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_X);
+        CollectionWriter collection(autoColl);
 
         // Build an index on `{a: 1}`.
         MultiIndexBlock indexer;
         auto abortOnExit = makeGuard([&] {
-            indexer.abortIndexBuild(
-                _opCtx, autoColl.getCollection(), MultiIndexBlock::kNoopOnCleanUpFn);
+            indexer.abortIndexBuild(_opCtx, collection, MultiIndexBlock::kNoopOnCleanUpFn);
         });
-        const LogicalTime beforeIndexBuild = _clock->reserveTicks(2);
+        const LogicalTime beforeIndexBuild = _clock->tickClusterTime(2);
         BSONObj indexInfoObj;
         {
             // Primaries do not have a wrapping `TimestampBlock`; secondaries do.
@@ -2007,23 +2235,23 @@ public:
 
             auto swIndexInfoObj = indexer.init(
                 _opCtx,
-                autoColl.getCollection(),
+                collection,
                 {BSON("v" << 2 << "unique" << true << "name"
                           << "a_1"
                           << "ns" << nss.ns() << "key" << BSON("a" << 1))},
-                MultiIndexBlock::makeTimestampedIndexOnInitFn(_opCtx, autoColl.getCollection()));
+                MultiIndexBlock::makeTimestampedIndexOnInitFn(_opCtx, collection.get()));
             ASSERT_OK(swIndexInfoObj.getStatus());
             indexInfoObj = std::move(swIndexInfoObj.getValue()[0]);
         }
 
-        const LogicalTime afterIndexInit = _clock->reserveTicks(1);
+        const LogicalTime afterIndexInit = _clock->tickClusterTime(1);
 
         // Insert a document that will be intercepted and need to be drained. This timestamp will
         // become the lastApplied time.
-        const LogicalTime firstInsert = _clock->reserveTicks(1);
+        const LogicalTime firstInsert = _clock->tickClusterTime(1);
         {
             WriteUnitOfWork wuow(_opCtx);
-            insertDocument(autoColl.getCollection(),
+            insertDocument(collection.get(),
                            InsertStatement(BSON("_id" << 0 << "a" << 1),
                                            firstInsert.asTimestamp(),
                                            presentTerm));
@@ -2034,13 +2262,13 @@ public:
         // Index build drain will timestamp writes from the side table into the index with the
         // lastApplied timestamp. This is because these writes are not associated with any specific
         // oplog entry.
-        ASSERT_EQ(repl::ReplicationCoordinator::get(getGlobalServiceContext())
+        ASSERT_EQ(repl::ReplicationCoordinator::get(_opCtx->getServiceContext())
                       ->getMyLastAppliedOpTime()
                       .getTimestamp(),
                   firstInsert.asTimestamp());
 
         ASSERT_OK(indexer.drainBackgroundWrites(_opCtx,
-                                                RecoveryUnit::ReadSource::kUnset,
+                                                RecoveryUnit::ReadSource::kNoTimestamp,
                                                 IndexBuildInterceptor::DrainYieldPolicy::kNoYield));
 
         auto indexCatalog = autoColl.getCollection()->getIndexCatalog();
@@ -2066,7 +2294,7 @@ public:
         }
 
         // Insert a second document that will be intercepted and need to be drained.
-        const LogicalTime secondInsert = _clock->reserveTicks(1);
+        const LogicalTime secondInsert = _clock->tickClusterTime(1);
         {
             WriteUnitOfWork wuow(_opCtx);
             insertDocument(autoColl.getCollection(),
@@ -2079,11 +2307,11 @@ public:
 
         // Advance the lastApplied optime to observe a point before the drain where there are
         // un-drained writes.
-        const LogicalTime afterSecondInsert = _clock->reserveTicks(1);
+        const LogicalTime afterSecondInsert = _clock->tickClusterTime(1);
         setReplCoordAppliedOpTime(repl::OpTime(afterSecondInsert.asTimestamp(), presentTerm));
 
         ASSERT_OK(indexer.drainBackgroundWrites(_opCtx,
-                                                RecoveryUnit::ReadSource::kUnset,
+                                                RecoveryUnit::ReadSource::kNoTimestamp,
                                                 IndexBuildInterceptor::DrainYieldPolicy::kNoYield));
 
         {
@@ -2098,24 +2326,26 @@ public:
             ASSERT_TRUE(buildingIndex->indexBuildInterceptor()->areAllWritesApplied(_opCtx));
         }
 
-        ASSERT_OK(indexer.checkConstraints(_opCtx));
+        ASSERT_OK(indexer.checkConstraints(_opCtx, autoColl.getCollection()));
 
         {
             WriteUnitOfWork wuow(_opCtx);
-            ASSERT_OK(indexer.commit(
-                _opCtx,
-                autoColl.getCollection(),
-                [&](const BSONObj& indexSpec) {
-                    if (SimulatePrimary) {
-                        // The timestamping responsibility for each index is placed on the caller.
-                        _opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
-                            _opCtx, nss, autoColl.getCollection()->uuid(), indexSpec, false);
-                    } else {
-                        ASSERT_OK(_opCtx->recoveryUnit()->setTimestamp(
-                            _clock->getClusterTime().asTimestamp()));
-                    }
-                },
-                MultiIndexBlock::kNoopOnCommitFn));
+            ASSERT_OK(
+                indexer.commit(_opCtx,
+                               collection.get(),
+                               [&](const BSONObj& indexSpec) {
+                                   if (SimulatePrimary) {
+                                       // The timestamping responsibility for each index is placed
+                                       // on the caller.
+                                       _opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
+                                           _opCtx, nss, collection.get()->uuid(), indexSpec, false);
+                                   } else {
+                                       const auto currentTime = _clock->getTime();
+                                       ASSERT_OK(_opCtx->recoveryUnit()->setTimestamp(
+                                           currentTime.clusterTime().asTimestamp()));
+                                   }
+                               },
+                               MultiIndexBlock::kNoopOnCommitFn));
             wuow.commit();
         }
         abortOnExit.dismiss();
@@ -2125,18 +2355,13 @@ public:
 class TimestampMultiIndexBuilds : public StorageTimestampTest {
 public:
     void run() {
-        // Disable index build commit quorum as we don't have support of replication subsystem for
-        // voting.
-        ASSERT_OK(ServerParameterSet::getGlobal()
-                      ->getMap()
-                      .find("enableIndexBuildCommitQuorum")
-                      ->second->setFromString("false"));
-
         auto storageEngine = _opCtx->getServiceContext()->getStorageEngine();
         auto durableCatalog = storageEngine->getCatalog();
 
         // Create config.system.indexBuilds collection to store commit quorum value during index
         // building.
+        ASSERT_OK(repl::StorageInterface::get(_opCtx)->dropCollection(
+            _opCtx, NamespaceString::kIndexBuildEntryNamespace));
         ASSERT_OK(
             createCollection(_opCtx,
                              NamespaceString::kIndexBuildEntryNamespace.db().toString(),
@@ -2149,7 +2374,7 @@ public:
         {
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_X);
 
-            const LogicalTime insertTimestamp = _clock->reserveTicks(1);
+            const LogicalTime insertTimestamp = _clock->tickClusterTime(1);
 
             WriteUnitOfWork wuow(_opCtx);
             insertDocument(autoColl.getCollection(),
@@ -2162,61 +2387,41 @@ public:
             // Save the pre-state idents so we can capture the specific ident related to index
             // creation.
             origIdents = durableCatalog->getAllIdents(_opCtx);
+
+            // Ensure we have a committed snapshot to avoid ReadConcernMajorityNotAvailableYet
+            // error at the beginning of the the collection scan phase.
+            auto snapshotManager = storageEngine->getSnapshotManager();
+            snapshotManager->setCommittedSnapshot(insertTimestamp.asTimestamp());
         }
 
         DBDirectClient client(_opCtx);
         {
-            IndexSpec index1;
-            // Name this index for easier querying.
-            index1.addKeys(BSON("a" << 1)).name("a_1");
-            IndexSpec index2;
-            index2.addKeys(BSON("b" << 1)).name("b_1");
-
-            std::vector<const IndexSpec*> indexes;
-            indexes.push_back(&index1);
-            indexes.push_back(&index2);
-            client.createIndexes(nss.ns(), indexes);
+            // Disable index build commit quorum as we don't have support of replication subsystem
+            // for voting.
+            auto index1 = BSON("v" << kIndexVersion << "key" << BSON("a" << 1) << "name"
+                                   << "a_1");
+            auto index2 = BSON("v" << kIndexVersion << "key" << BSON("b" << 1) << "name"
+                                   << "b_1");
+            auto createIndexesCmdObj =
+                BSON("createIndexes" << nss.coll() << "indexes" << BSON_ARRAY(index1 << index2)
+                                     << "commitQuorum" << 0);
+            BSONObj result;
+            ASSERT(client.runCommand(nss.db().toString(), createIndexesCmdObj, result)) << result;
         }
 
-        // Two phase index builds do not emit an createIndexes oplog entry for each index.
-        Timestamp indexCreateInitTs;
-        Timestamp indexAComplete;
-        Timestamp indexBComplete;
-        if (IndexBuildsCoordinator::supportsTwoPhaseIndexBuild()) {
-            indexCreateInitTs =
-                queryOplog(BSON("op"
-                                << "c"
-                                << "o.startIndexBuild" << nss.coll() << "o.indexes.0.name"
-                                << "a_1"))["ts"]
-                    .timestamp();
-            auto commitIndexBuildTs =
-                queryOplog(BSON("op"
-                                << "c"
-                                << "o.commitIndexBuild" << nss.coll() << "o.indexes.0.name"
-                                << "a_1"))["ts"]
-                    .timestamp();
-            indexBComplete = commitIndexBuildTs;
-        } else {
-            indexCreateInitTs =
-                queryOplog(BSON("op"
-                                << "n"
-                                << "ns"
-                                << ""
-                                << "o.msg"
-                                << std::string(str::stream()
-                                               << "Creating indexes. Coll: " << nss)))["ts"]
-                    .timestamp();
-            indexAComplete = queryOplog(BSON("op"
-                                             << "c"
-                                             << "o.createIndexes" << nss.coll() << "o.name"
-                                             << "a_1"))["ts"]
-                                 .timestamp();
-            indexBComplete = queryOplog(BSON("op"
-                                             << "c"
-                                             << "o.createIndexes" << nss.coll() << "o.name"
-                                             << "b_1"))["ts"]
-                                 .timestamp();
-        }
+        auto indexCreateInitTs = queryOplog(BSON("op"
+                                                 << "c"
+                                                 << "o.startIndexBuild" << nss.coll()
+                                                 << "o.indexes.0.name"
+                                                 << "a_1"))["ts"]
+                                     .timestamp();
+        auto commitIndexBuildTs = queryOplog(BSON("op"
+                                                  << "c"
+                                                  << "o.commitIndexBuild" << nss.coll()
+                                                  << "o.indexes.0.name"
+                                                  << "a_1"))["ts"]
+                                      .timestamp();
+        auto indexBComplete = commitIndexBuildTs;
 
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_S);
         RecordId catalogId = autoColl.getCollection()->getCatalogId();
@@ -2234,16 +2439,6 @@ public:
             getIndexMetaData(getMetaDataAtTime(durableCatalog, catalogId, indexCreateInitTs), "b_1")
                 .ready);
 
-        // Assert the `a_1` index becomes ready at the next oplog entry time.
-        if (!indexAComplete.isNull()) {
-            ASSERT_TRUE(getIndexMetaData(
-                            getMetaDataAtTime(durableCatalog, catalogId, indexAComplete), "a_1")
-                            .ready);
-            ASSERT_FALSE(getIndexMetaData(
-                             getMetaDataAtTime(durableCatalog, catalogId, indexAComplete), "b_1")
-                             .ready);
-        }
-
         // Assert the `b_1` index becomes ready at the last oplog entry time.
         ASSERT_TRUE(
             getIndexMetaData(getMetaDataAtTime(durableCatalog, catalogId, indexBComplete), "a_1")
@@ -2251,18 +2446,31 @@ public:
         ASSERT_TRUE(
             getIndexMetaData(getMetaDataAtTime(durableCatalog, catalogId, indexBComplete), "b_1")
                 .ready);
+
+        // Assert that the index build is removed from config.system.indexBuilds collection after
+        // completion.
+        {
+            AutoGetCollectionForRead collection(_opCtx, NamespaceString::kIndexBuildEntryNamespace);
+            ASSERT_TRUE(collection);
+
+            // At the commitIndexBuild entry time, the index build be still be present in the
+            // indexBuilds collection.
+            {
+                OneOffRead oor(_opCtx, indexBComplete);
+                // Fails if the collection is empty.
+                findOne(collection.getCollection());
+            }
+
+            // After the index build has finished, we should not see the doc in the indexBuilds
+            // collection.
+            ASSERT_EQUALS(0, itCount(collection.getCollection()));
+        }
     }
 };
 
 class TimestampMultiIndexBuildsDuringRename : public StorageTimestampTest {
 public:
     void run() {
-        // Disable index build commit quorum as we don't have support of replication subsystem for
-        // voting.
-        ASSERT_OK(ServerParameterSet::getGlobal()
-                      ->getMap()
-                      .find("enableIndexBuildCommitQuorum")
-                      ->second->setFromString("false"));
         auto storageEngine = _opCtx->getServiceContext()->getStorageEngine();
         auto durableCatalog = storageEngine->getCatalog();
 
@@ -2272,7 +2480,7 @@ public:
         {
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_X);
 
-            const LogicalTime insertTimestamp = _clock->reserveTicks(1);
+            const LogicalTime insertTimestamp = _clock->tickClusterTime(1);
 
             WriteUnitOfWork wuow(_opCtx);
             insertDocument(autoColl.getCollection(),
@@ -2281,20 +2489,26 @@ public:
                                            presentTerm));
             wuow.commit();
             ASSERT_EQ(1, itCount(autoColl.getCollection()));
+
+            // Ensure we have a committed snapshot to avoid ReadConcernMajorityNotAvailableYet
+            // error at the beginning of the the collection scan phase.
+            auto snapshotManager = storageEngine->getSnapshotManager();
+            snapshotManager->setCommittedSnapshot(insertTimestamp.asTimestamp());
         }
 
         DBDirectClient client(_opCtx);
         {
-            IndexSpec index1;
-            // Name this index for easier querying.
-            index1.addKeys(BSON("a" << 1)).name("a_1");
-            IndexSpec index2;
-            index2.addKeys(BSON("b" << 1)).name("b_1");
-
-            std::vector<const IndexSpec*> indexes;
-            indexes.push_back(&index1);
-            indexes.push_back(&index2);
-            client.createIndexes(nss.ns(), indexes);
+            // Disable index build commit quorum as we don't have support of replication subsystem
+            // for voting.
+            auto index1 = BSON("v" << kIndexVersion << "key" << BSON("a" << 1) << "name"
+                                   << "a_1");
+            auto index2 = BSON("v" << kIndexVersion << "key" << BSON("b" << 1) << "name"
+                                   << "b_1");
+            auto createIndexesCmdObj =
+                BSON("createIndexes" << nss.coll() << "indexes" << BSON_ARRAY(index1 << index2)
+                                     << "commitQuorum" << 0);
+            BSONObj result;
+            ASSERT(client.runCommand(nss.db().toString(), createIndexesCmdObj, result)) << result;
         }
 
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_X);
@@ -2308,10 +2522,11 @@ public:
 
         // Rename collection.
         BSONObj renameResult;
-        client.runCommand(
+        ASSERT(client.runCommand(
             "admin",
             BSON("renameCollection" << nss.ns() << "to" << renamedNss.ns() << "dropTarget" << true),
-            renameResult);
+            renameResult))
+            << renameResult;
 
         NamespaceString tmpName;
         Timestamp indexCommitTs;
@@ -2344,7 +2559,7 @@ public:
 
         // Assert the 'a_1' and `b_1` indexes becomes ready at the last oplog entry time.
         RecordId renamedCatalogId = CollectionCatalog::get(_opCtx)
-                                        .lookupCollectionByNamespace(_opCtx, renamedNss)
+                                        ->lookupCollectionByNamespace(_opCtx, renamedNss)
                                         ->getCatalogId();
         ASSERT_TRUE(getIndexMetaData(
                         getMetaDataAtTime(durableCatalog, renamedCatalogId, indexCommitTs), "a_1")
@@ -2367,6 +2582,15 @@ public:
         auto storageEngine = _opCtx->getServiceContext()->getStorageEngine();
         auto durableCatalog = storageEngine->getCatalog();
 
+        // Create config.system.indexBuilds collection to store commit quorum value during index
+        // building.
+        ASSERT_OK(repl::StorageInterface::get(_opCtx)->dropCollection(
+            _opCtx, NamespaceString::kIndexBuildEntryNamespace));
+        ASSERT_OK(
+            createCollection(_opCtx,
+                             NamespaceString::kIndexBuildEntryNamespace.db().toString(),
+                             BSON("create" << NamespaceString::kIndexBuildEntryNamespace.coll())));
+
         NamespaceString nss("unittests.timestampAbortIndexBuild");
         reset(nss);
 
@@ -2374,8 +2598,8 @@ public:
         {
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_X);
 
-            auto insertTimestamp1 = _clock->reserveTicks(1);
-            auto insertTimestamp2 = _clock->reserveTicks(1);
+            auto insertTimestamp1 = _clock->tickClusterTime(1);
+            auto insertTimestamp2 = _clock->tickClusterTime(1);
 
             // Insert two documents with the same value for field 'a' so that
             // we will fail to create a unique index.
@@ -2394,82 +2618,82 @@ public:
             // Save the pre-state idents so we can capture the specific ident related to index
             // creation.
             origIdents = durableCatalog->getAllIdents(_opCtx);
+
+            // Ensure we have a committed snapshot to avoid ReadConcernMajorityNotAvailableYet
+            // error at the beginning of the the collection scan phase.
+            auto snapshotManager = storageEngine->getSnapshotManager();
+            snapshotManager->setCommittedSnapshot(insertTimestamp2.asTimestamp());
         }
 
         {
+            // Disable index build commit quorum as we don't have support of replication subsystem
+            // for voting.
+            auto index1 = BSON("v" << kIndexVersion << "key" << BSON("a" << 1) << "name"
+                                   << "a_1"
+                                   << "unique" << true);
+            auto createIndexesCmdObj =
+                BSON("createIndexes" << nss.coll() << "indexes" << BSON_ARRAY(index1)
+                                     << "commitQuorum" << 0);
+
             DBDirectClient client(_opCtx);
-
-            IndexSpec index1;
-            // Name this index for easier querying.
-            index1.addKeys(BSON("a" << 1)).name("a_1").unique();
-
-            std::vector<const IndexSpec*> indexes;
-            indexes.push_back(&index1);
-            ASSERT_THROWS_CODE(
-                client.createIndexes(nss.ns(), indexes), DBException, ErrorCodes::DuplicateKey);
+            BSONObj result;
+            ASSERT_FALSE(client.runCommand(nss.db().toString(), createIndexesCmdObj, result));
+            ASSERT_EQUALS(ErrorCodes::DuplicateKey, getStatusFromCommandResult(result));
         }
 
         // Confirm that startIndexBuild and abortIndexBuild oplog entries have been written to the
         // oplog.
-        Timestamp indexStartTs;
-        Timestamp indexAbortTs;
-        if (IndexBuildsCoordinator::supportsTwoPhaseIndexBuild()) {
-            auto indexStartDocument =
-                queryOplog(BSON("ns" << nss.db() + ".$cmd"
-                                     << "o.startIndexBuild" << nss.coll() << "o.indexes.0.name"
-                                     << "a_1"));
-            indexStartTs = indexStartDocument["ts"].timestamp();
-            auto indexAbortDocument =
-                queryOplog(BSON("ns" << nss.db() + ".$cmd"
-                                     << "o.abortIndexBuild" << nss.coll() << "o.indexes.0.name"
-                                     << "a_1"));
-            indexAbortTs = indexAbortDocument["ts"].timestamp();
-
-        } else {
-            auto indexStartDocument =
-                queryOplog(BSON("op"
-                                << "n"
-                                << "ns"
-                                << ""
-                                << "o.msg"
-                                << std::string(str::stream()
-                                               << "Creating indexes. Coll: " << nss)));
-            indexStartTs = indexStartDocument["ts"].timestamp();
-            // Set abort timestamp to some future value greater than the ghost timestamp used to
-            // remove the index from the mdb catalog.
-            indexAbortTs = _clock->reserveTicks(1).asTimestamp();
-        }
+        auto indexStartDocument =
+            queryOplog(BSON("ns" << nss.db() + ".$cmd"
+                                 << "o.startIndexBuild" << nss.coll() << "o.indexes.0.name"
+                                 << "a_1"));
+        auto indexStartTs = indexStartDocument["ts"].timestamp();
+        auto indexAbortDocument =
+            queryOplog(BSON("ns" << nss.db() + ".$cmd"
+                                 << "o.abortIndexBuild" << nss.coll() << "o.indexes.0.name"
+                                 << "a_1"));
+        auto indexAbortTs = indexAbortDocument["ts"].timestamp();
 
         // Check index state in catalog at oplog entry times for both startIndexBuild and
         // abortIndexBuild.
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_X);
         RecordId catalogId = autoColl.getCollection()->getCatalogId();
 
-        if (IndexBuildsCoordinator::supportsTwoPhaseIndexBuild()) {
-            // We expect one new one new index ident during this index build.
-            assertRenamedCollectionIdentsAtTimestamp(
-                durableCatalog, origIdents, /*expectedNewIndexIdents*/ 1, indexStartTs);
-            ASSERT_FALSE(
-                getIndexMetaData(getMetaDataAtTime(durableCatalog, catalogId, indexStartTs), "a_1")
-                    .ready);
-        } else {
-            // In the absence of an abortIndexBuild oplog entry, the index entry will be removed
-            // from the mdb catalog using a ghost timestamp which should be equal to 'indexStartTs'.
-            // In this case, we won't be able to determine if the index entry is present with
-            // ready: false.
-            assertRenamedCollectionIdentsAtTimestamp(
-                durableCatalog, origIdents, /*expectedNewIndexIdents*/ 0, indexStartTs);
-        }
+        // We expect one new one new index ident during this index build.
+        assertRenamedCollectionIdentsAtTimestamp(
+            durableCatalog, origIdents, /*expectedNewIndexIdents*/ 1, indexStartTs);
+        ASSERT_FALSE(
+            getIndexMetaData(getMetaDataAtTime(durableCatalog, catalogId, indexStartTs), "a_1")
+                .ready);
 
         // We expect all new idents to be removed after the index build has aborted.
         assertRenamedCollectionIdentsAtTimestamp(
             durableCatalog, origIdents, /*expectedNewIndexIdents*/ 0, indexAbortTs);
         assertIndexMetaDataMissing(getMetaDataAtTime(durableCatalog, catalogId, indexAbortTs),
                                    "a_1");
+
+        // Assert that the index build is removed from config.system.indexBuilds collection after
+        // completion.
+        {
+            AutoGetCollectionForRead collection(_opCtx, NamespaceString::kIndexBuildEntryNamespace);
+            ASSERT_TRUE(collection);
+
+            // At the commitIndexBuild entry time, the index build be still be present in the
+            // indexBuilds collection.
+            {
+                OneOffRead oor(_opCtx, indexAbortTs);
+                // Fails if the collection is empty.
+                findOne(collection.getCollection());
+            }
+
+            // After the index build has finished, we should not see the doc in the indexBuilds
+            // collection.
+            ASSERT_EQUALS(0, itCount(collection.getCollection()));
+        }
     }
 };
 
-class TimestampIndexDrops : public StorageTimestampTest {
+class TimestampIndexDropsWildcard : public StorageTimestampTest {
 public:
     void run() {
         auto storageEngine = _opCtx->getServiceContext()->getStorageEngine();
@@ -2479,8 +2703,9 @@ public:
         reset(nss);
 
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_X);
+        CollectionWriter coll(autoColl);
 
-        const LogicalTime insertTimestamp = _clock->reserveTicks(1);
+        const LogicalTime insertTimestamp = _clock->tickClusterTime(1);
         {
             WriteUnitOfWork wuow(_opCtx);
             insertDocument(autoColl.getCollection(),
@@ -2492,7 +2717,7 @@ public:
         }
 
 
-        const Timestamp beforeIndexBuild = _clock->reserveTicks(1).asTimestamp();
+        const Timestamp beforeIndexBuild = _clock->tickClusterTime(1).asTimestamp();
 
         // Save the pre-state idents so we can capture the specific ident related to index
         // creation.
@@ -2502,10 +2727,10 @@ public:
         std::vector<std::string> indexIdents;
         // Create an index and get the ident for each index.
         for (auto key : {"a", "b", "c"}) {
-            createIndex(autoColl.getCollection(), str::stream() << key << "_1", BSON(key << 1));
+            createIndex(coll, str::stream() << key << "_1", BSON(key << 1));
 
             // Timestamps at the completion of each index build.
-            afterCreateTimestamps.push_back(_clock->reserveTicks(1).asTimestamp());
+            afterCreateTimestamps.push_back(_clock->tickClusterTime(1).asTimestamp());
 
             // Add the new ident to the vector and reset the current idents.
             indexIdents.push_back(
@@ -2521,7 +2746,8 @@ public:
                 durableCatalog, "", indexIdents[i], afterCreateTimestamps[i]);
         }
 
-        const LogicalTime beforeDropTs = _clock->getClusterTime();
+        const auto currentTime = _clock->getTime();
+        const LogicalTime beforeDropTs = currentTime.clusterTime();
 
         // Drop all of the indexes.
         BSONObjBuilder result;
@@ -2529,6 +2755,87 @@ public:
                               nss,
                               BSON("index"
                                    << "*"),
+                              &result));
+
+        // Assert that each index is dropped individually and with its own timestamp. The order of
+        // dropping and creating are not guaranteed to be the same, but assert all of the created
+        // indexes were also dropped.
+        size_t nIdents = indexIdents.size();
+        for (size_t i = 0; i < nIdents; i++) {
+            OneOffRead oor(_opCtx, beforeDropTs.addTicks(i + 1).asTimestamp());
+
+            auto ident = getDroppedIndexIdent(durableCatalog, origIdents);
+            indexIdents.erase(std::remove(indexIdents.begin(), indexIdents.end(), ident));
+
+            origIdents = durableCatalog->getAllIdents(_opCtx);
+        }
+        ASSERT_EQ(indexIdents.size(), 0ul) << "Dropped idents should match created idents";
+    }
+};
+
+class TimestampIndexDropsListed : public StorageTimestampTest {
+public:
+    void run() {
+        auto storageEngine = _opCtx->getServiceContext()->getStorageEngine();
+        auto durableCatalog = storageEngine->getCatalog();
+
+        NamespaceString nss("unittests.timestampIndexDrops");
+        reset(nss);
+
+        AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_X);
+        CollectionWriter coll(autoColl);
+
+        const LogicalTime insertTimestamp = _clock->tickClusterTime(1);
+        {
+            WriteUnitOfWork wuow(_opCtx);
+            insertDocument(autoColl.getCollection(),
+                           InsertStatement(BSON("_id" << 0 << "a" << 1 << "b" << 2 << "c" << 3),
+                                           insertTimestamp.asTimestamp(),
+                                           presentTerm));
+            wuow.commit();
+            ASSERT_EQ(1, itCount(autoColl.getCollection()));
+        }
+
+
+        const Timestamp beforeIndexBuild = _clock->tickClusterTime(1).asTimestamp();
+
+        // Save the pre-state idents so we can capture the specific ident related to index
+        // creation.
+        std::vector<std::string> origIdents = durableCatalog->getAllIdents(_opCtx);
+
+        std::vector<Timestamp> afterCreateTimestamps;
+        std::vector<std::string> indexIdents;
+        // Create an index and get the ident for each index.
+        for (auto key : {"a", "b", "c"}) {
+            createIndex(coll, str::stream() << key << "_1", BSON(key << 1));
+
+            // Timestamps at the completion of each index build.
+            afterCreateTimestamps.push_back(_clock->tickClusterTime(1).asTimestamp());
+
+            // Add the new ident to the vector and reset the current idents.
+            indexIdents.push_back(
+                getNewIndexIdentAtTime(durableCatalog, origIdents, Timestamp::min()));
+            origIdents = durableCatalog->getAllIdents(_opCtx);
+        }
+
+        // Ensure each index is visible at the correct timestamp, and not before.
+        for (size_t i = 0; i < indexIdents.size(); i++) {
+            auto beforeTs = (i == 0) ? beforeIndexBuild : afterCreateTimestamps[i - 1];
+            assertIdentsMissingAtTimestamp(durableCatalog, "", indexIdents[i], beforeTs);
+            assertIdentsExistAtTimestamp(
+                durableCatalog, "", indexIdents[i], afterCreateTimestamps[i]);
+        }
+
+        const auto currentTime = _clock->getTime();
+        const LogicalTime beforeDropTs = currentTime.clusterTime();
+
+        // Drop all of the indexes.
+        BSONObjBuilder result;
+        ASSERT_OK(dropIndexes(_opCtx,
+                              nss,
+                              BSON("index" << BSON_ARRAY("a_1"
+                                                         << "b_1"
+                                                         << "c_1")),
                               &result));
 
         // Assert that each index is dropped individually and with its own timestamp. The order of
@@ -2625,7 +2932,7 @@ public:
         reset(nss);
 
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_X);
-        auto collection = autoColl.getCollection();
+        CollectionWriter collection(autoColl);
 
         // Indexing of parallel arrays is not allowed, so these are deemed "bad".
         const auto badDoc1 =
@@ -2636,20 +2943,20 @@ public:
             BSON("_id" << 2 << "a" << BSON_ARRAY(4 << 5) << "b" << BSON_ARRAY(4 << 5));
 
         // NOTE: This test does not test any timestamp reads.
-        const LogicalTime insert1 = _clock->reserveTicks(1);
+        const LogicalTime insert1 = _clock->tickClusterTime(1);
         {
             LOGV2(22505, "inserting {badDoc1}", "badDoc1"_attr = badDoc1);
             WriteUnitOfWork wuow(_opCtx);
-            insertDocument(autoColl.getCollection(),
+            insertDocument(collection.get(),
                            InsertStatement(badDoc1, insert1.asTimestamp(), presentTerm));
             wuow.commit();
         }
 
-        const LogicalTime insert2 = _clock->reserveTicks(1);
+        const LogicalTime insert2 = _clock->tickClusterTime(1);
         {
             LOGV2(22506, "inserting {badDoc2}", "badDoc2"_attr = badDoc2);
             WriteUnitOfWork wuow(_opCtx);
-            insertDocument(autoColl.getCollection(),
+            insertDocument(collection.get(),
                            InsertStatement(badDoc2, insert2.asTimestamp(), presentTerm));
             wuow.commit();
         }
@@ -2664,7 +2971,7 @@ public:
         const auto buildUUID = UUID::gen();
         indexer.setTwoPhaseBuildUUID(buildUUID);
 
-        const LogicalTime indexInit = _clock->reserveTicks(3);
+        const LogicalTime indexInit = _clock->tickClusterTime(3);
 
         // First, simulate being a secondary. Indexing errors are ignored.
         {
@@ -2675,14 +2982,14 @@ public:
             {
                 TimestampBlock tsBlock(_opCtx, indexInit.asTimestamp());
 
-                auto swSpecs =
-                    indexer.init(_opCtx,
-                                 collection,
-                                 {BSON("v" << 2 << "name"
-                                           << "a_1_b_1"
-                                           << "ns" << collection->ns().ns() << "key"
-                                           << BSON("a" << 1 << "b" << 1))},
-                                 MultiIndexBlock::makeTimestampedIndexOnInitFn(_opCtx, collection));
+                auto swSpecs = indexer.init(
+                    _opCtx,
+                    collection,
+                    {BSON("v" << 2 << "name"
+                              << "a_1_b_1"
+                              << "ns" << collection->ns().ns() << "key"
+                              << BSON("a" << 1 << "b" << 1))},
+                    MultiIndexBlock::makeTimestampedIndexOnInitFn(_opCtx, collection.get()));
                 ASSERT_OK(swSpecs.getStatus());
             }
 
@@ -2691,7 +2998,7 @@ public:
                 indexCatalog->findIndexByName(_opCtx, "a_1_b_1", /* includeUnfinished */ true));
             ASSERT(buildingIndex);
 
-            ASSERT_OK(indexer.insertAllDocumentsInCollection(_opCtx, collection));
+            ASSERT_OK(indexer.insertAllDocumentsInCollection(_opCtx, collection.get()));
 
             ASSERT_TRUE(buildingIndex->indexBuildInterceptor()->areAllWritesApplied(_opCtx));
 
@@ -2725,7 +3032,7 @@ public:
             buildingIndex->indexBuildInterceptor()->getSkippedRecordTracker()->areAllRecordsApplied(
                 _opCtx));
         // This fails because the bad record is still invalid.
-        auto status = indexer.retrySkippedRecords(_opCtx, collection);
+        auto status = indexer.retrySkippedRecords(_opCtx, collection.get());
         ASSERT_EQ(status.code(), ErrorCodes::CannotIndexParallelArrays);
 
         ASSERT_FALSE(
@@ -2737,8 +3044,8 @@ public:
         // to the side writes table and must be drained.
         Helpers::upsert(_opCtx, collection->ns().ns(), BSON("_id" << 0 << "a" << 1 << "b" << 1));
         {
-            RecordId badRecord =
-                Helpers::findOne(_opCtx, collection, BSON("_id" << 1), false /* requireIndex */);
+            RecordId badRecord = Helpers::findOne(
+                _opCtx, collection.get(), BSON("_id" << 1), false /* requireIndex */);
             WriteUnitOfWork wuow(_opCtx);
             collection->deleteDocument(_opCtx, kUninitializedStmtId, badRecord, nullptr);
             wuow.commit();
@@ -2746,23 +3053,23 @@ public:
 
         ASSERT_FALSE(buildingIndex->indexBuildInterceptor()->areAllWritesApplied(_opCtx));
         ASSERT_OK(indexer.drainBackgroundWrites(_opCtx,
-                                                RecoveryUnit::ReadSource::kUnset,
+                                                RecoveryUnit::ReadSource::kNoTimestamp,
                                                 IndexBuildInterceptor::DrainYieldPolicy::kNoYield));
 
 
         // This succeeds because the bad documents are now either valid or removed.
-        ASSERT_OK(indexer.retrySkippedRecords(_opCtx, collection));
+        ASSERT_OK(indexer.retrySkippedRecords(_opCtx, collection.get()));
         ASSERT_TRUE(
             buildingIndex->indexBuildInterceptor()->getSkippedRecordTracker()->areAllRecordsApplied(
                 _opCtx));
         ASSERT_TRUE(buildingIndex->indexBuildInterceptor()->areAllWritesApplied(_opCtx));
-        ASSERT_OK(indexer.checkConstraints(_opCtx));
+        ASSERT_OK(indexer.checkConstraints(_opCtx, collection.get()));
 
         {
             WriteUnitOfWork wuow(_opCtx);
             ASSERT_OK(indexer.commit(
                 _opCtx,
-                collection,
+                collection.getWritableCollection(),
                 [&](const BSONObj& indexSpec) {
                     _opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
                         _opCtx, collection->ns(), collection->uuid(), indexSpec, false);
@@ -2847,24 +3154,37 @@ public:
 };
 
 /**
- * There are a few scenarios where a primary will be using the IndexBuilder thread to build
- * indexes. Specifically, when a primary builds an index from an oplog entry which can happen on
- * primary catch-up, drain, a secondary step-up or `applyOps`.
- *
- * This test will exercise IndexBuilder code on primaries by performing an index build via an
- * `applyOps` command.
+ * This test exercises the code path in which a primary performs an index build via oplog
+ * application of a createIndexes oplog entry. In this code path, a primary timestamps the
+ * index build through applying the oplog entry, rather than creating an oplog entry.
  */
-class TimestampIndexBuilderOnPrimary : public StorageTimestampTest {
+class TimestampIndexOplogApplicationOnPrimary : public StorageTimestampTest {
 public:
     void run() {
-        // In order for applyOps to assign timestamps, we must be in non-replicated mode.
+        // Index builds expect a non-empty oplog and a valid committed snapshot.
+        {
+            Lock::GlobalLock lk(_opCtx, MODE_IX);
+            WriteUnitOfWork wuow(_opCtx);
+            auto service = _opCtx->getServiceContext();
+            service->getOpObserver()->onOpMessage(_opCtx, BSONObj());
+            wuow.commit();
+
+            auto snapshotManager = service->getStorageEngine()->getSnapshotManager();
+            auto lastAppliedOpTime =
+                repl::ReplicationCoordinator::get(service)->getMyLastAppliedOpTime();
+            snapshotManager->setCommittedSnapshot(lastAppliedOpTime.getTimestamp());
+        }
+
+        // In order for oplog application to assign timestamps, we must be in non-replicated mode
+        // and disable document validation.
         repl::UnreplicatedWritesBlock uwb(_opCtx);
+        DisableDocumentValidation validationDisabler(_opCtx);
 
         std::string dbName = "unittest";
-        NamespaceString nss(dbName, "indexBuilderOnPrimary");
+        NamespaceString nss(dbName, "oplogApplicationOnPrimary");
         BSONObj doc = BSON("_id" << 1 << "field" << 1);
 
-        const LogicalTime setupStart = _clock->reserveTicks(1);
+        const LogicalTime setupStart = _clock->tickClusterTime(1);
 
         UUID collUUID = UUID::gen();
         {
@@ -2881,18 +3201,20 @@ public:
 
         {
             // Sanity check everything exists.
-            AutoGetCollectionForReadCommand autoColl(_opCtx, nss);
-            auto coll = autoColl.getCollection();
+            AutoGetCollectionForReadCommand coll(_opCtx, nss);
             ASSERT(coll);
 
-            const auto presentTs = _clock->getClusterTime().asTimestamp();
-            assertDocumentAtTimestamp(coll, presentTs, doc);
+            const auto currentTime = _clock->getTime();
+            const auto presentTs = currentTime.clusterTime().asTimestamp();
+            assertDocumentAtTimestamp(coll.getCollection(), presentTs, doc);
         }
 
+        // Simulate a scenario where the node is a primary, but does not accept writes. This is
+        // the only scenario in which a primary can do an index build via oplog application, since
+        // the applyOps command no longer allows createIndexes (see SERVER-41554).
+        _coordinatorMock->alwaysAllowWrites(false);
         {
-            // Create an index via `applyOps`. Because this is a primary, the index build is
-            // timestamped with `startBuildTs`.
-            const auto beforeBuildTime = _clock->reserveTicks(2);
+            const auto beforeBuildTime = _clock->tickClusterTime(2);
             const auto startBuildTs = beforeBuildTime.addTicks(1).asTimestamp();
 
             // Grab the existing idents to identify the ident created by the index build.
@@ -2904,28 +3226,55 @@ public:
                 origIdents = durableCatalog->getAllIdents(_opCtx);
             }
 
-            auto indexSpec =
-                BSON("createIndexes" << nss.coll() << "v" << static_cast<int>(kIndexVersion)
-                                     << "key" << BSON("field" << 1) << "name"
-                                     << "field_1");
+            auto keyPattern = BSON("field" << 1);
+            auto startBuildOpTime = repl::OpTime(startBuildTs, presentTerm);
+            UUID indexBuildUUID = UUID::gen();
 
-            auto createIndexOp = BSON("ts" << startBuildTs << "t" << 1LL << "v" << 2 << "op"
-                                           << "c"
-                                           << "ns" << nss.getCommandNS().ns() << "ui" << collUUID
-                                           << "wall" << Date_t() << "o" << indexSpec);
+            // Wait for the index build thread to start the collection scan before proceeding with
+            // checking the catalog and applying the commitIndexBuild oplog entry.
+            // There is a potential race between applying the commitIndexBuild oplog entry and the
+            // transitioning the index build thread's ReplIndexBuildState from kSetup to
+            // kInProgress. This is due to the commit retry logic using the ClockSourceMock, rather
+            // than an actual  system clock that advances automatically, through OperationContext's
+            // waitFor() function.
+            {
+                FailPointEnableBlock fpb("hangAfterStartingIndexBuild");
 
-            ASSERT_OK(doAtomicApplyOps(nss.db().toString(), {createIndexOp}));
+                auto start = repl::makeStartIndexBuildOplogEntry(
+                    startBuildOpTime, nss, "field_1", keyPattern, collUUID, indexBuildUUID);
+                ASSERT_OK(repl::applyOplogEntryOrGroupedInserts(
+                    _opCtx, &start, repl::OplogApplication::Mode::kSecondary));
 
+                // We cannot use the OperationContext to wait for the thread to reach the fail point
+                // because it also uses the ClockSourceMock.
+                fpb->waitForTimesEntered(Interruptible::notInterruptible(),
+                                         fpb.initialTimesEntered() + 1);
+            }
+
+            {
+                AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IS);
+                const std::string indexIdent =
+                    getNewIndexIdentAtTime(durableCatalog, origIdents, Timestamp::min());
+                assertIdentsMissingAtTimestamp(
+                    durableCatalog, "", indexIdent, beforeBuildTime.asTimestamp());
+                assertIdentsExistAtTimestamp(durableCatalog, "", indexIdent, startBuildTs);
+
+                // The index has not committed yet, so it is not ready.
+                RecordId catalogId = autoColl.getCollection()->getCatalogId();
+                ASSERT_FALSE(
+                    getIndexMetaData(getMetaDataAtTime(durableCatalog, catalogId, startBuildTs),
+                                     "field_1")
+                        .ready);
+            }  // release read lock so commit index build oplog entry can take its own locks.
+
+            auto commit = repl::makeCommitIndexBuildOplogEntry(
+                startBuildOpTime, nss, "field_1", keyPattern, collUUID, indexBuildUUID);
+            ASSERT_OK(repl::applyOplogEntryOrGroupedInserts(
+                _opCtx, &commit, repl::OplogApplication::Mode::kSecondary));
+
+            // Reacquire read lock to check index metadata.
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IS);
             RecordId catalogId = autoColl.getCollection()->getCatalogId();
-            const std::string indexIdent =
-                getNewIndexIdentAtTime(durableCatalog, origIdents, Timestamp::min());
-            assertIdentsMissingAtTimestamp(
-                durableCatalog, "", indexIdent, beforeBuildTime.asTimestamp());
-            assertIdentsExistAtTimestamp(durableCatalog, "", indexIdent, startBuildTs);
-
-            // On a primary, the index build should start and finish at `startBuildTs` because it is
-            // built in the foreground.
             ASSERT_TRUE(getIndexMetaData(getMetaDataAtTime(durableCatalog, catalogId, startBuildTs),
                                          "field_1")
                             .ready);
@@ -3077,18 +3426,18 @@ public:
         reset(nss);
         UUID ui = UUID::gen();
         {
-            AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
-            auto coll = autoColl.getCollection();
+            AutoGetCollection coll(_opCtx, nss, LockMode::MODE_IX);
             ASSERT(coll);
             ui = coll->uuid();
         }
 
-        presentTs = _clock->getClusterTime().asTimestamp();
+        const auto currentTime = _clock->getTime();
+        presentTs = currentTime.clusterTime().asTimestamp();
         // This test does not run a real ReplicationCoordinator, so must advance the snapshot
         // manager manually.
         auto storageEngine = cc().getServiceContext()->getStorageEngine();
-        storageEngine->getSnapshotManager()->setLocalSnapshot(presentTs);
-        const auto beforeTxnTime = _clock->reserveTicks(1);
+        storageEngine->getSnapshotManager()->setLastApplied(presentTs);
+        const auto beforeTxnTime = _clock->tickClusterTime(1);
         beforeTxnTs = beforeTxnTime.asTimestamp();
         commitEntryTs = beforeTxnTime.addTicks(1).asTimestamp();
 
@@ -3113,7 +3462,7 @@ public:
 
         {
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IS);
-            auto coll = autoColl.getCollection();
+            const auto& coll = autoColl.getCollection();
             assertDocumentAtTimestamp(coll, presentTs, BSONObj());
             assertDocumentAtTimestamp(coll, beforeTxnTs, BSONObj());
             assertDocumentAtTimestamp(coll, commitEntryTs, BSONObj());
@@ -3179,7 +3528,7 @@ public:
         assertNoStartOpTime();
         {
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
-            auto coll = autoColl.getCollection();
+            const auto& coll = autoColl.getCollection();
             assertDocumentAtTimestamp(coll, presentTs, BSONObj());
             assertDocumentAtTimestamp(coll, beforeTxnTs, BSONObj());
             assertDocumentAtTimestamp(coll, commitEntryTs, doc);
@@ -3214,9 +3563,10 @@ private:
 class MultiOplogEntryTransaction : public MultiDocumentTransactionTest {
 public:
     MultiOplogEntryTransaction() : MultiDocumentTransactionTest("multiOplogEntryTransaction") {
-        const auto currentTime = _clock->getClusterTime();
-        firstOplogEntryTs = currentTime.addTicks(1).asTimestamp();
-        commitEntryTs = currentTime.addTicks(2).asTimestamp();
+        const auto currentTime = _clock->getTime();
+        const auto clusterTime = currentTime.clusterTime();
+        firstOplogEntryTs = clusterTime.addTicks(1).asTimestamp();
+        commitEntryTs = clusterTime.addTicks(2).asTimestamp();
     }
 
     void run() {
@@ -3238,7 +3588,7 @@ public:
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
             const BSONObj query1 = BSON("_id" << 1);
             const BSONObj query2 = BSON("_id" << 2);
-            auto coll = autoColl.getCollection();
+            const auto& coll = autoColl.getCollection();
 
             // Collection should be empty until commit, at which point both documents
             // should show up.
@@ -3318,10 +3668,12 @@ class CommitPreparedMultiOplogEntryTransaction : public MultiDocumentTransaction
 public:
     CommitPreparedMultiOplogEntryTransaction()
         : MultiDocumentTransactionTest("preparedMultiOplogEntryTransaction") {
-        const auto currentTime = _clock->getClusterTime();
-        firstOplogEntryTs = currentTime.addTicks(1).asTimestamp();
-        prepareEntryTs = currentTime.addTicks(2).asTimestamp();
-        commitEntryTs = currentTime.addTicks(3).asTimestamp();
+        const auto currentTime = _clock->getTime();
+        const auto clusterTime = currentTime.clusterTime();
+        firstOplogEntryTs = clusterTime.addTicks(1).asTimestamp();
+        prepareEntryTs = clusterTime.addTicks(2).asTimestamp();
+        commitTs = clusterTime.addTicks(3).asTimestamp();
+        commitEntryTs = clusterTime.addTicks(4).asTimestamp();
     }
 
     void run() {
@@ -3334,7 +3686,7 @@ public:
         const auto commitFilter = BSON("ts" << commitEntryTs);
         {
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IS);
-            auto coll = autoColl.getCollection();
+            const auto& coll = autoColl.getCollection();
             assertDocumentAtTimestamp(coll, presentTs, BSONObj());
             assertDocumentAtTimestamp(coll, beforeTxnTs, BSONObj());
             assertDocumentAtTimestamp(coll, firstOplogEntryTs, BSONObj());
@@ -3374,7 +3726,7 @@ public:
         txnParticipant.stashTransactionResources(_opCtx);
         {
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IS);
-            auto coll = autoColl.getCollection();
+            const auto& coll = autoColl.getCollection();
             assertDocumentAtTimestamp(coll, presentTs, BSONObj());
             assertDocumentAtTimestamp(coll, beforeTxnTs, BSONObj());
             assertDocumentAtTimestamp(coll, firstOplogEntryTs, BSONObj());
@@ -3416,13 +3768,13 @@ public:
 
         {
             FailPointEnableBlock failPointBlock("skipCommitTxnCheckPrepareMajorityCommitted");
-            txnParticipant.commitPreparedTransaction(_opCtx, commitEntryTs, {});
+            txnParticipant.commitPreparedTransaction(_opCtx, commitTs, {});
         }
 
         txnParticipant.stashTransactionResources(_opCtx);
         {
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
-            auto coll = autoColl.getCollection();
+            const auto& coll = autoColl.getCollection();
             assertDocumentAtTimestamp(coll, presentTs, BSONObj());
             assertDocumentAtTimestamp(coll, beforeTxnTs, BSONObj());
             assertDocumentAtTimestamp(coll, firstOplogEntryTs, BSONObj());
@@ -3503,7 +3855,7 @@ public:
     }
 
 protected:
-    Timestamp firstOplogEntryTs, secondOplogEntryTs, prepareEntryTs;
+    Timestamp firstOplogEntryTs, secondOplogEntryTs, prepareEntryTs, commitTs;
 
 private:
     MultiOplogScopedSettings multiOplogSettings;
@@ -3513,9 +3865,10 @@ class AbortPreparedMultiOplogEntryTransaction : public MultiDocumentTransactionT
 public:
     AbortPreparedMultiOplogEntryTransaction()
         : MultiDocumentTransactionTest("preparedMultiOplogEntryTransaction") {
-        const auto currentTime = _clock->getClusterTime();
-        prepareEntryTs = currentTime.addTicks(1).asTimestamp();
-        abortEntryTs = currentTime.addTicks(2).asTimestamp();
+        const auto currentTime = _clock->getTime();
+        const auto clusterTime = currentTime.clusterTime();
+        prepareEntryTs = clusterTime.addTicks(1).asTimestamp();
+        abortEntryTs = clusterTime.addTicks(2).asTimestamp();
     }
 
     void run() {
@@ -3573,8 +3926,7 @@ public:
 
             UUID ui = UUID::gen();
             {
-                AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
-                auto coll = autoColl.getCollection();
+                AutoGetCollection coll(_opCtx, nss, LockMode::MODE_IX);
                 ASSERT(coll);
                 ui = coll->uuid();
             }
@@ -3622,15 +3974,17 @@ public:
         auto txnParticipant = TransactionParticipant::get(_opCtx);
         ASSERT(txnParticipant);
 
-        const auto currentTime = _clock->getClusterTime();
-        const auto prepareTs = currentTime.addTicks(1).asTimestamp();
-        commitEntryTs = currentTime.addTicks(2).asTimestamp();
+        const auto currentTime = _clock->getTime();
+        const auto clusterTime = currentTime.clusterTime();
+        const auto prepareTs = clusterTime.addTicks(1).asTimestamp();
+        const auto commitTs = clusterTime.addTicks(2).asTimestamp();
+        commitEntryTs = clusterTime.addTicks(3).asTimestamp();
         LOGV2(22514, "Prepare TS: {prepareTs}", "prepareTs"_attr = prepareTs);
         logTimestamps();
 
         {
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IS);
-            auto coll = autoColl.getCollection();
+            const auto& coll = autoColl.getCollection();
             assertDocumentAtTimestamp(coll, prepareTs, BSONObj());
             assertDocumentAtTimestamp(coll, commitEntryTs, BSONObj());
 
@@ -3676,7 +4030,7 @@ public:
 
         {
             FailPointEnableBlock failPointBlock("skipCommitTxnCheckPrepareMajorityCommitted");
-            txnParticipant.commitPreparedTransaction(_opCtx, commitEntryTs, {});
+            txnParticipant.commitPreparedTransaction(_opCtx, commitTs, {});
         }
 
         assertNoStartOpTime();
@@ -3684,7 +4038,7 @@ public:
         txnParticipant.stashTransactionResources(_opCtx);
         {
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
-            auto coll = autoColl.getCollection();
+            const auto& coll = autoColl.getCollection();
             assertDocumentAtTimestamp(coll, presentTs, BSONObj());
             assertDocumentAtTimestamp(coll, beforeTxnTs, BSONObj());
             assertDocumentAtTimestamp(coll, prepareTs, BSONObj());
@@ -3723,15 +4077,16 @@ public:
         auto txnParticipant = TransactionParticipant::get(_opCtx);
         ASSERT(txnParticipant);
 
-        const auto currentTime = _clock->getClusterTime();
-        const auto prepareTs = currentTime.addTicks(1).asTimestamp();
-        const auto abortEntryTs = currentTime.addTicks(2).asTimestamp();
+        const auto currentTime = _clock->getTime();
+        const auto clusterTime = currentTime.clusterTime();
+        const auto prepareTs = clusterTime.addTicks(1).asTimestamp();
+        const auto abortEntryTs = clusterTime.addTicks(2).asTimestamp();
         LOGV2(22515, "Prepare TS: {prepareTs}", "prepareTs"_attr = prepareTs);
         logTimestamps();
 
         {
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IS);
-            auto coll = autoColl.getCollection();
+            const auto& coll = autoColl.getCollection();
             assertDocumentAtTimestamp(coll, prepareTs, BSONObj());
             assertDocumentAtTimestamp(coll, abortEntryTs, BSONObj());
 
@@ -3781,7 +4136,7 @@ public:
         txnParticipant.stashTransactionResources(_opCtx);
         {
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
-            auto coll = autoColl.getCollection();
+            const auto& coll = autoColl.getCollection();
             assertDocumentAtTimestamp(coll, presentTs, BSONObj());
             assertDocumentAtTimestamp(coll, beforeTxnTs, BSONObj());
             assertDocumentAtTimestamp(coll, prepareTs, BSONObj());
@@ -3851,6 +4206,8 @@ public:
         addIf<SecondaryCreateCollectionBetweenInserts>();
         addIf<PrimaryCreateCollectionInApplyOps>();
         addIf<SecondarySetIndexMultikeyOnInsert>();
+        addIf<SecondarySetWildcardIndexMultikeyOnInsert>();
+        addIf<SecondarySetWildcardIndexMultikeyOnUpdate>();
         addIf<InitialSyncSetIndexMultikeyOnInsert>();
         addIf<PrimarySetIndexMultikeyOnInsert>();
         addIf<PrimarySetIndexMultikeyOnInsertUnreplicated>();
@@ -3865,14 +4222,12 @@ public:
         // TimestampIndexBuilds<SimulatePrimary>
         addIf<TimestampIndexBuilds<false>>();
         addIf<TimestampIndexBuilds<true>>();
-        // TODO (SERVER-40894): Make index builds timestamp drained writes
-        // addIf<TimestampIndexBuildDrain<false>>();
-        // addIf<TimestampIndexBuildDrain<true>>();
         addIf<TimestampMultiIndexBuilds>();
         addIf<TimestampMultiIndexBuildsDuringRename>();
         addIf<TimestampAbortIndexBuild>();
-        addIf<TimestampIndexDrops>();
-        addIf<TimestampIndexBuilderOnPrimary>();
+        addIf<TimestampIndexDropsWildcard>();
+        addIf<TimestampIndexDropsListed>();
+        addIf<TimestampIndexOplogApplicationOnPrimary>();
         addIf<SecondaryReadsDuringBatchApplicationAreAllowed>();
         addIf<ViewCreationSeparateTransaction>();
         addIf<CreateCollectionWithSystemIndex>();

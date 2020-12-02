@@ -53,6 +53,15 @@ class ScanningReplicaSetMonitor : public ReplicaSetMonitor {
 public:
     class Refresher;
 
+    /**
+     * Defaults to false, meaning that if multiple hosts meet a criteria we pick one at random.
+     * This is required by the replica set driver spec. Set this to true in tests that need host
+     * selection to be deterministic.
+     *
+     * NOTE: Used by unit-tests only.
+     */
+    static bool useDeterministicHostSelection;
+
     static constexpr auto kExpeditedRefreshPeriod = Milliseconds(500);
     static constexpr auto kCheckTimeout = Seconds(5);
 
@@ -62,15 +71,21 @@ public:
 
     void drop() override;
 
-    SemiFuture<HostAndPort> getHostOrRefresh(
-        const ReadPreferenceSetting& readPref,
-        Milliseconds maxWait = kDefaultFindHostTimeout) override;
+    /**
+     * NOTE: Cancelation via CancelationTokens is not implemented for the ScanningReplicaSetMonitor,
+     * so any token passed in will be ignored.
+     */
+    SemiFuture<HostAndPort> getHostOrRefresh(const ReadPreferenceSetting& readPref,
+                                             const CancelationToken&) override;
 
-    SemiFuture<std::vector<HostAndPort>> getHostsOrRefresh(
-        const ReadPreferenceSetting& readPref,
-        Milliseconds maxWait = kDefaultFindHostTimeout) override;
+    /**
+     * NOTE: Cancelation via CancelationTokens is not implemented for the ScanningReplicaSetMonitor,
+     * so any token passed in will be ignored.
+     */
+    SemiFuture<std::vector<HostAndPort>> getHostsOrRefresh(const ReadPreferenceSetting& readPref,
+                                                           const CancelationToken&) override;
 
-    HostAndPort getMasterOrUassert() override;
+    HostAndPort getPrimaryOrUassert() override;
 
     /*
      * For the ScanningReplicaSetMonitor, all the failedHost methods are equivalent.
@@ -124,13 +139,17 @@ public:
      * Allows tests to set initial conditions and introspect the current state.
      */
     explicit ScanningReplicaSetMonitor(const SetStatePtr& initialState);
-    ~ScanningReplicaSetMonitor();
+    ~ScanningReplicaSetMonitor() override;
 
     /**
      * This is for use in tests using MockReplicaSet to ensure that a full scan completes before
      * continuing.
      */
     void runScanForMockReplicaSet();
+
+    static void disableRefreshRetries_forTest();
+
+    static bool areRefreshRetriesDisabledForTest();
 
 private:
     Future<std::vector<HostAndPort>> _getHostsOrRefresh(const ReadPreferenceSetting& readPref,

@@ -27,13 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/read_write_concern_defaults.h"
 
-#include "mongo/db/logical_clock.h"
+#include "mongo/db/vector_clock.h"
 #include "mongo/logv2/log.h"
 
 namespace mongo {
@@ -119,7 +119,8 @@ RWConcernDefault ReadWriteConcernDefaults::generateNewConcerns(
     }
 
     auto* const serviceContext = opCtx->getServiceContext();
-    rwc.setUpdateOpTime(LogicalClock::get(serviceContext)->getClusterTime().asTimestamp());
+    const auto currentTime = VectorClock::get(serviceContext)->getTime();
+    rwc.setUpdateOpTime(currentTime.clusterTime().asTimestamp());
     rwc.setUpdateWallClockTime(serviceContext->getFastClockSource()->now());
 
     auto current = _getDefault(opCtx);
@@ -166,7 +167,7 @@ void ReadWriteConcernDefaults::setDefault(OperationContext* opCtx, RWConcernDefa
 }
 
 void ReadWriteConcernDefaults::refreshIfNecessary(OperationContext* opCtx) {
-    auto possibleNewDefaults = _defaults.lookup(opCtx, Type::kReadWriteConcernEntry);
+    auto possibleNewDefaults = _defaults.lookup(opCtx);
     if (!possibleNewDefaults) {
         return;
     }
@@ -216,16 +217,12 @@ ReadWriteConcernDefaults& ReadWriteConcernDefaults::get(OperationContext* opCtx)
 }
 
 void ReadWriteConcernDefaults::create(ServiceContext* service, FetchDefaultsFn fetchDefaultsFn) {
-    getReadWriteConcernDefaults(service).emplace(service, fetchDefaultsFn);
+    getReadWriteConcernDefaults(service).emplace(service, std::move(fetchDefaultsFn));
 }
 
 ReadWriteConcernDefaults::ReadWriteConcernDefaults(ServiceContext* service,
                                                    FetchDefaultsFn fetchDefaultsFn)
-    : _defaults(service,
-                _threadPool,
-                [fetchDefaultsFn = std::move(fetchDefaultsFn)](
-                    OperationContext* opCtx, const Type&) { return fetchDefaultsFn(opCtx); }),
-      _threadPool([] {
+    : _defaults(service, _threadPool, std::move(fetchDefaultsFn)), _threadPool([] {
           ThreadPool::Options options;
           options.poolName = "ReadWriteConcernDefaults";
           options.minThreads = 0;
@@ -240,14 +237,18 @@ ReadWriteConcernDefaults::~ReadWriteConcernDefaults() = default;
 
 ReadWriteConcernDefaults::Cache::Cache(ServiceContext* service,
                                        ThreadPoolInterface& threadPool,
-                                       LookupFn lookupFn)
-    : ReadThroughCache(_mutex, service, threadPool, 1 /* cacheSize */),
-      _lookupFn(std::move(lookupFn)) {}
+                                       FetchDefaultsFn fetchDefaultsFn)
+    : ReadThroughCache(_mutex,
+                       service,
+                       threadPool,
+                       [this](OperationContext* opCtx, Type, const ValueHandle& unusedCachedValue) {
+                           return LookupResult(lookup(opCtx));
+                       },
+                       1 /* cacheSize */),
+      _fetchDefaultsFn(std::move(fetchDefaultsFn)) {}
 
-boost::optional<RWConcernDefault> ReadWriteConcernDefaults::Cache::lookup(
-    OperationContext* opCtx, const ReadWriteConcernDefaults::Type& key) {
-    invariant(key == Type::kReadWriteConcernEntry);
-    return _lookupFn(opCtx, key);
+boost::optional<RWConcernDefault> ReadWriteConcernDefaults::Cache::lookup(OperationContext* opCtx) {
+    return _fetchDefaultsFn(opCtx);
 }
 
 }  // namespace mongo

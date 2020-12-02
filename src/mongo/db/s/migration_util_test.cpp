@@ -30,20 +30,19 @@
 #include "mongo/client/remote_command_targeter_factory_mock.h"
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/catalog_raii.h"
-#include "mongo/db/s/catalog_cache_loader_mock.h"
+#include "mongo/db/persistent_task_store.h"
+#include "mongo/db/repl/wait_for_majority_service.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/migration_util.h"
-#include "mongo/db/s/persistent_task_store.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/shard_server_catalog_cache_loader.h"
+#include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/s/sharding_state.h"
-#include "mongo/db/s/wait_for_majority_service.h"
 #include "mongo/s/catalog/sharding_catalog_client_mock.h"
 #include "mongo/s/catalog/type_shard.h"
-#include "mongo/s/database_version_helpers.h"
-#include "mongo/s/shard_server_test_fixture.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/s/catalog_cache_loader_mock.h"
+#include "mongo/s/database_version.h"
 #include "mongo/util/future.h"
 
 namespace mongo {
@@ -57,14 +56,6 @@ UUID getCollectionUuid(OperationContext* opCtx, const NamespaceString& nss) {
     ASSERT(autoColl.getCollection());
 
     return autoColl.getCollection()->uuid();
-}
-
-void addRangeToReceivingChunks(OperationContext* opCtx,
-                               const NamespaceString& nss,
-                               const ChunkRange& range) {
-    AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-
-    std::ignore = CollectionShardingRuntime::get(opCtx, nss)->beginReceive(range);
 }
 
 template <typename ShardKey>
@@ -323,8 +314,10 @@ TEST_F(MigrationUtilsTest, TestInvalidUUID) {
     ASSERT_FALSE(migrationutil::checkForConflictingDeletions(opCtx, range, wrongUuid));
 }
 
-// Fixture that uses a mocked CatalogCacheLoader and CatalogClient to allow metadata refreshes
-// without using the mock network.
+/**
+ * Fixture that uses a mocked CatalogCacheLoader and CatalogClient to allow metadata refreshes
+ * without using the mock network.
+ */
 class SubmitRangeDeletionTaskTest : public ShardServerTestFixture {
 public:
     const HostAndPort kConfigHostAndPort{"dummy", 123};
@@ -333,7 +326,7 @@ public:
     const UUID kDefaultUUID = UUID::gen();
     const OID kEpoch = OID::gen();
     const DatabaseType kDefaultDatabaseType =
-        DatabaseType(kNss.db().toString(), ShardId("0"), true, DatabaseVersion(kDefaultUUID, 1));
+        DatabaseType(kNss.db().toString(), ShardId("0"), true, DatabaseVersion(kDefaultUUID));
     const std::vector<ShardType> kShardList = {ShardType("0", "Host0:12345"),
                                                ShardType("1", "Host1:12345")};
 
@@ -347,8 +340,7 @@ public:
         _clusterId = OID::gen();
         ShardingState::get(getServiceContext())->setInitialized(_myShardName, _clusterId);
 
-        std::unique_ptr<CatalogCacheLoaderMock> mockLoader =
-            std::make_unique<CatalogCacheLoaderMock>();
+        auto mockLoader = std::make_unique<CatalogCacheLoaderMock>();
         _mockCatalogCacheLoader = mockLoader.get();
         CatalogCacheLoader::set(getServiceContext(), std::move(mockLoader));
 
@@ -372,9 +364,8 @@ public:
 
     void tearDown() override {
         WaitForMajorityService::get(getServiceContext()).shutDown();
-        CatalogCacheLoader::clearForTests(getServiceContext());
-        ShardingMongodTestFixture::tearDown();
-        CollectionShardingStateFactory::clear(getServiceContext());
+
+        ShardServerTestFixture::tearDown();
     }
 
     // Mock for the ShardingCatalogClient used to satisfy loading all shards for the ShardRegistry
@@ -389,10 +380,9 @@ public:
             return repl::OpTimeWith<std::vector<ShardType>>(_shards);
         }
 
-        StatusWith<std::vector<CollectionType>> getCollections(
+        std::vector<CollectionType> getCollections(
             OperationContext* opCtx,
-            const std::string* dbName,
-            repl::OpTime* optime,
+            StringData dbName,
             repl::ReadConcernLevel readConcernLevel) override {
             return _colls;
         }
@@ -423,12 +413,9 @@ public:
     }
 
     CollectionType makeCollectionType(UUID uuid, OID epoch) {
-        CollectionType coll;
-        coll.setNs(kNss);
-        coll.setEpoch(epoch);
+        CollectionType coll(kNss, epoch, Date_t::now(), uuid);
         coll.setKeyPattern(kShardKeyPattern.getKeyPattern());
         coll.setUnique(true);
-        coll.setUUID(uuid);
         return coll;
     }
 
@@ -531,7 +518,7 @@ TEST_F(SubmitRangeDeletionTaskTest,
     _mockCatalogCacheLoader->setDatabaseRefreshReturnValue(kDefaultDatabaseType);
     _mockCatalogCacheLoader->setCollectionRefreshReturnValue(
         Status(ErrorCodes::NamespaceNotFound, "dummy errmsg"));
-    forceShardFilteringMetadataRefresh(opCtx, kNss, true);
+    forceShardFilteringMetadataRefresh(opCtx, kNss);
 
     auto cleanupCompleteFuture = migrationutil::submitRangeDeletionTask(opCtx, deletionTask);
 
@@ -562,7 +549,7 @@ TEST_F(SubmitRangeDeletionTaskTest, SucceedsIfFilteringMetadataUUIDMatchesTaskUU
     _mockCatalogCacheLoader->setChunkRefreshReturnValue(
         makeChangedChunks(ChunkVersion(1, 0, kEpoch)));
     _mockCatalogClient->setCollections({coll});
-    forceShardFilteringMetadataRefresh(opCtx, kNss, true);
+    forceShardFilteringMetadataRefresh(opCtx, kNss);
 
     // The task should have been submitted successfully.
     auto cleanupCompleteFuture = migrationutil::submitRangeDeletionTask(opCtx, deletionTask);
@@ -605,7 +592,7 @@ TEST_F(SubmitRangeDeletionTaskTest,
     _mockCatalogCacheLoader->setDatabaseRefreshReturnValue(kDefaultDatabaseType);
     _mockCatalogCacheLoader->setCollectionRefreshReturnValue(
         Status(ErrorCodes::NamespaceNotFound, "dummy errmsg"));
-    forceShardFilteringMetadataRefresh(opCtx, kNss, true);
+    forceShardFilteringMetadataRefresh(opCtx, kNss);
 
     auto collectionUUID = createCollectionAndGetUUID(kNss);
     auto deletionTask = createDeletionTask(kNss, collectionUUID, 0, 10, _myShardName);
@@ -642,7 +629,7 @@ TEST_F(SubmitRangeDeletionTaskTest,
     _mockCatalogCacheLoader->setChunkRefreshReturnValue(
         makeChangedChunks(ChunkVersion(1, 0, staleEpoch)));
     _mockCatalogClient->setCollections({staleColl});
-    forceShardFilteringMetadataRefresh(opCtx, kNss, true);
+    forceShardFilteringMetadataRefresh(opCtx, kNss);
 
     auto collectionUUID = createCollectionAndGetUUID(kNss);
     auto deletionTask = createDeletionTask(kNss, collectionUUID, 0, 10, _myShardName);

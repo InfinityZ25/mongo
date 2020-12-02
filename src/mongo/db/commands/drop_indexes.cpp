@@ -27,14 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include <string>
 #include <vector>
 
-#include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/drop_indexes.h"
@@ -48,12 +47,13 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_builds_coordinator.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/durable_catalog.h"
+#include "mongo/db/vector_clock.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/logv2/log.h"
+#include "mongo/util/exit_code.h"
 #include "mongo/util/quick_exit.h"
 
 namespace mongo {
@@ -68,12 +68,22 @@ MONGO_FAIL_POINT_DEFINE(reIndexCrashAfterDrop);
 /* "dropIndexes" is now the preferred form - "deleteIndexes" deprecated */
 class CmdDropIndexes : public BasicCommand {
 public:
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
+
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
+
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
+
+    bool collectsResourceConsumptionMetrics() const override {
+        return true;
+    }
+
     std::string help() const override {
         return "drop indexes for a collection";
     }
@@ -102,7 +112,7 @@ public:
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         // Even though reIndex is a standalone-only command, this will return that the command is
         // allowed on secondaries so that it will fail with a more useful error message to the user
-        // rather than with a NotMaster error.
+        // rather than with a NotWritablePrimary error.
         return AllowedOnSecondary::kAlways;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -129,7 +139,7 @@ public:
         const NamespaceString toReIndexNss =
             CommandHelpers::parseNsCollectionRequired(dbname, jsobj);
 
-        LOGV2(20457, "CMD: reIndex {toReIndexNss}", "toReIndexNss"_attr = toReIndexNss);
+        LOGV2(20457, "CMD: reIndex {namespace}", "CMD reIndex", "namespace"_attr = toReIndexNss);
 
         if (repl::ReplicationCoordinator::get(opCtx)->getReplicationMode() !=
             repl::ReplicationCoordinator::modeNone) {
@@ -141,15 +151,15 @@ public:
         }
 
         AutoGetCollection autoColl(opCtx, toReIndexNss, MODE_X);
-        Collection* collection = autoColl.getCollection();
-        if (!collection) {
-            if (ViewCatalog::get(autoColl.getDb())->lookup(opCtx, toReIndexNss.ns()))
+        if (!autoColl) {
+            auto db = autoColl.getDb();
+            if (db && ViewCatalog::get(db)->lookup(opCtx, toReIndexNss.ns()))
                 uasserted(ErrorCodes::CommandNotSupportedOnView, "can't re-index a view");
             else
                 uasserted(ErrorCodes::NamespaceNotFound, "collection does not exist");
         }
 
-        BackgroundOperation::assertNoBgOpInProgForNs(toReIndexNss.ns());
+        CollectionWriter collection(autoColl);
         IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(
             collection->uuid());
 
@@ -212,10 +222,9 @@ public:
         indexer->setIndexBuildMethod(IndexBuildMethod::kForeground);
         StatusWith<std::vector<BSONObj>> swIndexesToRebuild(ErrorCodes::UnknownError,
                                                             "Uninitialized");
-
         writeConflictRetry(opCtx, "dropAllIndexes", toReIndexNss.ns(), [&] {
             WriteUnitOfWork wunit(opCtx);
-            collection->getIndexCatalog()->dropAllIndexes(opCtx, true);
+            collection.getWritableCollection()->getIndexCatalog()->dropAllIndexes(opCtx, true);
 
             swIndexesToRebuild =
                 indexer->init(opCtx, collection, all, MultiIndexBlock::kNoopOnInitFn);
@@ -229,32 +238,25 @@ public:
         });
 
         if (MONGO_unlikely(reIndexCrashAfterDrop.shouldFail())) {
-            LOGV2(20458, "exiting because 'reIndexCrashAfterDrop' fail point was set");
+            LOGV2(20458, "Exiting because 'reIndexCrashAfterDrop' fail point was set");
             quickExit(EXIT_ABRUPT);
         }
 
         // The following function performs its own WriteConflict handling, so don't wrap it in a
         // writeConflictRetry loop.
-        uassertStatusOK(indexer->insertAllDocumentsInCollection(opCtx, collection));
+        uassertStatusOK(indexer->insertAllDocumentsInCollection(opCtx, collection.get()));
 
-        uassertStatusOK(indexer->checkConstraints(opCtx));
+        uassertStatusOK(indexer->checkConstraints(opCtx, collection.get()));
 
         writeConflictRetry(opCtx, "commitReIndex", toReIndexNss.ns(), [&] {
             WriteUnitOfWork wunit(opCtx);
             uassertStatusOK(indexer->commit(opCtx,
-                                            collection,
+                                            collection.getWritableCollection(),
                                             MultiIndexBlock::kNoopOnCreateEachFn,
                                             MultiIndexBlock::kNoopOnCommitFn));
             wunit.commit();
         });
         abortOnExit.dismiss();
-
-        // Do not allow majority reads from this collection until all original indexes are visible.
-        // This was also done when dropAllIndexes() committed, but we need to ensure that no one
-        // tries to read in the intermediate state where all indexes are newer than the current
-        // snapshot so are unable to be used.
-        auto clusterTime = LogicalClock::getClusterTimeForReplicaSet(opCtx).asTimestamp();
-        collection->setMinimumVisibleSnapshot(clusterTime);
 
         result.append("nIndexes", static_cast<int>(swIndexesToRebuild.getValue().size()));
         result.append("indexes", swIndexesToRebuild.getValue());

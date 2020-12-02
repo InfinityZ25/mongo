@@ -29,127 +29,168 @@
 
 #pragma once
 
-#include <memory>
 #include <queue>
-#include <vector>
 
-#include "mongo/base/owned_pointer_vector.h"
-#include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/sbe/stages/plan_stats.h"
 #include "mongo/db/exec/working_set.h"
+#include "mongo/db/query/explain.h"
+#include "mongo/db/query/plan_ranking_decision.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/util/container_size_helper.h"
 
-namespace mongo {
-
-struct CandidatePlan;
-struct PlanRankingDecision;
+namespace mongo::plan_ranker {
+// The logging facility enforces the rule that logging should not be done in a header file. Since
+// template classes and functions below must be defined in the header file and since they use the
+// logging facility, we have to define the helper functions below to perform the actual logging
+// operation from template code.
+// Note that we pass std::function callback instead of string values to avoid spending time
+// generating log output that may never actually be written to the logs, depending on the current
+// log level.
+namespace log_detail {
+void logScoreFormula(std::function<std::string()> formula,
+                     double score,
+                     double baseScore,
+                     double productivity,
+                     double noFetchBonus,
+                     double noSortBonus,
+                     double noIxisectBonus,
+                     double tieBreakers);
+void logScoreBoost(double score);
+void logScoringPlan(std::function<std::string()> solution,
+                    std::function<std::string()> explain,
+                    std::function<std::string()> planSummary,
+                    size_t planIndex,
+                    bool isEOF);
+void logScore(double score);
+void logEOFBonus(double eofBonus);
+void logFailedPlan(std::function<std::string()> planSummary);
+}  // namespace log_detail
 
 /**
- * Ranks 2 or more plans.
+ * Assigns the stats tree a 'goodness' score. The higher the score, the better the plan. The exact
+ * value isn't meaningful except for imposing a ranking.
+ *
+ * All specific plan scorers should inherit from this scorer and provide methods to produce the plan
+ * productivity factor, and the number of plan "advances", representing the number of documents
+ * returned by the PlanStage tree.
  */
-class PlanRanker {
+template <typename PlanStageStatsType>
+class PlanScorer {
 public:
-    /**
-     * Returns a PlanRankingDecision which has the ranking and the information about the ranking
-     * process with status OK if everything worked. 'candidateOrder' within the PlanRankingDecision
-     * holds indices into candidates ordered by score (winner in first element).
-     *
-     * Returns an error if there was an issue with plan ranking (e.g. there was no viable plan).
-     */
-    static StatusWith<std::unique_ptr<PlanRankingDecision>> pickBestPlan(
-        const std::vector<CandidatePlan>& candidates);
+    PlanScorer() = default;
+    virtual ~PlanScorer() = default;
 
-    /**
-     * Assign the stats tree a 'goodness' score. The higher the score, the better
-     * the plan. The exact value isn't meaningful except for imposing a ranking.
-     */
-    static double scoreTree(const PlanStageStats* stats);
-};
+    double calculateScore(const PlanStageStatsType* stats) const {
+        // We start all scores at 1.  Our "no plan selected" score is 0 and we want all plans to
+        // be greater than that.
+        const double baseScore = 1;
 
-/**
- * A container holding one to-be-ranked plan and its associated/relevant data.
- * Does not own any of its pointers.
- */
-struct CandidatePlan {
-    CandidatePlan(std::unique_ptr<QuerySolution> solution, PlanStage* r, WorkingSet* w)
-        : solution(std::move(solution)), root(r), ws(w), failed(false) {}
+        const auto productivity = calculateProductivity(stats);
+        const auto advances = getNumberOfAdvances(stats);
+        const double epsilon =
+            std::min(1.0 / static_cast<double>(10 * (advances > 0 ? advances : 1)), 1e-4);
 
-    std::unique_ptr<QuerySolution> solution;
-    PlanStage* root;  // Not owned here.
-    WorkingSet* ws;   // Not owned here.
 
-    // Any results produced during the plan's execution prior to ranking are retained here.
-    std::queue<WorkingSetID> results;
-
-    bool failed;
-};
-
-/**
- * Information about why a plan was picked to be the best.  Data here is placed into the cache
- * and used to compare expected performance with actual.
- */
-struct PlanRankingDecision {
-    PlanRankingDecision() {}
-
-    /**
-     * Make a deep copy.
-     */
-    PlanRankingDecision* clone() const {
-        PlanRankingDecision* decision = new PlanRankingDecision();
-        for (size_t i = 0; i < stats.size(); ++i) {
-            PlanStageStats* s = stats[i].get();
-            invariant(s);
-            decision->stats.push_back(std::unique_ptr<PlanStageStats>{s->clone()});
+        // We prefer queries that don't require a fetch stage.
+        double noFetchBonus = epsilon;
+        if (hasStage(STAGE_FETCH, stats)) {
+            noFetchBonus = 0;
         }
-        decision->scores = scores;
-        decision->candidateOrder = candidateOrder;
-        decision->failedCandidates = failedCandidates;
-        return decision;
+
+        // In the case of ties, prefer solutions without a blocking sort
+        // to solutions with a blocking sort.
+        double noSortBonus = epsilon;
+        if (hasStage(STAGE_SORT_DEFAULT, stats) || hasStage(STAGE_SORT_SIMPLE, stats)) {
+            noSortBonus = 0;
+        }
+
+        // In the case of ties, prefer single index solutions to ixisect. Index
+        // intersection solutions are often slower than single-index solutions
+        // because they require examining a superset of index keys that would be
+        // examined by a single index scan.
+        //
+        // On the other hand, index intersection solutions examine the same
+        // number or fewer of documents. In the case that index intersection
+        // allows us to examine fewer documents, the penalty given to ixisect
+        // can be made up via the no fetch bonus.
+        double noIxisectBonus = epsilon;
+        if (hasStage(STAGE_AND_HASH, stats) || hasStage(STAGE_AND_SORTED, stats)) {
+            noIxisectBonus = 0;
+        }
+
+        const double tieBreakers = noFetchBonus + noSortBonus + noIxisectBonus;
+        double score = baseScore + productivity + tieBreakers;
+
+        log_detail::logScoreFormula([this, stats] { return getProductivityFormula(stats); },
+                                    score,
+                                    baseScore,
+                                    productivity,
+                                    noFetchBonus,
+                                    noSortBonus,
+                                    noIxisectBonus,
+                                    tieBreakers);
+
+        if (internalQueryForceIntersectionPlans.load()) {
+            if (hasStage(STAGE_AND_HASH, stats) || hasStage(STAGE_AND_SORTED, stats)) {
+                // The boost should be >2.001 to make absolutely sure the ixisect plan will win due
+                // to the combination of 1) productivity, 2) eof bonus, and 3) no ixisect bonus.
+                score += 3;
+                log_detail::logScoreBoost(score);
+            }
+        }
+        return score;
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
-        return  // Add size of each element in 'stats' vector.
-            container_size_helper::estimateObjectSizeInBytes(
-                stats, [](const auto& stat) { return stat->estimateObjectSizeInBytes(); }, true) +
-            // Add size of each element in 'candidateOrder' vector.
-            container_size_helper::estimateObjectSizeInBytes(candidateOrder) +
-            // Add size of each element in 'failedCandidates' vector.
-            container_size_helper::estimateObjectSizeInBytes(failedCandidates) +
-            // Add size of each element in 'scores' vector.
-            container_size_helper::estimateObjectSizeInBytes(scores) +
-            // Add size of the object.
-            sizeof(*this);
-    }
+protected:
+    /**
+     * Returns an abstract plan productivity value. Each implementation is free to define the
+     * formula to calculate the productivity. The value must be withing the range: [0, 1].
+     */
+    virtual double calculateProductivity(const PlanStageStatsType* stats) const = 0;
 
-    // Stats of all plans sorted in descending order by score.
-    // Owned by us.
-    std::vector<std::unique_ptr<PlanStageStats>> stats;
+    /**
+     * Returns a string desribing a formula to calculte plan producivity. It can be used for the log
+     * output, for example.
+     */
+    virtual std::string getProductivityFormula(const PlanStageStatsType* stats) const = 0;
 
-    // The "goodness" score corresponding to 'stats'.
-    // Sorted in descending order.
-    std::vector<double> scores;
+    /**
+     * Returns the number of advances from the root stage stats, which represents the number of
+     * documents returned by the PlanStage tree.
+     */
+    virtual double getNumberOfAdvances(const PlanStageStatsType* stats) const = 0;
 
-    // Ordering of original plans in descending of score.
-    // Filled in by PlanRanker::pickBestPlan(candidates, ...)
-    // so that candidates[candidateOrder[0]] refers to the best plan
-    // with corresponding cores[0] and stats[0]. Runner-up would be
-    // candidates[candidateOrder[1]] followed by
-    // candidates[candidateOrder[2]], ...
-    //
-    // Contains only non-failing plans.
-    std::vector<size_t> candidateOrder;
-
-    // Contains the list of original plans that failed.
-    //
-    // Like 'candidateOrder', the contents of this array are indicies into the 'candidates' array.
-    std::vector<size_t> failedCandidates;
-
-    // Whether two plans tied for the win.
-    //
-    // Reading this flag is the only reliable way for callers to determine if there was a tie,
-    // because the scores kept inside the PlanRankingDecision do not incorporate the EOF bonus.
-    bool tieForBest = false;
+    /**
+     * True, if the plan stage stats tree represents a plan stage of the given 'type'.
+     */
+    virtual bool hasStage(StageType type, const PlanStageStatsType* stats) const = 0;
 };
 
-}  // namespace mongo
+/**
+ * A container holding one to-be-scored plan and its associated/relevant data.
+ * It takes the following template parameters:
+ *    * PlanStageType - the type of plan stages in the execution tree.
+ *    * ResultType - the type of data produced by the execution tree during the candidate plan
+ *      execution.
+ *    * Data - the type of any auxiliary data which is needed to run the execution tree.
+ */
+template <typename PlanStageType, typename ResultType, typename Data>
+struct BaseCandidatePlan {
+    // A query solution representing this candidate plan.
+    std::unique_ptr<QuerySolution> solution;
+    // A root stage of the PlanStage tree constructed from the 'solution'.
+    PlanStageType root;
+    // Any auxiliary data required to run the execution tree.
+    Data data;
+    // Indicates whether this candidate plan has completed the trial run early by achieving one
+    // of the trial run metrics.
+    bool exitedEarly{false};
+    // Indicates that this candidate plan has failed in a recoverable fashion during the trial run.
+    bool failed{false};
+    // Any results produced during the plan's execution prior to scoring are retained here.
+    std::queue<ResultType> results;
+};
+
+using CandidatePlan = BaseCandidatePlan<PlanStage*, WorkingSetID, WorkingSet*>;
+}  // namespace mongo::plan_ranker

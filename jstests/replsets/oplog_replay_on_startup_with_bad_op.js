@@ -2,7 +2,10 @@
 // apply any remaining unapplied ops before coming up as a secondary. If the op fails to apply, the
 // server must fail to start up.
 //
-// @tags: [requires_persistence]
+// @tags: [
+//   requires_persistence,
+//   live_record_incompatible,
+// ]
 (function() {
 "use strict";
 
@@ -64,9 +67,6 @@ assert.eq(minValidColl.findOne(),
 
 assert.throws(() => rst.restart(0));  // Restart in replSet mode again.
 
-// fassert() calls std::abort(), which returns a different exit code for Windows vs. other
-// platforms.
-const exitCode = _isWindows() ? MongoRunner.EXIT_ABRUPT : MongoRunner.EXIT_ABORT;
-rst.stop(0, undefined, {allowedExitCode: exitCode});
+rst.stop(0, undefined, {allowedExitCode: MongoRunner.EXIT_ABORT});
 rst.stopSet();
 })();

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -35,17 +35,24 @@
 
 #include "mongo/db/operation_context.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/vector_clock.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/balancer_configuration.h"
-#include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_factory.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
 
 namespace mongo {
 namespace {
 const auto grid = ServiceContext::declareDecoration<Grid>();
+
+// TODO SERVER-50675: Remove this FVC function when 5.0 becomes last-lts.
+bool fcvGreaterThanOrEqualTo47() {
+    auto& fcv = serverGlobalParams.featureCompatibility;
+    return fcv.isVersionInitialized() &&
+        fcv.isGreaterThanOrEqualTo(ServerGlobalParams::FeatureCompatibility::Version::kVersion47);
+}
 }  // namespace
 
 Grid::Grid() = default;
@@ -83,7 +90,7 @@ void Grid::init(std::unique_ptr<ShardingCatalogClient> catalogClient,
     _executorPool = std::move(executorPool);
     _network = network;
 
-    _shardRegistry->init();
+    _shardRegistry->init(grid.owner(this));
 }
 
 bool Grid::isShardingInitialized() const {
@@ -112,6 +119,37 @@ bool Grid::allowLocalHost() const {
 
 void Grid::setAllowLocalHost(bool allow) {
     _allowLocalShard = allow;
+}
+
+repl::ReadConcernArgs Grid::readConcernWithConfigTime(
+    repl::ReadConcernLevel readConcernLevel) const {
+    if (fcvGreaterThanOrEqualTo47()) {
+        const auto currentTime = VectorClock::get(grid.owner(this))->getTime();
+        if (auto configTime = currentTime.configTime(); !configTime.asTimestamp().isNull()) {
+            // TODO SERVER-44097: investigate why not using a term (e.g. with a LogicalTime)
+            // can lead - upon CSRS stepdowns - to a last applied opTime lower than the
+            // previous primary's committed opTime
+            auto opTime = mongo::repl::OpTime(configTime.asTimestamp(),
+                                              mongo::repl::OpTime::kUninitializedTerm);
+            return ReadConcernArgs(opTime, readConcernLevel);
+        }
+    }
+    return ReadConcernArgs(configOpTime(), readConcernLevel);
+}
+
+ReadPreferenceSetting Grid::readPreferenceWithConfigTime(
+    const ReadPreferenceSetting& readPreference) const {
+    if (fcvGreaterThanOrEqualTo47()) {
+        const auto currentTime = VectorClock::get(grid.owner(this))->getTime();
+        if (auto configTime = currentTime.configTime(); !configTime.asTimestamp().isNull()) {
+            ReadPreferenceSetting readPrefToReturn(readPreference);
+            readPrefToReturn.minClusterTime = configTime.asTimestamp();
+            return readPrefToReturn;
+        }
+    }
+    ReadPreferenceSetting readPrefToReturn(readPreference);
+    readPrefToReturn.minClusterTime = configOpTime().getTimestamp();
+    return readPrefToReturn;
 }
 
 repl::OpTime Grid::configOpTime() const {
@@ -144,7 +182,6 @@ boost::optional<repl::OpTime> Grid::advanceConfigOpTime(OperationContext* opCtx,
 
 boost::optional<repl::OpTime> Grid::_advanceConfigOpTime(const repl::OpTime& opTime) {
     invariant(serverGlobalParams.clusterRole != ClusterRole::ConfigServer);
-
     stdx::lock_guard<Latch> lk(_mutex);
     if (_configOpTime < opTime) {
         repl::OpTime prev = _configOpTime;

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
 
 #include "mongo/platform/basic.h"
 
@@ -39,7 +39,6 @@
 #include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/audit.h"
-#include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_build_block.h"
 #include "mongo/db/catalog/index_catalog_entry_impl.h"
@@ -57,12 +56,12 @@
 #include "mongo/db/index_names.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/keypattern.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/query/collation/collation_spec.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/query/collection_index_usage_tracker_decoration.h"
 #include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/replication_coordinator.h"
@@ -73,7 +72,9 @@
 #include "mongo/db/storage/execution_context.h"
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/storage_engine_init.h"
+#include "mongo/db/storage/storage_util.h"
 #include "mongo/db/ttl_collection_cache.h"
+#include "mongo/db/vector_clock.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
@@ -98,6 +99,15 @@ const BSONObj IndexCatalogImpl::_idObj = BSON("_id" << 1);
 
 IndexCatalogImpl::IndexCatalogImpl(Collection* collection) : _collection(collection) {}
 
+std::unique_ptr<IndexCatalog> IndexCatalogImpl::clone() const {
+    return std::make_unique<IndexCatalogImpl>(*this);
+}
+
+void IndexCatalogImpl::setCollection(Collection* collection) {
+    _collection = collection;
+}
+
+
 Status IndexCatalogImpl::init(OperationContext* opCtx) {
     vector<string> indexNames;
     auto durableCatalog = DurableCatalog::get(opCtx);
@@ -111,15 +121,15 @@ Status IndexCatalogImpl::init(OperationContext* opCtx) {
             durableCatalog->getIndexSpec(opCtx, _collection->getCatalogId(), indexName).getOwned();
         BSONObj keyPattern = spec.getObjectField("key");
 
+        // TODO SERVER-51871: Delete this block once 5.0 becomes last-lts.
         if (spec.hasField(IndexDescriptor::kGeoHaystackBucketSize)) {
             LOGV2_OPTIONS(4670602,
                           {logv2::LogTag::kStartupWarnings},
                           "Found an existing geoHaystack index in the catalog. Support for "
-                          "geoHaystack indexes has been deprecated. Instead create a 2d index. See "
+                          "geoHaystack indexes has been removed. Instead create a 2d index. See "
                           "https://dochub.mongodb.org/core/4.4-deprecate-geoHaystack");
         }
-        auto descriptor =
-            std::make_unique<IndexDescriptor>(_collection, _getAccessMethodName(keyPattern), spec);
+        auto descriptor = std::make_unique<IndexDescriptor>(_getAccessMethodName(keyPattern), spec);
         if (spec.hasField(IndexDescriptor::kExpireAfterSecondsFieldName)) {
             TTLCollectionCache::get(opCtx->getServiceContext())
                 .registerTTLInfo(std::make_pair(_collection->uuid(), indexName));
@@ -155,7 +165,7 @@ Status IndexCatalogImpl::init(OperationContext* opCtx) {
         }
     }
 
-    CollectionQueryInfo::get(_collection).init(opCtx);
+    CollectionQueryInfo::get(_collection).init(opCtx, _collection);
     return Status::OK();
 }
 
@@ -306,11 +316,10 @@ void IndexCatalogImpl::_logInternalState(OperationContext* opCtx,
     }
 }
 
-namespace {
-std::string lastHaystackIndexLogged = "";
-}
-StatusWith<BSONObj> IndexCatalogImpl::prepareSpecForCreate(OperationContext* opCtx,
-                                                           const BSONObj& original) const {
+StatusWith<BSONObj> IndexCatalogImpl::prepareSpecForCreate(
+    OperationContext* opCtx,
+    const BSONObj& original,
+    const boost::optional<ResumeIndexInfo>& resumeInfo) const {
     auto swValidatedAndFixed = _validateAndFixIndexSpec(opCtx, original);
     if (!swValidatedAndFixed.isOK()) {
         return swValidatedAndFixed.getStatus().withContext(
@@ -318,17 +327,14 @@ StatusWith<BSONObj> IndexCatalogImpl::prepareSpecForCreate(OperationContext* opC
     }
 
     auto validatedSpec = swValidatedAndFixed.getValue();
-    auto indexName = validatedSpec.getField("name").String();
-    // This gets hit twice per index, so we keep track of what we last logged to avoid logging the
-    // same line for the same index twice.
-    if (validatedSpec.hasField(IndexDescriptor::kGeoHaystackBucketSize) &&
-        lastHaystackIndexLogged.compare(indexName) != 0) {
+
+    // TODO SERVER-51871: Delete this block once 5.0 becomes last-lts.
+    if (validatedSpec.hasField(IndexDescriptor::kGeoHaystackBucketSize)) {
         LOGV2_OPTIONS(4670601,
                       {logv2::LogTag::kStartupWarnings},
                       "Support for "
-                      "geoHaystack indexes has been deprecated. Instead create a 2d index. See "
+                      "geoHaystack indexes has been removed. Instead create a 2d index. See "
                       "https://dochub.mongodb.org/core/4.4-deprecate-geoHaystack");
-        lastHaystackIndexLogged = indexName;
     }
 
     // Check whether this is a non-_id index and there are any settings disallowing this server
@@ -342,6 +348,12 @@ StatusWith<BSONObj> IndexCatalogImpl::prepareSpecForCreate(OperationContext* opC
     status = _doesSpecConflictWithExisting(opCtx, validatedSpec, false);
     if (!status.isOK()) {
         return status;
+    }
+
+    if (resumeInfo) {
+        // Don't check against unfinished indexes if this index is being resumed, since it will
+        // conflict with itself.
+        return validatedSpec;
     }
 
     // Now we will check against all indexes, in-progress included.
@@ -424,10 +436,9 @@ IndexCatalogEntry* IndexCatalogImpl::createIndexEntry(OperationContext* opCtx,
 
     auto* const descriptorPtr = descriptor.get();
     auto entry = std::make_shared<IndexCatalogEntryImpl>(
-        opCtx, ident, std::move(descriptor), &CollectionQueryInfo::get(_collection), frozen);
+        opCtx, _collection->getCatalogId(), ident, std::move(descriptor), frozen);
 
     IndexDescriptor* desc = entry->descriptor();
-
     std::unique_ptr<SortedDataInterface> sdi =
         engine->getEngine()->getGroupedSortedDataInterface(opCtx, ident, desc, entry->getPrefix());
 
@@ -445,18 +456,14 @@ IndexCatalogEntry* IndexCatalogImpl::createIndexEntry(OperationContext* opCtx,
     }
 
     bool initFromDisk = CreateIndexEntryFlags::kInitFromDisk & flags;
-    if (!initFromDisk &&
-        UncommittedCollections::getForTxn(opCtx, descriptorPtr->parentNS()) == nullptr) {
-        opCtx->recoveryUnit()->onRollback([this, opCtx, isReadyIndex, descriptor = descriptorPtr] {
-            // Need to preserve indexName as descriptor no longer exists after remove().
-            const std::string indexName = descriptor->indexName();
-            if (isReadyIndex) {
-                _readyIndexes.remove(descriptor);
-            } else {
-                _buildingIndexes.remove(descriptor);
-            }
-            CollectionQueryInfo::get(_collection).droppedIndex(opCtx, indexName);
-        });
+    if (!initFromDisk && UncommittedCollections::getForTxn(opCtx, _collection->ns()) == nullptr) {
+        const std::string indexName = descriptorPtr->indexName();
+        opCtx->recoveryUnit()->onRollback(
+            [collectionDecorations = _collection->getSharedDecorations(),
+             indexName = std::move(indexName)] {
+                CollectionIndexUsageTrackerDecoration::get(collectionDecorations)
+                    .unregisterIndex(indexName);
+            });
     }
 
     return save;
@@ -466,10 +473,10 @@ StatusWith<BSONObj> IndexCatalogImpl::createIndexOnEmptyCollection(OperationCont
                                                                    BSONObj spec) {
     UncommittedCollections::get(opCtx).invariantHasExclusiveAccessToCollection(opCtx,
                                                                                _collection->ns());
-    invariant(_collection->numRecords(opCtx) == 0,
+    invariant(_collection->isEmpty(opCtx),
               str::stream() << "Collection must be empty. Collection: " << _collection->ns()
                             << " UUID: " << _collection->uuid()
-                            << " Count: " << _collection->numRecords(opCtx));
+                            << " Count (from size storer): " << _collection->numRecords(opCtx));
 
     StatusWith<BSONObj> statusWithSpec = prepareSpecForCreate(opCtx, spec);
     Status status = statusWithSpec.getStatus();
@@ -480,17 +487,16 @@ StatusWith<BSONObj> IndexCatalogImpl::createIndexOnEmptyCollection(OperationCont
     // now going to touch disk
     boost::optional<UUID> buildUUID = boost::none;
     IndexBuildBlock indexBuildBlock(
-        this, _collection->ns(), spec, IndexBuildMethod::kForeground, buildUUID);
+        _collection->ns(), spec, IndexBuildMethod::kForeground, buildUUID);
     status = indexBuildBlock.init(opCtx, _collection);
     if (!status.isOK())
         return status;
 
     // sanity checks, etc...
-    IndexCatalogEntry* entry = indexBuildBlock.getEntry();
+    IndexCatalogEntry* entry = indexBuildBlock.getEntry(opCtx, _collection);
     invariant(entry);
     IndexDescriptor* descriptor = entry->descriptor();
     invariant(descriptor);
-    invariant(entry == _buildingIndexes.find(descriptor));
 
     status = entry->accessMethod()->initializeAsEmpty(opCtx);
     if (!status.isOK())
@@ -707,7 +713,7 @@ Status IndexCatalogImpl::_isSpecOk(OperationContext* opCtx, const BSONObj& spec)
         // expression would have been successfully parsed upstream during index creation.
         StatusWithMatchExpression statusWithMatcher =
             MatchExpressionParser::parse(filterElement.Obj(),
-                                         std::move(expCtx),
+                                         expCtx,
                                          ExtensionsCallbackNoop(),
                                          MatchExpressionParser::kBanAllSpecialFeatures);
         if (!statusWithMatcher.isOK()) {
@@ -773,86 +779,95 @@ Status IndexCatalogImpl::_isSpecOk(OperationContext* opCtx, const BSONObj& spec)
 Status IndexCatalogImpl::_doesSpecConflictWithExisting(OperationContext* opCtx,
                                                        const BSONObj& spec,
                                                        const bool includeUnfinishedIndexes) const {
-    const char* name = spec.getStringField("name");
+    const char* name = spec.getStringField(IndexDescriptor::kIndexNameFieldName);
     invariant(name[0]);
 
-    const BSONObj key = spec.getObjectField("key");
-    const BSONObj collation = spec.getObjectField("collation");
+    const BSONObj key = spec.getObjectField(IndexDescriptor::kKeyPatternFieldName);
 
     {
+        // Check whether an index with the specified candidate name already exists in the catalog.
         const IndexDescriptor* desc = findIndexByName(opCtx, name, includeUnfinishedIndexes);
+
         if (desc) {
-            // index already exists with same name
+            // Index already exists with same name. Check whether the options are the same as well.
+            IndexDescriptor candidate(_getAccessMethodName(key), spec);
+            auto indexComparison =
+                candidate.compareIndexOptions(opCtx, _collection->ns(), getEntry(desc));
 
-            if (SimpleBSONObjComparator::kInstance.evaluate(desc->keyPattern() == key) &&
-                SimpleBSONObjComparator::kInstance.evaluate(
-                    desc->infoObj().getObjectField("collation") != collation)) {
-                // key patterns are equal but collations differ.
-                return Status(ErrorCodes::IndexOptionsConflict,
-                              str::stream()
-                                  << "An index with the same key pattern, but a different "
-                                  << "collation already exists with the same name.  Try again with "
-                                  << "a unique name. "
-                                  << "Existing index: " << desc->infoObj()
-                                  << " Requested index: " << spec);
-            }
-
-            if (SimpleBSONObjComparator::kInstance.evaluate(desc->keyPattern() != key) ||
-                SimpleBSONObjComparator::kInstance.evaluate(
-                    desc->infoObj().getObjectField("collation") != collation)) {
+            // Key pattern or another uniquely-identifying option differs. We can build this index,
+            // but not with the specified (duplicate) name. User must specify another index name.
+            if (indexComparison == IndexDescriptor::Comparison::kDifferent) {
                 return Status(ErrorCodes::IndexKeySpecsConflict,
-                              str::stream()
-                                  << "Index must have unique name."
-                                  << "The existing index: " << desc->infoObj()
-                                  << " has the same name as the requested index: " << spec);
+                              str::stream() << "An existing index has the same name as the "
+                                               "requested index. Requested index: "
+                                            << spec << ", existing index: " << desc->infoObj());
             }
 
-            IndexDescriptor temp(_collection, _getAccessMethodName(key), spec);
-            if (!desc->areIndexOptionsEquivalent(&temp))
+            // The candidate's key and uniquely-identifying options are equivalent to an existing
+            // index, but some other options are not identical. Return a message to that effect.
+            if (indexComparison == IndexDescriptor::Comparison::kEquivalent) {
                 return Status(ErrorCodes::IndexOptionsConflict,
-                              str::stream() << "Index with name: " << name
-                                            << " already exists with different options");
+                              str::stream() << "An equivalent index already exists with the same "
+                                               "name but different options. Requested index: "
+                                            << spec << ", existing index: " << desc->infoObj());
+            }
 
+            // If we've reached this point, the requested index is identical to an existing index.
+            invariant(indexComparison == IndexDescriptor::Comparison::kIdentical);
 
             // If an identical index exists, but it is frozen, return an error with a different
-            // code to the user, forcing the user to drop before recreating the index.
+            // error code to the user, forcing the user to drop before recreating the index.
             auto entry = getEntry(desc);
             if (entry->isFrozen()) {
                 return Status(ErrorCodes::CannotCreateIndex,
-                              str::stream() << "An identical, unfinished index already exists. The "
-                                               "index must be dropped first: "
-                                            << name << ", spec: " << desc->infoObj());
+                              str::stream()
+                                  << "An identical, unfinished index '" << name
+                                  << "' already exists. Must drop before recreating. Spec: "
+                                  << desc->infoObj());
             }
 
-            // Index already exists with the same options, so no need to build a new
-            // one (not an error). Most likely requested by a client using ensureIndex.
+            // Index already exists with the same options, so there is no need to build a new one.
+            // This is not an error condition.
             return Status(ErrorCodes::IndexAlreadyExists,
                           str::stream() << "Identical index already exists: " << name);
         }
     }
 
     {
+        // No index with the candidate name exists. Check for an index with conflicting options.
         const IndexDescriptor* desc =
-            findIndexByKeyPatternAndCollationSpec(opCtx, key, collation, includeUnfinishedIndexes);
+            findIndexByKeyPatternAndOptions(opCtx, key, spec, includeUnfinishedIndexes);
+
         if (desc) {
             LOGV2_DEBUG(20353,
                         2,
-                        "Index already exists with a different name: {name} pattern: {key} "
-                        "collation: {collation}",
-                        "name"_attr = name,
-                        "key"_attr = key,
-                        "collation"_attr = collation);
+                        "Index already exists with a different name: {name}, spec: {spec}",
+                        "Index already exists with a different name",
+                        "name"_attr = desc->indexName(),
+                        "spec"_attr = desc->infoObj());
 
-            IndexDescriptor temp(_collection, _getAccessMethodName(key), spec);
-            if (!desc->areIndexOptionsEquivalent(&temp))
+            // Index already exists with a different name. Check whether the options are identical.
+            // We will return an error in either case, but this check allows us to generate a more
+            // informative error message.
+            IndexDescriptor candidate(_getAccessMethodName(key), spec);
+            auto indexComparison =
+                candidate.compareIndexOptions(opCtx, _collection->ns(), getEntry(desc));
+
+            // The candidate's key and uniquely-identifying options are equivalent to an existing
+            // index, but some other options are not identical. Return a message to that effect.
+            if (indexComparison == IndexDescriptor::Comparison::kEquivalent)
                 return Status(ErrorCodes::IndexOptionsConflict,
-                              str::stream()
-                                  << "Index: " << spec
-                                  << " already exists with different options: " << desc->infoObj());
+                              str::stream() << "An equivalent index already exists with a "
+                                               "different name and options. Requested index: "
+                                            << spec << ", existing index: " << desc->infoObj());
 
+            // If we've reached this point, the requested index is identical to an existing index.
+            invariant(indexComparison == IndexDescriptor::Comparison::kIdentical);
+
+            // An identical index already exists with a different name. We cannot build this index.
             return Status(ErrorCodes::IndexOptionsConflict,
-                          str::stream() << "Index with name: " << name
-                                        << " already exists with a different name");
+                          str::stream() << "Index already exists with a different name: "
+                                        << desc->indexName());
         }
     }
 
@@ -867,12 +882,10 @@ Status IndexCatalogImpl::_doesSpecConflictWithExisting(OperationContext* opCtx,
         return Status(ErrorCodes::CannotCreateIndex, s);
     }
 
-    // Refuse to build text index for user connections if another text index exists or is in
-    // progress. This constraint is not based on technical limitations of the storage or execution
-    // layers, and thus we allow internal connections to temporarily build multiple text indexes for
-    // idempotency reasons.
+    // Refuse to build text index if another text index exists or is in progress.
+    // Collections should only have one text index.
     string pluginName = IndexNames::findPluginName(key);
-    if (pluginName == IndexNames::TEXT && opCtx->getClient()->isFromUserConnection()) {
+    if (pluginName == IndexNames::TEXT) {
         vector<const IndexDescriptor*> textIndexes;
         findIndexByType(opCtx, IndexNames::TEXT, textIndexes, includeUnfinishedIndexes);
         if (textIndexes.size() > 0) {
@@ -934,7 +947,7 @@ void IndexCatalogImpl::dropAllIndexes(OperationContext* opCtx,
         const IndexDescriptor* desc = findIndexByName(opCtx, indexName, true);
         invariant(desc);
         LOGV2_DEBUG(20355, 1, "\t dropAllIndexes dropping: {desc}", "desc"_attr = *desc);
-        IndexCatalogEntry* entry = _readyIndexes.find(desc);
+        IndexCatalogEntry* entry = desc->getEntry();
         invariant(entry);
 
         // If the onDrop function creates an oplog entry, it should run first so that the drop is
@@ -973,7 +986,7 @@ void IndexCatalogImpl::dropAllIndexes(OperationContext* opCtx, bool includingIdI
 Status IndexCatalogImpl::dropIndex(OperationContext* opCtx, const IndexDescriptor* desc) {
     invariant(opCtx->lockState()->isCollectionLockedForMode(_collection->ns(), MODE_X));
 
-    IndexCatalogEntry* entry = _readyIndexes.find(desc);
+    IndexCatalogEntry* entry = desc->getEntry();
 
     if (!entry)
         return Status(ErrorCodes::InternalError, "cannot find index to delete");
@@ -987,7 +1000,7 @@ Status IndexCatalogImpl::dropIndex(OperationContext* opCtx, const IndexDescripto
 Status IndexCatalogImpl::dropUnfinishedIndex(OperationContext* opCtx, const IndexDescriptor* desc) {
     invariant(opCtx->lockState()->isCollectionLockedForMode(_collection->ns(), MODE_X));
 
-    IndexCatalogEntry* entry = _buildingIndexes.find(desc);
+    IndexCatalogEntry* entry = desc->getEntry();
 
     if (!entry)
         return Status(ErrorCodes::InternalError, "cannot find index to delete");
@@ -1001,40 +1014,30 @@ Status IndexCatalogImpl::dropUnfinishedIndex(OperationContext* opCtx, const Inde
 namespace {
 class IndexRemoveChange final : public RecoveryUnit::Change {
 public:
-    IndexRemoveChange(OperationContext* opCtx,
-                      Collection* collection,
-                      IndexCatalogEntryContainer* entries,
-                      std::shared_ptr<IndexCatalogEntry> entry)
-        : _opCtx(opCtx), _collection(collection), _entries(entries), _entry(std::move(entry)) {}
+    IndexRemoveChange(IndexCatalogEntryContainer* entries,
+                      std::shared_ptr<IndexCatalogEntry> entry,
+                      SharedCollectionDecorations* collectionDecorations)
+        : _entries(entries),
+          _entry(std::move(entry)),
+          _collectionDecorations(collectionDecorations) {}
 
     void commit(boost::optional<Timestamp> commitTime) final {
-        // Ban reading from this collection on committed reads on snapshots before now.
-        if (!commitTime) {
-            // This is called when we refresh the index catalog entry, which does not always have
-            // a commit timestamp. We use the cluster time since it's guaranteed to be greater
-            // than the time of the index removal. It is possible the cluster time could be in the
-            // future, and we will need to do another write to reach the minimum visible snapshot.
-            commitTime = LogicalClock::getClusterTimeForReplicaSet(_opCtx).asTimestamp();
-        }
         _entry->setDropped();
-        _collection->setMinimumVisibleSnapshot(commitTime.get());
     }
 
     void rollback() final {
         auto indexDescriptor = _entry->descriptor();
-        _entries->add(std::move(_entry));
 
-        // Refresh the CollectionQueryInfo's knowledge of what indices are present. This must be
-        // done after re-adding our IndexCatalogEntry to the '_entries' list, since 'addedIndex()'
-        // refreshes its knowledge by iterating the list of indices currently in the catalog.
-        CollectionQueryInfo::get(_collection).addedIndex(_opCtx, indexDescriptor);
+        // Refresh the CollectionIndexUsageTrackerDecoration's knowledge of what indices are
+        // present as it is shared state across Collection copies.
+        CollectionIndexUsageTrackerDecoration::get(_collectionDecorations)
+            .registerIndex(indexDescriptor->indexName(), indexDescriptor->keyPattern());
     }
 
 private:
-    OperationContext* _opCtx;
-    Collection* _collection;
     IndexCatalogEntryContainer* _entries;
     std::shared_ptr<IndexCatalogEntry> _entry;
+    SharedCollectionDecorations* _collectionDecorations;
 };
 }  // namespace
 
@@ -1051,63 +1054,47 @@ Status IndexCatalogImpl::dropIndexEntry(OperationContext* opCtx, IndexCatalogEnt
     if (released) {
         invariant(released.get() == entry);
         opCtx->recoveryUnit()->registerChange(std::make_unique<IndexRemoveChange>(
-            opCtx, _collection, &_readyIndexes, std::move(released)));
+            &_readyIndexes, std::move(released), _collection->getSharedDecorations()));
     } else {
         released = _buildingIndexes.release(entry->descriptor());
         invariant(released.get() == entry);
         opCtx->recoveryUnit()->registerChange(std::make_unique<IndexRemoveChange>(
-            opCtx, _collection, &_buildingIndexes, std::move(released)));
+            &_buildingIndexes, std::move(released), _collection->getSharedDecorations()));
     }
 
-    CollectionQueryInfo::get(_collection).droppedIndex(opCtx, indexName);
-    entry = nullptr;
-    deleteIndexFromDisk(opCtx, indexName);
+    CollectionQueryInfo::get(_collection).rebuildIndexData(opCtx, _collection);
+    CollectionIndexUsageTrackerDecoration::get(_collection->getSharedDecorations())
+        .unregisterIndex(indexName);
+    _deleteIndexFromDisk(opCtx, indexName, entry->getSharedIdent());
 
     return Status::OK();
 }
 
 void IndexCatalogImpl::deleteIndexFromDisk(OperationContext* opCtx, const string& indexName) {
     invariant(opCtx->lockState()->isCollectionLockedForMode(_collection->ns(), MODE_X));
-
-    Status status =
-        DurableCatalog::get(opCtx)->removeIndex(opCtx, _collection->getCatalogId(), indexName);
-    if (status.code() == ErrorCodes::NamespaceNotFound) {
-        /*
-         * This is ok, as we may be partially through index creation.
-         */
-    } else if (!status.isOK()) {
-        LOGV2_WARNING(
-            20364,
-            "couldn't drop index {indexName} on collection: {collection_ns} because of {status}",
-            "couldn't drop index",
-            "index"_attr = indexName,
-            "namespace"_attr = _collection->ns(),
-            "reason"_attr = redact(status));
-    }
+    _deleteIndexFromDisk(opCtx, indexName, nullptr);
 }
 
-bool IndexCatalogImpl::isMultikey(const IndexDescriptor* const idx) {
-    IndexCatalogEntry* entry = _readyIndexes.find(idx);
-    invariant(entry);
-    return entry->isMultikey();
-}
-
-MultikeyPaths IndexCatalogImpl::getMultikeyPaths(OperationContext* opCtx,
-                                                 const IndexDescriptor* idx) {
-    IndexCatalogEntry* entry = _readyIndexes.find(idx);
-    invariant(entry);
-    return entry->getMultikeyPaths(opCtx);
+void IndexCatalogImpl::_deleteIndexFromDisk(OperationContext* opCtx,
+                                            const string& indexName,
+                                            std::shared_ptr<Ident> ident) {
+    invariant(!findIndexByName(opCtx, indexName, true /* includeUnfinishedIndexes*/));
+    catalog::removeIndex(opCtx,
+                         indexName,
+                         _collection->getCatalogId(),
+                         _collection->uuid(),
+                         _collection->ns(),
+                         std::move(ident));
 }
 
 void IndexCatalogImpl::setMultikeyPaths(OperationContext* const opCtx,
+                                        const CollectionPtr& coll,
                                         const IndexDescriptor* desc,
-                                        const MultikeyPaths& multikeyPaths) {
-    IndexCatalogEntry* entry = _readyIndexes.find(desc);
-    if (!entry) {
-        entry = _buildingIndexes.find(desc);
-    }
+                                        const KeyStringSet& multikeyMetadataKeys,
+                                        const MultikeyPaths& multikeyPaths) const {
+    IndexCatalogEntry* entry = desc->getEntry();
     invariant(entry);
-    entry->setMultikey(opCtx, multikeyPaths);
+    entry->setMultikey(opCtx, coll, multikeyMetadataKeys, multikeyPaths);
 };
 
 // ---------------------------
@@ -1121,58 +1108,14 @@ bool IndexCatalogImpl::haveAnyIndexesInProgress() const {
 }
 
 int IndexCatalogImpl::numIndexesTotal(OperationContext* opCtx) const {
-    int count = _readyIndexes.size() + _buildingIndexes.size();
-
-    if (kDebugBuild) {
-        try {
-            // Check if the in-memory index count matches the durable catalogs index count on disk.
-            // This can throw a WriteConflictException when retries on write conflicts are disabled
-            // during testing. The DurableCatalog fetches the metadata off of the disk using a
-            // findRecord() call.
-            dassert(DurableCatalog::get(opCtx)->getTotalIndexCount(
-                        opCtx, _collection->getCatalogId()) == count);
-        } catch (const WriteConflictException& ex) {
-            if (opCtx->lockState()->isWriteLocked()) {
-                // Must abort this write transaction now.
-                throw;
-            }
-            // Ignore the write conflict for read transactions; we will eventually roll back this
-            // transaction anyway.
-            LOGV2(20356, "Skipping dassert check", "reason"_attr = ex);
-        }
-    }
-
-    return count;
+    return _readyIndexes.size() + _buildingIndexes.size();
 }
 
 int IndexCatalogImpl::numIndexesReady(OperationContext* opCtx) const {
     std::vector<const IndexDescriptor*> itIndexes;
     std::unique_ptr<IndexIterator> ii = getIndexIterator(opCtx, /*includeUnfinished*/ false);
-    auto durableCatalog = DurableCatalog::get(opCtx);
     while (ii->more()) {
         itIndexes.push_back(ii->next()->descriptor());
-    }
-    if (kDebugBuild) {
-        std::vector<std::string> completedIndexes;
-        durableCatalog->getReadyIndexes(opCtx, _collection->getCatalogId(), &completedIndexes);
-
-        // There is a potential inconistency where the index information in the collection catalog
-        // entry and the index catalog differ. Log as much information as possible here.
-        if (itIndexes.size() != completedIndexes.size()) {
-            for (const IndexDescriptor* i : itIndexes) {
-                LOGV2(20358, "index catalog reports", "index"_attr = *i);
-            }
-
-            for (auto const& i : completedIndexes) {
-                LOGV2(20360, "collection catalog reports", "index"_attr = i);
-            }
-
-            LOGV2(20361, "uuid", "collection_uuid"_attr = _collection->uuid());
-
-            invariant(itIndexes.size() == completedIndexes.size(),
-                      "The number of ready indexes reported in the collection metadata catalog did "
-                      "not match the number of ready indexes reported by the index catalog.");
-        }
     }
     return itIndexes.size();
 }
@@ -1203,22 +1146,22 @@ const IndexDescriptor* IndexCatalogImpl::findIndexByName(OperationContext* opCtx
     return nullptr;
 }
 
-const IndexDescriptor* IndexCatalogImpl::findIndexByKeyPatternAndCollationSpec(
+const IndexDescriptor* IndexCatalogImpl::findIndexByKeyPatternAndOptions(
     OperationContext* opCtx,
     const BSONObj& key,
-    const BSONObj& collationSpec,
+    const BSONObj& indexSpec,
     bool includeUnfinishedIndexes) const {
     std::unique_ptr<IndexIterator> ii = getIndexIterator(opCtx, includeUnfinishedIndexes);
+    IndexDescriptor needle(_getAccessMethodName(key), indexSpec);
     while (ii->more()) {
-        const IndexDescriptor* desc = ii->next()->descriptor();
-        if (SimpleBSONObjComparator::kInstance.evaluate(desc->keyPattern() == key) &&
-            SimpleBSONObjComparator::kInstance.evaluate(
-                desc->infoObj().getObjectField("collation") == collationSpec)) {
-            return desc;
+        const auto* entry = ii->next();
+        if (needle.compareIndexOptions(opCtx, {}, entry) !=
+            IndexDescriptor::Comparison::kDifferent) {
+            return entry->descriptor();
         }
     }
     return nullptr;
-}
+}  // namespace mongo
 
 void IndexCatalogImpl::findIndexesByKeyPattern(OperationContext* opCtx,
                                                const BSONObj& key,
@@ -1241,8 +1184,9 @@ const IndexDescriptor* IndexCatalogImpl::findShardKeyPrefixedIndex(OperationCont
 
     std::unique_ptr<IndexIterator> ii = getIndexIterator(opCtx, false);
     while (ii->more()) {
-        const IndexDescriptor* desc = ii->next()->descriptor();
-        bool hasSimpleCollation = desc->infoObj().getObjectField("collation").isEmpty();
+        const IndexCatalogEntry* entry = ii->next();
+        const IndexDescriptor* desc = entry->descriptor();
+        bool hasSimpleCollation = desc->collation().isEmpty();
 
         if (desc->isPartial() || desc->isSparse())
             continue;
@@ -1250,7 +1194,7 @@ const IndexDescriptor* IndexCatalogImpl::findShardKeyPrefixedIndex(OperationCont
         if (!shardKey.isPrefixOf(desc->keyPattern(), SimpleBSONElementComparator::kInstance))
             continue;
 
-        if (!desc->isMultikey() && hasSimpleCollation)
+        if (!entry->isMultikey() && hasSimpleCollation)
             return desc;
 
         if (!requireSingleKey && hasSimpleCollation)
@@ -1274,22 +1218,14 @@ void IndexCatalogImpl::findIndexByType(OperationContext* opCtx,
 }
 
 const IndexCatalogEntry* IndexCatalogImpl::getEntry(const IndexDescriptor* desc) const {
-    const IndexCatalogEntry* entry = _readyIndexes.find(desc);
-    if (!entry) {
-        entry = _buildingIndexes.find(desc);
-    }
-
+    const IndexCatalogEntry* entry = desc->getEntry();
     massert(17357, "cannot find index entry", entry);
     return entry;
 }
 
 std::shared_ptr<const IndexCatalogEntry> IndexCatalogImpl::getEntryShared(
     const IndexDescriptor* indexDescriptor) const {
-    auto entry = _readyIndexes.findShared(indexDescriptor);
-    if (entry) {
-        return entry;
-    }
-    return _buildingIndexes.findShared(indexDescriptor);
+    return indexDescriptor->getEntry()->shared_from_this();
 }
 
 std::vector<std::shared_ptr<const IndexCatalogEntry>> IndexCatalogImpl::getAllReadyEntriesShared()
@@ -1308,12 +1244,13 @@ const IndexDescriptor* IndexCatalogImpl::refreshEntry(OperationContext* opCtx,
 
     // Delete the IndexCatalogEntry that owns this descriptor.  After deletion, 'oldDesc' is
     // invalid and should not be dereferenced. Also, invalidate the index from the
-    // CollectionQueryInfo.
+    // CollectionIndexUsageTrackerDecoration (shared state among Collection instances).
     auto oldEntry = _readyIndexes.release(oldDesc);
     invariant(oldEntry);
     opCtx->recoveryUnit()->registerChange(std::make_unique<IndexRemoveChange>(
-        opCtx, _collection, &_readyIndexes, std::move(oldEntry)));
-    CollectionQueryInfo::get(_collection).droppedIndex(opCtx, indexName);
+        &_readyIndexes, std::move(oldEntry), _collection->getSharedDecorations()));
+    CollectionIndexUsageTrackerDecoration::get(_collection->getSharedDecorations())
+        .unregisterIndex(indexName);
 
     // Ask the CollectionCatalogEntry for the new index spec.
     BSONObj spec =
@@ -1321,13 +1258,22 @@ const IndexDescriptor* IndexCatalogImpl::refreshEntry(OperationContext* opCtx,
     BSONObj keyPattern = spec.getObjectField("key");
 
     // Re-register this index in the index catalog with the new spec. Also, add the new index
-    // to the CollectionQueryInfo.
-    auto newDesc =
-        std::make_unique<IndexDescriptor>(_collection, _getAccessMethodName(keyPattern), spec);
-    const IndexCatalogEntry* newEntry =
-        createIndexEntry(opCtx, std::move(newDesc), CreateIndexEntryFlags::kIsReady);
+    // to the CollectionIndexUsageTrackerDecoration (shared state among Collection instances).
+    auto newDesc = std::make_unique<IndexDescriptor>(_getAccessMethodName(keyPattern), spec);
+    auto newEntry = createIndexEntry(opCtx, std::move(newDesc), CreateIndexEntryFlags::kIsReady);
     invariant(newEntry->isReady(opCtx));
-    CollectionQueryInfo::get(_collection).addedIndex(opCtx, newEntry->descriptor());
+    auto desc = newEntry->descriptor();
+    CollectionIndexUsageTrackerDecoration::get(_collection->getSharedDecorations())
+        .registerIndex(desc->indexName(), desc->keyPattern());
+
+    // Last rebuild index data for CollectionQueryInfo for this Collection.
+    CollectionQueryInfo::get(_collection).rebuildIndexData(opCtx, _collection);
+
+    opCtx->recoveryUnit()->onCommit([newEntry](auto commitTime) {
+        if (commitTime) {
+            newEntry->setMinimumVisibleSnapshot(*commitTime);
+        }
+    });
 
     // Return the new descriptor.
     return newEntry->descriptor();
@@ -1336,6 +1282,7 @@ const IndexDescriptor* IndexCatalogImpl::refreshEntry(OperationContext* opCtx,
 // ---------------------------
 
 Status IndexCatalogImpl::_indexKeys(OperationContext* opCtx,
+                                    const CollectionPtr& coll,
                                     IndexCatalogEntry* index,
                                     const KeyStringSet& keys,
                                     const KeyStringSet& multikeyMetadataKeys,
@@ -1368,17 +1315,19 @@ Status IndexCatalogImpl::_indexKeys(OperationContext* opCtx,
             *keysInsertedOut += inserted;
         }
     } else {
-        InsertResult result;
-        status = index->accessMethod()->insertKeys(
+        int64_t numInserted;
+        status = index->accessMethod()->insertKeysAndUpdateMultikeyPaths(
             opCtx,
+            coll,
             keys,
             {multikeyMetadataKeys.begin(), multikeyMetadataKeys.end()},
             multikeyPaths,
             loc,
             options,
-            &result);
+            nullptr,
+            &numInserted);
         if (keysInsertedOut) {
-            *keysInsertedOut += result.numInserted;
+            *keysInsertedOut += numInserted;
         }
     }
 
@@ -1386,13 +1335,14 @@ Status IndexCatalogImpl::_indexKeys(OperationContext* opCtx,
 }
 
 Status IndexCatalogImpl::_indexFilteredRecords(OperationContext* opCtx,
+                                               const CollectionPtr& coll,
                                                IndexCatalogEntry* index,
                                                const std::vector<BsonRecord>& bsonRecords,
                                                int64_t* keysInsertedOut) {
     auto& executionCtx = StorageExecutionContext::get(opCtx);
 
     InsertDeleteOptions options;
-    prepareInsertDeleteOptions(opCtx, index->descriptor(), &options);
+    prepareInsertDeleteOptions(opCtx, coll->ns(), index->descriptor(), &options);
 
     for (auto bsonRecord : bsonRecords) {
         invariant(bsonRecord.id != RecordId());
@@ -1418,6 +1368,7 @@ Status IndexCatalogImpl::_indexFilteredRecords(OperationContext* opCtx,
                                        IndexAccessMethod::kNoopOnSuppressedErrorFn);
 
         Status status = _indexKeys(opCtx,
+                                   coll,
                                    index,
                                    *keys,
                                    *multikeyMetadataKeys,
@@ -1435,6 +1386,7 @@ Status IndexCatalogImpl::_indexFilteredRecords(OperationContext* opCtx,
 }
 
 Status IndexCatalogImpl::_indexRecords(OperationContext* opCtx,
+                                       const CollectionPtr& coll,
                                        IndexCatalogEntry* index,
                                        const std::vector<BsonRecord>& bsonRecords,
                                        int64_t* keysInsertedOut) {
@@ -1444,7 +1396,7 @@ Status IndexCatalogImpl::_indexRecords(OperationContext* opCtx,
 
     const MatchExpression* filter = index->getFilterExpression();
     if (!filter)
-        return _indexFilteredRecords(opCtx, index, bsonRecords, keysInsertedOut);
+        return _indexFilteredRecords(opCtx, coll, index, bsonRecords, keysInsertedOut);
 
     std::vector<BsonRecord> filteredBsonRecords;
     for (auto bsonRecord : bsonRecords) {
@@ -1452,10 +1404,11 @@ Status IndexCatalogImpl::_indexRecords(OperationContext* opCtx,
             filteredBsonRecords.push_back(bsonRecord);
     }
 
-    return _indexFilteredRecords(opCtx, index, filteredBsonRecords, keysInsertedOut);
+    return _indexFilteredRecords(opCtx, coll, index, filteredBsonRecords, keysInsertedOut);
 }
 
 Status IndexCatalogImpl::_updateRecord(OperationContext* const opCtx,
+                                       const CollectionPtr& coll,
                                        IndexCatalogEntry* index,
                                        const BSONObj& oldDoc,
                                        const BSONObj& newDoc,
@@ -1465,14 +1418,14 @@ Status IndexCatalogImpl::_updateRecord(OperationContext* const opCtx,
     IndexAccessMethod* iam = index->accessMethod();
 
     InsertDeleteOptions options;
-    prepareInsertDeleteOptions(opCtx, index->descriptor(), &options);
+    prepareInsertDeleteOptions(opCtx, coll->ns(), index->descriptor(), &options);
 
     UpdateTicket updateTicket;
 
     iam->prepareUpdate(opCtx, index, oldDoc, newDoc, recordId, options, &updateTicket);
 
-    int64_t keysInserted;
-    int64_t keysDeleted;
+    int64_t keysInserted = 0;
+    int64_t keysDeleted = 0;
 
     auto status = Status::OK();
     if (index->isHybridBuilding() || !index->isReady(opCtx)) {
@@ -1480,6 +1433,7 @@ Status IndexCatalogImpl::_updateRecord(OperationContext* const opCtx,
         _unindexKeys(
             opCtx, index, updateTicket.removed, oldDoc, recordId, logIfError, &keysDeleted);
         status = _indexKeys(opCtx,
+                            coll,
                             index,
                             updateTicket.added,
                             updateTicket.newMultikeyMetadataKeys,
@@ -1489,7 +1443,7 @@ Status IndexCatalogImpl::_updateRecord(OperationContext* const opCtx,
                             options,
                             &keysInserted);
     } else {
-        status = iam->update(opCtx, updateTicket, &keysInserted, &keysDeleted);
+        status = iam->update(opCtx, coll, updateTicket, &keysInserted, &keysDeleted);
     }
 
     if (!status.isOK())
@@ -1509,7 +1463,7 @@ void IndexCatalogImpl::_unindexKeys(OperationContext* opCtx,
                                     bool logIfError,
                                     int64_t* const keysDeletedOut) {
     InsertDeleteOptions options;
-    prepareInsertDeleteOptions(opCtx, index->descriptor(), &options);
+    prepareInsertDeleteOptions(opCtx, _collection->ns(), index->descriptor(), &options);
     options.logIfError = logIfError;
 
     if (index->isHybridBuilding()) {
@@ -1548,11 +1502,11 @@ void IndexCatalogImpl::_unindexKeys(OperationContext* opCtx,
 
     if (!status.isOK()) {
         LOGV2(20362,
-              "Couldn't unindex record {obj} from collection {collection_ns}. Status: {status}",
+              "Couldn't unindex record {obj} from collection {namespace}: {error}",
               "Couldn't unindex record",
               "record"_attr = redact(obj),
               "namespace"_attr = _collection->ns(),
-              "reason"_attr = redact(status));
+              "error"_attr = redact(status));
     }
 
     if (keysDeletedOut) {
@@ -1595,6 +1549,7 @@ void IndexCatalogImpl::_unindexRecord(OperationContext* opCtx,
 }
 
 Status IndexCatalogImpl::indexRecords(OperationContext* opCtx,
+                                      const CollectionPtr& coll,
                                       const std::vector<BsonRecord>& bsonRecords,
                                       int64_t* keysInsertedOut) {
     if (keysInsertedOut) {
@@ -1602,13 +1557,13 @@ Status IndexCatalogImpl::indexRecords(OperationContext* opCtx,
     }
 
     for (auto&& it : _readyIndexes) {
-        Status s = _indexRecords(opCtx, it.get(), bsonRecords, keysInsertedOut);
+        Status s = _indexRecords(opCtx, coll, it.get(), bsonRecords, keysInsertedOut);
         if (!s.isOK())
             return s;
     }
 
     for (auto&& it : _buildingIndexes) {
-        Status s = _indexRecords(opCtx, it.get(), bsonRecords, keysInsertedOut);
+        Status s = _indexRecords(opCtx, coll, it.get(), bsonRecords, keysInsertedOut);
         if (!s.isOK())
             return s;
     }
@@ -1617,6 +1572,7 @@ Status IndexCatalogImpl::indexRecords(OperationContext* opCtx,
 }
 
 Status IndexCatalogImpl::updateRecord(OperationContext* const opCtx,
+                                      const CollectionPtr& coll,
                                       const BSONObj& oldDoc,
                                       const BSONObj& newDoc,
                                       const RecordId& recordId,
@@ -1630,8 +1586,8 @@ Status IndexCatalogImpl::updateRecord(OperationContext* const opCtx,
          it != _readyIndexes.end();
          ++it) {
         IndexCatalogEntry* entry = it->get();
-        auto status =
-            _updateRecord(opCtx, entry, oldDoc, newDoc, recordId, keysInsertedOut, keysDeletedOut);
+        auto status = _updateRecord(
+            opCtx, coll, entry, oldDoc, newDoc, recordId, keysInsertedOut, keysDeletedOut);
         if (!status.isOK())
             return status;
     }
@@ -1641,8 +1597,8 @@ Status IndexCatalogImpl::updateRecord(OperationContext* const opCtx,
          it != _buildingIndexes.end();
          ++it) {
         IndexCatalogEntry* entry = it->get();
-        auto status =
-            _updateRecord(opCtx, entry, oldDoc, newDoc, recordId, keysInsertedOut, keysDeletedOut);
+        auto status = _updateRecord(
+            opCtx, coll, entry, oldDoc, newDoc, recordId, keysInsertedOut, keysDeletedOut);
         if (!status.isOK())
             return status;
     }
@@ -1678,7 +1634,7 @@ void IndexCatalogImpl::unindexRecord(OperationContext* opCtx,
     }
 }
 
-Status IndexCatalogImpl::compactIndexes(OperationContext* opCtx) {
+Status IndexCatalogImpl::compactIndexes(OperationContext* opCtx) const {
     for (IndexCatalogEntryContainer::const_iterator it = _readyIndexes.begin();
          it != _readyIndexes.end();
          ++it) {
@@ -1690,7 +1646,10 @@ Status IndexCatalogImpl::compactIndexes(OperationContext* opCtx) {
                     "entry_descriptor"_attr = *(entry->descriptor()));
         Status status = entry->accessMethod()->compact(opCtx);
         if (!status.isOK()) {
-            LOGV2_ERROR(20377, "failed to compact index", "index"_attr = *(entry->descriptor()));
+            LOGV2_ERROR(20377,
+                        "Failed to compact index",
+                        "index"_attr = *(entry->descriptor()),
+                        "error"_attr = redact(status));
             return status;
         }
     }
@@ -1719,10 +1678,11 @@ BSONObj IndexCatalogImpl::fixIndexKey(const BSONObj& key) const {
 }
 
 void IndexCatalogImpl::prepareInsertDeleteOptions(OperationContext* opCtx,
+                                                  const NamespaceString& ns,
                                                   const IndexDescriptor* desc,
                                                   InsertDeleteOptions* options) const {
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-    if (replCoord->shouldRelaxIndexConstraints(opCtx, desc->parentNS())) {
+    if (replCoord->shouldRelaxIndexConstraints(opCtx, ns)) {
         options->getKeysMode = IndexAccessMethod::GetKeysMode::kRelaxConstraints;
     } else {
         options->getKeysMode = IndexAccessMethod::GetKeysMode::kEnforceConstraints;
@@ -1737,30 +1697,19 @@ void IndexCatalogImpl::prepareInsertDeleteOptions(OperationContext* opCtx,
     }
 }
 
-void IndexCatalogImpl::indexBuildSuccess(OperationContext* opCtx, IndexCatalogEntry* index) {
+void IndexCatalogImpl::indexBuildSuccess(OperationContext* opCtx,
+                                         const CollectionPtr& coll,
+                                         IndexCatalogEntry* index) {
     auto releasedEntry = _buildingIndexes.release(index->descriptor());
     invariant(releasedEntry.get() == index);
     _readyIndexes.add(std::move(releasedEntry));
 
-    auto interceptor = index->indexBuildInterceptor();
     index->setIndexBuildInterceptor(nullptr);
     index->setIsReady(true);
-
-    // Only roll back index changes that are part of pre-existing collections.
-    if (UncommittedCollections::getForTxn(opCtx, index->descriptor()->parentNS()) == nullptr) {
-        opCtx->recoveryUnit()->onRollback([this, index, interceptor]() {
-            auto releasedEntry = _readyIndexes.release(index->descriptor());
-            invariant(releasedEntry.get() == index);
-            _buildingIndexes.add(std::move(releasedEntry));
-
-            index->setIndexBuildInterceptor(interceptor);
-            index->setIsReady(false);
-        });
-    }
 }
 
 StatusWith<BSONObj> IndexCatalogImpl::_fixIndexSpec(OperationContext* opCtx,
-                                                    Collection* collection,
+                                                    const CollectionPtr& collection,
                                                     const BSONObj& spec) const {
     auto statusWithSpec = adjustIndexSpecObject(spec);
     if (!statusWithSpec.isOK()) {
@@ -1779,6 +1728,9 @@ StatusWith<BSONObj> IndexCatalogImpl::_fixIndexSpec(OperationContext* opCtx,
 
     if (o["unique"].trueValue())
         b.appendBool("unique", true);  // normalize to bool true in case was int 1 or something...
+
+    if (o["hidden"].trueValue())
+        b.appendBool("hidden", true);  // normalize to bool true in case was int 1 or something...
 
     BSONObj key = fixIndexKey(o["key"].Obj());
     b.append("key", key);
@@ -1808,7 +1760,7 @@ StatusWith<BSONObj> IndexCatalogImpl::_fixIndexSpec(OperationContext* opCtx,
             } else if (s == "dropDups" || s == "ns") {
                 // dropDups is silently ignored and removed from the spec as of SERVER-14710.
                 // ns is removed from the spec as of 4.4.
-            } else if (s == "v" || s == "unique" || s == "key" || s == "name") {
+            } else if (s == "v" || s == "unique" || s == "key" || s == "name" || s == "hidden") {
                 // covered above
             } else {
                 b.append(e);

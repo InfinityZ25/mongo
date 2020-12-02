@@ -52,6 +52,11 @@ class TestEvergreenProjectConfig(unittest.TestCase):
         self.assertIsNotNone(variant)
         self.assertEqual("osx-108", variant.name)
 
+    def test_get_required_variants(self):
+        variants = self.conf.get_required_variants()
+
+        self.assertEqual(len(variants), 2)
+
     def test_list_distro_names(self):
         self.assertEqual(5, len(self.conf.distro_names))
         self.assertIn("localtestdistro", self.conf.distro_names)
@@ -387,6 +392,15 @@ class TestVariant(unittest.TestCase):
         variant_osx = self.conf.get_variant("osx-108")
         self.assertIsNone(variant_osx.batchtime)
 
+    def test_is_required_variant(self):
+        variant_debian = self.conf.get_variant("debian")
+        is_required_variant = variant_debian.is_required_variant()
+        self.assertEqual(is_required_variant, True)
+
+        variant_ubuntu = self.conf.get_variant("ubuntu")
+        is_required_variant = variant_ubuntu.is_required_variant()
+        self.assertEqual(is_required_variant, False)
+
     def test_expansion(self):
         variant_ubuntu = self.conf.get_variant("ubuntu")
         self.assertEqual("--param=value --ubuntu", variant_ubuntu.expansion("test_flags"))
@@ -444,7 +458,7 @@ class TestVariant(unittest.TestCase):
 
         # Check combined_resmoke_args when test_flags is set on the variant.
         resmoke_task = variant_ubuntu.get_task("resmoke_task")
-        self.assertEqual("--suites=somesuite --storageEngine=mmapv1 --param=value --ubuntu",
+        self.assertEqual("--suites=somesuite --storageEngine=wiredTiger --param=value --ubuntu",
                          resmoke_task.combined_resmoke_args)
 
         # Check combined_resmoke_args when the task doesn't have resmoke_args.
@@ -454,7 +468,7 @@ class TestVariant(unittest.TestCase):
         # Check combined_resmoke_args when test_flags is not set on the variant.
         variant_debian = self.conf.get_variant("debian")
         resmoke_task = variant_debian.get_task("resmoke_task")
-        self.assertEqual("--suites=somesuite --storageEngine=mmapv1",
+        self.assertEqual("--suites=somesuite --storageEngine=wiredTiger",
                          resmoke_task.combined_resmoke_args)
 
         # Check for tasks included in task_groups

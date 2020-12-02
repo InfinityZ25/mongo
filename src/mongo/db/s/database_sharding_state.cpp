@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -36,7 +36,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/logv2/log.h"
-#include "mongo/s/database_version_helpers.h"
+#include "mongo/s/database_version.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/fail_point.h"
 
@@ -147,11 +147,11 @@ void DatabaseShardingState::checkDbVersion(OperationContext* opCtx, DSSLock&) co
     }
 
     uassert(StaleDbRoutingVersion(_dbName, *clientDbVersion, boost::none),
-            "don't know dbVersion",
+            str::stream() << "don't know dbVersion for database " << _dbName,
             _dbVersion);
     uassert(StaleDbRoutingVersion(_dbName, *clientDbVersion, *_dbVersion),
-            "dbVersion mismatch",
-            databaseVersion::equal(*clientDbVersion, *_dbVersion));
+            str::stream() << "dbVersion mismatch for database " << _dbName,
+            *clientDbVersion == *_dbVersion);
 }
 
 MovePrimarySourceManager* DatabaseShardingState::getMovePrimarySourceManager(DSSLock&) {

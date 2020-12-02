@@ -27,17 +27,16 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/base/exact_cast.h"
 #include "mongo/db/query/projection_ast_path_tracking_visitor.h"
-#include "mongo/db/query/projection_ast_walker.h"
 #include "mongo/db/query/query_planner_common.h"
+#include "mongo/db/query/tree_walker.h"
 #include "mongo/logv2/redaction.h"
 #include "mongo/util/assert_util.h"
-
 
 namespace mongo {
 
@@ -123,7 +122,7 @@ std::vector<FieldPath> QueryPlannerCommon::extractSortKeyMetaFieldsFromProjectio
     MetaFieldVisitorContext ctx;
     MetaFieldVisitor visitor(&ctx);
     projection_ast::PathTrackingConstWalker<MetaFieldData> walker{&ctx, {&visitor}, {}};
-    projection_ast_walker::walk(&walker, proj.root());
+    tree_walker::walk<true, projection_ast::ASTNode>(proj.root(), &walker);
 
     return std::move(ctx.data().metaPaths);
 }

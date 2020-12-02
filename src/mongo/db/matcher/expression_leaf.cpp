@@ -52,11 +52,16 @@ namespace mongo {
 ComparisonMatchExpressionBase::ComparisonMatchExpressionBase(
     MatchType type,
     StringData path,
-    const BSONElement& rhs,
+    Value rhs,
     ElementPath::LeafArrayBehavior leafArrBehavior,
-    ElementPath::NonLeafArrayBehavior nonLeafArrBehavior)
-    : LeafMatchExpression(type, path, leafArrBehavior, nonLeafArrBehavior), _rhs(rhs) {
-    invariant(_rhs);
+    ElementPath::NonLeafArrayBehavior nonLeafArrBehavior,
+    clonable_ptr<ErrorAnnotation> annotation,
+    const CollatorInterface* collator)
+    : LeafMatchExpression(type, path, leafArrBehavior, nonLeafArrBehavior, std::move(annotation)),
+      _backingBSON(BSON(path << rhs)),
+      _rhs(_backingBSON.firstElement()),
+      _collator(collator) {
+    invariant(_rhs.type() != BSONType::EOO);
 }
 
 bool ComparisonMatchExpressionBase::equivalent(const MatchExpression* other) const {
@@ -93,12 +98,16 @@ BSONObj ComparisonMatchExpressionBase::getSerializedRightHandSide() const {
 
 ComparisonMatchExpression::ComparisonMatchExpression(MatchType type,
                                                      StringData path,
-                                                     const BSONElement& rhs)
+                                                     Value rhs,
+                                                     clonable_ptr<ErrorAnnotation> annotation,
+                                                     const CollatorInterface* collator)
     : ComparisonMatchExpressionBase(type,
                                     path,
-                                    rhs,
+                                    std::move(rhs),
                                     ElementPath::LeafArrayBehavior::kTraverse,
-                                    ElementPath::NonLeafArrayBehavior::kTraverse) {
+                                    ElementPath::NonLeafArrayBehavior::kTraverse,
+                                    std::move(annotation),
+                                    collator) {
     uassert(
         ErrorCodes::BadValue, "cannot compare to undefined", _rhs.type() != BSONType::Undefined);
 
@@ -199,24 +208,21 @@ constexpr StringData GTEMatchExpression::kName;
 
 const std::set<char> RegexMatchExpression::kValidRegexFlags = {'i', 'm', 's', 'x'};
 
-RegexMatchExpression::RegexMatchExpression(StringData path, const BSONElement& e)
-    : LeafMatchExpression(REGEX, path),
-      _regex(e.regex()),
-      _flags(e.regexFlags()),
-      _re(new pcrecpp::RE(_regex.c_str(), regex_util::flagsToPcreOptions(_flags, true))) {
-    uassert(ErrorCodes::BadValue, "regex not a regex", e.type() == RegEx);
-    _init();
+std::unique_ptr<pcrecpp::RE> RegexMatchExpression::makeRegex(const std::string& regex,
+                                                             const std::string& flags) {
+    return std::make_unique<pcrecpp::RE>(regex.c_str(),
+                                         regex_util::flagsToPcreOptions(flags, true));
 }
 
-RegexMatchExpression::RegexMatchExpression(StringData path, StringData regex, StringData options)
-    : LeafMatchExpression(REGEX, path),
+RegexMatchExpression::RegexMatchExpression(StringData path,
+                                           StringData regex,
+                                           StringData options,
+                                           clonable_ptr<ErrorAnnotation> annotation)
+    : LeafMatchExpression(REGEX, path, std::move(annotation)),
       _regex(regex.toString()),
       _flags(options.toString()),
       _re(new pcrecpp::RE(_regex.c_str(), regex_util::flagsToPcreOptions(_flags, true))) {
-    _init();
-}
 
-void RegexMatchExpression::_init() {
     uassert(ErrorCodes::BadValue,
             "Regular expression cannot contain an embedded null byte",
             _regex.find('\0') == std::string::npos);
@@ -291,15 +297,20 @@ void RegexMatchExpression::shortDebugString(StringBuilder& debug) const {
 
 // ---------
 
-ModMatchExpression::ModMatchExpression(StringData path, int divisor, int remainder)
-    : LeafMatchExpression(MOD, path), _divisor(divisor), _remainder(remainder) {
+ModMatchExpression::ModMatchExpression(StringData path,
+                                       long long divisor,
+                                       long long remainder,
+                                       clonable_ptr<ErrorAnnotation> annotation)
+    : LeafMatchExpression(MOD, path, std::move(annotation)),
+      _divisor(divisor),
+      _remainder(remainder) {
     uassert(ErrorCodes::BadValue, "divisor cannot be 0", divisor != 0);
 }
 
 bool ModMatchExpression::matchesSingleElement(const BSONElement& e, MatchDetails* details) const {
     if (!e.isNumber())
         return false;
-    return overflow::safeMod(e.numberLong(), static_cast<long long>(_divisor)) == _remainder;
+    return overflow::safeMod(truncateToLong(e), _divisor) == _remainder;
 }
 
 void ModMatchExpression::debugString(StringBuilder& debug, int indentationLevel) const {
@@ -329,7 +340,9 @@ bool ModMatchExpression::equivalent(const MatchExpression* other) const {
 
 // ------------------
 
-ExistsMatchExpression::ExistsMatchExpression(StringData path) : LeafMatchExpression(EXISTS, path) {}
+ExistsMatchExpression::ExistsMatchExpression(StringData path,
+                                             clonable_ptr<ErrorAnnotation> annotation)
+    : LeafMatchExpression(EXISTS, path, std::move(annotation)) {}
 
 bool ExistsMatchExpression::matchesSingleElement(const BSONElement& e,
                                                  MatchDetails* details) const {
@@ -362,12 +375,12 @@ bool ExistsMatchExpression::equivalent(const MatchExpression* other) const {
 
 // ----
 
-InMatchExpression::InMatchExpression(StringData path)
-    : LeafMatchExpression(MATCH_IN, path),
+InMatchExpression::InMatchExpression(StringData path, clonable_ptr<ErrorAnnotation> annotation)
+    : LeafMatchExpression(MATCH_IN, path, std::move(annotation)),
       _eltCmp(BSONElementComparator::FieldNamesMode::kIgnore, _collator) {}
 
 std::unique_ptr<MatchExpression> InMatchExpression::shallowClone() const {
-    auto next = std::make_unique<InMatchExpression>(path());
+    auto next = std::make_unique<InMatchExpression>(path(), _errorAnnotation);
     next->setCollator(_collator);
     if (getTag()) {
         next->setTag(getTag()->clone());
@@ -381,7 +394,7 @@ std::unique_ptr<MatchExpression> InMatchExpression::shallowClone() const {
             static_cast<RegexMatchExpression*>(regex->shallowClone().release()));
         next->_regexes.push_back(std::move(clonedRegex));
     }
-    return std::move(next);
+    return next;
 }
 
 bool InMatchExpression::contains(const BSONElement& e) const {
@@ -556,7 +569,7 @@ MatchExpression::ExpressionOptimizerFunc InMatchExpression::getOptimizer() const
             if (expression->getTag()) {
                 simplifiedExpression->setTag(expression->getTag()->clone());
             }
-            return std::move(simplifiedExpression);
+            return simplifiedExpression;
         } else if (equalitySet.size() == 1 && regexList.empty()) {
             // Simplify IN of exactly one equality to be an EqualityMatchExpression.
             auto simplifiedExpression = std::make_unique<EqualityMatchExpression>(
@@ -566,7 +579,7 @@ MatchExpression::ExpressionOptimizerFunc InMatchExpression::getOptimizer() const
                 simplifiedExpression->setTag(expression->getTag()->clone());
             }
 
-            return std::move(simplifiedExpression);
+            return simplifiedExpression;
         }
 
         return expression;
@@ -577,8 +590,10 @@ MatchExpression::ExpressionOptimizerFunc InMatchExpression::getOptimizer() const
 
 BitTestMatchExpression::BitTestMatchExpression(MatchType type,
                                                StringData path,
-                                               std::vector<uint32_t> bitPositions)
-    : LeafMatchExpression(type, path), _bitPositions(std::move(bitPositions)) {
+                                               std::vector<uint32_t> bitPositions,
+                                               clonable_ptr<ErrorAnnotation> annotation)
+    : LeafMatchExpression(type, path, std::move(annotation)),
+      _bitPositions(std::move(bitPositions)) {
     // Process bit positions into bitmask.
     for (auto bitPosition : _bitPositions) {
         // Checking bits > 63 is just checking the sign bit, since we sign-extend numbers. For
@@ -589,8 +604,11 @@ BitTestMatchExpression::BitTestMatchExpression(MatchType type,
     }
 }
 
-BitTestMatchExpression::BitTestMatchExpression(MatchType type, StringData path, uint64_t bitMask)
-    : LeafMatchExpression(type, path), _bitMask(bitMask) {
+BitTestMatchExpression::BitTestMatchExpression(MatchType type,
+                                               StringData path,
+                                               uint64_t bitMask,
+                                               clonable_ptr<ErrorAnnotation> annotation)
+    : LeafMatchExpression(type, path, std::move(annotation)), _bitMask(bitMask) {
     // Process bitmask into bit positions.
     for (int bit = 0; bit < 64; bit++) {
         if (_bitMask & (1ULL << bit)) {
@@ -602,8 +620,9 @@ BitTestMatchExpression::BitTestMatchExpression(MatchType type, StringData path, 
 BitTestMatchExpression::BitTestMatchExpression(MatchType type,
                                                StringData path,
                                                const char* bitMaskBinary,
-                                               uint32_t bitMaskLen)
-    : LeafMatchExpression(type, path) {
+                                               uint32_t bitMaskLen,
+                                               clonable_ptr<ErrorAnnotation> annotation)
+    : LeafMatchExpression(type, path, std::move(annotation)) {
     for (uint32_t byte = 0; byte < bitMaskLen; byte++) {
         char byteAt = bitMaskBinary[byte];
         if (!byteAt) {

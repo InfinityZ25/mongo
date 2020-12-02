@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/util/net/private/ssl_expiration.h"
 
@@ -40,22 +40,36 @@ namespace mongo {
 
 static const auto oneDay = Hours(24);
 
-CertificateExpirationMonitor::CertificateExpirationMonitor(Date_t date)
-    : _certExpiration(date), _lastCheckTime(Date_t::now()) {}
+CertificateExpirationMonitor* theCertificateExpirationMonitor;
 
-std::string CertificateExpirationMonitor::taskName() const {
-    return "CertificateExpirationMonitor";
+void CertificateExpirationMonitor::updateExpirationDeadline(Date_t date) {
+    stdx::lock_guard<Mutex> lock(_mutex);
+    _certExpiration = date;
 }
 
-void CertificateExpirationMonitor::taskDoWork() {
-    const Milliseconds timeSinceLastCheck = Date_t::now() - _lastCheckTime;
+CertificateExpirationMonitor* CertificateExpirationMonitor::get() {
+    if (!theCertificateExpirationMonitor) {
+        theCertificateExpirationMonitor = new CertificateExpirationMonitor();
+    }
+    return theCertificateExpirationMonitor;
+}
 
-    if (timeSinceLastCheck < oneDay)
-        return;
+void CertificateExpirationMonitor::start(ServiceContext* service) {
+    stdx::lock_guard<Mutex> lock(_mutex);
 
+    auto periodicRunner = service->getPeriodicRunner();
+    invariant(periodicRunner);
+
+    PeriodicRunner::PeriodicJob job(
+        "CertificateExpirationMonitor", [this](Client* client) { return run(client); }, oneDay);
+
+    _job = std::make_unique<PeriodicJobAnchor>(periodicRunner->makeJob(std::move(job)));
+    _job->start();
+}
+
+void CertificateExpirationMonitor::run(Client* client) {
     const Date_t now = Date_t::now();
-    _lastCheckTime = now;
-
+    stdx::lock_guard<Mutex> lock(_mutex);
     if (_certExpiration <= now) {
         // The certificate has expired.
         LOGV2_WARNING(23785,
@@ -68,7 +82,7 @@ void CertificateExpirationMonitor::taskDoWork() {
     const auto remainingValidDuration = _certExpiration - now;
 
     if (remainingValidDuration <= 30 * oneDay) {
-        // The certificate will expire in the next 30 days.
+        // The certificate will expire in the next 30 days
         LOGV2_WARNING(23786,
                       "Server certificate will expire on {certExpiration} in "
                       "{validDuration}.",

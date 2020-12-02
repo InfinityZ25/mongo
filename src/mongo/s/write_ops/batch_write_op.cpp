@@ -37,10 +37,8 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/write_ops_parsers.h"
-#include "mongo/db/s/database_sharding_state.h"
 #include "mongo/s/client/num_hosts_targeted_metrics.h"
 #include "mongo/s/cluster_commands_helpers.h"
-#include "mongo/s/grid.h"
 #include "mongo/s/transaction_router.h"
 #include "mongo/util/transitional_tools_do_not_use/vector_spooling.h"
 
@@ -439,7 +437,6 @@ Status BatchWriteOp::targetBatch(const NSTargeter& targeter,
 
     for (TargetedBatchMap::iterator it = batchMap.begin(); it != batchMap.end(); ++it) {
         TargetedWriteBatch* batch = it->second;
-
         if (batch->getWrites().empty())
             continue;
 
@@ -513,8 +510,10 @@ BatchedCommandRequest BatchWriteOp::buildBatchRequest(
                 return BatchedCommandRequest([&] {
                     write_ops::Update updateOp(_clientRequest.getNS());
                     updateOp.setUpdates(std::move(*updates));
-                    // Each child batch inherits its runtime constants from the parent batch.
-                    updateOp.setRuntimeConstants(_clientRequest.getRuntimeConstants());
+                    // Each child batch inherits its let params/runtime constants from the parent
+                    // batch.
+                    updateOp.setLegacyRuntimeConstants(_clientRequest.getLegacyRuntimeConstants());
+                    updateOp.setLet(_clientRequest.getLet());
                     return updateOp;
                 }());
             }
@@ -522,6 +521,9 @@ BatchedCommandRequest BatchWriteOp::buildBatchRequest(
                 return BatchedCommandRequest([&] {
                     write_ops::Delete deleteOp(_clientRequest.getNS());
                     deleteOp.setDeletes(std::move(*deletes));
+                    // Each child batch inherits its let params from the parent batch.
+                    deleteOp.setLet(_clientRequest.getLet());
+                    deleteOp.setLegacyRuntimeConstants(_clientRequest.getLegacyRuntimeConstants());
                     return deleteOp;
                 }());
         }

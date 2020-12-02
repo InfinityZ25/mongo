@@ -1,5 +1,9 @@
 // Tests that JavaScript functions stored in system.js are loaded on a per-expression basis.
-// @tags: [assumes_unsharded_collection, requires_non_retryable_writes, requires_fcv_44]
+// @tags: [
+//   assumes_unsharded_collection,
+//   requires_non_retryable_writes,
+//   sbe_incompatible,
+// ]
 
 (function() {
 "use strict";

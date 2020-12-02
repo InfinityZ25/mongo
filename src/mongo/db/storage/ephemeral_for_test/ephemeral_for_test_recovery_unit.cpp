@@ -27,91 +27,164 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_recovery_unit.h"
+#include <mutex>
 
-#include "mongo/db/storage/sorted_data_interface.h"
-#include "mongo/logv2/log.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_recovery_unit.h"
+#include "mongo/db/storage/oplog_hack.h"
 
 namespace mongo {
+namespace ephemeral_for_test {
 
-EphemeralForTestRecoveryUnit::~EphemeralForTestRecoveryUnit() {
+RecoveryUnit::RecoveryUnit(KVEngine* parentKVEngine, std::function<void()> cb)
+    : _waitUntilDurableCallback(cb), _KVEngine(parentKVEngine) {}
+
+RecoveryUnit::~RecoveryUnit() {
     invariant(!_inUnitOfWork(), toString(_getState()));
+    _abort();
 }
 
-void EphemeralForTestRecoveryUnit::beginUnitOfWork(OperationContext* opCtx) {
+void RecoveryUnit::beginUnitOfWork(OperationContext* opCtx) {
     invariant(!_inUnitOfWork(), toString(_getState()));
     _setState(State::kInactiveInUnitOfWork);
 }
 
-void EphemeralForTestRecoveryUnit::doCommitUnitOfWork() {
+void RecoveryUnit::doCommitUnitOfWork() {
     invariant(_inUnitOfWork(), toString(_getState()));
+
+    if (_dirty) {
+        invariant(_forked);
+        while (true) {
+            auto masterInfo = _KVEngine->getMasterInfo(_readAtTimestamp);
+            try {
+                invariant(_mergeBase);
+                _workingCopy.merge3(*_mergeBase, *masterInfo.second);
+            } catch (const merge_conflict_exception&) {
+                throw WriteConflictException();
+            }
+
+            if (_KVEngine->trySwapMaster(_workingCopy, masterInfo.first)) {
+                // Merged successfully
+                break;
+            } else {
+                // Retry the merge, but update the mergeBase since some progress was made merging.
+                _mergeBase = masterInfo.second;
+            }
+        }
+        _forked = false;
+        _dirty = false;
+    } else if (_forked) {
+        if (kDebugBuild)
+            invariant(*_mergeBase == _workingCopy);
+    }
+
     _setState(State::kCommitting);
-
-    try {
-        for (Changes::iterator it = _changes.begin(), end = _changes.end(); it != end; ++it) {
-            (*it)->commit(boost::none);
-        }
-        _changes.clear();
-    } catch (...) {
-        std::terminate();
-    }
-
-    // This ensures that the journal listener gets called on each commit.
-    // SERVER-22575: Remove this once we add a generic mechanism to periodically wait
-    // for durability.
-    if (_waitUntilDurableCallback) {
-        _waitUntilDurableCallback();
-    }
-
+    commitRegisteredChanges(boost::none);
     _setState(State::kInactive);
 }
 
-void EphemeralForTestRecoveryUnit::doAbortUnitOfWork() {
+void RecoveryUnit::doAbortUnitOfWork() {
     invariant(_inUnitOfWork(), toString(_getState()));
-    _setState(State::kAborting);
-
-    try {
-        for (Changes::reverse_iterator it = _changes.rbegin(), end = _changes.rend(); it != end;
-             ++it) {
-            auto change = *it;
-            LOGV2_DEBUG(22217,
-                        2,
-                        "CUSTOM ROLLBACK {demangleName_typeid_change}",
-                        "demangleName_typeid_change"_attr = demangleName(typeid(*change)));
-            change->rollback();
-        }
-        _changes.clear();
-    } catch (...) {
-        std::terminate();
-    }
-
-    _setState(State::kInactive);
+    _abort();
 }
 
-bool EphemeralForTestRecoveryUnit::waitUntilDurable(OperationContext* opCtx) {
-    if (_waitUntilDurableCallback) {
-        _waitUntilDurableCallback();
-    }
-    return true;
-}
-
-bool EphemeralForTestRecoveryUnit::inActiveTxn() const {
-    return _inUnitOfWork();
-}
-
-void EphemeralForTestRecoveryUnit::doAbandonSnapshot() {
+bool RecoveryUnit::waitUntilDurable(OperationContext* opCtx) {
     invariant(!_inUnitOfWork(), toString(_getState()));
+    invariant(!opCtx->lockState()->isLocked() || storageGlobalParams.repair);
+    return true;  // This is an in-memory storage engine.
 }
 
-Status EphemeralForTestRecoveryUnit::obtainMajorityCommittedSnapshot() {
+Status RecoveryUnit::majorityCommittedSnapshotAvailable() const {
     return Status::OK();
 }
 
-void EphemeralForTestRecoveryUnit::registerChange(std::unique_ptr<Change> change) {
-    _changes.push_back(std::move(change));
+void RecoveryUnit::prepareUnitOfWork() {
+    invariant(_inUnitOfWork());
 }
+
+void RecoveryUnit::doAbandonSnapshot() {
+    invariant(!_inUnitOfWork(), toString(_getState()));
+    _forked = false;
+    _dirty = false;
+    _setMergeNull();
+}
+
+bool RecoveryUnit::forkIfNeeded() {
+    if (_forked)
+        return false;
+
+    boost::optional<Timestamp> readFrom = boost::none;
+    switch (_timestampReadSource) {
+        case ReadSource::kNoTimestamp:
+        case ReadSource::kMajorityCommitted:
+        case ReadSource::kNoOverlap:
+        case ReadSource::kLastApplied:
+            break;
+        case ReadSource::kProvided:
+            readFrom = _readAtTimestamp;
+            break;
+        case ReadSource::kAllDurableSnapshot:
+            readFrom = _KVEngine->getAllDurableTimestamp();
+            break;
+    }
+    // Update the copies of the trees when not in a WUOW so cursors can retrieve the latest data.
+    auto masterInfo = _KVEngine->getMasterInfo(readFrom);
+    _mergeBase = masterInfo.second;
+    _workingCopy = *masterInfo.second;
+    invariant(_mergeBase);
+
+    // Call cleanHistory in case _mergeBase was holding a shared_ptr to an older tree.
+    _KVEngine->cleanHistory();
+    _forked = true;
+    return true;
+}
+
+Status RecoveryUnit::setTimestamp(Timestamp timestamp) {
+    auto key = oploghack::keyForOptime(timestamp);
+    if (!key.isOK())
+        return key.getStatus();
+
+    _KVEngine->visibilityManager()->reserveRecord(this, key.getValue());
+    return Status::OK();
+}
+
+void RecoveryUnit::setOrderedCommit(bool orderedCommit) {}
+
+void RecoveryUnit::_abort() {
+    _forked = false;
+    _dirty = false;
+    _setMergeNull();
+    _setState(State::kAborting);
+    abortRegisteredChanges();
+    _setState(State::kInactive);
+}
+
+void RecoveryUnit::_setMergeNull() {
+    _mergeBase = nullptr;
+    if (!KVEngine::instanceExists()) {
+        _KVEngine->cleanHistory();
+    }
+}
+
+void RecoveryUnit::setTimestampReadSource(ReadSource readSource,
+                                          boost::optional<Timestamp> provided) {
+    invariant(!provided == (readSource != ReadSource::kProvided));
+    invariant(!(provided && provided->isNull()));
+
+    _timestampReadSource = readSource;
+    _readAtTimestamp = (provided) ? *provided : Timestamp();
+}
+
+RecoveryUnit::ReadSource RecoveryUnit::getTimestampReadSource() const {
+    return _timestampReadSource;
+}
+
+RecoveryUnit* RecoveryUnit::get(OperationContext* opCtx) {
+    return checked_cast<ephemeral_for_test::RecoveryUnit*>(opCtx->recoveryUnit());
+}
+}  // namespace ephemeral_for_test
 }  // namespace mongo

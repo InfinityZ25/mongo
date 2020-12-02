@@ -1,7 +1,9 @@
 //
 // More tests for N-dimensional polygon querying
 //
-// @tags: [requires_fastcount]
+// @tags: [
+//   requires_fastcount,
+// ]
 
 // Create a polygon of some shape (no holes)
 // using turtle graphics.  Basically, will look like a very contorted octopus (quad-pus?) shape.
@@ -229,7 +231,7 @@ for (var test = 0; test < numTests; test++) {
         }
     }
 
-    var res = t.ensureIndex({loc: "2d"}, {bits: 1 + bits, max: bounds[1], min: bounds[0]});
+    var res = t.createIndex({loc: "2d"}, {bits: 1 + bits, max: bounds[1], min: bounds[0]});
     assert.commandWorked(res);
 
     t.insert({loc: allPointsIn});

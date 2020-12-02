@@ -274,8 +274,8 @@ public:
      * {"pipeline": <explainOutput>}. Note that <explainOutput> can be an object (shardsvr) or an
      * array (non_shardsvr).
      */
-    virtual BSONObj attachCursorSourceAndExplain(Pipeline* ownedPipeline,
-                                                 ExplainOptions::Verbosity verbosity) = 0;
+    virtual BSONObj preparePipelineAndExplain(Pipeline* ownedPipeline,
+                                              ExplainOptions::Verbosity verbosity) = 0;
 
     /**
      * Accepts a pipeline and returns a new one which will draw input from the underlying
@@ -417,6 +417,17 @@ public:
     virtual void checkRoutingInfoEpochOrThrow(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                               const NamespaceString& nss,
                                               ChunkVersion targetCollectionVersion) const = 0;
+
+    /**
+     * Sets the expected shard version for the given namespace. Invariants if the caller attempts to
+     * change an existing shard version, or if the shard version for this namespace has already been
+     * checked by the commands infrastructure. Used by $lookup and $graphLookup to enforce the
+     * constraint that the foreign collection must be unsharded. If the parent operation is
+     * unversioned, this method does nothing.
+     */
+    virtual void setExpectedShardVersion(OperationContext* opCtx,
+                                         const NamespaceString& nss,
+                                         boost::optional<ChunkVersion> chunkVersion) = 0;
 
     virtual std::unique_ptr<ResourceYielder> getResourceYielder() const = 0;
 

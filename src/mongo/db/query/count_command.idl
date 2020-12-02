@@ -57,6 +57,7 @@ types:
 commands:
     count:
         description: "Parser for the 'count' command."
+        command_name: count
         cpp_name: CountCommand
         strict: true
         namespace: concatenate_with_db_or_uuid
@@ -82,10 +83,6 @@ commands:
             collation:
                 description: "The collation to use in the count command."
                 type: object
-                optional: true
-            comment:
-                description: "A comment."
-                type: string
                 optional: true
             fields:
                 description: "A BSONObj added by the shell. Left in for backwards compatibility."

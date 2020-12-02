@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -48,19 +48,11 @@
 
 namespace mongo {
 
-namespace {
-// Enabling the maxTimeAlwaysTimeOut fail point will cause any query or command run with a
-// valid non-zero max time to fail immediately.  Any getmore operation on a cursor already
-// created with a valid non-zero max time will also fail immediately.
-//
-// This fail point cannot be used with the maxTimeNeverTimeOut fail point.
 MONGO_FAIL_POINT_DEFINE(maxTimeAlwaysTimeOut);
 
-// Enabling the maxTimeNeverTimeOut fail point will cause the server to never time out any
-// query, command, or getmore operation, regardless of whether a max time is set.
-//
-// This fail point cannot be used with the maxTimeAlwaysTimeOut fail point.
 MONGO_FAIL_POINT_DEFINE(maxTimeNeverTimeOut);
+
+namespace {
 
 // Enabling the checkForInterruptFail fail point will start a game of random chance on the
 // connection specified in the fail point data, generating an interrupt with a given fixed
@@ -87,9 +79,7 @@ OperationContext::OperationContext(Client* client, OperationId opId)
                           : SystemTickSource::get()) {}
 
 OperationContext::~OperationContext() {
-    if (_opKey) {
-        OperationKeyManager::get(_client).remove(*_opKey);
-    }
+    releaseOperationKey();
 }
 
 void OperationContext::setDeadlineAndMaxTime(Date_t when,
@@ -97,7 +87,9 @@ void OperationContext::setDeadlineAndMaxTime(Date_t when,
                                              ErrorCodes::Error timeoutError) {
     invariant(!getClient()->isInDirectClient() || _hasArtificialDeadline);
     invariant(ErrorCodes::isExceededTimeLimitError(timeoutError));
-    invariant(!ErrorExtraInfo::parserFor(timeoutError));
+    if (ErrorCodes::mustHaveExtraInfo(timeoutError)) {
+        invariant(!ErrorExtraInfo::parserFor(timeoutError));
+    }
     uassert(40120,
             "Illegal attempt to change operation deadline",
             _hasArtificialDeadline || !hasDeadline());
@@ -349,14 +341,18 @@ StatusWith<stdx::cv_status> OperationContext::waitForConditionOrInterruptNoAsser
 
 void OperationContext::markKilled(ErrorCodes::Error killCode) {
     invariant(killCode != ErrorCodes::OK);
-    invariant(!ErrorExtraInfo::parserFor(killCode));
+    if (ErrorCodes::mustHaveExtraInfo(killCode)) {
+        invariant(!ErrorExtraInfo::parserFor(killCode));
+    }
 
     if (killCode == ErrorCodes::ClientDisconnect) {
         LOGV2(20883, "Interrupted operation as its client disconnected", "opId"_attr = getOpID());
     }
 
     if (auto status = ErrorCodes::OK; _killCode.compareAndSwap(&status, killCode)) {
-        _baton->notify();
+        if (_baton) {
+            _baton->notify();
+        }
     }
 }
 
@@ -398,6 +394,13 @@ void OperationContext::setOperationKey(OperationKey opKey) {
 
     _opKey.emplace(std::move(opKey));
     OperationKeyManager::get(_client).add(*_opKey, _opId);
+}
+
+void OperationContext::releaseOperationKey() {
+    if (_opKey) {
+        OperationKeyManager::get(_client).remove(*_opKey);
+    }
+    _opKey = boost::none;
 }
 
 void OperationContext::setTxnNumber(TxnNumber txnNumber) {

@@ -27,13 +27,12 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/catalog/rename_collection.h"
 
-#include "mongo/db/background.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
@@ -68,12 +67,12 @@ namespace {
 MONGO_FAIL_POINT_DEFINE(writeConflictInRenameCollCopyToTmp);
 
 boost::optional<NamespaceString> getNamespaceFromUUID(OperationContext* opCtx, const UUID& uuid) {
-    return CollectionCatalog::get(opCtx).lookupNSSByUUID(opCtx, uuid);
+    return CollectionCatalog::get(opCtx)->lookupNSSByUUID(opCtx, uuid);
 }
 
 bool isCollectionSharded(OperationContext* opCtx, const NamespaceString& nss) {
     return opCtx->writesAreReplicated() &&
-        CollectionShardingState::get(opCtx, nss)->getCollectionDescription().isSharded();
+        CollectionShardingState::get(opCtx, nss)->getCollectionDescription(opCtx).isSharded();
 }
 
 // From a replicated to an unreplicated collection or vice versa.
@@ -94,7 +93,7 @@ Status checkSourceAndTargetNamespaces(OperationContext* opCtx,
 
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     if (opCtx->writesAreReplicated() && !replCoord->canAcceptWritesFor(opCtx, source))
-        return Status(ErrorCodes::NotMaster,
+        return Status(ErrorCodes::NotWritablePrimary,
                       str::stream() << "Not primary while renaming collection " << source << " to "
                                     << target);
 
@@ -111,8 +110,8 @@ Status checkSourceAndTargetNamespaces(OperationContext* opCtx,
                       str::stream()
                           << "Database " << source.db() << " does not exist or is drop pending");
 
-    Collection* const sourceColl =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, source);
+    auto catalog = CollectionCatalog::get(opCtx);
+    const auto sourceColl = catalog->lookupCollectionByNamespace(opCtx, source);
     if (!sourceColl) {
         if (ViewCatalog::get(db)->lookup(opCtx, source.ns()))
             return Status(ErrorCodes::CommandNotSupportedOnView,
@@ -121,11 +120,9 @@ Status checkSourceAndTargetNamespaces(OperationContext* opCtx,
                       str::stream() << "Source collection " << source.ns() << " does not exist");
     }
 
-    BackgroundOperation::assertNoBgOpInProgForNs(source.ns());
     IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(sourceColl->uuid());
 
-    Collection* targetColl =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, target);
+    const auto targetColl = catalog->lookupCollectionByNamespace(opCtx, target);
 
     if (!targetColl) {
         if (ViewCatalog::get(db)->lookup(opCtx, target.ns()))
@@ -222,7 +219,7 @@ Status renameCollectionAndDropTarget(OperationContext* opCtx,
                                      OptionalCollectionUUID uuid,
                                      NamespaceString source,
                                      NamespaceString target,
-                                     Collection* targetColl,
+                                     const CollectionPtr& targetColl,
                                      RenameCollectionOptions options,
                                      repl::OpTime renameOpTimeFromApplyOps) {
     return writeConflictRetry(opCtx, "renameCollection", target.ns(), [&] {
@@ -231,15 +228,15 @@ Status renameCollectionAndDropTarget(OperationContext* opCtx,
         // Target collection exists - drop it.
         invariant(options.dropTarget);
 
-        // If this rename collection is replicated, check for long index names in the target
-        // collection that may exceed the MMAPv1 namespace limit when the target collection
-        // is renamed with a drop-pending namespace.
         auto replCoord = repl::ReplicationCoordinator::get(opCtx);
         auto isOplogDisabledForNamespace = replCoord->isOplogDisabledFor(opCtx, target);
         if (!isOplogDisabledForNamespace) {
             invariant(opCtx->writesAreReplicated());
             invariant(renameOpTimeFromApplyOps.isNull());
         }
+
+        IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(
+            targetColl->uuid());
 
         auto numRecords = targetColl->numRecords(opCtx);
         auto opObserver = opCtx->getServiceContext()->getOpObserver();
@@ -252,10 +249,12 @@ Status renameCollectionAndDropTarget(OperationContext* opCtx,
             if (!renameOpTime.isNull()) {
                 LOGV2_FATAL(
                     40616,
-                    "renameCollection: {source} to {target} (with dropTarget=true) - unexpected "
+                    "renameCollection: {from} to {to} (with dropTarget=true) - unexpected "
                     "renameCollection oplog entry written to the oplog with optime {renameOpTime}",
-                    "source"_attr = source,
-                    "target"_attr = target,
+                    "renameCollection (with dropTarget=true): unexpected renameCollection oplog "
+                    "entry written to the oplog",
+                    "from"_attr = source,
+                    "to"_attr = target,
                     "renameOpTime"_attr = renameOpTime);
             }
             renameOpTime = renameOpTimeFromApplyOps;
@@ -263,10 +262,6 @@ Status renameCollectionAndDropTarget(OperationContext* opCtx,
 
         // No logOp necessary because the entire renameCollection command is one logOp.
         repl::UnreplicatedWritesBlock uwb(opCtx);
-
-        BackgroundOperation::assertNoBgOpInProgForNs(targetColl->ns().ns());
-        IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(
-            targetColl->uuid());
 
         auto status = db->dropCollection(opCtx, targetColl->ns(), renameOpTime);
         if (!status.isOK())
@@ -320,16 +315,16 @@ Status renameCollectionWithinDB(OperationContext* opCtx,
         return status;
 
     auto db = DatabaseHolder::get(opCtx)->getDb(opCtx, source.db());
-    Collection* const sourceColl =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, source);
-    Collection* const targetColl =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, target);
+    auto catalog = CollectionCatalog::get(opCtx);
+    const auto sourceColl = catalog->lookupCollectionByNamespace(opCtx, source);
+    const auto targetColl = catalog->lookupCollectionByNamespace(opCtx, target);
 
-    AutoStatsTracker statsTracker(opCtx,
-                                  source,
-                                  Top::LockType::NotLocked,
-                                  AutoStatsTracker::LogMode::kUpdateCurOp,
-                                  db->getProfilingLevel());
+    AutoStatsTracker statsTracker(
+        opCtx,
+        source,
+        Top::LockType::NotLocked,
+        AutoStatsTracker::LogMode::kUpdateCurOp,
+        CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(source.db()));
 
     if (!targetColl) {
         return renameCollectionDirectly(opCtx, db, sourceColl->uuid(), source, target, options);
@@ -362,18 +357,18 @@ Status renameCollectionWithinDBForApplyOps(OperationContext* opCtx,
         return status;
 
     auto db = DatabaseHolder::get(opCtx)->getDb(opCtx, source.db());
-    Collection* const sourceColl =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, source);
+    const auto sourceColl =
+        CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, source);
 
-    AutoStatsTracker statsTracker(opCtx,
-                                  source,
-                                  Top::LockType::NotLocked,
-                                  AutoStatsTracker::LogMode::kUpdateCurOp,
-                                  db->getProfilingLevel());
+    AutoStatsTracker statsTracker(
+        opCtx,
+        source,
+        Top::LockType::NotLocked,
+        AutoStatsTracker::LogMode::kUpdateCurOp,
+        CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(source.db()));
 
     return writeConflictRetry(opCtx, "renameCollection", target.ns(), [&] {
-        Collection* targetColl =
-            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, target);
+        auto targetColl = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, target);
         WriteUnitOfWork wuow(opCtx);
         if (targetColl) {
             if (sourceColl->uuid() == targetColl->uuid()) {
@@ -417,7 +412,7 @@ Status renameCollectionWithinDBForApplyOps(OperationContext* opCtx,
             auto collToDropBasedOnUUID = getNamespaceFromUUID(opCtx, uuidToDrop.get());
             if (collToDropBasedOnUUID && !collToDropBasedOnUUID->isDropPendingNamespace()) {
                 invariant(collToDropBasedOnUUID->db() == target.db());
-                targetColl = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
+                targetColl = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
                     opCtx, *collToDropBasedOnUUID);
             }
         }
@@ -482,15 +477,16 @@ Status renameBetweenDBs(OperationContext* opCtx,
     if (!sourceDB)
         return Status(ErrorCodes::NamespaceNotFound, "source namespace does not exist");
 
-    boost::optional<AutoStatsTracker> statsTracker(boost::in_place_init,
-                                                   opCtx,
-                                                   source,
-                                                   Top::LockType::NotLocked,
-                                                   AutoStatsTracker::LogMode::kUpdateCurOp,
-                                                   sourceDB->getProfilingLevel());
+    boost::optional<AutoStatsTracker> statsTracker(
+        boost::in_place_init,
+        opCtx,
+        source,
+        Top::LockType::NotLocked,
+        AutoStatsTracker::LogMode::kUpdateCurOp,
+        CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(source.db()));
 
-    Collection* const sourceColl =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, source);
+    auto catalog = CollectionCatalog::get(opCtx);
+    const auto sourceColl = catalog->lookupCollectionByNamespace(opCtx, source);
     if (!sourceColl) {
         if (sourceDB && ViewCatalog::get(sourceDB)->lookup(opCtx, source.ns()))
             return Status(ErrorCodes::CommandNotSupportedOnView,
@@ -506,7 +502,6 @@ Status renameBetweenDBs(OperationContext* opCtx,
         return {ErrorCodes::IllegalOperation,
                 "Cannot rename collections between a replicated and an unreplicated database"};
 
-    BackgroundOperation::assertNoBgOpInProgForNs(source.ns());
     IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(sourceColl->uuid());
 
     auto targetDB = DatabaseHolder::get(opCtx)->getDb(opCtx, target.db());
@@ -514,9 +509,8 @@ Status renameBetweenDBs(OperationContext* opCtx,
     // Check if the target namespace exists and if dropTarget is true.
     // Return a non-OK status if target exists and dropTarget is not true or if the collection
     // is sharded.
-    Collection* targetColl = targetDB
-        ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, target)
-        : nullptr;
+    const auto targetColl =
+        targetDB ? catalog->lookupCollectionByNamespace(opCtx, target) : nullptr;
     if (targetColl) {
         if (sourceColl->uuid() == targetColl->uuid()) {
             invariant(source == target);
@@ -544,6 +538,9 @@ Status renameBetweenDBs(OperationContext* opCtx,
     // The generated unique collection name is only guaranteed to exist if the database is
     // exclusively locked.
     invariant(opCtx->lockState()->isDbLockedForMode(targetDB->name(), LockMode::MODE_X));
+
+    // Note that this temporary collection name is used by MongoMirror and thus must not be changed
+    // without consultation.
     auto tmpNameResult =
         targetDB->makeUniqueCollectionNamespace(opCtx, "tmp%%%%%.renameCollection");
     if (!tmpNameResult.isOK()) {
@@ -592,12 +589,12 @@ Status renameBetweenDBs(OperationContext* opCtx,
             // the rename operation has already failed for another reason.
             LOGV2(20399,
                   "Unable to drop temporary collection {tmpName} while renaming from {source} to "
-                  "{target}: {status}",
+                  "{target}: {error}",
                   "Unable to drop temporary collection while renaming",
                   "tempCollection"_attr = tmpName,
                   "source"_attr = source,
                   "target"_attr = target,
-                  "reason"_attr = status);
+                  "error"_attr = status);
         }
     });
 
@@ -626,8 +623,9 @@ Status renameBetweenDBs(OperationContext* opCtx,
             WriteUnitOfWork wunit(opCtx);
             auto fromMigrate = false;
             try {
+                CollectionWriter tmpCollWriter(tmpColl);
                 IndexBuildsCoordinator::get(opCtx)->createIndexesOnEmptyCollection(
-                    opCtx, tmpColl->uuid(), indexesToCopy, fromMigrate);
+                    opCtx, tmpCollWriter, indexesToCopy, fromMigrate);
             } catch (DBException& ex) {
                 return ex.toStatus();
             }
@@ -642,6 +640,7 @@ Status renameBetweenDBs(OperationContext* opCtx,
     {
         NamespaceStringOrUUID tmpCollUUID =
             NamespaceStringOrUUID(std::string(tmpName.db()), tmpColl->uuid());
+        tmpColl = nullptr;
         statsTracker.reset();
 
         // Copy over all the data from source collection to temporary collection. For this we can
@@ -650,8 +649,7 @@ Status renameBetweenDBs(OperationContext* opCtx,
         targetDBLock.reset();
 
         AutoGetCollection autoTmpColl(opCtx, tmpCollUUID, MODE_IX);
-        tmpColl = autoTmpColl.getCollection();
-        if (!tmpColl) {
+        if (!autoTmpColl) {
             return Status(ErrorCodes::NamespaceNotFound,
                           str::stream() << "Temporary collection '" << tmpName
                                         << "' was removed while renaming collection across DBs");
@@ -664,19 +662,25 @@ Status renameBetweenDBs(OperationContext* opCtx,
             // Cursor is left one past the end of the batch inside writeConflictRetry.
             auto beginBatchId = record->id;
             Status status = writeConflictRetry(opCtx, "renameCollection", tmpName.ns(), [&] {
-                WriteUnitOfWork wunit(opCtx);
                 // Need to reset cursor if it gets a WCE midway through.
                 if (!record || (beginBatchId != record->id)) {
                     record = cursor->seekExact(beginBatchId);
                 }
                 for (int i = 0; record && (i < internalInsertMaxBatchSize.load()); i++) {
+                    WriteUnitOfWork wunit(opCtx);
                     const InsertStatement stmt(record->data.releaseToBson());
                     OpDebug* const opDebug = nullptr;
-                    auto status = tmpColl->insertDocument(opCtx, stmt, opDebug, true);
+                    auto status = autoTmpColl->insertDocument(opCtx, stmt, opDebug, true);
                     if (!status.isOK()) {
                         return status;
                     }
                     record = cursor->next();
+
+                    // Used to make sure that a WCE can be handled by this logic without data loss.
+                    if (MONGO_unlikely(writeConflictInRenameCollCopyToTmp.shouldFail())) {
+                        throw WriteConflictException();
+                    }
+                    wunit.commit();
                 }
 
                 // Time to yield; make a safe copy of the current record before releasing our
@@ -690,11 +694,6 @@ Status renameBetweenDBs(OperationContext* opCtx,
                     writeConflictRetry(
                         opCtx, "retryRestoreCursor", ns, [&cursor] { cursor->restore(); });
                 });
-                // Used to make sure that a WCE can be handled by this logic without data loss.
-                if (MONGO_unlikely(writeConflictInRenameCollCopyToTmp.shouldFail())) {
-                    throw WriteConflictException();
-                }
-                wunit.commit();
                 return Status::OK();
             });
             if (!status.isOK())
@@ -728,7 +727,7 @@ void doLocalRenameIfOptionsAndIndexesHaveNotChanged(OperationContext* opCtx,
                                                     BSONObj originalCollectionOptions) {
     AutoGetDb dbLock(opCtx, targetNs.db(), MODE_X);
     auto collection = dbLock.getDb()
-        ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, targetNs)
+        ? CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, targetNs)
         : nullptr;
     BSONObj collectionOptions = {};
     if (collection) {
@@ -863,7 +862,7 @@ Status renameCollectionForApplyOps(OperationContext* opCtx,
     NamespaceString sourceNss(sourceNsElt.valueStringData());
     NamespaceString targetNss(targetNsElt.valueStringData());
     if (uuidToRename) {
-        auto nss = CollectionCatalog::get(opCtx).lookupNSSByUUID(opCtx, uuidToRename.get());
+        auto nss = CollectionCatalog::get(opCtx)->lookupNSSByUUID(opCtx, uuidToRename.get());
         if (nss)
             sourceNss = *nss;
     }
@@ -879,7 +878,7 @@ Status renameCollectionForApplyOps(OperationContext* opCtx,
     }
 
     // Check that the target namespace is in the correct form, "database.collection".
-    auto targetStatus = userAllowedWriteNS(targetNss);
+    auto targetStatus = userAllowedCreateNS(targetNss);
     if (!targetStatus.isOK()) {
         return Status(targetStatus.code(),
                       str::stream() << "error with target namespace: " << targetStatus.reason());
@@ -892,11 +891,10 @@ Status renameCollectionForApplyOps(OperationContext* opCtx,
                       str::stream() << "Cannot rename collection to the oplog");
     }
 
-    const Collection* const sourceColl =
-        AutoGetCollectionForRead(opCtx, sourceNss, AutoGetCollection::ViewMode::kViewsPermitted)
-            .getCollection();
+    AutoGetCollectionForRead sourceColl(
+        opCtx, sourceNss, AutoGetCollectionViewMode::kViewsPermitted);
 
-    if (sourceNss.isDropPendingNamespace() || sourceColl == nullptr) {
+    if (sourceNss.isDropPendingNamespace() || !sourceColl) {
         boost::optional<NamespaceString> dropTargetNss;
 
         if (options.dropTarget)

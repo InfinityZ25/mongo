@@ -2,7 +2,11 @@
 
 Import([
     'env',
-    'get_option'
+    'get_option',
+    'has_option',
+    'usemozjs',
+    'version_parts',
+    'version_extra',
 ])
 
 env = env.Clone()
@@ -17,7 +21,10 @@ env.Library(
         '$BUILD_DIR/mongo/client/clientdriver_minimal',
         '$BUILD_DIR/mongo/db/logical_session_id',
         '$BUILD_DIR/mongo/scripting/bson_template_evaluator',
-    ]
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/third_party/shim_pcrecpp',
+    ],
 )
 
 generateJSErrorCodes = env.Command(
@@ -32,7 +39,7 @@ env.Alias('generated-sources', generateJSErrorCodes)
 
 # Files added here need to be added in scripting/engine.cpp and buildscripts/vcxproj.header as well.
 js_header = env.JSHeader(
-    target="mongo.cpp",
+    target="mongojs.cpp",
     source=[
         "assert.js",
         "bulk_api.js",
@@ -75,7 +82,7 @@ env.Alias('generated-sources', "mongo-server.cpp")
 env.Library(
     target='mongojs',
     source=[
-        'mongo.cpp',
+        'mongojs.cpp',
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
@@ -99,11 +106,11 @@ env.Library(
 env.Library(
     target='shell_options_register',
     source=[
-        env.Idlc('shell_options.idl')[0],
+        'shell_options.idl',
     ],
     LIBDEPS=[
-        'shell_options_storage',
         '$BUILD_DIR/mongo/base',
+        'shell_options_storage',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/util/options_parser/options_parser',
@@ -120,7 +127,6 @@ env.Library(
         'shell_utils_launcher.cpp',
     ],
     LIBDEPS=[
-        'benchrun',
         '$BUILD_DIR/mongo/base/environment_buffer',
         '$BUILD_DIR/mongo/client/clientdriver_network',
         '$BUILD_DIR/mongo/db/mongohasher',
@@ -128,67 +134,208 @@ env.Library(
         '$BUILD_DIR/mongo/scripting/scripting',
         '$BUILD_DIR/mongo/transport/message_compressor',
         '$BUILD_DIR/mongo/util/password',
+        'benchrun',
         'shell_options_storage',
     ]
 )
 
-kmsEnv = env.Clone()
+if get_option('ssl') == 'on':
+    kmsEnv = env.Clone()
 
-kmsEnv.InjectThirdParty(libraries=['kms-message'])
+    kmsEnv.InjectThirdParty(libraries=['kms-message'])
 
-kmsEnv.Library(
-    target="kms",
+    kmsEnv.Library(
+        target="kms",
+        source=[
+            "kms.cpp",
+            "kms_aws.cpp",
+            "kms_local.cpp",
+            "kms_network.cpp",
+            "kms.idl",
+        ],
+        LIBDEPS=[
+            '$BUILD_DIR/mongo/base/secure_allocator',
+        ],
+        LIBDEPS_PRIVATE=[
+            '$BUILD_DIR/mongo/base',
+            '$BUILD_DIR/mongo/crypto/aead_encryption',
+            '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
+            '$BUILD_DIR/mongo/util/net/network',
+            '$BUILD_DIR/mongo/util/net/ssl_manager',
+            '$BUILD_DIR/mongo/util/net/ssl_options',
+            '$BUILD_DIR/third_party/shim_kms_message',
+        ],
+    )
+
+    env.Library(
+        target="kms_shell",
+        source=[
+            "kms_shell.cpp",
+        ],
+        LIBDEPS_PRIVATE=[
+            'kms',
+            'shell_utils',
+        ],
+    )
+
+    scriptingEnv = env.Clone()
+    scriptingEnv.InjectMozJS()
+
+    scriptingEnv.Library(
+        target="encrypted_dbclient",
+        source=[
+            "encrypted_dbclient_base.cpp",
+            "fle_shell_options.idl",
+        ],
+        LIBDEPS_PRIVATE=[
+            '$BUILD_DIR/mongo/client/clientdriver_minimal',
+            '$BUILD_DIR/mongo/crypto/aead_encryption',
+            '$BUILD_DIR/mongo/crypto/symmetric_crypto',
+            '$BUILD_DIR/mongo/scripting/scripting',
+            '$BUILD_DIR/mongo/shell/shell_options_register',
+            '$BUILD_DIR/third_party/shim_mozjs',
+            'kms',
+        ],
+    )
+
+env.Library(
+    target="linenoise_utf8",
     source=[
-        "kms.cpp",
-        "kms_aws.cpp",
-        "kms_local.cpp",
-        kmsEnv.Idlc("kms.idl")[0],
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base/secure_allocator',
-    ],
-    LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/crypto/aead_encryption',
-        '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
-        '$BUILD_DIR/mongo/util/net/network',
-        '$BUILD_DIR/mongo/util/net/socket',
-        '$BUILD_DIR/mongo/util/net/ssl_manager',
-        '$BUILD_DIR/mongo/util/net/ssl_options',
-        '$BUILD_DIR/third_party/shim_kms_message',
+        "linenoise_utf8.cpp",
     ],
 )
 
 env.Library(
-    target="kms_shell",
+    target="linenoise",
     source=[
-        "kms_shell.cpp",
+        "linenoise.cpp",
+        "mk_wcwidth.cpp"
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
     ],
     LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/shell_core',
-        'kms',
+        "linenoise_utf8",
     ],
 )
 
-scriptingEnv = env.Clone()
-scriptingEnv.InjectMozJS()
+if not has_option('noshell') and usemozjs:
 
-scriptingEnv.Library(
-    target="encrypted_dbclient",
-    source=[
-        "encrypted_dbclient_base.cpp",
-        scriptingEnv.Idlc("fle_shell_options.idl")[0],
-    ],
-    LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/crypto/aead_encryption',
-        '$BUILD_DIR/mongo/crypto/symmetric_crypto',
-        '$BUILD_DIR/mongo/client/clientdriver_minimal',
-        '$BUILD_DIR/mongo/scripting/scripting',
-        '$BUILD_DIR/mongo/shell/shell_options_register',
-        '$BUILD_DIR/third_party/shim_mozjs',
-        'kms',
-    ],
-)
+    env.Library(
+        target="mongo_initializers",
+        source=[
+            "mongodbcr.cpp",
+            "shell_options_init.cpp",
+        ],
+        LIBDEPS_PRIVATE=[
+            # NOTE: If you need to add a static or mongo initializer to mongo startup,
+            # please add that library here, as a private library dependency.
+            "$BUILD_DIR/mongo/client/clientdriver_network",
+            "$BUILD_DIR/mongo/client/connection_string",
+            "$BUILD_DIR/mongo/db/catalog/index_key_validate",
+            "$BUILD_DIR/mongo/db/logical_session_id_helpers",
+            "$BUILD_DIR/mongo/db/mongohasher",
+            "$BUILD_DIR/mongo/db/query/command_request_response",
+            "$BUILD_DIR/mongo/db/query/query_request",
+            "$BUILD_DIR/mongo/db/server_options_core",
+            "$BUILD_DIR/mongo/db/storage/duplicate_key_error_info",
+            "$BUILD_DIR/mongo/db/traffic_reader",
+            "$BUILD_DIR/mongo/db/views/resolved_view",
+            "$BUILD_DIR/mongo/executor/network_interface_factory",
+            "$BUILD_DIR/mongo/executor/network_interface_thread_pool",
+            "$BUILD_DIR/mongo/executor/thread_pool_task_executor",
+            "$BUILD_DIR/mongo/rpc/protocol",
+            "$BUILD_DIR/mongo/scripting/scripting",
+            "$BUILD_DIR/mongo/transport/message_compressor",
+            "$BUILD_DIR/mongo/transport/message_compressor_options_client",
+            "$BUILD_DIR/mongo/transport/transport_layer_manager",
+            "$BUILD_DIR/mongo/util/net/network",
+            "$BUILD_DIR/mongo/util/net/ssl_options_client" if get_option('ssl') == 'on' else '',
+            "$BUILD_DIR/mongo/util/options_parser/options_parser_init",
+            "$BUILD_DIR/mongo/util/password",
+            "$BUILD_DIR/mongo/util/processinfo",
+            "$BUILD_DIR/mongo/util/signal_handlers",
+            "$BUILD_DIR/mongo/util/version_impl",
+            "$BUILD_DIR/third_party/shim_pcrecpp",
+            "benchrun",
+            "encrypted_dbclient" if get_option('ssl') == 'on' else '',
+            "kms_shell" if get_option('ssl') == 'on' else '',
+            "mongojs",
+            "shell_options_register",
+            "shell_utils",
+        ],
+        LIBDEPS=[
+            # NOTE: This list must remain empty. Please only add to LIBDEPS_PRIVATE
+        ],
+
+    )
+
+    env.Library(
+        target="mongo_main",
+        source=[
+            "mongo_main.cpp",
+        ],
+        LIBDEPS_PRIVATE=[
+            # NOTE: Do not add new libdeps (public or private) here unless
+            # required by the linker to satisfy symbol dependencies from
+            # the files listed above in `sources`. If you need to add a
+            # library to inject a static or mongo initializer to mongo,
+            # please add that library as a private libdep of
+            # mongo_initializers.
+            "$BUILD_DIR/mongo/transport/transport_layer",
+            "$BUILD_DIR/mongo/util/net/ssl_manager",
+            "$BUILD_DIR/mongo/util/signal_handlers",
+            "$BUILD_DIR/third_party/shim_pcrecpp",
+            "linenoise",
+            "mongo_initializers",
+            "shell_utils",
+        ],
+        LIBDEPS=[
+            # NOTE: This list must remain empty. Please only add to LIBDEPS_PRIVATE
+        ],
+    )
+
+    shellEnv = env.Clone()
+    if env.TargetOSIs('windows'):
+        shellEnv.Append(LIBS=["winmm"])
+
+        generatedMongoManifest = shellEnv.Substfile(
+                'mongo.manifest.in',
+                SUBST_DICT=[
+                    ('@mongo_version_major@', version_parts[0]),
+                    ('@mongo_version_minor@', version_parts[1]),
+                    ('@mongo_version_patch@', version_parts[2]),
+                    ('@mongo_version_extra@', version_parts[3]),
+                    ('@mongo_version_extra_str@', version_extra),
+                ])
+        shellEnv.Alias('generated-sources', generatedMongoManifest)
+        shellEnv.Depends("mongo.res", generatedMongoManifest)
+
+    mongo_shell = shellEnv.Program(
+        target="mongo",
+        source=[
+            "mongo.cpp",
+        ] + env.WindowsResourceFile("mongo.rc"),
+        LIBDEPS=[
+            # NOTE: Do not add new libdeps (public or private) here unless
+            # required by the linker to satisfy symbol dependencies from
+            # the files listed above in `sources`. If you need to add a
+            # library to inject a static or mongo initializer to mongo,
+            # please add that library as a private libdep of
+            # mongo_initializers.
+            '$BUILD_DIR/mongo/base',
+            'mongo_main',
+        ],
+        AIB_COMPONENT="mongo",
+        AIB_COMPONENTS_EXTRA=[
+            "core",
+            "dist",
+            "dist-test",
+            "shell",
+            "integration-tests",
+        ],
+    )
+
 
 env.CppUnitTest(
     target='shell_test',

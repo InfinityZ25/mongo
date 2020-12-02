@@ -5,7 +5,7 @@
 (function() {
 "use strict";
 
-// TODO SERVER-35447: Multiple users cannot be authenticated on one connection within a session.
+// Multiple users cannot be authenticated on one connection within a session.
 TestData.disableImplicitSessions = true;
 
 let st = new ShardingTest({mongos: 1, config: 1, shards: 1, keyFile: 'jstests/libs/key1'});
@@ -47,7 +47,8 @@ const cmdObj = {
 };
 jsTestLog("running NonTrusted. command: " + tojson(cmdObj));
 res = testDB.runCommand(cmdObj);
-assert.commandFailed(res, "Command request was: " + tojsononeline(cmdObj));
+assert.commandFailedWithCode(
+    res, ErrorCodes.TimeProofMismatch, "Command request was: " + tojsononeline(cmdObj));
 
 assert.eq(1, testDB.auth("Trusted", "pwd"));
 jsTestLog("running Trusted. command: " + tojson(cmdObj));

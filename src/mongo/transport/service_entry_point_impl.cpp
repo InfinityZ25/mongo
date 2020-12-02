@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -38,7 +38,7 @@
 #include "mongo/db/auth/restriction_environment.h"
 #include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
-#include "mongo/transport/ismaster_metrics.h"
+#include "mongo/transport/hello_metrics.h"
 #include "mongo/transport/service_state_machine.h"
 #include "mongo/transport/session.h"
 #include "mongo/util/processinfo.h"
@@ -46,6 +46,10 @@
 
 #if !defined(_WIN32)
 #include <sys/resource.h>
+#endif
+
+#if !defined(__has_feature)
+#define __has_feature(x) 0
 #endif
 
 namespace mongo {
@@ -94,10 +98,11 @@ ServiceEntryPointImpl::ServiceEntryPointImpl(ServiceContext* svcCtx) : _svcCtx(s
 
         LOGV2_DEBUG(22940,
                     1,
-                    "fd limit hard:{limit_rlim_max} soft:{limit_rlim_cur} max conn: {max}",
-                    "limit_rlim_max"_attr = limit.rlim_max,
-                    "limit_rlim_cur"_attr = limit.rlim_cur,
-                    "max"_attr = max);
+                    "fd limit hard:{hard} soft:{soft} max conn: {conn}",
+                    "file descriptor and connection resource limits",
+                    "hard"_attr = limit.rlim_max,
+                    "soft"_attr = limit.rlim_cur,
+                    "conn"_attr = max);
 
         return std::min(max, serverGlobalParams.maxConns);
 #endif
@@ -107,25 +112,35 @@ ServiceEntryPointImpl::ServiceEntryPointImpl(ServiceContext* svcCtx) : _svcCtx(s
     if (supportedMax < serverGlobalParams.maxConns &&
         serverGlobalParams.maxConns != DEFAULT_MAX_CONN) {
         LOGV2(22941,
-              " --maxConns too high, can only handle {supportedMax}",
-              "supportedMax"_attr = supportedMax);
+              " --maxConns too high, can only handle {limit}",
+              " --maxConns too high",
+              "limit"_attr = supportedMax);
     }
 
     _maxNumConnections = supportedMax;
-
-    if (serverGlobalParams.reservedAdminThreads) {
-        _adminInternalPool = std::make_unique<transport::ServiceExecutorReserved>(
-            _svcCtx, "admin/internal connections", serverGlobalParams.reservedAdminThreads);
-    }
 }
 
 Status ServiceEntryPointImpl::start() {
-    if (_adminInternalPool)
-        return _adminInternalPool->start();
-    else
-        return Status::OK();
+    if (auto status = transport::ServiceExecutorSynchronous::get(_svcCtx)->start();
+        !status.isOK()) {
+        return status;
+    }
+
+    if (auto exec = transport::ServiceExecutorReserved::get(_svcCtx)) {
+        if (auto status = exec->start(); !status.isOK()) {
+            return status;
+        }
+    }
+
+    // TODO: Reintroduce SEF once it is attached as initial SE in SERVER-49109
+    // if (auto status = transport::ServiceExecutorFixed::get(_svcCtx)->start(); !status.isOK()) {
+    //     return status;
+    // }
+
+    return Status::OK();
 }
 
+// TODO: explicitly start on the fixed executor
 void ServiceEntryPointImpl::startSession(transport::SessionHandle session) {
     // Setup the restriction environment on the Session, if the Session has local/remote Sockaddrs
     const auto& remoteAddr = session->remoteAddr();
@@ -138,7 +153,7 @@ void ServiceEntryPointImpl::startSession(transport::SessionHandle session) {
 
     const bool quiet = serverGlobalParams.quiet.load();
     size_t connectionCount;
-    auto transportMode = _svcCtx->getServiceExecutor()->transportMode();
+    auto transportMode = transport::ServiceExecutorSynchronous::get(_svcCtx)->transportMode();
 
     auto ssm = ServiceStateMachine::create(_svcCtx, session, transportMode);
     auto usingMaxConnOverride = false;
@@ -162,19 +177,20 @@ void ServiceEntryPointImpl::startSession(transport::SessionHandle session) {
     if (connectionCount > _maxNumConnections && !usingMaxConnOverride) {
         if (!quiet) {
             LOGV2(22942,
-                  "connection refused because too many open connections",
+                  "Connection refused because there are too many open connections",
                   "connectionCount"_attr = connectionCount);
         }
         return;
-    } else if (usingMaxConnOverride && _adminInternalPool) {
-        ssm->setServiceExecutor(_adminInternalPool.get());
+    } else if (auto exec = transport::ServiceExecutorReserved::get(_svcCtx);
+               usingMaxConnOverride && exec) {
+        ssm->setServiceExecutor(exec);
     }
 
     if (!quiet) {
         LOGV2(22943,
-              "connection accepted",
+              "Connection accepted",
               "remote"_attr = session->remote(),
-              "sessionId"_attr = session->id(),
+              "connectionId"_attr = session->id(),
               "connectionCount"_attr = connectionCount);
     }
 
@@ -191,8 +207,9 @@ void ServiceEntryPointImpl::startSession(transport::SessionHandle session) {
 
         if (!quiet) {
             LOGV2(22944,
-                  "connection ended",
+                  "Connection ended",
                   "remote"_attr = remote,
+                  "connectionId"_attr = session->id(),
                   "connectionCount"_attr = connectionCount);
         }
     });
@@ -216,8 +233,14 @@ void ServiceEntryPointImpl::endAllSessions(transport::Session::TagMask tags) {
 }
 
 bool ServiceEntryPointImpl::shutdown(Milliseconds timeout) {
-    using logger::LogComponent;
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+    // When running under address sanitizer, we get false positive leaks due to disorder around
+    // the lifecycle of a connection and request. When we are running under ASAN, we try a lot
+    // harder to dry up the server from active connections before going on to really shut down.
 
+    using logv2::LogComponent;
+
+    auto start = _svcCtx->getPreciseClockSource()->now();
     stdx::unique_lock<decltype(_sessionsMutex)> lk(_sessionsMutex);
 
     // Request that all sessions end, while holding the _sesionsMutex, loop over all the current
@@ -236,26 +259,55 @@ bool ServiceEntryPointImpl::shutdown(Milliseconds timeout) {
     auto noWorkersLeft = [this] { return numOpenSessions() == 0; };
     while (timeSpent < timeout &&
            !_shutdownCondition.wait_for(lk, checkInterval.toSystemDuration(), noWorkersLeft)) {
-        LOGV2_OPTIONS(22945,
-                      {logComponentV1toV2(LogComponent::kNetwork)},
-                      "shutdown: still waiting on {numOpenSessions} active workers to drain... ",
-                      "numOpenSessions"_attr = numOpenSessions());
+        LOGV2(22945,
+              "shutdown: still waiting on {workers} active workers to drain... ",
+              "shutdown: still waiting on active workers to drain... ",
+              "workers"_attr = numOpenSessions());
         timeSpent += checkInterval;
     }
 
     bool result = noWorkersLeft();
     if (result) {
-        LOGV2_OPTIONS(22946,
-                      {logComponentV1toV2(LogComponent::kNetwork)},
-                      "shutdown: no running workers found...");
+        LOGV2(22946, "shutdown: no running workers found...");
     } else {
-        LOGV2_OPTIONS(22947,
-                      {logComponentV1toV2(LogComponent::kNetwork)},
-                      "shutdown: exhausted grace period for{numOpenSessions} active workers to "
-                      "drain; continuing with shutdown... ",
-                      "numOpenSessions"_attr = numOpenSessions());
+        LOGV2(
+            22947,
+            "shutdown: exhausted grace period for {workers} active workers to "
+            "drain; continuing with shutdown...",
+            "shutdown: exhausted grace period active workers to drain; continuing with shutdown...",
+            "workers"_attr = numOpenSessions());
     }
+
+    lk.unlock();
+
+    // TODO: Reintroduce SEF once it is attached as initial SE in SERVER-49109
+    // timeSpent = _svcCtx->getPreciseClockSource()->now() - start;
+    // timeout = std::max(Milliseconds{0}, timeout - timeSpent);
+    // if (auto status = transport::ServiceExecutorFixed::get(_svcCtx)->shutdown(timeout);
+    //     !status.isOK()) {
+    //     LOGV2(4907202, "Failed to shutdown ServiceExecutorFixed", "error"_attr = status);
+    // }
+
+    timeSpent = _svcCtx->getPreciseClockSource()->now() - start;
+    timeout = std::max(Milliseconds{0}, timeout - timeSpent);
+    if (auto exec = transport::ServiceExecutorReserved::get(_svcCtx)) {
+        if (auto status = exec->shutdown(timeout); !status.isOK()) {
+            LOGV2(4907201, "Failed to shutdown ServiceExecutorReserved", "error"_attr = status);
+        }
+    }
+
+    timeSpent = _svcCtx->getPreciseClockSource()->now() - start;
+    timeout = std::max(Milliseconds{0}, timeout - timeSpent);
+    if (auto status =
+            transport::ServiceExecutorSynchronous::get(_svcCtx)->shutdown(timeout - timeSpent);
+        !status.isOK()) {
+        LOGV2(4907200, "Failed to shutdown ServiceExecutorSynchronous", "error"_attr = status);
+    }
+
     return result;
+#else
+    return true;
+#endif
 }
 
 void ServiceEntryPointImpl::appendStats(BSONObjBuilder* bob) const {
@@ -265,17 +317,18 @@ void ServiceEntryPointImpl::appendStats(BSONObjBuilder* bob) const {
     bob->append("current", static_cast<int>(sessionCount));
     bob->append("available", static_cast<int>(_maxNumConnections - sessionCount));
     bob->append("totalCreated", static_cast<int>(_createdConnections.load()));
-    if (auto sc = getGlobalServiceContext()) {
-        bob->append("active", static_cast<int>(sc->getActiveClientOperations()));
-        bob->append("exhaustIsMaster",
-                    static_cast<int>(IsMasterMetrics::get(sc)->getNumExhaustIsMaster()));
-        bob->append("awaitingTopologyChanges",
-                    static_cast<int>(IsMasterMetrics::get(sc)->getNumAwaitingTopologyChanges()));
-    }
 
-    if (_adminInternalPool) {
+    invariant(_svcCtx);
+    bob->append("active", static_cast<int>(_svcCtx->getActiveClientOperations()));
+    bob->append("exhaustIsMaster",
+                static_cast<int>(HelloMetrics::get(_svcCtx)->getNumExhaustIsMaster()));
+    bob->append("exhaustHello", static_cast<int>(HelloMetrics::get(_svcCtx)->getNumExhaustHello()));
+    bob->append("awaitingTopologyChanges",
+                static_cast<int>(HelloMetrics::get(_svcCtx)->getNumAwaitingTopologyChanges()));
+
+    if (auto adminExec = transport::ServiceExecutorReserved::get(_svcCtx)) {
         BSONObjBuilder section(bob->subobjStart("adminConnections"));
-        _adminInternalPool->appendStats(&section);
+        adminExec->appendStats(&section);
     }
 }
 

@@ -394,7 +394,28 @@ assert = (function() {
     assert.soonNoExcept = function(func, msg, timeout, interval) {
         var safeFunc =
             _convertExceptionToReturnStatus(func, "assert.soonNoExcept caught exception");
-        assert.soon(safeFunc, msg, timeout, interval);
+        var getFunc = () => {
+            // No TestData means not running from resmoke. Non-resmoke tests usually don't trace
+            // exceptions.
+            if (typeof TestData === "undefined") {
+                return safeFunc;
+            }
+            return () => {
+                // Turns off printing the JavaScript stacktrace in doassert() to avoid
+                // generating an overwhelming amount of log messages when handling transient
+                // errors.
+                const origTraceExceptions = TestData.traceExceptions;
+                TestData.traceExceptions = false;
+
+                const res = safeFunc();
+
+                // Restore it's value to original value.
+                TestData.traceExceptions = origTraceExceptions;
+                return res;
+            };
+        };
+
+        assert.soon(getFunc(), msg, timeout, interval);
     };
 
     /*
@@ -419,7 +440,7 @@ assert = (function() {
         // Used up all attempts
         msg = _buildAssertionMessage(msg);
         if (runHangAnalyzer) {
-            msg = msg + "The hang analyzer is automatically called in assert.retry functions. " +
+            msg = msg + " The hang analyzer is automatically called in assert.retry functions. " +
                 "If you are *expecting* assert.soon to possibly fail, call assert.retry " +
                 "with {runHangAnalyzer: false} as the fifth argument " +
                 "(you can fill unused arguments with `undefined`).";
@@ -481,7 +502,8 @@ assert = (function() {
                 "assert.time failed timeout " + timeout + "ms took " + diff + "ms : " + f + ", msg";
             msg = _buildAssertionMessage(msg, msgPrefix);
             if (runHangAnalyzer) {
-                msg = msg + "The hang analyzer is automatically called in assert.time functions. " +
+                msg = msg +
+                    " The hang analyzer is automatically called in assert.time functions. " +
                     "If you are *expecting* assert.soon to possibly fail, call assert.time " +
                     "with {runHangAnalyzer: false} as the fourth argument " +
                     "(you can fill unused arguments with `undefined`).";
@@ -630,7 +652,34 @@ assert = (function() {
         if (isWriteConcernTimeout) {
             print("Running hang analyzer for writeConcern timeout " + tojson(res));
             MongoRunner.runHangAnalyzer();
+            return true;
         }
+        return false;
+    }
+
+    function _runHangAnalyzerIfNonTransientLockTimeoutError(res) {
+        // Concurrency suites see a lot of LockTimeouts when running concurrent transactions.
+        // However, they will also abort transactions and continue running rather than fail the
+        // test, so we don't want to run the hang analyzer when the error has a
+        // TransientTransactionError error label.
+        const isTransientTxnError = res.hasOwnProperty("errorLabels") &&
+            res.errorLabels.includes("TransientTransactionError");
+        const isLockTimeout = res.hasOwnProperty("code") && ErrorCodes.LockTimeout === res.code;
+        if (isLockTimeout && !isTransientTxnError) {
+            print("Running hang analyzer for lock timeout " + tojson(res));
+            MongoRunner.runHangAnalyzer();
+            return true;
+        }
+        return false;
+    }
+
+    function _runHangAnalyzerForSpecificFailureTypes(res) {
+        // If the hang analyzer is run, then we shouldn't try to run it again.
+        if (_runHangAnalyzerIfWriteConcernTimedOut(res)) {
+            return;
+        }
+
+        _runHangAnalyzerIfNonTransientLockTimeoutError(res);
     }
 
     function _assertCommandWorked(res, msg, {ignoreWriteErrors, ignoreWriteConcernErrors}) {
@@ -659,7 +708,7 @@ assert = (function() {
                     ignoreWriteErrors: ignoreWriteErrors,
                     ignoreWriteConcernErrors: ignoreWriteConcernErrors
                 })) {
-                _runHangAnalyzerIfWriteConcernTimedOut(res);
+                _runHangAnalyzerForSpecificFailureTypes(res);
                 doassert(makeFailMsg(), res);
             }
         } else if (res.hasOwnProperty("acknowledged")) {
@@ -712,7 +761,6 @@ assert = (function() {
             // Handle raw command responses or cases like MapReduceResult which extend command
             // response.
             if (_rawReplyOkAndNoWriteErrors(res)) {
-                _runHangAnalyzerIfWriteConcernTimedOut(res);
                 doassert(makeFailMsg(), res);
             }
 
@@ -727,7 +775,7 @@ assert = (function() {
                 }
 
                 if (!foundCode) {
-                    _runHangAnalyzerIfWriteConcernTimedOut(res);
+                    _runHangAnalyzerForSpecificFailureTypes(res);
                     doassert(makeFailCodeMsg(), res);
                 }
             }
@@ -803,7 +851,7 @@ assert = (function() {
         }
 
         if (errMsg) {
-            _runHangAnalyzerIfWriteConcernTimedOut(res);
+            _runHangAnalyzerForSpecificFailureTypes(res);
             doassert(_buildAssertionMessage(msg, errMsg), res);
         }
 
@@ -865,7 +913,7 @@ assert = (function() {
         }
 
         if (errMsg) {
-            _runHangAnalyzerIfWriteConcernTimedOut(res);
+            _runHangAnalyzerForSpecificFailureTypes(res);
             doassert(_buildAssertionMessage(msg, errMsg));
         }
 

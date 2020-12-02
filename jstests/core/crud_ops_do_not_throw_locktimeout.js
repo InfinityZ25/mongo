@@ -1,11 +1,13 @@
 /**
  * Tests that CRUD operations do not throw lock timeouts outside of transactions.
  *
- * @tags: [assumes_against_mongod_not_mongos,
- *         assumes_read_concern_unchanged,
- *         assumes_write_concern_unchanged,
- *         # This test requires failpoint behavior not available in v4.2.
- *         requires_fcv_44]
+ * @tags: [
+ *   assumes_against_mongod_not_mongos,
+ *   assumes_read_concern_unchanged,
+ *   assumes_write_concern_unchanged,
+ *   uses_parallel_shell,
+ *   incompatible_with_lockfreereads,
+ * ]
  */
 (function() {
 "use strict";
@@ -61,19 +63,16 @@ assert.commandFailedWithCode(
 
 assert.commandFailedWithCode(db.runCommand({
     findAndModify: coll.getName(),
-    query: {q: doc},
+    query: doc,
     update: {$set: {b: 2}},
     maxTimeMS: failureTimeoutMS
 }),
                              ErrorCodes.MaxTimeMSExpired);
 
-assert.commandFailedWithCode(db.runCommand({
-    findAndModify: coll.getName(),
-    query: {q: doc},
-    remove: true,
-    maxTimeMS: failureTimeoutMS
-}),
-                             ErrorCodes.MaxTimeMSExpired);
+assert.commandFailedWithCode(
+    db.runCommand(
+        {findAndModify: coll.getName(), query: doc, remove: true, maxTimeMS: failureTimeoutMS}),
+    ErrorCodes.MaxTimeMSExpired);
 
 jsTestLog("Waiting for threads to join");
 assert.commandWorked(db.adminCommand({configureFailPoint: failpoint, mode: "off"}));

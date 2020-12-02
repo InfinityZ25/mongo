@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -72,6 +72,10 @@ void ShardingTaskExecutor::join() {
 
 SharedSemiFuture<void> ShardingTaskExecutor::joinAsync() {
     return _executor->joinAsync();
+}
+
+bool ShardingTaskExecutor::isShuttingDown() const {
+    return _executor->isShuttingDown();
 }
 
 void ShardingTaskExecutor::appendDiagnosticBSON(mongo::BSONObjBuilder* builder) const {

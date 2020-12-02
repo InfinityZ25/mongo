@@ -95,9 +95,9 @@ function isRetryableError(error) {
         "HostNotFound",
         "NetworkTimeout",
         "SocketException",
-        "NotMaster",
-        "NotMasterNoSlaveOk",
-        "NotMasterOrSecondary",
+        "NotWritablePrimary",
+        "NotPrimaryNoSecondaryOk",
+        "NotPrimaryOrSecondary",
         "PrimarySteppedDown",
         "WriteConcernFailed",
         "WriteConcernLegacyOK",
@@ -268,7 +268,11 @@ jsTestOptions = function() {
             // TestData
             enableTestCommands:
                 TestData.hasOwnProperty('enableTestCommands') ? TestData.enableTestCommands : true,
-            serviceExecutor: TestData.serviceExecutor,
+            // Testing diagnostics should be enabled by default if no testingDiagnosticsEnabled was
+            // present in TestData
+            testingDiagnosticsEnabled: TestData.hasOwnProperty('testingDiagnosticsEnabled')
+                ? TestData.testingDiagnosticsEnabled
+                : true,
             setParameters: TestData.setParameters,
             setParametersMongos: TestData.setParametersMongos,
             storageEngine: TestData.storageEngine,
@@ -294,6 +298,7 @@ jsTestOptions = function() {
             enableMajorityReadConcern: TestData.enableMajorityReadConcern,
             writeConcernMajorityShouldJournal: TestData.writeConcernMajorityShouldJournal,
             enableEncryption: TestData.enableEncryption,
+            encryptionCipherMode: TestData.encryptionCipherMode,
             encryptionKeyFile: TestData.encryptionKeyFile,
             auditDestination: TestData.auditDestination,
             minPort: TestData.minPort,
@@ -345,8 +350,8 @@ jsTestOptions = function() {
             roleGraphInvalidationIsFatal: TestData.roleGraphInvalidationIsFatal || false,
             networkErrorAndTxnOverrideConfig: TestData.networkErrorAndTxnOverrideConfig || {},
             // When useRandomBinVersionsWithinReplicaSet is true, randomly assign the binary
-            // versions of each node in the replica set to 'latest' or 'last-stable'.
-            // This flag is currently a placeholder and only sets the replica set to last-stable
+            // versions of each node in the replica set to 'latest' or 'last-lts'.
+            // This flag is currently a placeholder and only sets the replica set to last-lts
             // FCV.
             useRandomBinVersionsWithinReplicaSet:
                 TestData.useRandomBinVersionsWithinReplicaSet || false,
@@ -358,8 +363,10 @@ jsTestOptions = function() {
             // is shut down.
             alwaysUseLogFiles: TestData.alwaysUseLogFiles || false,
             skipCheckOrphans: TestData.skipCheckOrphans || false,
-            isAsanBuild: TestData.isAsanBuild,
             inEvergreen: TestData.inEvergreen || false,
+
+            undoRecorderPath: TestData.undoRecorderPath,
+            backupOnRestartDir: TestData.backupOnRestartDir || false,
         });
     }
     return _jsTestOptions;
@@ -862,6 +869,8 @@ shellHelper.show = function(what) {
     what = args[0];
     args = args.splice(1);
 
+    var messageIndent = "        ";
+
     if (what == "profile") {
         if (db.system.profile.count() == 0) {
             print("db.system.profile is empty");
@@ -1008,15 +1017,33 @@ shellHelper.show = function(what) {
             dbDeclared = false;
         }
         if (dbDeclared) {
-            var res = db.adminCommand({getLog: "startupWarnings"});
+            var res =
+                db.getSiblingDB("admin")._runCommandWithoutApiStrict({getLog: "startupWarnings"});
             if (res.ok) {
                 if (res.log.length == 0) {
                     return "";
                 }
-                print("Server has startup warnings: ");
+                print("---");
+                print("The server generated these startup warnings when booting: ");
                 for (var i = 0; i < res.log.length; i++) {
-                    print(res.log[i]);
+                    var logOut;
+                    try {
+                        var parsedLog = JSON.parse(res.log[i]);
+                        var linePrefix = messageIndent + parsedLog.t["$date"] + ": ";
+                        logOut = linePrefix + parsedLog.msg + "\n";
+                        if (parsedLog.attr) {
+                            for (var attr in parsedLog.attr) {
+                                logOut += linePrefix + messageIndent + attr + ": " +
+                                    parsedLog.attr[attr] + "\n";
+                            }
+                        }
+                    } catch (err) {
+                        // err is intentionally unused here
+                        logOut = res.log[i];
+                    }
+                    print(logOut);
                 }
+                print("---");
                 return "";
             } else if (res.errmsg == "no such cmd: getLog") {
                 // Don't print if the command is not available
@@ -1089,15 +1116,19 @@ shellHelper.show = function(what) {
                     print("---");
                 } else if (freemonStatus.state === 'undecided') {
                     print(
-                        "---\n" +
+                        "---\n" + messageIndent +
                         "Enable MongoDB's free cloud-based monitoring service, which will then receive and display\n" +
+                        messageIndent +
                         "metrics about your deployment (disk utilization, CPU, operation statistics, etc).\n" +
-                        "\n" +
+                        "\n" + messageIndent +
                         "The monitoring data will be available on a MongoDB website with a unique URL accessible to you\n" +
+                        messageIndent +
                         "and anyone you share the URL with. MongoDB may use this information to make product\n" +
+                        messageIndent +
                         "improvements and to suggest MongoDB products and deployment options to you.\n" +
-                        "\n" +
+                        "\n" + messageIndent +
                         "To enable free monitoring, run the following command: db.enableFreeMonitoring()\n" +
+                        messageIndent +
                         "To permanently disable this reminder, run the following command: db.disableFreeMonitoring()\n" +
                         "---\n");
                 }
@@ -1435,30 +1466,46 @@ rs.help = function() {
         "\trs.freeze(secs)                            make a node ineligible to become primary for the time specified");
     print(
         "\trs.remove(hostportstr)                     remove a host from the replica set (disconnects)");
-    print("\trs.slaveOk()                               allow queries on secondary nodes");
+    print("\trs.secondaryOk()                               allow queries on secondary nodes");
     print();
     print("\trs.printReplicationInfo()                  check oplog size and time range");
     print(
-        "\trs.printSlaveReplicationInfo()             check replica set members and replication lag");
+        "\trs.printSecondaryReplicationInfo()             check replica set members and replication lag");
     print("\tdb.isMaster()                              check who is primary");
+    print("\tdb.hello()                              check who is primary");
     print();
     print("\treconfiguration helpers disconnect from the database so the shell will display");
     print("\tan error, even if the command succeeds.");
 };
 rs.slaveOk = function(value) {
-    return db.getMongo().setSlaveOk(value);
+    print(
+        "WARNING: slaveOk() is deprecated and may be removed in the next major release. Please use secondaryOk() instead.");
+    return db.getMongo().setSecondaryOk(value);
 };
+
+rs.secondaryOk = function(value) {
+    return db.getMongo().setSecondaryOk(value);
+};
+
 rs.status = function() {
     return db._adminCommand("replSetGetStatus");
 };
 rs.isMaster = function() {
     return db.isMaster();
 };
+rs.hello = function() {
+    return db.hello();
+};
 rs.initiate = function(c) {
     return db._adminCommand({replSetInitiate: c});
 };
 rs.printSlaveReplicationInfo = function() {
-    return db.printSlaveReplicationInfo();
+    print(
+        "WARNING: printSlaveReplicationInfo is deprecated and may be removed in the next major release. Please use printSecondaryReplicationInfo instead.");
+    return db.printSecondaryReplicationInfo();
+};
+rs.printSecondaryReplicationInfo = function() {
+    return db.printSecondaryReplicationInfo();
 };
 rs.printReplicationInfo = function() {
     return db.printReplicationInfo();
@@ -1496,34 +1543,65 @@ rs.reconfig = function(cfg, options) {
     return this._runCmd(cmd);
 };
 rs.add = function(hostport, arb) {
-    var cfg = hostport;
+    let res;
+    let self = this;
 
-    var local = db.getSisterDB("local");
-    assert(local.system.replset.count() <= 1,
-           "error: local.system.replset has unexpected contents");
-    var c = local.system.replset.findOne();
-    assert(c, "no config object retrievable from local.system.replset");
+    assert.soon(function() {
+        var cfg = hostport;
 
-    c.version++;
+        var local = db.getSiblingDB("local");
+        assert(local.system.replset.count() <= 1,
+               "error: local.system.replset has unexpected contents");
+        var c = local.system.replset.findOne();
+        assert(c, "no config object retrievable from local.system.replset");
 
-    var max = 0;
-    for (var i in c.members)
-        if (c.members[i]._id > max)
-            max = c.members[i]._id;
-    if (isString(hostport)) {
-        cfg = {_id: max + 1, host: hostport};
-        if (arb)
-            cfg.arbiterOnly = true;
-    } else if (arb == true) {
-        throw Error("Expected first parameter to be a host-and-port string of arbiter, but got " +
-                    tojson(hostport));
-    }
+        const attemptedVersion = c.version++;
 
-    if (cfg._id == null) {
-        cfg._id = max + 1;
-    }
-    c.members.push(cfg);
-    return this._runCmd({replSetReconfig: c});
+        var max = 0;
+        for (var i in c.members) {
+            // Omit 'newlyAdded' field if it exists in the config.
+            delete c.members[i].newlyAdded;
+            if (c.members[i]._id > max)
+                max = c.members[i]._id;
+        }
+        if (isString(hostport)) {
+            cfg = {_id: max + 1, host: hostport};
+            if (arb)
+                cfg.arbiterOnly = true;
+        } else if (arb == true) {
+            throw Error(
+                "Expected first parameter to be a host-and-port string of arbiter, but got " +
+                tojson(hostport));
+        }
+
+        if (cfg._id == null) {
+            cfg._id = max + 1;
+        }
+        c.members.push(cfg);
+
+        res = self._runCmd({replSetReconfig: c});
+        if (res === "") {
+            // _runCmd caught an exception.
+            return true;
+        }
+        if (res.ok) {
+            return true;
+        }
+        if (res.code === ErrorCodes.ConfigurationInProgress) {
+            return false;  // keep retrying
+        }
+        if (res.code === ErrorCodes.NewReplicaSetConfigurationIncompatible) {
+            // We will retry only if this error was due to our config version being too low.
+            const cfgState = local.system.replset.findOne();
+            if (cfgState.version >= attemptedVersion) {
+                return false;  // keep retrying
+            }
+        }
+        // Take no action on other errors.
+        return true;
+    }, () => tojson(res), 10 * 60 * 1000 /* timeout */, 200 /* interval */);
+
+    return res;
 };
 rs.syncFrom = function(host) {
     return db._adminCommand({replSetSyncFrom: host});
@@ -1547,13 +1625,13 @@ rs.conf = function() {
     if (resp.ok && !(resp.errmsg) && resp.config)
         return resp.config;
     else if (resp.errmsg && resp.errmsg.startsWith("no such cmd"))
-        return db.getSisterDB("local").system.replset.findOne();
+        return db.getSiblingDB("local").system.replset.findOne();
     throw new Error("Could not retrieve replica set config: " + tojson(resp));
 };
 rs.config = rs.conf;
 
 rs.remove = function(hn) {
-    var local = db.getSisterDB("local");
+    var local = db.getSiblingDB("local");
     assert(local.system.replset.count() <= 1,
            "error: local.system.replset has unexpected contents");
     var c = local.system.replset.findOne();
@@ -1575,7 +1653,7 @@ rs.debug = {};
 rs.debug.nullLastOpWritten = function(primary, secondary) {
     var p = connect(primary + "/local");
     var s = connect(secondary + "/local");
-    s.getMongo().setSlaveOk();
+    s.getMongo().setSecondaryOk();
 
     var secondToLast = s.oplog.rs.find().sort({$natural: -1}).limit(1).next();
     var last = p.runCommand({
@@ -1596,11 +1674,11 @@ rs.debug.nullLastOpWritten = function(primary, secondary) {
 };
 
 rs.debug.getLastOpWritten = function(server) {
-    var s = db.getSisterDB("local");
+    var s = db.getSiblingDB("local");
     if (server) {
         s = connect(server + "/local");
     }
-    s.getMongo().setSlaveOk();
+    s.getMongo().setSecondaryOk();
 
     return s.oplog.rs.find().sort({$natural: -1}).limit(1).next();
 };

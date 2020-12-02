@@ -32,6 +32,7 @@
 #include <iosfwd>
 #include <string>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/rpc/metadata.h"
 #include "mongo/transport/transport_layer.h"
@@ -44,17 +45,14 @@ namespace executor {
 
 struct RemoteCommandRequestBase {
     struct HedgeOptions {
-        size_t count;
-        int maxTimeMSForHedgedReads;
+        size_t count = 0;
+        int maxTimeMSForHedgedReads = 0;
     };
 
     enum FireAndForgetMode { kOn, kOff };
 
     // Indicates that there is no timeout for the request to complete
     static constexpr Milliseconds kNoTimeout{-1};
-
-    // Indicates that there is no expiration time by when the request needs to complete
-    static constexpr Date_t kNoExpirationDate{Date_t::max()};
 
     // Type to represent the internal id of this request
     typedef uint64_t RequestId;
@@ -89,17 +87,32 @@ struct RemoteCommandRequestBase {
 
     boost::optional<UUID> operationKey;
 
-    FireAndForgetMode fireAndForgetMode;
+    FireAndForgetMode fireAndForgetMode = FireAndForgetMode::kOff;
+
+    // When false, the network interface will refrain from enforcing the 'timeout' for this request,
+    // but will still pass the timeout on as maxTimeMSOpOnly.
+    bool enforceLocalTimeout = true;
 
     Milliseconds timeout = kNoTimeout;
+    ErrorCodes::Error timeoutCode = ErrorCodes::NetworkInterfaceExceededTimeLimit;
 
-    // Deadline by when the request must be completed
-    Date_t expirationDate = kNoExpirationDate;
+    // Time when the request was scheduled.
+    boost::optional<Date_t> dateScheduled;
 
     transport::ConnectSSLMode sslMode = transport::kGlobalSSLMode;
 
 protected:
     ~RemoteCommandRequestBase() = default;
+
+private:
+    /**
+     * Sets 'timeout' to the min of the current 'timeout' value and the remaining time on the OpCtx.
+     * If the remaining time is less than the provided 'timeout', remembers the timeout error code
+     * from the opCtx to use later if the timeout is indeed triggered.  This is important so that
+     * timeouts that are a direct result of a user-provided maxTimeMS return MaxTimeMSExpired rather
+     * than NetworkInterfaceExceededTimeLimit.
+     */
+    void _updateTimeoutFromOpCtxDeadline(const OperationContext* opCtx);
 };
 
 /**

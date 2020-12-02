@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -41,7 +41,6 @@
 #include "mongo/client/connection_pool.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
-#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/dbhelpers.h"
@@ -51,6 +50,7 @@
 #include "mongo/db/repl/oplog_interface_local.h"
 #include "mongo/db/repl/oplog_interface_remote.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
+#include "mongo/db/repl/replication_consistency_markers_impl.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/replication_process.h"
@@ -58,10 +58,12 @@
 #include "mongo/db/repl/rs_rollback.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
+#include "mongo/db/shutdown_in_progress_quiesce_info.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/util/str.h"
+#include "mongo/util/testing_proctor.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -109,10 +111,11 @@ public:
         ReplicationCoordinator* replicationCoordinator,
         ReplicationCoordinatorExternalState* replicationCoordinatorExternalState,
         BackgroundSync* bgsync);
-    bool shouldStopFetching(const HostAndPort& source,
-                            const rpc::ReplSetMetadata& replMetadata,
-                            const rpc::OplogQueryMetadata& oqMetadata,
-                            const OpTime& lastOpTimeFetched) override;
+    ChangeSyncSourceAction shouldStopFetching(const HostAndPort& source,
+                                              const rpc::ReplSetMetadata& replMetadata,
+                                              const rpc::OplogQueryMetadata& oqMetadata,
+                                              const OpTime& previousOpTimeFetched,
+                                              const OpTime& lastOpTimeFetched) override;
 
 private:
     BackgroundSync* _bgsync;
@@ -125,17 +128,18 @@ DataReplicatorExternalStateBackgroundSync::DataReplicatorExternalStateBackground
     : DataReplicatorExternalStateImpl(replicationCoordinator, replicationCoordinatorExternalState),
       _bgsync(bgsync) {}
 
-bool DataReplicatorExternalStateBackgroundSync::shouldStopFetching(
+ChangeSyncSourceAction DataReplicatorExternalStateBackgroundSync::shouldStopFetching(
     const HostAndPort& source,
     const rpc::ReplSetMetadata& replMetadata,
     const rpc::OplogQueryMetadata& oqMetadata,
+    const OpTime& previousOpTimeFetched,
     const OpTime& lastOpTimeFetched) {
     if (_bgsync->shouldStopFetching()) {
-        return true;
+        return ChangeSyncSourceAction::kStopSyncingAndEnqueueLastBatch;
     }
 
     return DataReplicatorExternalStateImpl::shouldStopFetching(
-        source, replMetadata, oqMetadata, lastOpTimeFetched);
+        source, replMetadata, oqMetadata, previousOpTimeFetched, lastOpTimeFetched);
 }
 
 size_t getSize(const BSONObj& o) {
@@ -265,7 +269,7 @@ void BackgroundSync::_produce() {
         LOGV2(21079,
               "bgsync - stopReplProducer fail point "
               "enabled. Blocking until fail point is disabled.");
-        mongo::sleepsecs(1);
+        mongo::sleepmillis(_getRetrySleepMS());
         return;
     }
 
@@ -338,7 +342,7 @@ void BackgroundSync::_produce() {
 
     numSyncSourceSelections.increment(1);
 
-    if (syncSourceResp.syncSourceStatus == ErrorCodes::OplogStartMissing) {
+    if (syncSourceResp.syncSourceStatus == ErrorCodes::TooStaleToSyncFromSource) {
         // All (accessible) sync sources are too far ahead of us.
         if (_replCoord->getMemberState().primary()) {
             LOGV2_WARNING(21115,
@@ -407,10 +411,7 @@ void BackgroundSync::_produce() {
         // out of date. In that case we sleep for 1 second to reduce the amount we spin waiting
         // for our map to update.
         if (oldSource == source) {
-            long long sleepMS = 1000;
-            forceBgSyncSyncSourceRetryWaitMS.execute(
-                [&](const BSONObj& data) { sleepMS = data["sleepMS"].numberInt(); });
-
+            long long sleepMS = _getRetrySleepMS();
             LOGV2(21087,
                   "Chose same sync source candidate as last time, {syncSource}. Sleeping for "
                   "{sleepDurationMillis}ms to avoid immediately choosing a new sync source for the "
@@ -439,10 +440,7 @@ void BackgroundSync::_produce() {
                   "error"_attr = syncSourceResp.syncSourceStatus.getStatus());
         }
 
-        long long sleepMS = 1000;
-        forceBgSyncSyncSourceRetryWaitMS.execute(
-            [&](const BSONObj& data) { sleepMS = data["sleepMS"].numberInt(); });
-
+        long long sleepMS = _getRetrySleepMS();
         // No sync source found.
         LOGV2_DEBUG(21090,
                     1,
@@ -488,6 +486,20 @@ void BackgroundSync::_produce() {
     // before the OplogWriter gets a chance to append to the oplog.
     {
         auto opCtx = cc().makeOperationContext();
+
+        // Check if the producer has been stopped so that we can prevent setting the applied point
+        // after step up has already cleared it. We need to acquire the collection lock before the
+        // mutex to preserve proper lock ordering.
+        AutoGetCollection autoColl(
+            opCtx.get(),
+            NamespaceString(ReplicationConsistencyMarkersImpl::kDefaultMinValidNamespace),
+            MODE_IX);
+        stdx::lock_guard<Latch> lock(_mutex);
+
+        if (_state != ProducerState::Running) {
+            return;
+        }
+
         if (_replicationProcess->getConsistencyMarkers()->getAppliedThrough(opCtx.get()).isNull()) {
             _replicationProcess->getConsistencyMarkers()->setAppliedThrough(
                 opCtx.get(), _replCoord->getMyLastAppliedOpTime());
@@ -496,12 +508,20 @@ void BackgroundSync::_produce() {
 
     // "lastFetched" not used. Already set in _enqueueDocuments.
     Status fetcherReturnStatus = Status::OK();
+    int syncSourceRBID = syncSourceResp.rbid;
+
     DataReplicatorExternalStateBackgroundSync dataReplicatorExternalState(
         _replCoord, _replicationCoordinatorExternalState, this);
     OplogFetcher* oplogFetcher;
     try {
-        auto onOplogFetcherShutdownCallbackFn = [&fetcherReturnStatus](const Status& status) {
+        auto onOplogFetcherShutdownCallbackFn = [&fetcherReturnStatus,
+                                                 &syncSourceRBID](const Status& status, int rbid) {
             fetcherReturnStatus = status;
+            // If the syncSourceResp rbid is uninitialized, syncSourceRBID will be set to the
+            // rbid obtained in the oplog fetcher.
+            if (syncSourceRBID == ReplicationProcess::kUninitializedRollbackId) {
+                syncSourceRBID = rbid;
+            }
         };
         // The construction of OplogFetcher has to be outside bgsync mutex, because it calls
         // replication coordinator.
@@ -531,9 +551,9 @@ void BackgroundSync::_produce() {
         fassertFailedWithStatus(34440, exceptionToStatus());
     }
 
-    const auto logLevel = getTestCommandsEnabled() ? 0 : 1;
+    const auto logLevel = TestingProctor::instance().isEnabled() ? 0 : 1;
     LOGV2_DEBUG(21092,
-                logSeverityV1toV2(logLevel).toInt(),
+                logLevel,
                 "scheduling fetcher to read remote oplog on {syncSource} starting at "
                 "{lastOpTimeFetched}",
                 "Scheduling fetcher to read remote oplog",
@@ -566,20 +586,20 @@ void BackgroundSync::_produce() {
         return;
     }
 
+    Milliseconds blacklistDuration(60000);
     if (fetcherReturnStatus.code() == ErrorCodes::OplogOutOfOrder) {
         // This is bad because it means that our source
         // has not returned oplog entries in ascending ts order, and they need to be.
 
         LOGV2_WARNING(
-            21120, "{error}", "Fetcher returned error", "error"_attr = redact(fetcherReturnStatus));
+            21120, "Oplog fetcher returned error", "error"_attr = redact(fetcherReturnStatus));
         // Do not blacklist the server here, it will be blacklisted when we try to reuse it,
         // if it can't return a matching oplog start from the last fetch oplog ts field.
         return;
     } else if (fetcherReturnStatus.code() == ErrorCodes::OplogStartMissing) {
         auto opCtx = cc().makeOperationContext();
         auto storageInterface = StorageInterface::get(opCtx.get());
-        _runRollback(
-            opCtx.get(), fetcherReturnStatus, source, syncSourceResp.rbid, storageInterface);
+        _runRollback(opCtx.get(), fetcherReturnStatus, source, syncSourceRBID, storageInterface);
 
         if (bgSyncHangAfterRunRollback.shouldFail()) {
             LOGV2(21095, "bgSyncHangAfterRunRollback failpoint is set");
@@ -587,19 +607,38 @@ void BackgroundSync::_produce() {
                 mongo::sleepmillis(100);
             }
         }
-    } else if (fetcherReturnStatus == ErrorCodes::InvalidBSON) {
-        Seconds blacklistDuration(60);
-        LOGV2_WARNING(21121,
-                      "Fetcher got invalid BSON while querying oplog. Blacklisting sync source "
-                      "{syncSource} for {blacklistDuration}.",
-                      "Fetcher got invalid BSON while querying oplog. Blacklisting sync source",
-                      "syncSource"_attr = source,
-                      "blacklistDuration"_attr = blacklistDuration);
+    } else if (fetcherReturnStatus.code() == ErrorCodes::TooStaleToSyncFromSource) {
+        LOGV2_WARNING(
+            2806800,
+            "Oplog fetcher discovered we are too stale to sync from sync source. Blacklisting "
+            "sync source",
+            "syncSource"_attr = source,
+            "blacklistDuration"_attr = blacklistDuration);
         _replCoord->blacklistSyncSource(source, Date_t::now() + blacklistDuration);
+    } else if (fetcherReturnStatus == ErrorCodes::InvalidBSON) {
+        LOGV2_WARNING(
+            21121,
+            "Oplog fetcher got invalid BSON while querying oplog. Blacklisting sync source "
+            "{syncSource} for {blacklistDuration}.",
+            "Oplog fetcher got invalid BSON while querying oplog. Blacklisting sync source",
+            "syncSource"_attr = source,
+            "blacklistDuration"_attr = blacklistDuration);
+        _replCoord->blacklistSyncSource(source, Date_t::now() + blacklistDuration);
+    } else if (fetcherReturnStatus.code() == ErrorCodes::ShutdownInProgress) {
+        if (auto quiesceInfo = fetcherReturnStatus.extraInfo<ShutdownInProgressQuiesceInfo>()) {
+            blacklistDuration = Milliseconds(quiesceInfo->getRemainingQuiesceTimeMillis());
+            LOGV2_WARNING(
+                4696201,
+                "Sync source was in quiesce mode while we were querying its oplog. Blacklisting "
+                "sync source",
+                "syncSource"_attr = source,
+                "blacklistDuration"_attr = blacklistDuration);
+            _replCoord->blacklistSyncSource(source, Date_t::now() + blacklistDuration);
+        }
     } else if (!fetcherReturnStatus.isOK()) {
         LOGV2_WARNING(21122,
-                      "Fetcher stopped querying remote oplog with error: {error}",
-                      "Fetcher stopped querying remote oplog with error",
+                      "Oplog fetcher stopped querying remote oplog with error: {error}",
+                      "Oplog fetcher stopped querying remote oplog with error",
                       "error"_attr = redact(fetcherReturnStatus));
     }
 }
@@ -676,8 +715,9 @@ void BackgroundSync::_runRollback(OperationContext* opCtx,
 
     ShouldNotConflictWithSecondaryBatchApplicationBlock noConflict(opCtx->lockState());
 
-    // Explicitly start future read transactions without a timestamp.
-    opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
+    // Ensure future transactions read without a timestamp.
+    invariant(RecoveryUnit::ReadSource::kNoTimestamp ==
+              opCtx->recoveryUnit()->getTimestampReadSource());
 
     // Rollback is a synchronous operation that uses the task executor and may not be
     // executed inside the fetcher callback.
@@ -854,8 +894,9 @@ void BackgroundSync::start(OperationContext* opCtx) {
     OpTime lastAppliedOpTime;
     ShouldNotConflictWithSecondaryBatchApplicationBlock noConflict(opCtx->lockState());
 
-    // Explicitly start future read transactions without a timestamp.
-    opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
+    // Ensure future transactions read without a timestamp.
+    invariant(RecoveryUnit::ReadSource::kNoTimestamp ==
+              opCtx->recoveryUnit()->getTimestampReadSource());
 
     do {
         lastAppliedOpTime = _readLastAppliedOpTime(opCtx);
@@ -962,6 +1003,12 @@ void BackgroundSync::startProducerIfStopped() {
     }
 }
 
+long long BackgroundSync::_getRetrySleepMS() {
+    long long sleepMS = 1000;
+    forceBgSyncSyncSourceRetryWaitMS.execute(
+        [&](const BSONObj& data) { sleepMS = data["sleepMS"].numberInt(); });
+    return sleepMS;
+}
 
 }  // namespace repl
 }  // namespace mongo

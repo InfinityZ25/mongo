@@ -1,4 +1,7 @@
 // SERVER-2386, general geo-indexing using very large and very small bounds
+// @tags: [
+//   sbe_incompatible,
+// ]
 
 load("jstests/libs/geo_near_random.js");
 
@@ -53,7 +56,7 @@ for (var i = 0; i < scales.length; i++) {
 
     var t = db["geo_small_large"];
     t.drop();
-    t.ensureIndex({p: "2d"}, {min: min, max: max, bits: bits});
+    t.createIndex({p: "2d"}, {min: min, max: max, bits: bits});
 
     var outPoints = 0;
     var inPoints = 0;

@@ -1,5 +1,3 @@
-// @tags: [requires_fcv_44]
-
 (function() {
 'use strict';
 
@@ -120,7 +118,8 @@ assert.commandWorked(s.s0.adminCommand({shardcollection: "test.foo9", key: {a: 1
 // --- listDatabases ---
 var r = db.getMongo().getDBs();
 assert.eq(3, r.databases.length, tojson(r));
-assert.eq("number", typeof (r.totalSize), "listDatabases 3 : " + tojson(r));
+assert(r.totalSize > 0, "listDatabases 3 : " + tojson(r));
+assert(r.totalSizeMb >= 0, "listDatabases 3 : " + tojson(r));
 
 // --- flushRouterconfig ---
 assert.commandWorked(s.s0.adminCommand({flushRouterConfig: 1}));

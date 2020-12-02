@@ -32,6 +32,7 @@
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/commands/feature_compatibility_version_document_gen.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/server_options.h"
 
@@ -52,25 +53,38 @@ public:
     static Lock::ResourceMutex fcvLock;
 
     /**
-     * Records intent to perform a 4.4 -> 4.6 upgrade by updating the on-disk feature
-     * compatibility version document to have 'version'=4.4, 'targetVersion'=4.6.
-     * Should be called before schemas are modified.
+     * Reads the featureCompatibilityVersion (FCV) document in admin.system.version and initializes
+     * the FCV global state. Returns an error if the FCV document exists and is invalid. Does not
+     * return an error if it is missing. This should be checked after startup with
+     * fassertInitializedAfterStartup.
+     *
+     * Throws a MustDowngrade error if an existing FCV document contains an invalid version.
      */
-    static void setTargetUpgrade(OperationContext* opCtx);
+    static void initializeForStartup(OperationContext* opCtx);
 
     /**
-     * Records intent to perform a 4.6 -> 4.4 downgrade by updating the on-disk feature
-     * compatibility version document to have 'version'=4.4, 'targetVersion'=4.4.
-     * Should be called before schemas are modified.
+     * Fatally asserts if the featureCompatibilityVersion is not properly initialized after startup.
      */
-    static void setTargetDowngrade(OperationContext* opCtx);
+    static void fassertInitializedAfterStartup(OperationContext* opCtx);
 
     /**
-     * Records the completion of a 4.4 <-> 4.6 upgrade or downgrade by updating the on-disk feature
-     * compatibility version document to have 'version'=version and unsetting the 'targetVersion'
-     * field. Should be called after schemas are modified.
+     * uassert that a transition from fromVersion to newVersion is permitted. Different rules apply
+     * if the request is from a config server.
      */
-    static void unsetTargetUpgradeOrDowngrade(OperationContext* opCtx, StringData version);
+    static void validateSetFeatureCompatibilityVersionRequest(
+        ServerGlobalParams::FeatureCompatibility::Version fromVersion,
+        ServerGlobalParams::FeatureCompatibility::Version newVersion,
+        bool isFromConfigServer);
+
+    /**
+     * Updates the on-disk feature compatibility version document for the transition fromVersion ->
+     * newVersion. This is required to be a valid transition.
+     */
+    static void updateFeatureCompatibilityVersionDocument(
+        OperationContext* opCtx,
+        ServerGlobalParams::FeatureCompatibility::Version fromVersion,
+        ServerGlobalParams::FeatureCompatibility::Version newVersion,
+        bool isFromConfigServer);
 
     /**
      * If there are no non-local databases, store the featureCompatibilityVersion document. If we
@@ -87,41 +101,10 @@ public:
     static bool isCleanStartUp();
 
     /**
-     * Examines a document inserted or updated in the server configuration collection
-     * (admin.system.version). If it is the featureCompatibilityVersion document, validates the
-     * document and on commit, updates the server parameter.
-     */
-    static void onInsertOrUpdate(OperationContext* opCtx, const BSONObj& doc);
-
-    /**
      * Sets the server's outgoing and incomingInternalClient minWireVersions according to the
      * current featureCompatibilityVersion value.
      */
     static void updateMinWireVersion();
-
-    /**
-     * Ensures the in-memory and on-disk FCV states are consistent after a rollback.
-     */
-    static void onReplicationRollback(OperationContext* opCtx);
-
-private:
-    /**
-     * Validate version. Uasserts if invalid.
-     */
-    static void _validateVersion(StringData version);
-
-    /**
-     * Build update command.
-     */
-    typedef std::function<void(BSONObjBuilder)> UpdateBuilder;
-    static void _runUpdateCommand(OperationContext* opCtx, UpdateBuilder callback);
-
-    /**
-     * Set the FCV to newVersion, making sure to close any outgoing connections with incompatible
-     * servers and closing open transactions if necessary. Increments the server TopologyVersion.
-     */
-    static void _setVersion(OperationContext* opCtx,
-                            ServerGlobalParams::FeatureCompatibility::Version newVersion);
 };
 
 /**
@@ -135,6 +118,10 @@ public:
     }
 
     ~FixedFCVRegion() = default;
+
+    void release() {
+        _lk.reset();
+    }
 
 private:
     boost::optional<Lock::SharedLock> _lk;

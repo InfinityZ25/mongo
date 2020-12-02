@@ -29,7 +29,9 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/pipeline/variables.h"
 #include "mongo/s/write_ops/batched_command_request.h"
+#include "mongo/util/visit_helper.h"
 
 #include "mongo/bson/bsonobj.h"
 
@@ -45,12 +47,10 @@ BatchedCommandRequest constructBatchedCommandRequest(const OpMsgRequest& request
 
     auto chunkVersion = ChunkVersion::parseFromCommand(request.body);
     if (chunkVersion != ErrorCodes::NoSuchKey) {
-        batchRequest.setShardVersion(uassertStatusOK(std::move(chunkVersion)));
         if (chunkVersion == ChunkVersion::UNSHARDED()) {
-            auto dbVersion = DatabaseVersion::parse(IDLParserErrorContext("BatchedCommandRequest"),
-                                                    request.body);
-            batchRequest.setDbVersion(std::move(dbVersion));
+            batchRequest.setDbVersion(DatabaseVersion(request.body));
         }
+        batchRequest.setShardVersion(uassertStatusOK(std::move(chunkVersion)));
     }
 
     auto writeConcernField = request.body[kWriteConcern];
@@ -66,6 +66,10 @@ BatchedCommandRequest constructBatchedCommandRequest(const OpMsgRequest& request
 }
 
 }  // namespace
+
+const boost::optional<LegacyRuntimeConstants> BatchedCommandRequest::kEmptyRuntimeConstants =
+    boost::optional<LegacyRuntimeConstants>{};
+const boost::optional<BSONObj> BatchedCommandRequest::kEmptyLet = boost::optional<BSONObj>{};
 
 BatchedCommandRequest BatchedCommandRequest::parseInsert(const OpMsgRequest& request) {
     return constructBatchedCommandRequest<InsertOp>(request);
@@ -97,6 +101,51 @@ std::size_t BatchedCommandRequest::sizeWriteOps() const {
     };
     return _visit(Visitor{});
 }
+
+bool BatchedCommandRequest::hasLegacyRuntimeConstants() const {
+    return _visit(visit_helper::Overloaded{
+        [](write_ops::Insert&) { return false; },
+        [&](write_ops::Update& op) { return op.getLegacyRuntimeConstants().has_value(); },
+        [&](write_ops::Delete& op) { return op.getLegacyRuntimeConstants().has_value(); }});
+}
+
+void BatchedCommandRequest::setLegacyRuntimeConstants(LegacyRuntimeConstants runtimeConstants) {
+    _visit(visit_helper::Overloaded{
+        [](write_ops::Insert&) {},
+        [&](write_ops::Update& op) { op.setLegacyRuntimeConstants(std::move(runtimeConstants)); },
+        [&](write_ops::Delete& op) { op.setLegacyRuntimeConstants(std::move(runtimeConstants)); }});
+}
+
+const boost::optional<LegacyRuntimeConstants>& BatchedCommandRequest::getLegacyRuntimeConstants()
+    const {
+    struct Visitor {
+        auto& operator()(const write_ops::Insert& op) const {
+            return kEmptyRuntimeConstants;
+        }
+        auto& operator()(const write_ops::Update& op) const {
+            return op.getLegacyRuntimeConstants();
+        }
+        auto& operator()(const write_ops::Delete& op) const {
+            return op.getLegacyRuntimeConstants();
+        }
+    };
+    return _visit(Visitor{});
+};
+
+const boost::optional<BSONObj>& BatchedCommandRequest::getLet() const {
+    struct Visitor {
+        auto& operator()(const write_ops::Insert& op) const {
+            return kEmptyLet;
+        }
+        auto& operator()(const write_ops::Update& op) const {
+            return op.getLet();
+        }
+        auto& operator()(const write_ops::Delete& op) const {
+            return op.getLet();
+        }
+    };
+    return _visit(Visitor{});
+};
 
 bool BatchedCommandRequest::isVerboseWC() const {
     if (!hasWriteConcern()) {

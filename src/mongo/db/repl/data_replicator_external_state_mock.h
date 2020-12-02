@@ -45,16 +45,18 @@ public:
     DataReplicatorExternalStateMock();
 
     executor::TaskExecutor* getTaskExecutor() const override;
+    std::shared_ptr<executor::TaskExecutor> getSharedTaskExecutor() const override;
 
     OpTimeWithTerm getCurrentTermAndLastCommittedOpTime() override;
 
     void processMetadata(const rpc::ReplSetMetadata& metadata,
                          rpc::OplogQueryMetadata oqMetadata) override;
 
-    bool shouldStopFetching(const HostAndPort& source,
-                            const rpc::ReplSetMetadata& replMetadata,
-                            const rpc::OplogQueryMetadata& oqMetadata,
-                            const OpTime& lastOpTimeFetched) override;
+    ChangeSyncSourceAction shouldStopFetching(const HostAndPort& source,
+                                              const rpc::ReplSetMetadata& replMetadata,
+                                              const rpc::OplogQueryMetadata& oqMetadata,
+                                              const OpTime& previousOpTimeFetched,
+                                              const OpTime& lastOpTimeFetched) override;
 
     std::unique_ptr<OplogBuffer> makeInitialSyncOplogBuffer(OperationContext* opCtx) const override;
 
@@ -68,8 +70,8 @@ public:
 
     StatusWith<ReplSetConfig> getCurrentConfig() const override;
 
-    // Task executor. Not owned by us.
-    executor::TaskExecutor* taskExecutor = nullptr;
+    // Task executor.
+    std::shared_ptr<executor::TaskExecutor> taskExecutor = nullptr;
 
     // Returned by getCurrentTermAndLastCommittedOpTime.
     long long currentTerm = OpTime::kUninitializedTerm;
@@ -86,7 +88,7 @@ public:
     bool syncSourceHasSyncSource = false;
 
     // Returned by shouldStopFetching.
-    bool shouldStopFetchingResult = false;
+    ChangeSyncSourceAction shouldStopFetchingResult = ChangeSyncSourceAction::kContinueSyncing;
 
     // Override to change applyOplogBatch behavior.
     using ApplyOplogBatchFn = std::function<StatusWith<OpTime>(

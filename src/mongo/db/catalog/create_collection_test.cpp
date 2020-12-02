@@ -55,7 +55,7 @@ private:
     void tearDown() override;
 
 protected:
-    void validateValidator(const std::string& validatorStr, const int expectedError);
+    void validateValidator(const std::string& validatorStr, int expectedError);
 
     // Use StorageInterface to access storage features below catalog interface.
     std::unique_ptr<repl::StorageInterface> _storage;
@@ -86,11 +86,12 @@ void CreateCollectionTest::tearDown() {
  * Creates an OperationContext.
  */
 ServiceContext::UniqueOperationContext makeOpCtx() {
-    return cc().makeOperationContext();
+    auto opCtx = cc().makeOperationContext();
+    repl::createOplog(opCtx.get());
+    return opCtx;
 }
 
-void CreateCollectionTest::validateValidator(const std::string& validatorStr,
-                                             const int expectedError) {
+void CreateCollectionTest::validateValidator(const std::string& validatorStr, int expectedError) {
     NamespaceString newNss("test.newCollWithValidation");
 
     auto opCtx = makeOpCtx();
@@ -105,6 +106,7 @@ void CreateCollectionTest::validateValidator(const std::string& validatorStr,
     ASSERT_TRUE(db) << "Cannot create collection " << newNss << " because database " << newNss.db()
                     << " does not exist.";
 
+    WriteUnitOfWork wuow(opCtx.get());
     const auto status =
         db->userCreateNS(opCtx.get(), newNss, options, false /*createDefaultIndexes*/);
     ASSERT_EQ(expectedError, status.code());
@@ -121,8 +123,7 @@ bool collectionExists(OperationContext* opCtx, const NamespaceString& nss) {
  * Returns collection options.
  */
 CollectionOptions getCollectionOptions(OperationContext* opCtx, const NamespaceString& nss) {
-    AutoGetCollectionForRead autoColl(opCtx, nss);
-    auto collection = autoColl.getCollection();
+    AutoGetCollectionForRead collection(opCtx, nss);
     ASSERT_TRUE(collection) << "Unable to get collections options for " << nss
                             << " because collection does not exist.";
     return DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, collection->getCatalogId());
@@ -213,8 +214,8 @@ TEST_F(CreateCollectionTest,
     ASSERT_EQUALS(uuid, getCollectionUuid(opCtx.get(), newNss));
 
     // Check that old collection that was renamed out of the way still exists.
-    auto& catalog = CollectionCatalog::get(opCtx.get());
-    auto renamedCollectionNss = catalog.lookupNSSByUUID(opCtx.get(), existingCollectionUuid);
+    auto catalog = CollectionCatalog::get(opCtx.get());
+    auto renamedCollectionNss = catalog->lookupNSSByUUID(opCtx.get(), existingCollectionUuid);
     ASSERT(renamedCollectionNss);
     ASSERT_TRUE(collectionExists(opCtx.get(), *renamedCollectionNss))
         << "old renamed collection with UUID " << existingCollectionUuid
@@ -267,4 +268,28 @@ TEST_F(CreateCollectionTest, ValidationOptions) {
     validateValidator("{$expr: {$_internalJsEmit: {eval: 'function() {}', this: {}}}}", 4660801);
     validateValidator("{$where: 'this.a == this.b'}", static_cast<int>(ErrorCodes::BadValue));
 }
+
+// Tests that validator validation is disabled when inserting a document into a
+// <database>.system.resharding.* collection. The primary donor is responsible for validating
+// documents before they are inserted into the recipient's temporary resharding collection.
+TEST_F(CreateCollectionTest, ValidationDisabledForTemporaryReshardingCollection) {
+    NamespaceString reshardingNss("myDb", "system.resharding.yay");
+    auto opCtx = makeOpCtx();
+
+    Lock::GlobalLock lk(opCtx.get(), MODE_X);  // Satisfy low-level locking invariants.
+    BSONObj createCmdObj = BSON("create" << reshardingNss.coll() << "validator" << BSON("a" << 5));
+    ASSERT_OK(createCollection(opCtx.get(), reshardingNss.db().toString(), createCmdObj));
+    ASSERT_TRUE(collectionExists(opCtx.get(), reshardingNss));
+
+    AutoGetCollection collection(opCtx.get(), reshardingNss, MODE_X);
+
+    WriteUnitOfWork wuow(opCtx.get());
+    // Ensure a document that violates validator criteria can be inserted into the temporary
+    // resharding collection.
+    auto insertObj = fromjson("{'_id':2, a:1}");
+    auto status =
+        collection->insertDocument(opCtx.get(), InsertStatement(insertObj), nullptr, false);
+    ASSERT_OK(status);
+}
+
 }  // namespace

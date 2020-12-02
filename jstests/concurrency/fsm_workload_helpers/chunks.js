@@ -60,13 +60,20 @@ var ChunkHelper = (function() {
         return runCommandWithRetries(db, cmd, res => res.code === ErrorCodes.LockBusy);
     }
 
-    function moveChunk(db, collName, bounds, toShard, waitForDelete) {
+    function moveChunk(db, collName, bounds, toShard, waitForDelete, secondaryThrottle) {
         var cmd = {
             moveChunk: db[collName].getFullName(),
             bounds: bounds,
             to: toShard,
             _waitForDelete: waitForDelete
         };
+
+        // Using _secondaryThrottle adds coverage for additional waits for write concern on the
+        // recipient during cloning.
+        if (secondaryThrottle) {
+            cmd._secondaryThrottle = true;
+            cmd.writeConcern = {w: "majority"};  // _secondaryThrottle requires a write concern.
+        }
 
         const runningWithStepdowns =
             TestData.runningWithConfigStepdowns || TestData.runningWithShardStepdowns;
@@ -76,6 +83,7 @@ var ChunkHelper = (function() {
             cmd,
             res => (res.code === ErrorCodes.ConflictingOperationInProgress ||
                     res.code === ErrorCodes.ChunkRangeCleanupPending ||
+                    res.code === ErrorCodes.LockTimeout ||
                     // The chunk migration has surely been aborted if the startCommit of the
                     // procedure was interrupted by a stepdown.
                     (runningWithStepdowns && res.code === ErrorCodes.CommandFailed &&
@@ -83,7 +91,15 @@ var ChunkHelper = (function() {
                     // The chunk migration has surely been aborted if the recipient shard didn't
                     // believe there was an active chunk migration.
                     (runningWithStepdowns && res.code === ErrorCodes.OperationFailed &&
-                     res.errmsg.includes("NotYetInitialized"))));
+                     res.errmsg.includes("NotYetInitialized")) ||
+                    // The chunk migration has surely been aborted if there was another active
+                    // chunk migration on the donor.
+                    (runningWithStepdowns && res.code === ErrorCodes.OperationFailed &&
+                     res.errmsg.includes("does not match active session id")) ||
+                    // A stepdown may cause the collection's lock to become temporarily unreleasable
+                    // and cause the chunk migration to timeout.  The migration may still succeed
+                    // after the lock's lease expires.
+                    (runningWithStepdowns && res.code === ErrorCodes.LockBusy)));
     }
 
     function mergeChunks(db, collName, bounds) {
@@ -93,7 +109,7 @@ var ChunkHelper = (function() {
 
     // Take a set of connections to a shard (replica set or standalone mongod),
     // or a set of connections to the config servers, and return a connection
-    // to any node in the set for which ismaster is true.
+    // to any node in the set for which isWritablePrimary is true.
     function getPrimary(connArr) {
         const kDefaultTimeoutMS = 10 * 60 * 1000;  // 10 minutes.
         assertAlways(Array.isArray(connArr), 'Expected an array but got ' + tojson(connArr));
@@ -102,10 +118,10 @@ var ChunkHelper = (function() {
         assert.soon(() => {
             for (let conn of connArr) {
                 assert(isMongod(conn.getDB('admin')), tojson(conn) + ' is not to a mongod');
-                let res = conn.adminCommand({isMaster: 1});
+                let res = conn.adminCommand({hello: 1});
                 assertAlways.commandWorked(res);
 
-                if (res.ismaster) {
+                if (res.isWritablePrimary) {
                     primary = conn;
                     return primary;
                 }

@@ -46,7 +46,6 @@
 namespace mongo {
 
 class CollatorInterface;
-class CollectionQueryInfo;
 class IndexAccessMethod;
 class IndexDescriptor;
 class MatchExpression;
@@ -59,20 +58,18 @@ class IndexCatalogEntryImpl : public IndexCatalogEntry {
 
 public:
     IndexCatalogEntryImpl(OperationContext* opCtx,
+                          RecordId catalogId,
                           const std::string& ident,
                           std::unique_ptr<IndexDescriptor> descriptor,  // ownership passes to me
-                          CollectionQueryInfo* queryInfo,               // not owned, optional
                           bool isFrozen);
-
-    ~IndexCatalogEntryImpl() final;
-
-    const NamespaceString& ns() const final;
 
     void init(std::unique_ptr<IndexAccessMethod> accessMethod) final;
 
     const std::string& getIdent() const final {
         return _ident;
     }
+
+    std::shared_ptr<Ident> getSharedIdent() const final;
 
     IndexDescriptor* descriptor() final {
         return _descriptor.get();
@@ -92,11 +89,7 @@ public:
         return _indexBuildInterceptor != nullptr;
     }
 
-    IndexBuildInterceptor* indexBuildInterceptor() final {
-        return _indexBuildInterceptor;
-    }
-
-    const IndexBuildInterceptor* indexBuildInterceptor() const final {
+    IndexBuildInterceptor* indexBuildInterceptor() const final {
         return _indexBuildInterceptor;
     }
 
@@ -115,6 +108,8 @@ public:
     const CollatorInterface* getCollator() const final {
         return _collator.get();
     }
+
+    NamespaceString getNSSFromCatalog(OperationContext* opCtx) const final;
 
     /// ---------------------
 
@@ -161,12 +156,18 @@ public:
      * namespace, index name, and multikey paths on the OperationContext rather than set the index
      * as multikey here.
      */
-    void setMultikey(OperationContext* opCtx, const MultikeyPaths& multikeyPaths) final;
+    void setMultikey(OperationContext* opCtx,
+                     const CollectionPtr& coll,
+                     const KeyStringSet& multikeyMetadataKeys,
+                     const MultikeyPaths& multikeyPaths) final;
 
-    // if this ready is ready for queries
     bool isReady(OperationContext* opCtx) const final;
 
     bool isFrozen() const final;
+
+    bool isPresentInMySnapshot(OperationContext* opCtx) const final;
+
+    bool isReadyInMySnapshot(OperationContext* opCtx) const final;
 
     KVPrefix getPrefix() const final {
         return _prefix;
@@ -176,7 +177,7 @@ public:
      * If return value is not boost::none, reads with majority read concern using an older snapshot
      * must treat this index as unfinished.
      */
-    boost::optional<Timestamp> getMinimumVisibleSnapshot() final {
+    boost::optional<Timestamp> getMinimumVisibleSnapshot() const final {
         return _minVisibleSnapshot;
     }
 
@@ -192,10 +193,8 @@ private:
      * Used by setMultikey() only.
      */
     Status _setMultikeyInMultiDocumentTransaction(OperationContext* opCtx,
+                                                  const CollectionPtr& collection,
                                                   const MultikeyPaths& multikeyPaths);
-
-    bool _catalogIsReady(OperationContext* opCtx) const;
-    bool _catalogIsPresent(OperationContext* opCtx) const;
 
     /**
      * Retrieves the multikey information associated with this index from '_collection',
@@ -207,7 +206,9 @@ private:
     /**
      * Sets on-disk multikey flag for this index.
      */
-    void _catalogSetMultikey(OperationContext* opCtx, const MultikeyPaths& multikeyPaths);
+    void _catalogSetMultikey(OperationContext* opCtx,
+                             const CollectionPtr& collection,
+                             const MultikeyPaths& multikeyPaths);
 
     KVPrefix _catalogGetPrefix(OperationContext* opCtx) const;
 
@@ -216,8 +217,6 @@ private:
     const std::string _ident;
 
     std::unique_ptr<IndexDescriptor> _descriptor;  // owned here
-
-    CollectionQueryInfo* _queryInfo;  // not owned here
 
     std::unique_ptr<IndexAccessMethod> _accessMethod;
 
@@ -230,15 +229,16 @@ private:
 
     // cached stuff
 
-    Ordering _ordering;  // TODO: this might be b-tree specific
-    bool _isReady;       // cache of NamespaceDetails info
+    const RecordId _catalogId;  // Location in the durable catalog of the collection entry
+                                // containing this index entry.
+    Ordering _ordering;         // TODO: this might be b-tree specific
+    bool _isReady;              // cache of NamespaceDetails info
     bool _isFrozen;
     AtomicWord<bool> _isDropped;  // Whether the index drop is committed.
 
-    // Set to true if this index supports path-level multikey tracking.
-    // '_indexTracksPathLevelMultikeyInfo' is effectively const after IndexCatalogEntry::init() is
-    // called.
-    bool _indexTracksPathLevelMultikeyInfo = false;
+    // Set to true if this index can track path-level multikey information in the catalog. This
+    // member is effectively const after IndexCatalogEntry::init() is called.
+    bool _indexTracksMultikeyPathsInCatalog = false;
 
     // Set to true if this index may contain multikey data.
     AtomicWord<bool> _isMultikeyForRead;

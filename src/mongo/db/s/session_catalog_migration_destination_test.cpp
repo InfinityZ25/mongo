@@ -46,6 +46,7 @@
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/migration_session_id.h"
 #include "mongo/db/s/session_catalog_migration_destination.h"
+#include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/session_txn_record_gen.h"
@@ -55,9 +56,7 @@
 #include "mongo/s/catalog/sharding_catalog_client_mock.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/shard_server_test_fixture.h"
 #include "mongo/stdx/thread.h"
-#include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace {
@@ -92,22 +91,24 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
                                 boost::optional<StmtId> stmtId,
                                 boost::optional<repl::OpTime> preImageOpTime = boost::none,
                                 boost::optional<repl::OpTime> postImageOpTime = boost::none) {
-    return repl::OplogEntry(opTime,            // optime
-                            0,                 // hash
-                            opType,            // opType
-                            kNs,               // namespace
-                            boost::none,       // uuid
-                            boost::none,       // fromMigrate
-                            0,                 // version
-                            object,            // o
-                            object2,           // o2
-                            sessionInfo,       // sessionInfo
-                            boost::none,       // isUpsert
-                            wallClockTime,     // wall clock time
-                            stmtId,            // statement id
-                            boost::none,       // optime of previous write within same transaction
-                            preImageOpTime,    // pre-image optime
-                            postImageOpTime);  // post-image optime
+    return repl::OplogEntry(opTime,           // optime
+                            0,                // hash
+                            opType,           // opType
+                            kNs,              // namespace
+                            boost::none,      // uuid
+                            boost::none,      // fromMigrate
+                            0,                // version
+                            object,           // o
+                            object2,          // o2
+                            sessionInfo,      // sessionInfo
+                            boost::none,      // isUpsert
+                            wallClockTime,    // wall clock time
+                            stmtId,           // statement id
+                            boost::none,      // optime of previous write within same transaction
+                            preImageOpTime,   // pre-image optime
+                            postImageOpTime,  // post-image optime
+                            boost::none,      // ShardId of resharding recipient
+                            boost::none);     // _id
 }
 
 repl::OplogEntry extractInnerOplog(const repl::OplogEntry& oplog) {
@@ -242,17 +243,13 @@ public:
             Client::initThread("test-insert-thread");
             auto innerOpCtx = Client::getCurrent()->makeOperationContext();
 
-            // The ephemeral for test storage engine doesn't support document-level locking, so
-            // requests with txnNumbers aren't allowed. To get around this, we have to manually set
-            // up the session state and perform the insert.
-            initializeOperationSessionInfo(
-                innerOpCtx.get(), insertBuilder.obj(), true, true, true, true);
+            initializeOperationSessionInfo(innerOpCtx.get(), insertBuilder.obj(), true, true, true);
             MongoDOperationContextSession sessionTxnState(innerOpCtx.get());
             auto txnParticipant = TransactionParticipant::get(innerOpCtx.get());
             txnParticipant.beginOrContinue(
                 innerOpCtx.get(), *sessionInfo.getTxnNumber(), boost::none, boost::none);
 
-            const auto reply = performInserts(innerOpCtx.get(), insertRequest);
+            const auto reply = write_ops_exec::performInserts(innerOpCtx.get(), insertRequest);
             ASSERT(reply.results.size() == 1);
             ASSERT(reply.results[0].isOK());
         });
@@ -1731,7 +1728,10 @@ TEST_F(SessionCatalogMigrationDestinationTest, MigratingKnownStmtWhileOplogTrunc
 
     {
         AutoGetCollection oplogColl(opCtx, NamespaceString::kRsOplogNamespace, MODE_X);
-        ASSERT_OK(oplogColl.getCollection()->truncate(opCtx));  // Empties the oplog collection.
+        WriteUnitOfWork wuow(opCtx);
+        ASSERT_OK(
+            oplogColl.getWritableCollection()->truncate(opCtx));  // Empties the oplog collection.
+        wuow.commit();
     }
 
     {

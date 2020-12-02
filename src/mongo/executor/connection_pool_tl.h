@@ -35,6 +35,7 @@
 #include "mongo/executor/connection_pool.h"
 #include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface.h"
+#include "mongo/transport/ssl_connection_context.h"
 #include "mongo/util/future.h"
 #include "mongo/util/hierarchical_acquisition.h"
 
@@ -50,16 +51,19 @@ public:
     TLTypeFactory(transport::ReactorHandle reactor,
                   transport::TransportLayer* tl,
                   std::unique_ptr<NetworkConnectionHook> onConnectHook,
-                  const ConnectionPool::Options& connPoolOptions)
+                  const ConnectionPool::Options& connPoolOptions,
+                  std::shared_ptr<const transport::SSLConnectionContext> transientSSLContext)
         : _executor(std::move(reactor)),
           _tl(tl),
           _onConnectHook(std::move(onConnectHook)),
-          _connPoolOptions(connPoolOptions) {}
+          _connPoolOptions(connPoolOptions),
+          _transientSSLContext(transientSSLContext) {}
 
     std::shared_ptr<ConnectionPool::ConnectionInterface> makeConnection(
         const HostAndPort& hostAndPort,
         transport::ConnectSSLMode sslMode,
         size_t generation) override;
+
     std::shared_ptr<ConnectionPool::TimerInterface> makeTimer() override;
     const std::shared_ptr<OutOfLineExecutor>& getExecutor() override {
         return _executor;
@@ -78,7 +82,9 @@ private:
     std::shared_ptr<OutOfLineExecutor> _executor;  // This is always a transport::Reactor
     transport::TransportLayer* _tl;
     std::unique_ptr<NetworkConnectionHook> _onConnectHook;
+    // Options originated from instance of NetworkInterfaceTL.
     const ConnectionPool::Options _connPoolOptions;
+    std::shared_ptr<const transport::SSLConnectionContext> _transientSSLContext;
 
     mutable Mutex _mutex =
         MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), "TLTypeFactory::_mutex");
@@ -133,14 +139,16 @@ private:
 
 class TLConnection final : public ConnectionPool::ConnectionInterface, public TLTypeFactory::Type {
 public:
-    TLConnection(const std::shared_ptr<TLTypeFactory>& factory,
-                 transport::ReactorHandle reactor,
-                 ServiceContext* serviceContext,
-                 HostAndPort peer,
-                 transport::ConnectSSLMode sslMode,
-                 size_t generation,
-                 NetworkConnectionHook* onConnectHook,
-                 bool skipAuth)
+    TLConnection(
+        const std::shared_ptr<TLTypeFactory>& factory,
+        transport::ReactorHandle reactor,
+        ServiceContext* serviceContext,
+        HostAndPort peer,
+        transport::ConnectSSLMode sslMode,
+        size_t generation,
+        NetworkConnectionHook* onConnectHook,
+        bool skipAuth,
+        std::shared_ptr<const transport::SSLConnectionContext> transientSSLContext = nullptr)
         : ConnectionInterface(generation),
           TLTypeFactory::Type(factory),
           _reactor(reactor),
@@ -149,7 +157,9 @@ public:
           _skipAuth(skipAuth),
           _peer(std::move(peer)),
           _sslMode(sslMode),
-          _onConnectHook(onConnectHook) {}
+          _onConnectHook(onConnectHook),
+          _transientSSLContext(transientSSLContext) {}
+
     ~TLConnection() {
         // Release must be the first expression of this dtor
         release();
@@ -162,6 +172,7 @@ public:
     const HostAndPort& getHostAndPort() const override;
     transport::ConnectSSLMode getSslMode() const override;
     bool isHealthy() override;
+    bool maybeHealthy() override;
     AsyncDBClient* client();
     Date_t now() override;
 
@@ -178,9 +189,16 @@ private:
     std::shared_ptr<ConnectionPool::TimerInterface> _timer;
     const bool _skipAuth;
 
+    // Metadata for caching "isHealthy()" return value to boost performance.
+    bool _isHealthyCache = false;
+    Date_t _isHealthyExpiresAt = Date_t::min();
+    static constexpr auto kIsHealthyCacheTimeout = Milliseconds(1);
+
     HostAndPort _peer;
     transport::ConnectSSLMode _sslMode;
     NetworkConnectionHook* const _onConnectHook;
+    // SSL context to use intead of the default one for this pool.
+    const std::shared_ptr<const transport::SSLConnectionContext> _transientSSLContext;
     AsyncDBClient::Handle _client;
 };
 

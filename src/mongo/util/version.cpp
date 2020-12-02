@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -209,7 +209,7 @@ void VersionInfoInterface::logBuildInfo(std::ostream* os) const {
     BSONObj obj = bob.done();
     if (os) {
         // If printing to ostream, print a json object with a single "buildInfo" element.
-        *os << "Build Info:" << tojson(obj, ExtendedRelaxedV2_0_0, true) << std::endl;
+        *os << "Build Info: " << tojson(obj, ExtendedRelaxedV2_0_0, true) << std::endl;
     } else {
         LOGV2(23403, "Build Info", "buildInfo"_attr = obj);
     }

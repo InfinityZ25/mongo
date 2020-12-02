@@ -4,9 +4,11 @@
  *  - With the only data-bearing secondary down, committed reads should not include newly inserted
  *    data.
  *  - When data-bearing node comes back up and catches up, writes should be readable.
+ *
+ * @tags: [requires_majority_read_concern]
  */
 
-load("jstests/replsets/rslib.js");  // For startSetIfSupportsReadMajority.
+load("jstests/libs/write_concern_util.js");
 
 (function() {
 "use strict";
@@ -56,12 +58,7 @@ var name = "read_committed";
 var replTest =
     new ReplSetTest({name: name, nodes: 3, nodeOptions: {enableMajorityReadConcern: ''}});
 
-if (!startSetIfSupportsReadMajority(replTest)) {
-    jsTest.log("skipping test since storage engine doesn't support committed reads");
-    replTest.stopSet();
-    return;
-}
-
+replTest.startSet();
 var nodes = replTest.nodeList();
 var config = {
     "_id": name,
@@ -76,7 +73,7 @@ replTest.initiate(config);
 
 // Get connections and collection.
 var primary = replTest.getPrimary();
-var secondary = replTest._slaves[0];
+var secondary = replTest.getSecondary();
 var coll = primary.getDB(name)[name];
 var secondaryColl = secondary.getDB(name)[name];
 
@@ -138,8 +135,7 @@ for (var testName in testCases) {
     // Return to the initial state, then stop the secondary from applying new writes to prevent
     // them from becoming committed.
     setUpInitialState();
-    assert.commandWorked(
-        secondary.adminCommand({configureFailPoint: "rsSyncApplyStop", mode: "alwaysOn"}));
+    stopServerReplication(secondary);
     const initialOplogTs = readLatestOplogEntry('local').ts;
 
     // Writes done without majority write concern must be immediately visible to dirty read
@@ -158,8 +154,7 @@ for (var testName in testCases) {
     assert.eq(readLatestOplogEntry('majority').ts, initialOplogTs);
 
     // Restart oplog application on the secondary and ensure the committed view is updated.
-    assert.commandWorked(
-        secondary.adminCommand({configureFailPoint: "rsSyncApplyStop", mode: "off"}));
+    restartServerReplication(secondary);
     coll.getDB().getLastError("majority", 60 * 1000);
     assert.eq(doCommittedRead(coll), test.expectedAfter);
     assert.neq(readLatestOplogEntry('majority').ts, initialOplogTs);

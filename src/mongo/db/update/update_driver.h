@@ -56,7 +56,7 @@ class OperationContext;
 
 class UpdateDriver {
 public:
-    enum class UpdateType { kOperator, kReplacement, kPipeline };
+    enum class UpdateType { kOperator, kReplacement, kPipeline, kDelta };
 
     UpdateDriver(const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
@@ -115,7 +115,8 @@ public:
      * The caller must either provide a null pointer, or a non-null pointer to an empty field ref
      * set.
      */
-    Status update(StringData matchedField,
+    Status update(OperationContext* opCtx,
+                  StringData matchedField,
                   mutablebson::Document* doc,
                   bool validateForStorage,
                   const FieldRefSet& immutablePaths,

@@ -4,13 +4,13 @@
  * the two failing on the unique index constraint. This test confirms that the failed insert will be
  * retried, resulting in an update.
  *
- * In order for one of the two conflicting upserts to make progress we require a storage engine
- * which supports document level locking.
- *  @tags: [requires_replication, requires_document_locking]
+ * @tags: [requires_replication]
  */
 
 (function() {
 "use strict";
+
+load("jstests/libs/curop_helpers.js");  // For waitForCurOpByFailPoint().
 
 const rst = new ReplSetTest({nodes: 1});
 rst.startSet();
@@ -22,15 +22,6 @@ const collName = "upsert_duplicate_key_retry";
 const testColl = testDB.getCollection(collName);
 
 testDB.runCommand({drop: collName});
-
-// Queries current operations until 'count' matching operations are found.
-function awaitMatchingCurrentOpCount(message, count) {
-    assert.soon(() => {
-        const currentOp =
-            adminDB.aggregate([{$currentOp: {}}, {$match: {failpointMsg: message}}]).toArray();
-        return (currentOp.length === count);
-    });
-}
 
 function performUpsert() {
     // This function is called from startParallelShell(), so closed-over variables will not be
@@ -48,7 +39,11 @@ assert.commandWorked(
 const awaitUpdate1 = startParallelShell(performUpsert, rst.ports[0]);
 const awaitUpdate2 = startParallelShell(performUpsert, rst.ports[0]);
 
-awaitMatchingCurrentOpCount("hangBeforeUpsertPerformsInsert", 2);
+// Query current operations until 2 matching operations are found.
+assert.soon(() => {
+    const curOps = waitForCurOpByFailPointNoNS(adminDB, "hangBeforeUpsertPerformsInsert");
+    return curOps.length === 2;
+});
 
 assert.commandWorked(
     testDB.adminCommand({configureFailPoint: "hangBeforeUpsertPerformsInsert", mode: "off"}));

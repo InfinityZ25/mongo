@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/db/server_options_helpers.h"
 
@@ -43,17 +43,17 @@
 #include <iostream>
 
 #include "mongo/base/status.h"
+#include "mongo/bson/json.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/config.h"
 #include "mongo/db/server_options.h"
 #include "mongo/idl/server_parameter.h"
-#include "mongo/logger/log_component.h"
-#include "mongo/logger/message_event_utf8_encoder.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/log_component_settings.h"
+#include "mongo/logv2/log_manager.h"
 #include "mongo/transport/message_compressor_registry.h"
 #include "mongo/util/cmdline_utils/censor_cmdline.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log_global_settings.h"
-#include "mongo/util/map_util.h"
 #include "mongo/util/net/sock.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/net/ssl_options.h"
@@ -154,7 +154,7 @@ Status validateBaseOptions(const moe::Environment& params) {
 
         // Must come after registerAllFailPointsAsServerParameters() above.
         const auto& spMap = ServerParameterSet::getGlobal()->getMap();
-        for (const auto setParam : parameters) {
+        for (const auto& setParam : parameters) {
             const auto it = spMap.find(setParam.first);
 
             if (it == spMap.end()) {
@@ -308,14 +308,11 @@ Status storeBaseOptions(const moe::Environment& params) {
     }
 
     if (params.count("systemLog.timeStampFormat")) {
-        using logger::MessageEventDetailsEncoder;
         std::string formatterName = params["systemLog.timeStampFormat"].as<string>();
         if (formatterName == "iso8601-utc") {
-            MessageEventDetailsEncoder::setDateFormatter(outputDateAsISOStringUTC);
             serverGlobalParams.logTimestampFormat = logv2::LogTimestampFormat::kISO8601UTC;
             setDateFormatIsLocalTimezone(false);
         } else if (formatterName == "iso8601-local") {
-            MessageEventDetailsEncoder::setDateFormatter(outputDateAsISOStringLocal);
             serverGlobalParams.logTimestampFormat = logv2::LogTimestampFormat::kISO8601Local;
             setDateFormatIsLocalTimezone(true);
         } else {
@@ -419,10 +416,9 @@ Status storeBaseOptions(const moe::Environment& params) {
         for (std::map<std::string, std::string>::iterator parametersIt = parameters.begin();
              parametersIt != parameters.end();
              parametersIt++) {
-            ServerParameter* parameter =
-                mapFindWithDefault(ServerParameterSet::getGlobal()->getMap(),
-                                   parametersIt->first,
-                                   static_cast<ServerParameter*>(nullptr));
+            const auto& serverParams = ServerParameterSet::getGlobal()->getMap();
+            auto iter = serverParams.find(parametersIt->first);
+            ServerParameter* parameter = (iter == serverParams.end()) ? nullptr : iter->second;
             if (nullptr == parameter) {
                 StringBuilder sb;
                 sb << "Illegal --setParameter parameter: \"" << parametersIt->first << "\"";
@@ -450,6 +446,18 @@ Status storeBaseOptions(const moe::Environment& params) {
 
     if (params.count("operationProfiling.slowOpSampleRate")) {
         serverGlobalParams.sampleRate = params["operationProfiling.slowOpSampleRate"].as<double>();
+    }
+
+    if (params.count("operationProfiling.filter")) {
+        try {
+            serverGlobalParams.defaultProfileFilter =
+                fromjson(params["operationProfiling.filter"].as<std::string>()).getOwned();
+        } catch (AssertionException& e) {
+            // Add more context to the error
+            uasserted(ErrorCodes::FailedToParse,
+                      str::stream()
+                          << "Failed to parse option operationProfiling.filter: " << e.reason());
+        }
     }
 
     return Status::OK();

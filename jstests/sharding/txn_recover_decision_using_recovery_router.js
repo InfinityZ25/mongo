@@ -2,10 +2,6 @@
  * Tests that the coordinateCommitTransaction command falls back to recovering the decision from
  * the local participant.
  *
- * TODO (SERVER-37364): Once coordinateCommit returns as soon as the decision is made durable, these
- * tests will pass but will be racy in terms of whether they're testing that coordinateCommit
- * returns the TransactionCoordinator's decision or local TransactionParticipant's decision.
- *
  * @tags: [uses_transactions, uses_prepare_transaction]
  */
 (function() {
@@ -13,6 +9,7 @@
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/write_concern_util.js");
+load("jstests/sharding/libs/sharded_transactions_helpers.js");
 
 // The test modifies config.transactions, which must be done outside of a session.
 TestData.disableImplicitSessions = true;
@@ -179,9 +176,19 @@ const sendCommitViaRecoveryMongos = function(lsid, txnNumber, recoveryToken, wri
                                                         writeConcern));
 };
 
+const waitForCommitTransactionToComplete = function(coordinatorRs, lsid, txnNumber) {
+    assert.soon(() => {
+        return coordinatorRs.getPrimary()
+                   .getCollection("config.transaction_coordinators")
+                   .find({"_id.lsid.id": lsid.id, "_id.txnNumber": txnNumber})
+                   .itcount() === 0;
+    });
+};
+
 let st =
     new ShardingTest({shards: 2, rs: {nodes: 2}, mongos: 2, other: {mongosOptions: {verbose: 3}}});
 
+enableCoordinateCommitReturnImmediatelyAfterPersistingDecision(st);
 assert.commandWorked(st.s0.adminCommand({enableSharding: 'test'}));
 st.ensurePrimaryShard('test', st.shard0.name);
 assert.commandWorked(st.s0.adminCommand({shardCollection: 'test.user', key: {x: 1}}));
@@ -244,6 +251,13 @@ txnNumber++;
 
 const recoveryToken = startNewMultiShardWriteTransaction();
 assert.commandWorked(sendCommitViaOriginalMongos(lsid, txnNumber, recoveryToken));
+
+// Wait until the transaction is committed. Otherwise, the remove command against the participant or
+// recovery shard below could fail due to PreparedTransactionInProgress error if the coordinator
+// has binVersion "latest", since the coordinateCommit command is expected to return immediately
+// after the decision is made durable (i.e. before commitTransaction/abortTransaction is sent to
+// participant shards).
+waitForCommitTransactionToComplete(st.rs0, lsid, txnNumber);
 
 assert.commandWorked(
     st.rs1.getPrimary().getDB("config").transactions.remove({}, false /* justOne */));

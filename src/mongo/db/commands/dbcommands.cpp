@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -45,7 +45,6 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/user_management_commands_parser.h"
 #include "mongo/db/auth/user_name.h"
-#include "mongo/db/background.h"
 #include "mongo/db/catalog/coll_mod.h"
 #include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog/database_holder.h"
@@ -63,6 +62,8 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
+#include "mongo/db/drop_database_gen.h"
+#include "mongo/db/drop_gen.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -87,6 +88,7 @@
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/stats/storage_stats.h"
 #include "mongo/db/storage/storage_engine_init.h"
+#include "mongo/db/storage/storage_parameters_gen.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/logv2/log.h"
 #include "mongo/scripting/engine.h"
@@ -106,6 +108,10 @@ namespace {
 
 class CmdDropDatabase : public BasicCommand {
 public:
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
+
     std::string help() const override {
         return "drop (delete) this database";
     }
@@ -123,6 +129,10 @@ public:
 
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
+
+    bool collectsResourceConsumptionMetrics() const override {
         return true;
     }
 
@@ -147,20 +157,21 @@ public:
                       str::stream()
                           << "Cannot drop '" << dbname << "' database while replication is active");
         }
-        BSONElement e = cmdObj.firstElement();
-        int p = (int)e.number();
-        if (p != 1) {
+
+        auto request = DropDatabase::parse(IDLParserErrorContext("dropDatabase"), cmdObj);
+        if (request.getCommandParameter() != 1) {
             uasserted(ErrorCodes::IllegalOperation, "have to pass 1 as db parameter");
         }
 
         Status status = dropDatabase(opCtx, dbname);
-        if (status == ErrorCodes::NamespaceNotFound) {
-            return true;
+        if (status != ErrorCodes::NamespaceNotFound) {
+            uassertStatusOK(status);
         }
+        DropDatabaseReply reply;
         if (status.isOK()) {
-            result.append("dropped", dbname);
+            reply.setDropped(request.getDbName());
         }
-        uassertStatusOK(status);
+        reply.serialize(&result);
         return true;
     }
 
@@ -205,6 +216,11 @@ public:
 class CmdDrop : public ErrmsgCommandDeprecated {
 public:
     CmdDrop() : ErrmsgCommandDeprecated("drop") {}
+
+    virtual const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
+
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
@@ -227,14 +243,17 @@ public:
         return true;
     }
 
+    bool collectsResourceConsumptionMetrics() const override {
+        return true;
+    }
+
     virtual bool errmsgRun(OperationContext* opCtx,
                            const string& dbname,
                            const BSONObj& cmdObj,
                            string& errmsg,
                            BSONObjBuilder& result) {
-        const NamespaceString nsToDrop(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
-
-        if (nsToDrop.isOplog()) {
+        auto parsed = Drop::parse(IDLParserErrorContext("drop"), cmdObj);
+        if (parsed.getNamespace().isOplog()) {
             if (repl::ReplicationCoordinator::get(opCtx)->isReplEnabled()) {
                 errmsg = "can't drop live oplog while replicating";
                 return false;
@@ -254,7 +273,7 @@ public:
 
         uassertStatusOK(
             dropCollection(opCtx,
-                           nsToDrop,
+                           parsed.getNamespace(),
                            result,
                            DropCollectionSystemCollectionMode::kDisallowSystemCollectionDrops));
         return true;
@@ -267,6 +286,10 @@ class CmdCreate : public BasicCommand {
 public:
     CmdCreate() : BasicCommand("create") {}
 
+    virtual const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
+
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
@@ -276,6 +299,10 @@ public:
     }
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
+
+    bool collectsResourceConsumptionMetrics() const override {
         return true;
     }
 
@@ -312,17 +339,16 @@ public:
                      const string& dbname,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
+        const auto nsToCreate = CommandHelpers::parseNsCollectionRequired(dbname, cmdObj);
+
         IDLParserErrorContext ctx("create");
         CreateCommand cmd = CreateCommand::parse(ctx, cmdObj);
 
-        const NamespaceString ns = cmd.getNamespace();
-
         if (cmd.getAutoIndexId()) {
-            const char* deprecationWarning =
-                "the autoIndexId option is deprecated and will be removed in a future release";
-            LOGV2_WARNING(
-                23800, "{deprecationWarning}", "deprecationWarning"_attr = deprecationWarning);
-            result.append("note", deprecationWarning);
+#define DEPR_23800 "The autoIndexId option is deprecated and will be removed in a future release"
+            LOGV2_WARNING(23800, DEPR_23800);
+            result.append("note", DEPR_23800);
+#undef DEPR_23800
         }
 
         // Ensure that the 'size' field is present if 'capped' is set to true.
@@ -345,8 +371,59 @@ public:
             uassert(ErrorCodes::InvalidOptions,
                     str::stream() << "the 'temp' field is an invalid option",
                     opCtx->getClient()->isInDirectClient() ||
-                        (opCtx->getClient()->session()->getTags() |
+                        (opCtx->getClient()->session()->getTags() &
                          transport::Session::kInternalClient));
+        }
+
+        if (cmd.getPipeline()) {
+            uassert(ErrorCodes::InvalidOptions,
+                    "'pipeline' requires 'viewOn' to also be specified",
+                    cmd.getViewOn());
+        }
+
+        if (auto timeseries = cmd.getTimeseries()) {
+            uassert(ErrorCodes::InvalidOptions,
+                    "Time-series collection is not enabled",
+                    feature_flags::gTimeseriesCollection.isEnabled(
+                        serverGlobalParams.featureCompatibility));
+
+            const auto timeseriesNotAllowedWith = [&nsToCreate](StringData option) -> std::string {
+                return str::stream()
+                    << nsToCreate << ": 'timeseries' is not allowed with '" << option << "'";
+            };
+
+            uassert(
+                ErrorCodes::InvalidOptions, timeseriesNotAllowedWith("capped"), !cmd.getCapped());
+            uassert(ErrorCodes::InvalidOptions,
+                    timeseriesNotAllowedWith("autoIndexId"),
+                    !cmd.getAutoIndexId());
+            uassert(
+                ErrorCodes::InvalidOptions, timeseriesNotAllowedWith("idIndex"), !cmd.getIdIndex());
+            uassert(ErrorCodes::InvalidOptions, timeseriesNotAllowedWith("size"), !cmd.getSize());
+            uassert(ErrorCodes::InvalidOptions, timeseriesNotAllowedWith("max"), !cmd.getMax());
+            uassert(ErrorCodes::InvalidOptions,
+                    timeseriesNotAllowedWith("validator"),
+                    !cmd.getValidator());
+            uassert(ErrorCodes::InvalidOptions,
+                    timeseriesNotAllowedWith("validationLevel"),
+                    !cmd.getValidationLevel());
+            uassert(ErrorCodes::InvalidOptions,
+                    timeseriesNotAllowedWith("validationAction"),
+                    !cmd.getValidationAction());
+            uassert(
+                ErrorCodes::InvalidOptions, timeseriesNotAllowedWith("viewOn"), !cmd.getViewOn());
+            uassert(ErrorCodes::InvalidOptions,
+                    timeseriesNotAllowedWith("pipeline"),
+                    !cmd.getPipeline());
+
+            if (auto metaField = timeseries->getMetaField()) {
+                uassert(ErrorCodes::InvalidOptions,
+                        "'metaField' cannot be \"_id\"",
+                        *metaField != "_id");
+                uassert(ErrorCodes::InvalidOptions,
+                        "'metaField' cannot be the same as 'timeField'",
+                        *metaField != timeseries->getTimeField());
+            }
         }
 
         // Validate _id index spec and fill in missing fields.
@@ -392,15 +469,10 @@ public:
                           "'idIndex' must have the same collation as the collection.");
             }
 
-            // Remove "idIndex" field from command.
-            auto resolvedCmdObj = cmdObj.removeField("idIndex");
-
-            uassertStatusOK(createCollection(opCtx, dbname, resolvedCmdObj, idIndexSpec));
-            return true;
+            cmd.setIdIndex(idIndexSpec);
         }
 
-        BSONObj idIndexSpec;
-        uassertStatusOK(createCollection(opCtx, dbname, cmdObj, idIndexSpec));
+        uassertStatusOK(createCollection(opCtx, nsToCreate, cmd));
         return true;
     }
 } cmdCreate;
@@ -456,10 +528,10 @@ public:
         bool estimate = jsobj["estimate"].trueValue();
 
         const NamespaceString nss(ns);
-        AutoGetCollectionForReadCommand ctx(opCtx, nss);
-        Collection* collection = ctx.getCollection();
+        AutoGetCollectionForReadCommand collection(opCtx, nss);
 
-        const auto collDesc = CollectionShardingState::get(opCtx, nss)->getCollectionDescription();
+        const auto collDesc =
+            CollectionShardingState::get(opCtx, nss)->getCollectionDescription(opCtx);
 
         if (collDesc.isSharded()) {
             const ShardKeyPattern shardKeyPattern(collDesc.getKeyPattern());
@@ -502,7 +574,8 @@ public:
                 result.append("millis", timer.millis());
                 return 1;
             }
-            exec = InternalPlanner::collectionScan(opCtx, ns, collection, PlanExecutor::NO_YIELD);
+            exec = InternalPlanner::collectionScan(
+                opCtx, ns, &collection.getCollection(), PlanYieldPolicy::YieldPolicy::NO_YIELD);
         } else if (min.isEmpty() || max.isEmpty()) {
             errmsg = "only one of min or max specified";
             return false;
@@ -527,12 +600,12 @@ public:
             max = Helpers::toKeyFormat(kp.extendRangeBound(max, false));
 
             exec = InternalPlanner::indexScan(opCtx,
-                                              collection,
+                                              &collection.getCollection(),
                                               idx,
                                               min,
                                               max,
                                               BoundInclusion::kIncludeStartKeyOnly,
-                                              PlanExecutor::NO_YIELD);
+                                              PlanYieldPolicy::YieldPolicy::NO_YIELD);
         }
 
         long long avgObjSize = collection->dataSize(opCtx) / numRecords;
@@ -543,27 +616,28 @@ public:
         long long size = 0;
         long long numObjects = 0;
 
-        RecordId loc;
-        BSONObj obj;
-        PlanExecutor::ExecState state;
-        while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, &loc))) {
-            if (estimate)
-                size += avgObjSize;
-            else
-                size += collection->getRecordStore()->dataFor(opCtx, loc).size();
+        try {
+            RecordId loc;
+            while (PlanExecutor::ADVANCED == exec->getNext(static_cast<BSONObj*>(nullptr), &loc)) {
+                if (estimate)
+                    size += avgObjSize;
+                else
+                    size += collection->getRecordStore()->dataFor(opCtx, loc).size();
 
-            numObjects++;
+                numObjects++;
 
-            if ((maxSize && size > maxSize) || (maxObjects && numObjects > maxObjects)) {
-                result.appendBool("maxReached", true);
-                break;
+                if ((maxSize && size > maxSize) || (maxObjects && numObjects > maxObjects)) {
+                    result.appendBool("maxReached", true);
+                    break;
+                }
             }
-        }
-
-        if (PlanExecutor::FAILURE == state) {
-            LOGV2_WARNING(23801, "Internal error while reading {ns}", "ns"_attr = ns);
-            uassertStatusOK(WorkingSetCommon::getMemberObjectStatus(obj).withContext(
-                "Executor error while reading during dataSize command"));
+        } catch (DBException& exception) {
+            LOGV2_WARNING(23801,
+                          "Internal error while reading {namespace}",
+                          "Internal error while reading",
+                          "namespace"_attr = ns);
+            exception.addContext("Executor error while reading during dataSize command");
+            throw;
         }
 
         ostringstream os;
@@ -634,12 +708,21 @@ class CollectionModCommand : public BasicCommand {
 public:
     CollectionModCommand() : BasicCommand("collMod") {}
 
+    virtual const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
+
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
+
+    bool collectsResourceConsumptionMetrics() const override {
+        return true;
+    }
+
     std::string help() const override {
         return "Sets collection options.\n"
                "Example: { collMod: 'foo', viewOn: 'bar'} "
@@ -751,7 +834,8 @@ public:
             {
                 stdx::lock_guard<Client> lk(*opCtx->getClient());
                 // TODO: OldClientContext legacy, needs to be removed
-                CurOp::get(opCtx)->enter_inlock(dbname.c_str(), db->getProfilingLevel());
+                CurOp::get(opCtx)->enter_inlock(
+                    dbname.c_str(), CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(dbname));
             }
 
             db->getStats(opCtx, &result, scale);

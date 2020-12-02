@@ -29,32 +29,36 @@
 
 #pragma once
 
-#include "mongo/util/background.h"
+#include "mongo/db/client.h"
+#include "mongo/util/periodic_runner.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 
-class CertificateExpirationMonitor : public PeriodicTask {
+class CertificateExpirationMonitor {
 public:
-    explicit CertificateExpirationMonitor(Date_t date);
+    /**
+     * Get the singleton instance of the monitor.
+     */
+    static CertificateExpirationMonitor* get();
 
     /**
-     * Gets the PeriodicTask's name.
-     * @return CertificateExpirationMonitor's name.
+     * Sets the server certificate's expiration deadline.
      */
-    virtual std::string taskName() const;
+    void updateExpirationDeadline(Date_t date);
 
     /**
-     * Wakes up every minute as it is a PeriodicTask.
-     * Checks once a day if the server certificate has expired
-     * or will expire in the next 30 days and sends a warning
-     * to the log accordingly.
+     * Kick off the CertificateExpirationMonitor background job.
      */
-    virtual void taskDoWork();
+    void start(ServiceContext* service);
 
 private:
-    const Date_t _certExpiration;
-    Date_t _lastCheckTime;
+    void run(Client* client);
+
+    std::unique_ptr<PeriodicJobAnchor> _job;
+
+    Mutex _mutex = MONGO_MAKE_LATCH("CertificateExpirationMonitor::_mutex");
+    Date_t _certExpiration{Date_t::max()};
 };
 
 }  // namespace mongo

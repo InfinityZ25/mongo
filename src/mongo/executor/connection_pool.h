@@ -33,6 +33,7 @@
 #include <memory>
 #include <queue>
 
+#include "mongo/config.h"
 #include "mongo/executor/egress_tag_closer.h"
 #include "mongo/executor/egress_tag_closer_manager.h"
 #include "mongo/platform/mutex.h"
@@ -43,6 +44,7 @@
 #include "mongo/util/future.h"
 #include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/net/ssl_options.h"
 #include "mongo/util/out_of_line_executor.h"
 #include "mongo/util/time_support.h"
 
@@ -149,6 +151,14 @@ public:
          * Connections created through this connection pool will not attempt to authenticate.
          */
         bool skipAuthentication = false;
+
+#ifdef MONGO_CONFIG_SSL
+        /**
+         * Provides SSL params if the egress cluster connection requires custom SSL certificates
+         * different from the global (default) certificates.
+         */
+        boost::optional<TransientSSLParams> transientSSLParams;
+#endif
 
         std::function<std::shared_ptr<ControllerInterface>(void)> controllerFactory =
             &ConnectionPool::makeLimitController;
@@ -257,7 +267,7 @@ private:
     std::string _name;
 
     const std::shared_ptr<DependentTypeFactoryInterface> _factory;
-    Options _options;
+    const Options _options;
 
     std::shared_ptr<ControllerInterface> _controller;
 
@@ -356,6 +366,16 @@ public:
      * Check if the connection is healthy using some implementation defined condition.
      */
     virtual bool isHealthy() = 0;
+
+    /**
+     * The implementation may choose to override this method to provide a quick check for
+     * connection health (e.g., by periodically caching the return value of the last invocation).
+     * Callers should be aware that a "true" return value does not always indicate a healthy
+     * connection.
+     */
+    virtual bool maybeHealthy() {
+        return isHealthy();
+    }
 
     /**
      * Returns the last used time point for the connection

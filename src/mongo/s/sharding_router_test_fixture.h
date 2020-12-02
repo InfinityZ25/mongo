@@ -29,7 +29,6 @@
 
 #pragma once
 
-#include "mongo/db/service_context_test_fixture.h"
 #include "mongo/s/sharding_test_fixture_common.h"
 
 namespace mongo {
@@ -39,8 +38,6 @@ class ShardingCatalogClient;
 struct ChunkVersion;
 class CollectionType;
 class DistLockManagerMock;
-class RemoteCommandTargeterFactoryMock;
-class RemoteCommandTargeterMock;
 class ShardRegistry;
 class ShardType;
 
@@ -52,21 +49,27 @@ class TransportLayerMock;
  * Sets up the mocked out objects for testing the replica-set backed catalog manager and catalog
  * client.
  */
-class ShardingTestFixture : public ServiceContextTest, public ShardingTestFixtureCommon {
-public:
+class ShardingTestFixture : public ShardingTestFixtureCommon {
+protected:
     ShardingTestFixture();
     ~ShardingTestFixture();
+
+    /**
+     * Returns the mock targeter for the config server. Useful to use like so,
+     *
+     *     configTargeterMock()->setFindHostReturnValue(HostAndPort);
+     *     configTargeterMock()->setFindHostReturnValue({ErrorCodes::InternalError, "can't target"})
+     *
+     * Remote calls always need to resolve a host with RemoteCommandTargeterMock::findHost, so it
+     * must be set.
+     */
+    std::shared_ptr<RemoteCommandTargeterMock> configTargeter();
 
     // Syntactic sugar for getting sharding components off the Grid, if they have been initialized.
 
     ShardingCatalogClient* catalogClient() const;
     ShardRegistry* shardRegistry() const;
-    RemoteCommandTargeterFactoryMock* targeterFactory() const;
     std::shared_ptr<executor::TaskExecutor> executor() const;
-    DistLockManagerMock* distLock() const;
-    RemoteCommandTargeterMock* configTargeter() const;
-
-    OperationContext* operationContext() const;
 
     /**
      * Same as the onCommand* variants, but expects the request to be placed on the arbitrary
@@ -110,55 +113,12 @@ public:
     void expectFindSendBSONObjVector(const HostAndPort& configHost, std::vector<BSONObj> obj);
 
     /**
-     * Waits for an operation which creates a capped config collection with the specified name and
-     * capped size.
-     */
-    void expectConfigCollectionCreate(const HostAndPort& configHost,
-                                      StringData collName,
-                                      int cappedSize,
-                                      const BSONObj& response);
-
-    /**
-     * Wait for a single insert in one of the change or action log collections with the specified
-     * contents and return a successful response.
-     */
-    void expectConfigCollectionInsert(const HostAndPort& configHost,
-                                      StringData collName,
-                                      Date_t timestamp,
-                                      const std::string& what,
-                                      const std::string& ns,
-                                      const BSONObj& detail);
-
-    /**
-     * Wait for the config.changelog collection to be created on the specified host.
-     */
-    void expectChangeLogCreate(const HostAndPort& configHost, const BSONObj& response);
-
-    /**
-     * Expect a log message with the specified contents to be written to the config.changelog
-     * collection.
-     */
-    void expectChangeLogInsert(const HostAndPort& configHost,
-                               Date_t timestamp,
-                               const std::string& what,
-                               const std::string& ns,
-                               const BSONObj& detail);
-
-    /**
      * Expects an update call, which changes the specified collection's namespace contents to match
      * those of the input argument.
      */
     void expectUpdateCollection(const HostAndPort& expectedHost,
                                 const CollectionType& coll,
                                 bool expectUpsert = true);
-
-    /**
-     * Expects a setShardVersion command to be executed on the specified shard.
-     */
-    void expectSetShardVersion(const HostAndPort& expectedHost,
-                               const ShardType& expectedShard,
-                               const NamespaceString& expectedNs,
-                               const ChunkVersion& expectedChunkVersion);
 
     void shutdownExecutor();
 
@@ -171,21 +131,28 @@ public:
                           const Timestamp& expectedTS,
                           long long expectedTerm) const;
 
-private:
-    ServiceContext::UniqueClient _client;
-    ServiceContext::UniqueOperationContext _opCtx;
-    transport::SessionHandle _transportSession;
+    /**
+     * Mocks an error cursor response from a remote with the given 'status'.
+     */
+    BSONObj createErrorCursorResponse(Status status) {
+        invariant(!status.isOK());
+        BSONObjBuilder result;
+        status.serializeErrorToBSON(&result);
+        result.appendBool("ok", false);
+        return result.obj();
+    }
 
-    RemoteCommandTargeterFactoryMock* _targeterFactory;
-    RemoteCommandTargeterMock* _configTargeter;
+private:
+    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient(
+        std::unique_ptr<DistLockManager> distLockManager) override;
+
+    transport::SessionHandle _transportSession;
 
     // For the Grid's fixed executor.
     std::shared_ptr<executor::TaskExecutor> _fixedExecutor;
 
     // For the Grid's arbitrary executor in its executorPool.
     std::unique_ptr<executor::NetworkTestEnv> _networkTestEnvForPool;
-
-    DistLockManagerMock* _distLockManager = nullptr;
 };
 
 }  // namespace mongo

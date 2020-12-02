@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -77,6 +77,8 @@
 
 namespace mongo {
 namespace repl {
+
+MONGO_FAIL_POINT_DEFINE(failIsSelfCheck);
 
 OID instanceId;
 
@@ -163,6 +165,13 @@ std::vector<std::string> getAddrsForHost(const std::string& iporhost,
 }  // namespace
 
 bool isSelf(const HostAndPort& hostAndPort, ServiceContext* const ctx) {
+    if (MONGO_unlikely(failIsSelfCheck.shouldFail())) {
+        LOGV2(356490,
+              "failIsSelfCheck failpoint activated, returning false from isSelf",
+              "hostAndPort"_attr = hostAndPort);
+        return false;
+    }
+
     // Fastpath: check if the host&port in question is bound to one
     // of the interfaces on this machine.
     // No need for ip match if the ports do not match
@@ -226,12 +235,25 @@ bool isSelf(const HostAndPort& hostAndPort, ServiceContext* const ctx) {
         // a replica set configuration document, but the 'isMaster' command requires a lock on the
         // replication coordinator to execute. As such we call we call 'connectSocketOnly', which
         // does not call 'isMaster'.
-        if (!conn.connectSocketOnly(hostAndPort).isOK()) {
+        auto connectSocketResult = conn.connectSocketOnly(hostAndPort);
+        if (!connectSocketResult.isOK()) {
+            LOGV2(4834700,
+                  "isSelf could not connect via connectSocketOnly",
+                  "hostAndPort"_attr = hostAndPort,
+                  "error"_attr = connectSocketResult);
             return false;
         }
 
-        if (auth::isInternalAuthSet() && !conn.authenticateInternalUser().isOK()) {
-            return false;
+        if (auth::isInternalAuthSet()) {
+            auto authInternalUserResult =
+                conn.authenticateInternalUser(auth::StepDownBehavior::kKeepConnectionOpen);
+            if (!authInternalUserResult.isOK()) {
+                LOGV2(4834701,
+                      "isSelf could not authenticate internal user",
+                      "hostAndPort"_attr = hostAndPort,
+                      "error"_attr = authInternalUserResult);
+                return false;
+            }
         }
         BSONObj out;
         bool ok = conn.simpleCommand("admin", &out, "_isSelf");

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -69,11 +69,20 @@ IndexBuildsCoordinatorEmbedded::startIndexBuild(OperationContext* opCtx,
     if (!status.isOK()) {
         return status;
     }
-    invariant(!indexBuildOptions.replSetAndNotPrimaryAtStart);
-    _runIndexBuild(opCtx, buildUUID, indexBuildOptions);
+    _runIndexBuild(opCtx, buildUUID, indexBuildOptions, boost::none /* resumeInfo */);
 
     auto replState = invariant(_getIndexBuild(buildUUID));
     return replState->sharedPromise.getFuture();
+}
+
+StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>>
+IndexBuildsCoordinatorEmbedded::resumeIndexBuild(OperationContext* opCtx,
+                                                 std::string dbName,
+                                                 CollectionUUID collectionUUID,
+                                                 const std::vector<BSONObj>& specs,
+                                                 const UUID& buildUUID,
+                                                 const ResumeIndexInfo& resumeInfo) {
+    MONGO_UNREACHABLE;
 }
 
 void IndexBuildsCoordinatorEmbedded::_signalPrimaryForCommitReadiness(
@@ -83,12 +92,6 @@ void IndexBuildsCoordinatorEmbedded::_waitForNextIndexBuildActionAndCommit(
     OperationContext* opCtx,
     std::shared_ptr<ReplIndexBuildState> replState,
     const IndexBuildOptions& indexBuildOptions) {}
-
-void IndexBuildsCoordinatorEmbedded::setSignalAndCancelVoteRequestCbkIfActive(
-    WithLock ReplIndexBuildStateLk,
-    OperationContext* opCtx,
-    std::shared_ptr<ReplIndexBuildState> replState,
-    IndexBuildAction signal) {}
 
 Status IndexBuildsCoordinatorEmbedded::voteCommitIndexBuild(OperationContext* opCtx,
                                                             const UUID& buildUUID,

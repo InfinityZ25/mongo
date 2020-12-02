@@ -40,10 +40,8 @@
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/logger/logger.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/unittest/log_test.h"
-#include "mongo/util/log_global_settings.h"
 
 namespace mongo {
 namespace repl {
@@ -98,7 +96,6 @@ void ApplyOpsTest::setUp() {
 
     // Set up ReplicationCoordinator and create oplog.
     ReplicationCoordinator::set(service, std::make_unique<ReplicationCoordinatorMock>(service));
-    setOplogCollectionName(service);
     createOplog(opCtx.get());
 
     // Ensure that we are primary.
@@ -355,7 +352,9 @@ OplogEntry makeOplogEntry(OpTypeEnum opType, const BSONObj& oField) {
                       boost::none,                 // statement id
                       boost::none,   // optime of previous write within same transaction
                       boost::none,   // pre-image optime
-                      boost::none);  // post-image optime
+                      boost::none,   // post-image optime
+                      boost::none,   // ShardId of resharding recipient
+                      boost::none);  // _id
 }
 
 TEST_F(ApplyOpsTest, ExtractOperationsReturnsTypeMismatchIfNotCommand) {

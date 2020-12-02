@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplicationElection
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationElection
 
 #include "mongo/platform/basic.h"
@@ -197,7 +196,7 @@ stdx::unordered_set<HostAndPort> VoteRequester::Algorithm::getResponders() const
     return _responders;
 }
 
-VoteRequester::VoteRequester() : _isCanceled(false) {}
+VoteRequester::VoteRequester() {}
 VoteRequester::~VoteRequester() {}
 
 StatusWith<executor::TaskExecutor::EventHandle> VoteRequester::start(
@@ -215,7 +214,6 @@ StatusWith<executor::TaskExecutor::EventHandle> VoteRequester::start(
 }
 
 void VoteRequester::cancel() {
-    _isCanceled = true;
     _runner->cancel();
 }
 

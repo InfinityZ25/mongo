@@ -1,4 +1,7 @@
 // Test dropping an index that is being used by an agg pipeline.
+// @tags: [
+//   sbe_incompatible,
+// ]
 var coll = db.server14969;
 var docsPerBatch = 3;
 coll.drop();
@@ -8,7 +11,7 @@ var longString = new Array(1024 * 1024).join('x');
 for (var i = 0; i < 100; ++i) {
     assert.commandWorked(coll.insert({a: 1, bigField: longString}));
 }
-assert.commandWorked(coll.ensureIndex({a: 1}));
+assert.commandWorked(coll.createIndex({a: 1}));
 
 // Create pipeline that uses index "a", with a small initial batch size.
 var cursor = coll.aggregate([{$match: {a: 1}}], {cursor: {batchSize: docsPerBatch}});

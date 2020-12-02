@@ -42,6 +42,9 @@
 #include "mongo/db/repl/idempotency_update_sequence.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/update/document_diff_calculator.h"
+#include "mongo/db/update/document_diff_test_helpers.h"
+#include "mongo/db/update/update_oplog_entry_serialization.h"
 #include "mongo/logv2/log.h"
 #include "mongo/unittest/unittest.h"
 
@@ -55,7 +58,7 @@ protected:
     const BSONObj kDocIdQuery = BSON("_id" << kDocId);
 
     std::vector<OplogEntry> createUpdateSequence(const UpdateSequenceGenerator& generator,
-                                                 const size_t length);
+                                                 size_t length);
 
     BSONObj canonicalizeDocumentForDataHash(const BSONObj& obj) override;
 
@@ -63,27 +66,50 @@ protected:
 
     std::string getStatesString(const std::vector<CollectionState>& state1,
                                 const std::vector<CollectionState>& state2,
-                                const std::vector<OplogEntry>& ops) override;
+                                const std::vector<OplogEntry>& state1Ops,
+                                const std::vector<OplogEntry>& state2Ops) override;
 
     Status resetState() override;
 
     void runIdempotencyTestCase();
+    void runUpdateV2IdempotencyTestCase(double v2Probability);
 
     std::vector<OplogEntry> initOps;
     int64_t seed;
+
+private:
+    // Op-style updates cannot guarantee field order for certain cases.
+    bool _ignoreFieldOrder = true;
 };
 
-BSONObj RandomizedIdempotencyTest::canonicalizeDocumentForDataHash(const BSONObj& obj) {
+BSONObj canonicalizeBSONObjForDataHash(const BSONObj& obj);
+
+BSONArray canonicalizeArrayForDataHash(const BSONObj& arr) {
+    BSONArrayBuilder arrBuilder;
+    for (auto&& elem : arr) {
+        if (elem.type() == mongo::Array) {
+            arrBuilder.append(canonicalizeArrayForDataHash(elem.embeddedObject()));
+        } else if (elem.type() == mongo::Object) {
+            arrBuilder.append(canonicalizeBSONObjForDataHash(elem.embeddedObject()));
+        } else {
+            arrBuilder.append(elem);
+        }
+    }
+    return BSONArray(arrBuilder.obj());
+}
+
+BSONObj canonicalizeBSONObjForDataHash(const BSONObj& obj) {
     BSONObjBuilder objBuilder;
     BSONObjIteratorSorted iter(obj);
     while (iter.more()) {
         auto elem = iter.next();
         if (elem.isABSONObj()) {
             if (elem.type() == mongo::Array) {
-                objBuilder.append(elem.fieldName(), obj);
+                objBuilder.append(elem.fieldName(),
+                                  canonicalizeArrayForDataHash(elem.embeddedObject()));
             } else {
                 // If it is a sub object, we'll have to sort it as well before we append it.
-                auto sortedObj = canonicalizeDocumentForDataHash(elem.Obj());
+                auto sortedObj = canonicalizeBSONObjForDataHash(elem.Obj());
                 objBuilder.append(elem.fieldName(), sortedObj);
             }
         } else {
@@ -91,10 +117,15 @@ BSONObj RandomizedIdempotencyTest::canonicalizeDocumentForDataHash(const BSONObj
             objBuilder.append(elem);
         }
     }
-
     return objBuilder.obj();
 }
 
+BSONObj RandomizedIdempotencyTest::canonicalizeDocumentForDataHash(const BSONObj& obj) {
+    if (!_ignoreFieldOrder) {
+        return obj;
+    }
+    return canonicalizeBSONObjForDataHash(obj);
+}
 BSONObj RandomizedIdempotencyTest::getDoc() {
     AutoGetCollectionForReadCommand autoColl(_opCtx.get(), nss);
     BSONObj doc;
@@ -103,7 +134,7 @@ BSONObj RandomizedIdempotencyTest::getDoc() {
 }
 
 std::vector<OplogEntry> RandomizedIdempotencyTest::createUpdateSequence(
-    const UpdateSequenceGenerator& generator, const size_t length) {
+    const UpdateSequenceGenerator& generator, size_t length) {
     // for each document enumerated & inserted generate a sequence of updates to apply to it.
     std::vector<OplogEntry> updateSequence;
     updateSequence.reserve(length);
@@ -116,16 +147,17 @@ std::vector<OplogEntry> RandomizedIdempotencyTest::createUpdateSequence(
 
 std::string RandomizedIdempotencyTest::getStatesString(const std::vector<CollectionState>& state1,
                                                        const std::vector<CollectionState>& state2,
-                                                       const std::vector<OplogEntry>& ops) {
+                                                       const std::vector<OplogEntry>& state1Ops,
+                                                       const std::vector<OplogEntry>& state2Ops) {
     LOGV2(21157,
           "{IdempotencyTest_getStatesString_state1_state2_ops}",
           "IdempotencyTest_getStatesString_state1_state2_ops"_attr =
-              IdempotencyTest::getStatesString(state1, state2, ops));
+              IdempotencyTest::getStatesString(state1, state2, state1Ops, state2Ops));
     StringBuilder sb;
     sb << "Ran update ops: ";
     sb << "[ ";
     bool firstIter = true;
-    for (const auto& op : ops) {
+    for (const auto& op : state2Ops) {
         if (!firstIter) {
             sb << ", ";
         } else {
@@ -136,9 +168,13 @@ std::string RandomizedIdempotencyTest::getStatesString(const std::vector<Collect
     sb << " ]\n";
 
     ASSERT_OK(resetState());
+    ASSERT_OK(runOpsInitialSync(state1Ops));
+    sb << "Document at the end of state1: " << getDoc() << "\n";
 
-    sb << "Start: " << getDoc() << "\n";
-    for (const auto& op : ops) {
+    ASSERT_OK(resetState());
+
+    sb << "Start document for state2: " << getDoc() << "\n";
+    for (const auto& op : state2Ops) {
         ASSERT_OK(runOpInitialSync(op));
         sb << "Apply: " << op.getObject() << "\n  ==> " << getDoc() << "\n";
     }
@@ -158,31 +194,36 @@ Status RandomizedIdempotencyTest::resetState() {
 }
 
 void RandomizedIdempotencyTest::runIdempotencyTestCase() {
+    _ignoreFieldOrder = true;
     ASSERT_OK(
         ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
 
     std::set<StringData> fields{"a", "b"};
-    size_t depth = 1;
-    size_t length = 1;
+    size_t depth = 2;
+    const size_t lengthOfNumericComponent = 1;
 
-    // Eliminate the chance of a sub array, because they cause theoretically valid sequences that
-    // cause idempotency issues.
+    // Eliminate modification of array elements, because they cause theoretically valid sequences
+    // that cause idempotency issues.
     const double kScalarProbability = 0.375;
     const double kDocProbability = 0.375;
-    const double kArrProbability = 0.0;
+    const double kArrProbability = 0;
 
     this->seed = SecureRandom().nextInt64();
     PseudoRandom seedGenerator(this->seed);
     RandomizedScalarGenerator scalarGenerator{PseudoRandom(seedGenerator.nextInt64())};
-    UpdateSequenceGenerator updateGenerator(
-        {fields, depth, length, kScalarProbability, kDocProbability, kArrProbability},
-        PseudoRandom{seedGenerator.nextInt64()},
-        &scalarGenerator);
+    UpdateSequenceGenerator updateGenerator({fields,
+                                             depth,
+                                             lengthOfNumericComponent,
+                                             kScalarProbability,
+                                             kDocProbability,
+                                             kArrProbability},
+                                            PseudoRandom{seedGenerator.nextInt64()},
+                                            &scalarGenerator);
 
     const bool kSkipDocs = kDocProbability == 0.0;
     const bool kSkipArrs = kArrProbability == 0.0;
-    DocumentStructureEnumerator enumerator({fields, depth, length, kSkipDocs, kSkipArrs},
-                                           &scalarGenerator);
+    DocumentStructureEnumerator enumerator(
+        {fields, depth, lengthOfNumericComponent, kSkipDocs, kSkipArrs}, &scalarGenerator);
 
     const size_t kUpdateSequenceLength = 5;
     // For the sake of keeping the speed of iteration sane and feasible.
@@ -199,23 +240,86 @@ void RandomizedIdempotencyTest::runIdempotencyTestCase() {
     }
 }
 
-TEST_F(RandomizedIdempotencyTest, CheckUpdateSequencesAreIdempotent) {
-    runIdempotencyTestCase();
-}
-
-TEST_F(IdempotencyTest, UpdateTwoFields) {
+void RandomizedIdempotencyTest::runUpdateV2IdempotencyTestCase(double v2Probability) {
+    _ignoreFieldOrder = (v2Probability < 1.0);
     ASSERT_OK(
         ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
 
-    ASSERT_OK(runOpInitialSync(createCollection(kUuid)));
-    ASSERT_OK(runOpInitialSync(insert(fromjson("{_id: 1, y: [0]}"))));
+    this->seed = SecureRandom().nextInt64();
+    PseudoRandom seedGenerator(this->seed);
+    RandomizedScalarGenerator scalarGenerator{PseudoRandom(seedGenerator.nextInt64())};
 
-    auto updateOp1 = update(1, fromjson("{$set: {x: 1}}"));
-    auto updateOp2 = update(1, fromjson("{$set: {x: 2, 'y.0': 2}}"));
-    auto updateOp3 = update(1, fromjson("{$set: {y: 3}}"));
+    // Eliminate modification of array elements when generating $v:1 oplog udpates, because they
+    // cause theoretically valid sequences that cause idempotency issues.
+    //
+    // For example oplog entries '{$unset: {a.1: null}}' and '{$set: {a.1.1: null}}' can break
+    // idempotency if the entries are applied on an input document '{a: []}'. These entries should
+    // not have been generated in practice if the starting document is '{a: []}', but the current
+    // 'UpdateSequenceGenerator' is not smart enough to figure that out.
+    const size_t lengthOfNumericComponent = 0;
 
-    auto ops = {updateOp1, updateOp2, updateOp3};
-    testOpsAreIdempotent(ops);
+    std::set<StringData> fields{"f00", "f10", "f01", "f11", "f02", "f20"};
+    UpdateSequenceGenerator updateV1Generator({fields, 2 /* depth */, lengthOfNumericComponent},
+                                              PseudoRandom(seedGenerator.nextInt64()),
+                                              &scalarGenerator);
+
+    auto generateDocWithId = [&seedGenerator](int id) {
+        MutableDocument doc;
+        doc.addField("_id", Value(id));
+        PseudoRandom rng(seedGenerator.nextInt64());
+        return doc_diff::generateDoc(&rng, &doc, 0);
+    };
+
+    PseudoRandom rng(seedGenerator.nextInt64());
+    for (auto simulation = 0; simulation < 10; ++simulation) {
+        // Initialize the collection with a single document, which would later be updated.
+        auto inputObj = generateDocWithId(kDocId);
+        this->initOps = std::vector<OplogEntry>{createCollection(), insert(inputObj)};
+        ASSERT_OK(resetState());
+        ASSERT_BSONOBJ_BINARY_EQ(inputObj, getDoc());
+
+        auto oldDoc = inputObj;
+        const size_t kUpdateSequenceLength = 15;
+        std::vector<OplogEntry> updateSequence;
+        for (size_t i = 0; i < kUpdateSequenceLength; i++) {
+            BSONObj oplogDiff;
+            boost::optional<BSONObj> generatedDoc;
+            if (rng.nextCanonicalDouble() <= v2Probability) {
+                // With delta based updates, we cannot just generate any random diff since certains
+                // diff when applied to an unrelated object (which would never have produced by
+                // computing the input objects) would break idempotency. So we do a dry run of what
+                // the collection state would look like and compute diffs based on that.
+                generatedDoc = generateDocWithId(kDocId);
+                auto diffOutput =
+                    doc_diff::computeDiff(oldDoc,
+                                          *generatedDoc,
+                                          update_oplog_entry::kSizeOfDeltaOplogEntryMetadata,
+                                          nullptr);
+                ASSERT(diffOutput);
+                oplogDiff = BSON("$v" << 2 << "diff" << diffOutput->diff);
+            } else {
+                oplogDiff = updateV1Generator.generateUpdate();
+            }
+            auto op = update(kDocId, oplogDiff);
+            ASSERT_OK(runOpInitialSync(op));
+            if (generatedDoc) {
+                ASSERT_BSONOBJ_BINARY_EQ(*generatedDoc, getDoc());
+            }
+            oldDoc = getDoc();
+            updateSequence.push_back(std::move(op));
+        }
+        testOpsAreIdempotent(updateSequence, SequenceType::kAnyPrefixOrSuffix);
+    }
+}
+
+TEST_F(RandomizedIdempotencyTest, CheckUpdateSequencesAreIdempotent) {
+    runIdempotencyTestCase();
+}
+TEST_F(RandomizedIdempotencyTest, CheckUpdateSequencesAreIdempotentV2) {
+    runUpdateV2IdempotencyTestCase(1.0);
+    runUpdateV2IdempotencyTestCase(0.4);
+    runUpdateV2IdempotencyTestCase(0.5);
+    runUpdateV2IdempotencyTestCase(0.6);
 }
 
 }  // namespace

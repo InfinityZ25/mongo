@@ -48,6 +48,10 @@
 
 namespace mongo {
 
+namespace sbe::value {
+class ValueBuilder;
+}
+
 namespace KeyString {
 
 enum class Version : uint8_t { V0 = 0, V1 = 1, kLatestVersion = V1 };
@@ -372,6 +376,13 @@ public:
         buf.appendBuf(_buffer.get(), _buffer.size());  // Serialize Keystring + Typebits
     }
 
+    /**
+     * Serializes this Value, excluing the RecordId, into a storable format with TypeBits
+     * information. The serialized format takes the following form:
+     *   [keystring size][keystring encoding][typebits encoding]
+     */
+    void serializeWithoutRecordId(BufBuilder& buf) const;
+
     // Deserialize the Value from a serialized format.
     static Value deserialize(BufReader& buf, KeyString::Version version) {
         const int32_t sizeOfKeystring = buf.read<LittleEndian<int32_t>>();
@@ -417,6 +428,10 @@ public:
 
     Value getOwned() const {
         return *this;
+    }
+
+    Version getVersion() const {
+        return _version;
     }
 
 private:
@@ -920,10 +935,6 @@ size_t getKeySize(const char* buffer, size_t len, Ordering ord, const TypeBits& 
 BSONObj toBson(StringData data, Ordering ord, const TypeBits& types);
 BSONObj toBson(const char* buffer, size_t len, Ordering ord, const TypeBits& types) noexcept;
 BSONObj toBsonSafe(const char* buffer, size_t len, Ordering ord, const TypeBits& types);
-BSONObj toBsonSafeWithDiscriminator(const char* buffer,
-                                    size_t len,
-                                    Ordering ord,
-                                    const TypeBits& typeBits);
 Discriminator decodeDiscriminator(const char* buffer,
                                   size_t len,
                                   Ordering ord,
@@ -950,6 +961,18 @@ size_t sizeWithoutRecordIdAtEnd(const void* bufferRaw, size_t bufSize);
 RecordId decodeRecordId(BufReader* reader);
 
 int compare(const char* leftBuf, const char* rightBuf, size_t leftSize, size_t rightSize);
+
+/**
+ * Read one KeyString component from the given 'reader' and 'typeBits' inputs and stream it to the
+ * 'valueBuilder' object, which converts it to a "Slot-Based Execution" (SBE) representation. When
+ * no components remain in the KeyString, this function returns false and leaves 'valueBuilder'
+ * unmodified.
+ */
+bool readSBEValue(BufReader* reader,
+                  TypeBits::Reader* typeBits,
+                  bool inverted,
+                  Version version,
+                  sbe::value::ValueBuilder* valueBuilder);
 
 template <class BufferT>
 template <class T>

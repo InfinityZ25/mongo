@@ -81,6 +81,8 @@ public:
                                       RecordId id,
                                       StringData idxName) const = 0;
 
+    virtual BSONObj getCatalogEntry(OperationContext* opCtx, RecordId catalogId) const = 0;
+
     virtual BSONCollectionCatalogEntry::MetaData getMetaData(OperationContext* opCtx,
                                                              RecordId id) const = 0;
 
@@ -92,6 +94,14 @@ public:
     virtual void putMetaData(OperationContext* opCtx,
                              RecordId id,
                              BSONCollectionCatalogEntry::MetaData& md) = 0;
+
+    /**
+     * Checks that the metadata for the index exists and matches the given spec.
+     */
+    virtual Status checkMetaDataForIndex(OperationContext* opCtx,
+                                         RecordId catalogId,
+                                         const std::string& indexName,
+                                         const BSONObj& spec) = 0;
 
     virtual std::vector<std::string> getAllIdents(OperationContext* opCtx) const = 0;
 
@@ -120,6 +130,11 @@ public:
     virtual std::string newInternalIdent() = 0;
 
     /**
+     * Generate an internal resumable index build ident name.
+     */
+    virtual std::string newInternalResumableIndexBuildIdent() = 0;
+
+    /**
      * On success, returns the RecordId which identifies the new record store in the durable catalog
      * in addition to ownership of the new RecordStore.
      */
@@ -129,11 +144,46 @@ public:
         const CollectionOptions& options,
         bool allocateDefaultSpace) = 0;
 
+    /**
+     * Import a collection by inserting the given metadata into the durable catalog and instructing
+     * the storage engine to import the corresponding idents. The metadata object should be a valid
+     * catalog entry and contain the following fields:
+     * "md": A document representing the BSONCollectionCatalogEntry::MetaData of the collection.
+     * "idxIdent": A document containing {<index_name>: <index_ident>} pairs for all indexes.
+     * "ns": Namespace of the collection being imported.
+     * "ident": Ident of the collection file.
+     *
+     * On success, returns an ImportResult structure containing the RecordId which identifies the
+     * new record store in the durable catalog, ownership of the new RecordStore and the UUID of the
+     * collection imported.
+     *
+     * The collection must be locked in MODE_X when calling this function.
+     */
+    struct ImportResult {
+        ImportResult(RecordId catalogId, std::unique_ptr<RecordStore> rs, UUID uuid)
+            : catalogId(catalogId), rs(std::move(rs)), uuid(uuid) {}
+        RecordId catalogId;
+        std::unique_ptr<RecordStore> rs;
+        UUID uuid;
+    };
+    enum class ImportCollectionUUIDOption { kKeepOld, kGenerateNew };
+    virtual StatusWith<ImportResult> importCollection(OperationContext* opCtx,
+                                                      const NamespaceString& nss,
+                                                      const BSONObj& metadata,
+                                                      const BSONObj& storageMetadata,
+                                                      ImportCollectionUUIDOption uuidOption) = 0;
+
     virtual Status renameCollection(OperationContext* opCtx,
                                     RecordId catalogId,
                                     const NamespaceString& toNss,
                                     bool stayTemp) = 0;
 
+    /**
+     * Deletes the persisted collection catalog entry identified by 'catalogId'.
+     *
+     * Expects (invariants) that all of the index catalog entries have been removed already via
+     * removeIndex.
+     */
     virtual Status dropCollection(OperationContext* opCtx, RecordId catalogId) = 0;
 
     /**
@@ -188,9 +238,11 @@ public:
                                  StringData validationLevel,
                                  StringData validationAction) = 0;
 
-    virtual Status removeIndex(OperationContext* opCtx,
-                               RecordId catalogId,
-                               StringData indexName) = 0;
+    /**
+     * Removes the index 'indexName' from the persisted collection catalog entry identified by
+     * 'catalogId'.
+     */
+    virtual void removeIndex(OperationContext* opCtx, RecordId catalogId, StringData indexName) = 0;
 
     /**
      * Updates the persisted catalog entry for 'ns' with the new index and creates the index on
@@ -203,6 +255,15 @@ public:
                                         const IndexDescriptor* spec,
                                         boost::optional<UUID> buildUUID,
                                         bool isBackgroundSecondaryBuild) = 0;
+
+    /**
+     * Drops the provided ident and recreates it as empty for use in resuming an index build.
+     */
+    virtual Status dropAndRecreateIndexIdentForResume(OperationContext* opCtx,
+                                                      RecordId catalogId,
+                                                      const IndexDescriptor* spec,
+                                                      StringData ident,
+                                                      KVPrefix prefix) = 0;
 
     /**
      * Returns a UUID if the index is being built with the two-phase index build procedure.
@@ -278,5 +339,9 @@ public:
     virtual KVPrefix getIndexPrefix(OperationContext* opCtx,
                                     RecordId catalogId,
                                     StringData indexName) const = 0;
+
+    virtual void setRand_forTest(const std::string& rand) = 0;
+
+    virtual std::string getRand_forTest() const = 0;
 };
 }  // namespace mongo

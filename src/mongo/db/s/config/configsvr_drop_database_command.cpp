@@ -27,8 +27,9 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
+#include "mongo/db/api_parameters.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
@@ -53,6 +54,14 @@ namespace {
 class ConfigSvrDropDatabaseCommand : public BasicCommand {
 public:
     ConfigSvrDropDatabaseCommand() : BasicCommand("_configsvrDropDatabase") {}
+
+    /**
+     * We accept any apiVersion, apiStrict, and/or apiDeprecationErrors, and forward it with the
+     * "dropDatabase" command to shards.
+     */
+    bool acceptsAnyApiVersionParameters() const override {
+        return true;
+    }
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
@@ -121,21 +130,18 @@ public:
         // Invalidate the database metadata so the next access kicks off a full reload.
         ON_BLOCK_EXIT([opCtx, dbname] { Grid::get(opCtx)->catalogCache()->purgeDatabase(dbname); });
 
-        auto dbInfo =
-            catalogClient->getDatabase(opCtx, dbname, repl::ReadConcernArgs::get(opCtx).getLevel());
-
-        // If the namespace isn't found, treat the drop as a success. In case the drop just happened
-        // and has not fully propagated, set the client's last optime to the system's last optime to
-        // ensure the client waits.
-        if (dbInfo.getStatus() == ErrorCodes::NamespaceNotFound) {
+        DatabaseType dbType;
+        try {
+            dbType = catalogClient->getDatabase(
+                opCtx, dbname, repl::ReadConcernArgs::get(opCtx).getLevel());
+        } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+            // If the namespace isn't found, treat the drop as a success. In case the drop just
+            // happened and has not fully propagated, set the client's last optime to the system's
+            // last optime to ensure the client waits.
             result.append("info", "database does not exist");
             repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
             return true;
         }
-
-        // If we didn't get a NamespaceNotFound error, make sure there wasn't some other type of
-        // error.
-        auto dbType = uassertStatusOK(dbInfo).value;
 
         uassertStatusOK(ShardingLogging::get(opCtx)->logChangeChecked(
             opCtx,
@@ -173,6 +179,7 @@ public:
             status, str::stream() << "Could not remove database '" << dbname << "' from metadata");
 
         // Send _flushDatabaseCacheUpdates to all shards
+        IgnoreAPIParametersBlock ignoreApiParametersBlock{opCtx};
         for (const ShardId& shardId : allShardIds) {
             const auto shard =
                 uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardId));

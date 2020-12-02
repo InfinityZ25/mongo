@@ -4,7 +4,9 @@
 // also covers the use of an indexed collection and includes a couple of test cases
 // using limit()
 //
-// @tags: [requires_fastcount]
+// @tags: [
+//   requires_fastcount,
+// ]
 
 t = db.explain_batch_size;
 t.drop();

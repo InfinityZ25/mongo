@@ -1,6 +1,6 @@
 /**
  * Validates the operationTime value in the command response depends on the read/writeConcern of the
- * the read/write commmand that produced it.
+ * the read/write command that produced it.
  * @tags: [requires_majority_read_concern]
  */
 (function() {
@@ -9,19 +9,13 @@
 // Skip db hash check because replication is stopped on secondaries.
 TestData.skipCheckDBHashes = true;
 
-load("jstests/replsets/rslib.js");           // For startSetIfSupportsReadMajority.
 load("jstests/libs/write_concern_util.js");  // For stopReplicationOnSecondaries,
                                              // restartReplicationOnSecondaries
 var name = "operation_time_read_and_write_concern";
 
 var replTest = new ReplSetTest(
     {name: name, nodes: 3, nodeOptions: {enableMajorityReadConcern: ""}, waitForKeys: true});
-
-if (!startSetIfSupportsReadMajority(replTest)) {
-    jsTestLog("Skipping test since storage engine doesn't support majority read concern.");
-    replTest.stopSet();
-    return;
-}
+replTest.startSet();
 replTest.initiate();
 
 var res;
@@ -56,12 +50,12 @@ assert.eq(res.cursor.firstBatch,
           [majorityDoc],
           "only the committed document, " + tojson(majorityDoc) +
               ", should be returned for the majority read with afterClusterTime: " +
-              majorityWriteOperationTime);
+              tojson(majorityWriteOperationTime));
 assert.eq(majorityReadOperationTime,
           majorityWriteOperationTime,
-          "the operationTime of the majority read, " + majorityReadOperationTime +
+          "the operationTime of the majority read, " + tojson(majorityReadOperationTime) +
               ", should be the cluster time of the last committed op in the oplog, " +
-              majorityWriteOperationTime);
+              tojson(majorityWriteOperationTime));
 
 // Validate that after replication, the local write data is now returned by the same query.
 restartReplicationOnSecondaries(replTest);
@@ -78,12 +72,13 @@ assert.eq(res.cursor.firstBatch,
           [majorityDoc, localDoc],
           "expected both inserted documents, " + tojson([majorityDoc, localDoc]) +
               ", to be returned for the second majority read with afterClusterTime: " +
-              majorityWriteOperationTime);
+              tojson(majorityWriteOperationTime));
 assert.eq(secondMajorityReadOperationTime,
           localWriteOperationTime,
-          "the operationTime of the second majority read, " + secondMajorityReadOperationTime +
+          "the operationTime of the second majority read, " +
+              tojson(secondMajorityReadOperationTime) +
               ", should be the cluster time of the replicated local write, " +
-              localWriteOperationTime);
+              tojson(localWriteOperationTime));
 
 // readConcern level linearizable is not currently supported.
 jsTestLog("Verifying readConcern linearizable with afterClusterTime is not supported.");
@@ -119,8 +114,8 @@ var failedWriteOperationTime = res.operationTime;
 
 assert.eq(failedWriteOperationTime,
           majorityWriteOperationTime,
-          "the operationTime of the failed majority write, " + failedWriteOperationTime +
+          "the operationTime of the failed majority write, " + tojson(failedWriteOperationTime) +
               ", should be the cluster time of the last successful write at the time it failed, " +
-              majorityWriteOperationTime);
+              tojson(majorityWriteOperationTime));
 replTest.stopSet();
 })();

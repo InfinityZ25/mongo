@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -96,7 +96,7 @@ public:
         uassertStatusOK(shardingState->canAcceptShardedCommands());
 
         // Steps
-        // 1. Set the `authoritative` and `forceRefresh` variables from the command object.
+        // 1. Set the `authoritative` variable from the command object.
         //
         // 2. Validate all command parameters against the info in our ShardingState, and return an
         //    error if they do not match.
@@ -117,41 +117,8 @@ public:
         LastError::get(client).disable();
 
         const bool authoritative = cmdObj.getBoolField("authoritative");
-        // A flag that specifies whether the set shard version catalog refresh
-        // is allowed to join an in-progress refresh triggered by an other
-        // thread, or whether it's required to either a) trigger its own
-        // refresh or b) wait for a refresh to be started after it has entered the
-        // getCollectionRoutingInfoWithRefresh function
-        const bool forceRefresh = cmdObj.getBoolField("forceRefresh");
 
         // Step 2
-
-        // Validate shardName parameter.
-        const auto shardName = cmdObj["shard"].str();
-        const auto storedShardName = shardingState->shardId().toString();
-        uassert(ErrorCodes::BadValue,
-                str::stream() << "received shardName " << shardName
-                              << " which differs from stored shardName " << storedShardName,
-                storedShardName == shardName);
-
-        // Validate config connection string parameter.
-        const auto configdb = cmdObj["configdb"].String();
-        uassert(ErrorCodes::BadValue,
-                "Config server connection string cannot be empty",
-                !configdb.empty());
-
-        const auto givenConnStr = uassertStatusOK(ConnectionString::parse(configdb));
-        uassert(ErrorCodes::InvalidOptions,
-                str::stream() << "Given config server string " << givenConnStr.toString()
-                              << " is not of type SET",
-                givenConnStr.type() == ConnectionString::SET);
-
-        const auto storedConnStr =
-            Grid::get(opCtx)->shardRegistry()->getConfigServerConnectionString();
-        uassert(ErrorCodes::IllegalOperation,
-                str::stream() << "Given config server set name: " << givenConnStr.getSetName()
-                              << " differs from known set name: " << storedConnStr.getSetName(),
-                givenConnStr.getSetName() == storedConnStr.getSetName());
 
         // Validate namespace parameter.
         const NamespaceString nss(cmdObj["setShardVersion"].String());
@@ -169,8 +136,8 @@ public:
             boost::optional<AutoGetDb> autoDb;
             autoDb.emplace(opCtx, nss.db(), MODE_IS);
 
-            // Slave nodes cannot support set shard version
-            uassert(ErrorCodes::NotMaster,
+            // Secondary nodes cannot support set shard version
+            uassert(ErrorCodes::NotWritablePrimary,
                     str::stream() << "setShardVersion with collection version is only supported "
                                      "against primary nodes, but it was received for namespace "
                                   << nss.ns(),
@@ -183,7 +150,7 @@ public:
             // Views do not require a shard version check. We do not care about invalid system views
             // for this check, only to validate if a view already exists for this namespace.
             if (autoDb->getDb() &&
-                !CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss) &&
+                !CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss) &&
                 ViewCatalog::get(autoDb->getDb())
                     ->lookupWithoutValidatingDurableViews(opCtx, nss.ns())) {
                 return true;
@@ -220,6 +187,8 @@ public:
 
                 // Step 5
 
+                const auto kTenSeconds = Milliseconds(10000);
+
                 // TODO: Refactor all of this
                 if (requestedVersion < collectionShardVersion &&
                     requestedVersion.epoch() == collectionShardVersion.epoch()) {
@@ -229,7 +198,12 @@ public:
                         collLock.reset();
                         autoDb.reset();
                         LOGV2(22056, "waiting till out of critical section");
-                        critSecSignal->waitFor(opCtx, Seconds(10));
+                        auto deadline = opCtx->getServiceContext()->getFastClockSource()->now() +
+                            std::min(opCtx->getRemainingMaxTimeMillis(), kTenSeconds);
+
+                        opCtx->runWithDeadline(deadline, ErrorCodes::ExceededTimeLimit, [&] {
+                            critSecSignal->wait(opCtx);
+                        });
                     }
 
                     errmsg = str::stream() << "shard global version for collection is higher "
@@ -250,7 +224,13 @@ public:
                         collLock.reset();
                         autoDb.reset();
                         LOGV2(22057, "waiting till out of critical section");
-                        critSecSignal->waitFor(opCtx, Seconds(10));
+
+                        auto deadline = opCtx->getServiceContext()->getFastClockSource()->now() +
+                            std::min(opCtx->getRemainingMaxTimeMillis(), kTenSeconds);
+
+                        opCtx->runWithDeadline(deadline, ErrorCodes::ExceededTimeLimit, [&] {
+                            critSecSignal->wait(opCtx);
+                        });
                     }
 
                     // need authoritative for first look
@@ -266,10 +246,19 @@ public:
 
         // Step 6
 
-        // Note: The forceRefresh flag controls whether we make sure to do our
-        // own refresh or if we're okay with joining another thread
-        const auto status = onShardVersionMismatchNoExcept(
-            opCtx, nss, requestedVersion, forceRefresh /*forceRefreshFromThisThread*/);
+        const auto status = [&] {
+            try {
+                // TODO (SERVER-50812) remove this if-else: just call onShardVersionMismatch
+                if (requestedVersion == ChunkVersion::UNSHARDED()) {
+                    forceShardFilteringMetadataRefresh(opCtx, nss);
+                } else {
+                    onShardVersionMismatch(opCtx, nss, requestedVersion);
+                }
+            } catch (const DBException& ex) {
+                return ex.toStatus();
+            }
+            return Status::OK();
+        }();
 
         {
             // Avoid using AutoGetCollection() as it returns the InvalidViewDefinition error code
@@ -298,7 +287,7 @@ public:
                     "error"_attr = redact(status));
 
                 result.append("ns", nss.ns());
-                result.append("code", status.code());
+                status.serializeErrorToBSON(&result);
                 requestedVersion.appendLegacyWithField(&result, "version");
                 currVersion.appendLegacyWithField(&result, "globalVersion");
                 result.appendBool("reloadConfig", true);

@@ -45,12 +45,6 @@ public:
     std::vector<std::string> listDatabases() const final {
         return {};
     }
-    bool supportsDocLocking() const final {
-        return false;
-    }
-    bool supportsDBLocking() const final {
-        return true;
-    }
     bool supportsCappedCollections() const final {
         return true;
     }
@@ -63,7 +57,7 @@ public:
     bool isEphemeral() const final {
         return true;
     }
-    void loadCatalog(OperationContext* opCtx) final {}
+    void loadCatalog(OperationContext* opCtx, bool loadingFromUncleanShutdown) final {}
     void closeCatalog(OperationContext* opCtx) final {}
     Status closeDatabase(OperationContext* opCtx, StringData db) final {
         return Status::OK();
@@ -81,7 +75,7 @@ public:
         return Status(ErrorCodes::CommandNotSupported,
                       "The current storage engine doesn't support backup mode");
     }
-    StatusWith<StorageEngine::BackupInformation> beginNonBlockingBackup(
+    StatusWith<std::unique_ptr<StorageEngine::StreamingCursor>> beginNonBlockingBackup(
         OperationContext* opCtx, const StorageEngine::BackupOptions& options) final {
         return Status(ErrorCodes::CommandNotSupported,
                       "The current storage engine doesn't support backup mode");
@@ -97,6 +91,14 @@ public:
         return Status::OK();
     }
     std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStore(OperationContext* opCtx) final {
+        return {};
+    }
+    std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStoreForResumableIndexBuild(
+        OperationContext* opCtx) final {
+        return {};
+    }
+    std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStoreFromExistingIdent(
+        OperationContext* opCtx, StringData ident) final {
         return {};
     }
     void cleanShutdown() final {}
@@ -119,13 +121,13 @@ public:
     bool supportsOplogStones() const final {
         return false;
     }
+    bool supportsResumableIndexBuilds() const final {
+        return false;
+    }
     bool supportsPendingDrops() const final {
         return false;
     }
     void clearDropPendingState() final {}
-    bool supportsTwoPhaseIndexBuild() const final {
-        return false;
-    }
     StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) final {
         fassertFailed(40547);
     }
@@ -136,23 +138,26 @@ public:
         MONGO_UNREACHABLE;
     }
     void setStableTimestamp(Timestamp stableTimestamp, bool force = false) final {}
+    Timestamp getStableTimestamp() const override {
+        return Timestamp();
+    }
     void setInitialDataTimestamp(Timestamp timestamp) final {}
+    Timestamp getInitialDataTimestamp() const override {
+        return Timestamp();
+    }
     void setOldestTimestampFromStable() final {}
     void setOldestTimestamp(Timestamp timestamp) final {}
+    Timestamp getOldestTimestamp() const final {
+        return {};
+    };
     void setOldestActiveTransactionTimestampCallback(
         OldestActiveTransactionTimestampCallback callback) final {}
-    bool isCacheUnderPressure(OperationContext* opCtx) const final {
-        return false;
-    }
-    void setCachePressureForTest(int pressure) final {}
+
     StatusWith<StorageEngine::ReconcileResult> reconcileCatalogAndIdents(
-        OperationContext* opCtx) final {
+        OperationContext* opCtx, InternalIdentReconcilePolicy internalIdentReconcilePolicy) final {
         return ReconcileResult{};
     }
     Timestamp getAllDurableTimestamp() const final {
-        return {};
-    }
-    Timestamp getOldestOpenReadTimestamp() const final {
         return {};
     }
     boost::optional<Timestamp> getOplogNeededForCrashRecovery() const final {
@@ -164,11 +169,19 @@ public:
     std::set<std::string> getDropPendingIdents() const final {
         return {};
     }
+    void addDropPendingIdent(const Timestamp& dropTimestamp,
+                             const NamespaceString& nss,
+                             std::shared_ptr<Ident> ident,
+                             DropIdentCallback&& onDrop) final {}
+    void checkpoint() final {}
     Status currentFilesCompatible(OperationContext* opCtx) const final {
         return Status::OK();
     }
     int64_t sizeOnDiskForDb(OperationContext* opCtx, StringData dbName) final {
         return 0;
+    }
+    bool isUsingDirectoryPerDb() const final {
+        return false;
     }
     KVEngine* getEngine() final {
         return nullptr;
@@ -181,14 +194,6 @@ public:
     }
     const DurableCatalog* getCatalog() const final {
         return nullptr;
-    }
-    std::unique_ptr<CheckpointLock> getCheckpointLock(OperationContext* opCtx) final {
-        return nullptr;
-    }
-    void addIndividuallyCheckpointedIndexToList(const std::string& ident) final {}
-    void clearIndividuallyCheckpointedIndexesList() final {}
-    bool isInIndividuallyCheckpointedIndexesList(const std::string& ident) const final {
-        return false;
     }
 };
 

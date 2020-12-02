@@ -29,12 +29,12 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/logical_clock.h"
-#include "mongo/db/logical_clock_test_fixture.h"
 #include "mongo/db/read_write_concern_defaults.h"
 #include "mongo/db/read_write_concern_defaults_cache_lookup_mock.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/service_context_test_fixture.h"
+#include "mongo/db/vector_clock_mutable.h"
+#include "mongo/db/vector_clock_test_fixture.h"
 #include "mongo/util/clock_source_mock.h"
 
 namespace mongo {
@@ -251,7 +251,7 @@ TEST_F(ReadWriteConcernDefaultsTest, TestRefreshDefaultsWithLowerEpoch) {
  * ReadWriteConcernDefaults::generateNewConcerns() uses the current clusterTime and wall clock time
  * (for epoch and setTime/localSetTime), so testing it requires a fixture with a logical clock.
  */
-class ReadWriteConcernDefaultsTestWithClusterTime : public LogicalClockTestFixture {
+class ReadWriteConcernDefaultsTestWithClusterTime : public VectorClockTestFixture {
 public:
     virtual ~ReadWriteConcernDefaultsTestWithClusterTime() {
         _rwcd.invalidate();
@@ -272,7 +272,7 @@ protected:
         _lookupMock.setLookupCallReturnValue(std::move(defaults));
         auto oldDefaults = _rwcd.getDefault(operationContext());
 
-        getClock()->reserveTicks(1);
+        VectorClockMutable::get(getServiceContext())->tickClusterTime(1);
         getMockClockSource()->advance(Milliseconds(1));
 
         return oldDefaults;
@@ -471,7 +471,7 @@ TEST_F(ReadWriteConcernDefaultsTestWithClusterTime, TestRefreshDefaultsWithDelet
     ASSERT_EQ(Timestamp(10, 20), *origCachedDefaults.getUpdateOpTime());
     ASSERT_EQ(Date_t::fromMillisSinceEpoch(1234), *origCachedDefaults.getUpdateWallClockTime());
 
-    getClock()->reserveTicks(1);
+    VectorClockMutable::get(getServiceContext())->tickClusterTime(1);
     getMockClockSource()->advance(Milliseconds(1));
 
     _lookupMock.setLookupCallReturnValue(RWConcernDefault());

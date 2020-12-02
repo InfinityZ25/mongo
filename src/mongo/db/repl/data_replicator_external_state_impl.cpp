@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -73,6 +73,11 @@ executor::TaskExecutor* DataReplicatorExternalStateImpl::getTaskExecutor() const
     return _replicationCoordinatorExternalState->getTaskExecutor();
 }
 
+std::shared_ptr<executor::TaskExecutor> DataReplicatorExternalStateImpl::getSharedTaskExecutor()
+    const {
+    return _replicationCoordinatorExternalState->getSharedTaskExecutor();
+}
+
 OpTimeWithTerm DataReplicatorExternalStateImpl::getCurrentTermAndLastCommittedOpTime() {
     return {_replicationCoordinator->getTerm(), _replicationCoordinator->getLastCommittedOpTime()};
 }
@@ -91,13 +96,16 @@ void DataReplicatorExternalStateImpl::processMetadata(const rpc::ReplSetMetadata
     }
 }
 
-bool DataReplicatorExternalStateImpl::shouldStopFetching(const HostAndPort& source,
-                                                         const rpc::ReplSetMetadata& replMetadata,
-                                                         const rpc::OplogQueryMetadata& oqMetadata,
-                                                         const OpTime& lastOpTimeFetched) {
+ChangeSyncSourceAction DataReplicatorExternalStateImpl::shouldStopFetching(
+    const HostAndPort& source,
+    const rpc::ReplSetMetadata& replMetadata,
+    const rpc::OplogQueryMetadata& oqMetadata,
+    const OpTime& previousOpTimeFetched,
+    const OpTime& lastOpTimeFetched) {
     // Re-evaluate quality of sync target.
-    if (_replicationCoordinator->shouldChangeSyncSource(
-            source, replMetadata, oqMetadata, lastOpTimeFetched)) {
+    auto changeSyncSourceAction = _replicationCoordinator->shouldChangeSyncSource(
+        source, replMetadata, oqMetadata, previousOpTimeFetched, lastOpTimeFetched);
+    if (changeSyncSourceAction != ChangeSyncSourceAction::kContinueSyncing) {
         LOGV2(21150,
               "Canceling oplog query due to OplogQueryMetadata. We have to choose a new "
               "sync source. Current source: {syncSource}, OpTime {lastAppliedOpTime}, "
@@ -107,10 +115,8 @@ bool DataReplicatorExternalStateImpl::shouldStopFetching(const HostAndPort& sour
               "syncSource"_attr = source,
               "lastAppliedOpTime"_attr = oqMetadata.getLastOpApplied(),
               "syncSourceIndex"_attr = oqMetadata.getSyncSourceIndex());
-
-        return true;
     }
-    return false;
+    return changeSyncSourceAction;
 }
 
 std::unique_ptr<OplogBuffer> DataReplicatorExternalStateImpl::makeInitialSyncOplogBuffer(

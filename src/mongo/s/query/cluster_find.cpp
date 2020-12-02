@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -45,7 +45,6 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/curop_failpoint_helpers.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/getmore_request.h"
@@ -172,7 +171,7 @@ StatusWith<std::unique_ptr<QueryRequest>> transformQueryForShards(
  */
 std::vector<std::pair<ShardId, BSONObj>> constructRequestsForShards(
     OperationContext* opCtx,
-    const CachedCollectionRoutingInfo& routingInfo,
+    const ChunkManager& cm,
     const std::set<ShardId>& shardIds,
     const CanonicalQuery& query,
     bool appendGeoNearDistanceProjection) {
@@ -187,21 +186,26 @@ std::vector<std::pair<ShardId, BSONObj>> constructRequestsForShards(
         qrToForward = std::make_unique<QueryRequest>(query.getQueryRequest());
     }
 
+    auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+    if (readConcernArgs.wasAtClusterTimeSelected()) {
+        // If mongos selected atClusterTime or received it from client, transmit it to shard.
+        qrToForward->setReadConcern(readConcernArgs.toBSONInner());
+    }
+
     auto shardRegistry = Grid::get(opCtx)->shardRegistry();
     std::vector<std::pair<ShardId, BSONObj>> requests;
     for (const auto& shardId : shardIds) {
         const auto shard = uassertStatusOK(shardRegistry->getShard(opCtx, shardId));
-        invariant(!shard->isConfig() || shard->getConnString().type() != ConnectionString::INVALID);
+        invariant(!shard->isConfig() || shard->getConnString());
 
         BSONObjBuilder cmdBuilder;
         qrToForward->asFindCommand(&cmdBuilder);
 
-        if (routingInfo.cm()) {
-            routingInfo.cm()->getVersion(shardId).appendToCommand(&cmdBuilder);
+        if (cm.isSharded()) {
+            cm.getVersion(shardId).appendToCommand(&cmdBuilder);
         } else if (!query.nss().isOnInternalDb()) {
             ChunkVersion::UNSHARDED().appendToCommand(&cmdBuilder);
-            auto dbVersion = routingInfo.db().databaseVersion();
-            cmdBuilder.append("databaseVersion", dbVersion.toBSON());
+            cmdBuilder.append("databaseVersion", cm.dbVersion().toBSON());
         }
 
         if (opCtx->getTxnNumber()) {
@@ -215,11 +219,11 @@ std::vector<std::pair<ShardId, BSONObj>> constructRequestsForShards(
 }
 
 void updateNumHostsTargetedMetrics(OperationContext* opCtx,
-                                   const CachedCollectionRoutingInfo& routingInfo,
+                                   const ChunkManager& cm,
                                    int nTargetedShards) {
     int nShardsOwningChunks = 0;
-    if (routingInfo.cm()) {
-        nShardsOwningChunks = routingInfo.cm()->getNShardsOwningChunks();
+    if (cm.isSharded()) {
+        nShardsOwningChunks = cm.getNShardsOwningChunks();
     }
 
     auto targetType = NumHostsTargetedMetrics::get(opCtx).parseTargetType(
@@ -231,18 +235,19 @@ void updateNumHostsTargetedMetrics(OperationContext* opCtx,
 CursorId runQueryWithoutRetrying(OperationContext* opCtx,
                                  const CanonicalQuery& query,
                                  const ReadPreferenceSetting& readPref,
-                                 const CachedCollectionRoutingInfo& routingInfo,
+                                 const ChunkManager& cm,
                                  std::vector<BSONObj>* results,
                                  bool* partialResultsReturned) {
     // Get the set of shards on which we will run the query.
-    auto shardIds = getTargetedShardsForQuery(opCtx,
-                                              routingInfo,
+    auto shardIds = getTargetedShardsForQuery(query.getExpCtx(),
+                                              cm,
                                               query.getQueryRequest().getFilter(),
                                               query.getQueryRequest().getCollation());
 
     // Construct the query and parameters. Defer setting skip and limit here until
     // we determine if the query is targeting multi-shards or a single shard below.
-    ClusterClientCursorParams params(query.nss(), readPref);
+    ClusterClientCursorParams params(
+        query.nss(), APIParameters::get(opCtx), readPref, ReadConcernArgs::get(opCtx));
     params.originatingCommandObj = CurOp::get(opCtx)->opDescription().getOwned();
     params.batchSize = query.getQueryRequest().getEffectiveBatchSize();
     params.tailableMode = query.getQueryRequest().getTailableMode();
@@ -294,13 +299,15 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
     }
 
     // Tailable cursors can't have a sort, which should have already been validated.
-    invariant(sortComparatorObj.isEmpty() || !query.getQueryRequest().isTailable());
+    tassert(4457013,
+            "tailable cursor unexpectedly has a sort",
+            sortComparatorObj.isEmpty() || !query.getQueryRequest().isTailable());
 
     // Construct the requests that we will use to establish cursors on the targeted shards,
     // attaching the shardVersion and txnNumber, if necessary.
 
-    auto requests = constructRequestsForShards(
-        opCtx, routingInfo, shardIds, query, appendGeoNearDistanceProjection);
+    auto requests =
+        constructRequestsForShards(opCtx, cm, shardIds, query, appendGeoNearDistanceProjection);
 
     // Establish the cursors with a consistent shardVersion across shards.
     params.remotes = establishCursors(opCtx,
@@ -391,7 +398,7 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
         CurOp::get(opCtx)->debug().cursorExhausted = true;
 
         if (shardIds.size() > 0) {
-            updateNumHostsTargetedMetrics(opCtx, routingInfo, shardIds.size());
+            updateNumHostsTargetedMetrics(opCtx, cm, shardIds.size());
         }
         return CursorId(0);
     }
@@ -412,7 +419,7 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
     CurOp::get(opCtx)->debug().cursorid = cursorId;
 
     if (shardIds.size() > 0) {
-        updateNumHostsTargetedMetrics(opCtx, routingInfo, shardIds.size());
+        updateNumHostsTargetedMetrics(opCtx, cm, shardIds.size());
     }
 
     return cursorId;
@@ -428,6 +435,13 @@ Status setUpOperationContextStateForGetMore(OperationContext* opCtx,
     if (auto readPref = cursor->getReadPreference()) {
         ReadPreferenceSetting::get(opCtx) = *readPref;
     }
+
+    if (auto readConcern = cursor->getReadConcern()) {
+        // Used to return "atClusterTime" in cursor replies to clients for snapshot reads.
+        ReadConcernArgs::get(opCtx) = *readConcern;
+    }
+
+    APIParameters::get(opCtx) = cursor->getAPIParameters();
 
     // If the originating command had a 'comment' field, we extract it and set it on opCtx. Note
     // that if the 'getMore' command itself has a 'comment' field, we give precedence to it.
@@ -491,18 +505,18 @@ CursorId ClusterFind::runQuery(OperationContext* opCtx,
     // Re-target and re-send the initial find command to the shards until we have established the
     // shard version.
     for (size_t retries = 1; retries <= kMaxRetries; ++retries) {
-        auto routingInfoStatus = getCollectionRoutingInfoForTxnCmd(opCtx, query.nss());
-        if (routingInfoStatus == ErrorCodes::NamespaceNotFound) {
+        auto swCM = getCollectionRoutingInfoForTxnCmd(opCtx, query.nss());
+        if (swCM == ErrorCodes::NamespaceNotFound) {
             // If the database doesn't exist, we successfully return an empty result set without
             // creating a cursor.
             return CursorId(0);
         }
 
-        auto routingInfo = uassertStatusOK(routingInfoStatus);
+        const auto cm = uassertStatusOK(std::move(swCM));
 
         try {
             return runQueryWithoutRetrying(
-                opCtx, query, readPref, routingInfo, results, partialResultsReturned);
+                opCtx, query, readPref, cm, results, partialResultsReturned);
         } catch (ExceptionFor<ErrorCodes::StaleDbVersion>& ex) {
             if (retries >= kMaxRetries) {
                 // Check if there are no retries remaining, so the last received error can be
@@ -514,15 +528,15 @@ CursorId ClusterFind::runQuery(OperationContext* opCtx,
 
             LOGV2_DEBUG(22839,
                         1,
-                        "Received error status for query {query_Short} on attempt {retries} of "
-                        "{kMaxRetries}: {ex}",
-                        "query_Short"_attr = redact(query.toStringShort()),
-                        "retries"_attr = retries,
-                        "kMaxRetries"_attr = kMaxRetries,
-                        "ex"_attr = redact(ex));
+                        "Received error status for query",
+                        "query"_attr = redact(query.toStringShort()),
+                        "attemptNumber"_attr = retries,
+                        "maxRetries"_attr = kMaxRetries,
+                        "error"_attr = redact(ex));
 
+            // Mark database entry in cache as stale.
             Grid::get(opCtx)->catalogCache()->onStaleDatabaseVersion(ex->getDb(),
-                                                                     ex->getVersionReceived());
+                                                                     ex->getVersionWanted());
 
             if (auto txnRouter = TransactionRouter::get(opCtx)) {
                 if (!txnRouter.canContinueOnStaleShardOrDbError(kFindCmdName, ex.toStatus())) {
@@ -555,23 +569,18 @@ CursorId ClusterFind::runQuery(OperationContext* opCtx,
 
             LOGV2_DEBUG(22840,
                         1,
-                        "Received error status for query {query_Short} on attempt {retries} of "
-                        "{kMaxRetries}: {ex}",
-                        "query_Short"_attr = redact(query.toStringShort()),
-                        "retries"_attr = retries,
-                        "kMaxRetries"_attr = kMaxRetries,
-                        "ex"_attr = redact(ex));
+                        "Received error status for query",
+                        "query"_attr = redact(query.toStringShort()),
+                        "attemptNumber"_attr = retries,
+                        "maxRetries"_attr = kMaxRetries,
+                        "error"_attr = redact(ex));
 
             if (ex.code() != ErrorCodes::ShardInvalidatedForTargeting) {
                 if (auto staleInfo = ex.extraInfo<StaleConfigInfo>()) {
                     catalogCache->invalidateShardOrEntireCollectionEntryForShardedCollection(
-                        opCtx,
-                        query.nss(),
-                        staleInfo->getVersionWanted(),
-                        staleInfo->getVersionReceived(),
-                        staleInfo->getShardId());
+                        query.nss(), staleInfo->getVersionWanted(), staleInfo->getShardId());
                 } else {
-                    catalogCache->onEpochChange(query.nss());
+                    catalogCache->invalidateCollectionEntry_LINEARIZABLE(query.nss());
                 }
             }
 
@@ -764,6 +773,7 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
         StatusWith<ClusterQueryResult> next =
             Status{ErrorCodes::InternalError, "uninitialized cluster query result"};
         try {
+            IgnoreAPIParametersBlock ignoreApiParametersBlock(opCtx);
             next = pinnedCursor.getValue()->next(context);
         } catch (const ExceptionFor<ErrorCodes::CloseChangeStream>&) {
             // This exception is thrown when a $changeStream stage encounters an event
@@ -835,9 +845,14 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
             "waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch");
     }
 
+    auto atClusterTime = !opCtx->inMultiDocumentTransaction()
+        ? repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime()
+        : boost::none;
     return CursorResponse(request.nss,
                           idToReturn,
                           std::move(batch),
+                          atClusterTime ? atClusterTime->asTimestamp()
+                                        : boost::optional<Timestamp>{},
                           startingFrom,
                           postBatchResumeToken,
                           boost::none,

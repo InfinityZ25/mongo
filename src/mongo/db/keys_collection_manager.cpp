@@ -26,7 +26,7 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -37,10 +37,10 @@
 #include "mongo/db/key_generator.h"
 #include "mongo/db/keys_collection_cache.h"
 #include "mongo/db/keys_collection_client.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/vector_clock.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/fail_point.h"
@@ -61,14 +61,15 @@ Milliseconds kMaxRefreshWaitTime(10 * 60 * 1000);
 // a successful refresh.
 MONGO_FAIL_POINT_DEFINE(maxKeyRefreshWaitTimeOverrideMS);
 
-/**
- * Returns the amount of time to wait until the monitoring thread should attempt to refresh again.
- */
+}  // unnamed namespace
+
+namespace keys_collection_manager_util {
+
 Milliseconds howMuchSleepNeedFor(const LogicalTime& currentTime,
                                  const LogicalTime& latestExpiredAt,
                                  const Milliseconds& interval) {
-    auto currentSecs = currentTime.asTimestamp().getSecs();
-    auto expiredSecs = latestExpiredAt.asTimestamp().getSecs();
+    auto currentSecs = Seconds(currentTime.asTimestamp().getSecs());
+    auto expiredSecs = Seconds(latestExpiredAt.asTimestamp().getSecs());
 
     if (currentSecs >= expiredSecs) {
         // This means that the last round didn't generate a usable key for the current time.
@@ -76,16 +77,16 @@ Milliseconds howMuchSleepNeedFor(const LogicalTime& currentTime,
         return kRefreshIntervalIfErrored;
     }
 
-    auto millisBeforeExpire = 1000 * (expiredSecs - currentSecs);
+    Milliseconds millisBeforeExpire = Milliseconds(expiredSecs) - Milliseconds(currentSecs);
 
-    if (interval.count() <= millisBeforeExpire) {
+    if (interval <= millisBeforeExpire) {
         return interval;
     }
 
-    return Milliseconds(millisBeforeExpire);
+    return millisBeforeExpire;
 }
 
-}  // unnamed namespace
+}  // namespace keys_collection_manager_util
 
 KeysCollectionManager::KeysCollectionManager(std::string purpose,
                                              std::unique_ptr<KeysCollectionClient> client,
@@ -182,7 +183,7 @@ void KeysCollectionManager::enableKeyGenerator(OperationContext* opCtx, bool doE
             opCtx, [this](OperationContext* opCtx) { return _keysCache.refresh(opCtx); });
     }
 } catch (const ExceptionForCat<ErrorCategory::ShutdownError>& ex) {
-    LOGV2(518091, "{ex}, doEnable = {doEnable}", "ex"_attr = ex, "doEnable"_attr = doEnable);
+    LOGV2(518091, "Exception during key generation", "error"_attr = ex, "enable"_attr = doEnable);
     return;
 }
 
@@ -223,6 +224,8 @@ void KeysCollectionManager::PeriodicRunner::_doPeriodicRefresh(ServiceContext* s
                                                                Milliseconds refreshInterval) {
     ThreadClient tc(threadName, service);
 
+    ON_BLOCK_EXIT([this]() mutable { _hasSeenKeys.store(false); });
+
     while (true) {
         unsigned errorCount = 0;
 
@@ -249,21 +252,22 @@ void KeysCollectionManager::PeriodicRunner::_doPeriodicRefresh(ServiceContext* s
             if (latestKeyStatusWith.getStatus().isOK()) {
                 errorCount = 0;
                 const auto& latestKey = latestKeyStatusWith.getValue();
-                auto currentTime = LogicalClock::get(service)->getClusterTime();
+                const auto currentTime = VectorClock::get(service)->getTime();
 
-                {
-                    stdx::unique_lock<Latch> lock(_mutex);
-                    _hasSeenKeys = true;
-                }
+                _hasSeenKeys.store(true);
 
-                nextWakeup =
-                    howMuchSleepNeedFor(currentTime, latestKey.getExpiresAt(), refreshInterval);
+                nextWakeup = keys_collection_manager_util::howMuchSleepNeedFor(
+                    currentTime.clusterTime(), latestKey.getExpiresAt(), refreshInterval);
             } else {
                 errorCount += 1;
                 nextWakeup = Milliseconds(kRefreshIntervalIfErrored.count() * errorCount);
                 if (nextWakeup > kMaxRefreshWaitTime) {
                     nextWakeup = kMaxRefreshWaitTime;
                 }
+                LOGV2(4939300,
+                      "Failed to refresh key cache",
+                      "error"_attr = redact(latestKeyStatusWith.getStatus()),
+                      "nextWakeup"_attr = nextWakeup);
             }
 
             // Notify all waiters that the refresh has finished and they can move on
@@ -345,16 +349,14 @@ void KeysCollectionManager::PeriodicRunner::stop() {
         }
 
         _inShutdown = true;
-        _hasSeenKeys = false;
         _refreshNeededCV.notify_all();
     }
 
     _backgroundThread.join();
 }
 
-bool KeysCollectionManager::PeriodicRunner::hasSeenKeys() {
-    stdx::lock_guard<Latch> lock(_mutex);
-    return _hasSeenKeys;
+bool KeysCollectionManager::PeriodicRunner::hasSeenKeys() const noexcept {
+    return _hasSeenKeys.load();
 }
 
 }  // namespace mongo

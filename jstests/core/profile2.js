@@ -1,9 +1,11 @@
 // Tests that large queries and updates are properly profiled.
 
 // Special db so that it can be run in parallel tests.
-// @tags: [requires_profiling]
+// @tags: [
+//   requires_profiling,
+// ]
 
-var coll = db.getSisterDB("profile2").profile2;
+var coll = db.getSiblingDB("profile2").profile2;
 
 assert.commandWorked(coll.getDB().runCommand({profile: 0}));
 coll.drop();

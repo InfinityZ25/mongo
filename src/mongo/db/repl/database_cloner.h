@@ -33,11 +33,13 @@
 
 #include "mongo/db/repl/base_cloner.h"
 #include "mongo/db/repl/collection_cloner.h"
+#include "mongo/db/repl/initial_sync_base_cloner.h"
+#include "mongo/db/repl/initial_sync_shared_data.h"
 
 namespace mongo {
 namespace repl {
 
-class DatabaseCloner final : public BaseCloner {
+class DatabaseCloner final : public InitialSyncBaseCloner {
 public:
     struct Stats {
         std::string dbname;

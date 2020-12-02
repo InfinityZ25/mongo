@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -37,7 +37,6 @@
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/oplog_entry.h"
-#include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/sync_source_selector.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
@@ -342,7 +341,7 @@ void SyncSourceResolver::_firstOplogEntryFetcherCallback(
     if (_lastOpTimeFetched.getTimestamp() < remoteEarliestOpTime.getTimestamp()) {
         // We're too stale to use this sync source.
         const auto blacklistDuration = kTooStaleBlacklistDuration;
-        const auto until = _taskExecutor->now() + Minutes(1);
+        const auto until = _taskExecutor->now() + blacklistDuration;
 
         LOGV2(21771,
               "We are too stale to use {candidate} as a sync source. Blacklisting this sync source "
@@ -369,6 +368,13 @@ void SyncSourceResolver::_firstOplogEntryFetcherCallback(
         }
 
         _chooseAndProbeNextSyncSource(earliestOpTimeSeen).transitional_ignore();
+        return;
+    }
+
+    // If we should not proceed with the rollback-via-refetch checks, we can safely return the
+    // candidate with an uninitialized rbid.
+    if (_requiredOpTime.isNull()) {
+        _finishCallback(candidate, ReplicationProcess::kUninitializedRollbackId).ignore();
         return;
     }
 
@@ -434,18 +440,12 @@ void SyncSourceResolver::_rbidRequestCallback(
         return;
     }
 
-    if (!_requiredOpTime.isNull()) {
-        // Schedule fetcher to look for '_requiredOpTime' in the remote oplog.
-        // Unittest requires that this kind of failure be handled specially.
-        auto status =
-            _scheduleFetcher(_makeRequiredOpTimeFetcher(candidate, earliestOpTimeSeen, rbid));
-        if (!status.isOK()) {
-            _finishCallback(status).transitional_ignore();
-        }
-        return;
+    // Schedule fetcher to look for '_requiredOpTime' in the remote oplog.
+    // Unittest requires that this kind of failure be handled specially.
+    auto status = _scheduleFetcher(_makeRequiredOpTimeFetcher(candidate, earliestOpTimeSeen, rbid));
+    if (!status.isOK()) {
+        _finishCallback(status).ignore();
     }
-
-    _finishCallback(candidate, rbid).ignore();
 }
 
 Status SyncSourceResolver::_compareRequiredOpTimeWithQueryResponse(
@@ -553,7 +553,7 @@ Status SyncSourceResolver::_chooseAndProbeNextSyncSource(OpTime earliestOpTimeSe
         }
 
         SyncSourceResolverResponse response;
-        response.syncSourceStatus = {ErrorCodes::OplogStartMissing, "too stale to catch up"};
+        response.syncSourceStatus = {ErrorCodes::TooStaleToSyncFromSource, "too stale to catch up"};
         response.earliestOpTimeSeen = earliestOpTimeSeen;
         return _finishCallback(response);
     }
@@ -570,9 +570,7 @@ Status SyncSourceResolver::_chooseAndProbeNextSyncSource(OpTime earliestOpTimeSe
 Status SyncSourceResolver::_finishCallback(HostAndPort hostAndPort, int rbid) {
     SyncSourceResolverResponse response;
     response.syncSourceStatus = std::move(hostAndPort);
-    if (rbid != ReplicationProcess::kUninitializedRollbackId) {
-        response.rbid = rbid;
-    }
+    response.rbid = rbid;
     return _finishCallback(response);
 }
 

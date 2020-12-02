@@ -66,7 +66,6 @@ void installShellUtilsLauncher(Scope& scope);
 class ProgramOutputMultiplexer {
 public:
     void appendLine(int port, ProcessId pid, const std::string& name, const std::string& line);
-    /** @return up to 100000 characters of the most recent log output. */
     std::string str() const;
     void clear();
 
@@ -94,12 +93,28 @@ public:
     void unregisterProgram(ProcessId pid);
 
     bool isPidRegistered(ProcessId pid) const;
+    /** platform-agnostic wrapper around waitpid that automatically cleans up
+     * the program registry
+     * @param pid the processid
+     * @param block if true, block the thread until the child has exited
+     * @param exit_code[out] if set, and an exit code is available, the code will be stored here
+     * @return true if the process has exited, false otherwise */
+    bool waitForPid(const ProcessId pid, const bool block, int* const exit_code = nullptr);
+    /** check if a child process is alive. Never blocks
+     * @param pid the processid
+     * @param exit_code[out] if set, and an exit code is available, the code will be stored here
+     * @return true if the process has exited, false otherwise */
+    bool isPidDead(const ProcessId pids, int* const exit_code = nullptr);
     void getRegisteredPorts(std::vector<int>& ports);
     void getRegisteredPids(std::vector<ProcessId>& pids);
 
 private:
+    void updatePidExitCode(const ProcessId pid, int exitCode);
+
+private:
     stdx::unordered_set<ProcessId> _registeredPids;
     stdx::unordered_map<int, ProcessId> _portToPidMap;
+    stdx::unordered_map<ProcessId, int> _pidToExitCode;
     stdx::unordered_map<ProcessId, stdx::thread> _outputReaderThreads;
     mutable stdx::recursive_mutex _mutex;
 

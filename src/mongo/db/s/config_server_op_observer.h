@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/db/op_observer.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 
@@ -81,7 +82,7 @@ public:
                    OptionalCollectionUUID uuid,
                    std::vector<InsertStatement>::const_iterator begin,
                    std::vector<InsertStatement>::const_iterator end,
-                   bool fromMigrate) override {}
+                   bool fromMigrate) override;
 
     void onUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) override {}
 
@@ -100,10 +101,14 @@ public:
                              const NamespaceString& nss,
                              const boost::optional<UUID> uuid,
                              const BSONObj& msgObj,
-                             const boost::optional<BSONObj> o2MsgObj) override {}
+                             const boost::optional<BSONObj> o2MsgObj,
+                             const boost::optional<repl::OpTime> preImageOpTime,
+                             const boost::optional<repl::OpTime> postImageOpTime,
+                             const boost::optional<repl::OpTime> prevWriteOpTimeInTransaction,
+                             const boost::optional<OplogSlot> slot) final{};
 
     void onCreateCollection(OperationContext* opCtx,
-                            Collection* coll,
+                            const CollectionPtr& coll,
                             const NamespaceString& collectionName,
                             const CollectionOptions& options,
                             const BSONObj& idIndex,
@@ -137,6 +142,14 @@ public:
                             OptionalCollectionUUID dropTargetUUID,
                             std::uint64_t numRecords,
                             bool stayTemp) override {}
+    void onImportCollection(OperationContext* opCtx,
+                            const UUID& importUUID,
+                            const NamespaceString& nss,
+                            long long numRecords,
+                            long long dataSize,
+                            const BSONObj& catalogEntry,
+                            const BSONObj& storageMetadata,
+                            bool isDryRun) override {}
     repl::OpTime preRenameCollection(OperationContext* opCtx,
                                      const NamespaceString& fromCollection,
                                      const NamespaceString& toCollection,
@@ -155,7 +168,7 @@ public:
 
     void onApplyOps(OperationContext* opCtx,
                     const std::string& dbName,
-                    const BSONObj& applyOpCmd) override {}
+                    const BSONObj& applyOpCmd) override;
 
     void onEmptyCapped(OperationContext* opCtx,
                        const NamespaceString& collectionName,
@@ -180,6 +193,18 @@ public:
                             boost::optional<OplogSlot> abortOplogEntryOpTime) override {}
 
     void onReplicationRollback(OperationContext* opCtx, const RollbackObserverInfo& rbInfo);
+
+    void onMajorityCommitPointUpdate(ServiceContext* service,
+                                     const repl::OpTime& newCommitPoint) override;
+
+private:
+    void _registerTopologyTimeTickPoint(Timestamp newTopologyTime);
+    void _tickTopologyTimeIfNecessary(ServiceContext* service, Timestamp newCommitPointTime);
+
+    // Guards access to the instance variables below.
+    Mutex _mutex = MONGO_MAKE_LATCH("ConfigServerOpObserver");
+
+    std::vector<Timestamp> _topologyTimeTickPoints;
 };
 
 }  // namespace mongo

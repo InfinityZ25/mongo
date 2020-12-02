@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -85,6 +85,7 @@ public:
                              << "for correctness.\nThis is a slow operation.\n"
                              << "\tAdd {full: true} option to do a more thorough check.\n"
                              << "\tAdd {background: true} to validate in the background.\n"
+                             << "\tAdd {repair: true} to run repair mode.\n"
                              << "Cannot specify both {full: true, background: true}.";
     }
 
@@ -97,7 +98,7 @@ public:
     }
 
     bool canIgnorePrepareConflicts() const override {
-        return true;
+        return false;
     }
 
     bool maintenanceOk() const override {
@@ -122,16 +123,15 @@ public:
         }
 
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
+        bool background = cmdObj["background"].trueValue();
 
-        const bool background = cmdObj["background"].trueValue();
-
-        // Background validation requires the storage engine to support checkpoints because it
-        // performs the validation on a checkpoint using checkpoint cursors.
-        if (background && !opCtx->getServiceContext()->getStorageEngine()->supportsCheckpoints()) {
-            uasserted(ErrorCodes::CommandNotSupported,
-                      str::stream() << "Running validate on collection " << nss
-                                    << " with { background: true } is not supported on the "
-                                    << storageGlobalParams.engine << " storage engine");
+        // Background validation is not supported on the ephemeralForTest storage engine due to its
+        // lack of support for timestamps. Switch the mode to foreground validation instead.
+        if (background && storageGlobalParams.engine == "ephemeralForTest") {
+            LOGV2(4775400,
+                  "ephemeralForTest does not support background validation, switching to "
+                  "foreground validation");
+            background = false;
         }
 
         const bool fullValidate = cmdObj["full"].trueValue();
@@ -141,12 +141,41 @@ public:
                                     << " and { full: true } is not supported.");
         }
 
+        const bool enforceFastCount = cmdObj["enforceFastCount"].trueValue();
+        if (background && enforceFastCount) {
+            uasserted(ErrorCodes::CommandNotSupported,
+                      str::stream() << "Running the validate command with both { background: true }"
+                                    << " and { enforceFastCount: true } is not supported.");
+        }
+
+        const bool repair = cmdObj["repair"].trueValue();
+        if (background && repair) {
+            uasserted(ErrorCodes::CommandNotSupported,
+                      str::stream() << "Running the validate command with both {background: true }"
+                                    << " and { repair: true } is not supported.");
+        }
+        if (enforceFastCount && repair) {
+            uasserted(ErrorCodes::CommandNotSupported,
+                      str::stream()
+                          << "Running the validate command with both {enforceFastCount: true }"
+                          << " and { repair: true } is not supported.");
+        }
+        repl::ReplicationCoordinator* replCoord = repl::ReplicationCoordinator::get(opCtx);
+        if (repair && replCoord->isReplEnabled()) {
+            uasserted(ErrorCodes::CommandNotSupported,
+                      str::stream()
+                          << "Running the validate command with { repair: true } can only be"
+                          << " performed in standalone mode.");
+        }
+
         if (!serverGlobalParams.quiet.load()) {
             LOGV2(20514,
-                  "CMD: validate {nss_ns}{background_background_true}{fullValidate_full_true}",
-                  "nss_ns"_attr = nss.ns(),
-                  "background_background_true"_attr = (background ? ", background:true" : ""),
-                  "fullValidate_full_true"_attr = (fullValidate ? ", full:true" : ""));
+                  "CMD: validate",
+                  "namespace"_attr = nss,
+                  "background"_attr = background,
+                  "full"_attr = fullValidate,
+                  "enforceFastCount"_attr = enforceFastCount,
+                  "repair"_attr = repair);
         }
 
         // Only one validation per collection can be in progress, the rest wait.
@@ -173,24 +202,32 @@ public:
             _validationNotifier.notify_all();
         });
 
-        auto options = (fullValidate) ? CollectionValidation::ValidateOptions::kFullValidation
-                                      : CollectionValidation::ValidateOptions::kNoFullValidation;
+        auto mode = [&] {
+            if (background)
+                return CollectionValidation::ValidateMode::kBackground;
+            if (enforceFastCount)
+                return CollectionValidation::ValidateMode::kForegroundFullEnforceFastCount;
+            if (fullValidate)
+                return CollectionValidation::ValidateMode::kForegroundFull;
+            return CollectionValidation::ValidateMode::kForeground;
+        }();
+
+        auto repairMode = repair ? CollectionValidation::RepairMode::kRepair
+                                 : CollectionValidation::RepairMode::kNone;
+
+        if (repair) {
+            opCtx->recoveryUnit()->setPrepareConflictBehavior(
+                PrepareConflictBehavior::kIgnoreConflictsAllowWrites);
+        }
 
         ValidateResults validateResults;
-        Status status = CollectionValidation::validate(
-            opCtx, nss, options, background, &validateResults, &result);
+        Status status =
+            CollectionValidation::validate(opCtx, nss, mode, repairMode, &validateResults, &result);
         if (!status.isOK()) {
             return CommandHelpers::appendCommandStatusNoThrow(result, status);
         }
 
-        result.appendBool("valid", validateResults.valid);
-        if (validateResults.readTimestamp) {
-            result.append("readTimestamp", validateResults.readTimestamp.get());
-        }
-        result.append("warnings", validateResults.warnings);
-        result.append("errors", validateResults.errors);
-        result.append("extraIndexEntries", validateResults.extraIndexEntries);
-        result.append("missingIndexEntries", validateResults.missingIndexEntries);
+        validateResults.appendToResultObj(result, /*debugging=*/false);
 
         if (!validateResults.valid) {
             result.append("advice",

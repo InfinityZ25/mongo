@@ -45,6 +45,10 @@ class RefreshSessionsCommand final : public BasicCommand {
 public:
     RefreshSessionsCommand() : BasicCommand("refreshSessions") {}
 
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
+
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }

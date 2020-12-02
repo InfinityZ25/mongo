@@ -34,16 +34,18 @@
 
 #include "mongo/base/string_data.h"
 #include "mongo/client/authenticate.h"
+#include "mongo/client/client_api_version_parameters_gen.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/client/dbclient_cursor.h"
 #include "mongo/client/index_spec.h"
 #include "mongo/client/mongo_uri.h"
 #include "mongo/client/query.h"
 #include "mongo/client/read_preference.h"
+#include "mongo/config.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/logger/log_severity.h"
+#include "mongo/logv2/log_severity.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/rpc/message.h"
 #include "mongo/rpc/metadata.h"
@@ -108,11 +110,15 @@ class DBClientBase : public DBClientQueryInterface {
     DBClientBase& operator=(const DBClientBase&) = delete;
 
 public:
-    DBClientBase()
-        : _logLevel(logger::LogSeverity::Log()),
+    DBClientBase(const ClientAPIVersionParameters* apiParameters = nullptr)
+        : _logLevel(logv2::LogSeverity::Log()),
           _connectionId(ConnectionIdSequence.fetchAndAdd(1)),
           _cachedAvailableOptions((enum QueryOptions)0),
-          _haveCachedAvailableOptions(false) {}
+          _haveCachedAvailableOptions(false) {
+        if (apiParameters) {
+            _apiParameters = *apiParameters;
+        }
+    }
 
     virtual ~DBClientBase() {}
 
@@ -169,7 +175,7 @@ public:
 
     /**
      * actualServer is set to the actual server where they call went if there was a choice (for
-     * example SlaveOk).
+     * example SecondaryOk).
      */
     virtual bool call(Message& toSend,
                       Message& response,
@@ -268,7 +274,7 @@ public:
         directly call runCommand.
 
         @param dbname database name.  Use "admin" for global administrative commands.
-        @param cmd  the command object to execute.  For example, { ismaster : 1 }
+        @param cmd  the command object to execute.  For example, { hello : 1 }
         @param info the result object the database returns. Typically has { ok : ..., errmsg : ... }
                     fields set.
         @param options see enum QueryOptions - normally not needed to run a command
@@ -304,7 +310,8 @@ public:
      * Authenticates to another cluster member using appropriate authentication data.
      * @return true if the authentication was successful
      */
-    virtual Status authenticateInternalUser();
+    virtual Status authenticateInternalUser(
+        auth::StepDownBehavior stepDownBehavior = auth::StepDownBehavior::kKillConnection);
 
     /**
      * Authenticate a user.
@@ -369,15 +376,14 @@ public:
     static std::string createPasswordDigest(const std::string& username,
                                             const std::string& clearTextPassword);
 
-    /** returns true in isMaster parm if this db is the current master
-       of a replica pair.
+    /** returns true in isPrimary param if this db is the current primary of a replica pair.
 
        pass in info for more details e.g.:
-         { "ismaster" : 1.0 , "msg" : "not paired" , "ok" : 1.0  }
+         { "isprimary" : 1.0 , "msg" : "not paired" , "ok" : 1.0  }
 
        returns true if command invoked successfully.
     */
-    virtual bool isMaster(bool& isMaster, BSONObj* info = nullptr);
+    virtual bool isPrimary(bool& isPrimary, BSONObj* info = nullptr);
 
     /**
        Create a new collection in the database.  Normally, collection creation is automatic.  You
@@ -609,7 +615,7 @@ public:
     virtual int getMinWireVersion() = 0;
     virtual int getMaxWireVersion() = 0;
 
-    const std::vector<std::string>& getIsMasterSaslMechanisms() const {
+    const std::vector<std::string>& getIsPrimarySaslMechanisms() const {
         return _saslMechsForAuth;
     }
 
@@ -751,15 +757,33 @@ public:
     virtual rpc::UniqueReply parseCommandReplyMessage(const std::string& host,
                                                       const Message& replyMsg);
 
+    /**
+     * Returns the latest operationTime tracked on this client.
+     */
+    Timestamp getOperationTime();
+
+    void setOperationTime(Timestamp operationTime);
+
     // This is only for DBClientCursor.
     static void (*withConnection_do_not_use)(std::string host, std::function<void(DBClientBase*)>);
+
+#ifdef MONGO_CONFIG_SSL
+    /**
+     * Get the SSL configuration of this client.
+     */
+    virtual const SSLConfiguration* getSSLConfiguration() = 0;
+#endif
+
+    const ClientAPIVersionParameters& getApiParameters() const {
+        return _apiParameters;
+    }
 
 protected:
     /** if the result of a command is ok*/
     bool isOk(const BSONObj&);
 
-    /** if the element contains a not master error */
-    bool isNotMasterErrorString(const BSONElement& e);
+    /** if the element contains a not primary error */
+    bool isNotPrimaryErrorString(const BSONElement& e);
 
     BSONObj _countCmd(const NamespaceStringOrUUID nsOrUuid,
                       const BSONObj& query,
@@ -782,7 +806,7 @@ protected:
     void _setServerRPCProtocols(rpc::ProtocolSet serverProtocols);
 
     /** controls how chatty the client is about network errors & such.  See log.h */
-    const logger::LogSeverity _logLevel;
+    const logv2::LogSeverity _logLevel;
 
     static AtomicWord<long long> ConnectionIdSequence;
     long long _connectionId;  // unique connection id for this connection
@@ -816,9 +840,45 @@ private:
 
     enum QueryOptions _cachedAvailableOptions;
     bool _haveCachedAvailableOptions;
+
+    // The operationTime associated with the last command handles by the client.
+    // TODO(SERVER-49791): Implement proper tracking of operationTime.
+    Timestamp _lastOperationTime;
+
+    ClientAPIVersionParameters _apiParameters;
 };  // DBClientBase
 
 BSONElement getErrField(const BSONObj& result);
 bool hasErrField(const BSONObj& result);
+
+/*
+ * RAII-style class to set new RequestMetadataWriter and ReplyMetadataReader on DBClientConnection
+ * "_conn". On object destruction, '_conn' is set back to it's old RequestsMetadataWriter and
+ * ReplyMetadataReader.
+ */
+class ScopedMetadataWriterAndReader {
+    ScopedMetadataWriterAndReader(const ScopedMetadataWriterAndReader&) = delete;
+    ScopedMetadataWriterAndReader& operator=(const ScopedMetadataWriterAndReader&) = delete;
+
+public:
+    ScopedMetadataWriterAndReader(DBClientBase* conn,
+                                  rpc::RequestMetadataWriter writer,
+                                  rpc::ReplyMetadataReader reader)
+        : _conn(conn),
+          _oldWriter(std::move(conn->getRequestMetadataWriter())),
+          _oldReader(std::move(conn->getReplyMetadataReader())) {
+        _conn->setRequestMetadataWriter(std::move(writer));
+        _conn->setReplyMetadataReader(std::move(reader));
+    }
+    ~ScopedMetadataWriterAndReader() {
+        _conn->setRequestMetadataWriter(std::move(_oldWriter));
+        _conn->setReplyMetadataReader(std::move(_oldReader));
+    }
+
+private:
+    DBClientBase* const _conn;  // not owned.
+    rpc::RequestMetadataWriter _oldWriter;
+    rpc::ReplyMetadataReader _oldReader;
+};
 
 }  // namespace mongo

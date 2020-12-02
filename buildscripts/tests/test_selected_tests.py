@@ -54,18 +54,16 @@ class TestAcceptance(unittest.TestCase):
         selected_tests_service_mock.get_test_mappings.return_value = []
         selected_tests_variant_expansions = {
             "task_name": "selected_tests_gen", "build_variant": "selected-tests",
-            "build_id": "my_build_id", "project": "mongodb-mongo-master"
+            "build_id": "my_build_id", "project": "mongodb-mongo-master",
+            "version_id": "my_version", "task_id": "task_id"
         }
         repos = [mock_changed_git_files([])]
-        origin_build_variants = ["enterprise-rhel-62-64-bit"]
 
         config_dict = under_test.run(evg_api_mock, evg_config, selected_tests_service_mock,
-                                     selected_tests_variant_expansions, repos,
-                                     origin_build_variants)
+                                     selected_tests_variant_expansions, repos)
 
-        self.assertEqual(
-            json.loads(config_dict["selected_tests_config.json"]),
-            empty_build_variant(origin_build_variants[0]))
+        # assert that config_dict does not contain keys for any generated task configs
+        self.assertEqual(config_dict.keys(), {"selected_tests_config.json"})
 
     @unittest.skipIf(sys.platform.startswith("win"), "not supported on windows")
     def test_when_test_mappings_are_found_for_changed_files(self):
@@ -79,27 +77,38 @@ class TestAcceptance(unittest.TestCase):
             },
         ]
         selected_tests_variant_expansions = {
-            "task_name": "selected_tests_gen", "build_variant": "selected-tests",
-            "build_id": "my_build_id", "project": "mongodb-mongo-master"
+            "task_name": "selected_tests_gen",
+            "build_variant": "selected-tests",
+            "build_id": "my_build_id",
+            "project": "mongodb-mongo-master",
+            "version_id": "my_version",
+            "task_id": "task_id",
+            "max_sub_suites": 3,
         }
         repos = [mock_changed_git_files(["src/file1.cpp"])]
-        origin_build_variants = ["enterprise-rhel-62-64-bit"]
 
         config_dict = under_test.run(evg_api_mock, evg_config, selected_tests_service_mock,
-                                     selected_tests_variant_expansions, repos,
-                                     origin_build_variants)
+                                     selected_tests_variant_expansions, repos)
 
         self.assertIn("selected_tests_config.json", config_dict)
-        # jstests/auth/auth1.js belongs to two suites, auth and auth_audit, each of which has
-        # fallback_num_sub_suites = 4 in their resmoke args, resulting in 4 subtasks being generated
-        # for each
-        self.assertEqual(len(config_dict), 9)
+
+        # assert that generated suite files have the suite name and the variant name in the
+        # filename, to prevent tasks on different variants from using the same suite file
+        self.assertIn("auth_enterprise-rhel-62-64-bit-dynamic-required_0.yml", config_dict)
+
+        # assert that tasks are generated on all required build variants
+        build_variants_with_generated_tasks = json.loads(
+            config_dict["selected_tests_config.json"])["buildvariants"]
         self.assertEqual(
-            sorted(config_dict.keys()), [
-                "auth_0.yml", "auth_1.yml", "auth_2.yml", "auth_3.yml", "auth_audit_4.yml",
-                "auth_audit_5.yml", "auth_audit_6.yml", "auth_audit_7.yml",
-                "selected_tests_config.json"
-            ])
+            len(build_variants_with_generated_tasks), len(evg_config.get_required_variants()))
+
+        # jstests/auth/auth1.js belongs to two suites, auth and auth_audit,
+        # max_sub_suites = 3, resulting in 3 subtasks being generated
+        # for each, hence 6 tasks total
+        rhel_62_with_generated_tasks = next(
+            (variant for variant in build_variants_with_generated_tasks
+             if variant["name"] == "enterprise-rhel-62-64-bit-dynamic-required"), None)
+        self.assertEqual(len(rhel_62_with_generated_tasks["tasks"]), 6)
 
     @unittest.skipIf(sys.platform.startswith("win"), "not supported on windows")
     def test_when_task_mappings_are_found_for_changed_files(self):
@@ -113,25 +122,30 @@ class TestAcceptance(unittest.TestCase):
             },
         ]
         selected_tests_variant_expansions = {
-            "task_name": "selected_tests_gen", "build_variant": "selected-tests",
-            "build_id": "my_build_id", "project": "mongodb-mongo-master"
+            "task_name": "selected_tests_gen",
+            "build_variant": "selected-tests",
+            "build_id": "my_build_id",
+            "project": "mongodb-mongo-master",
+            "version_id": "my_version",
+            "task_id": "task id",
+            "max_sub_suites": 3,
         }
         repos = [mock_changed_git_files(["src/file1.cpp"])]
-        origin_build_variants = ["enterprise-rhel-62-64-bit"]
 
         config_dict = under_test.run(evg_api_mock, evg_config, selected_tests_service_mock,
-                                     selected_tests_variant_expansions, repos,
-                                     origin_build_variants)
+                                     selected_tests_variant_expansions, repos)
 
         self.assertIn("selected_tests_config.json", config_dict)
-        # the auth task's generator task, auth_gen, has fallback_num_sub_suites = 4 in
-        # its resmoke args, resulting in 4 subtasks being generated, plus a _misc task
-        self.assertEqual(len(config_dict), 6)
-        self.assertEqual(
-            sorted(config_dict.keys()), [
-                "auth_0.yml", "auth_1.yml", "auth_2.yml", "auth_3.yml", "auth_misc.yml",
-                "selected_tests_config.json"
-            ])
+
+        # the auth task's generator task, max_sub_suites is 3,
+        # resulting in 3 subtasks being generated, plus a _misc task, hence 4
+        # tasks total
+        build_variants_with_generated_tasks = json.loads(
+            config_dict["selected_tests_config.json"])["buildvariants"]
+        rhel_62_with_generated_tasks = next(
+            (variant for variant in build_variants_with_generated_tasks
+             if variant["name"] == "enterprise-rhel-62-64-bit-dynamic-required"), None)
+        self.assertEqual(len(rhel_62_with_generated_tasks["tasks"]), 4)
 
 
 class TestSelectedTestsConfigOptions(unittest.TestCase):
@@ -584,7 +598,7 @@ class TestGetTaskConfigs(unittest.TestCase):
         self.assertEqual(task_configs["task_config_key"], "task_config_value_2")
 
 
-class RemoveRepoPathPrefix(unittest.TestCase):
+class TestRemoveRepoPathPrefix(unittest.TestCase):
     def test_file_is_in_enterprise_modules(self):
         filepath = under_test._remove_repo_path_prefix(
             "src/mongo/db/modules/enterprise/src/file1.cpp")
@@ -595,3 +609,45 @@ class RemoveRepoPathPrefix(unittest.TestCase):
         filepath = under_test._remove_repo_path_prefix("other_directory/src/file1.cpp")
 
         self.assertEqual(filepath, "other_directory/src/file1.cpp")
+
+
+class TestRemoveTaskConfigsAlreadyInBuild(unittest.TestCase):
+    def test_tasks_are_already_in_build(self):
+        task_configs = {
+            "aggregation": {"build_variant": "linux-64-debug"},
+            "jsCore": {"build_variant": "linux-64-debug"}
+        }
+        evg_api = MagicMock()
+        aggregation_task = MagicMock(display_name="aggregation")
+        evg_api.version_by_id.return_value.build_by_variant.return_value.get_tasks.return_value = [
+            aggregation_task
+        ]
+        build_variant_config = MagicMock()
+        version_id = "version_id"
+        under_test.remove_task_configs_already_in_build(task_configs, evg_api, build_variant_config,
+                                                        version_id)
+
+        self.assertNotIn("aggregation", task_configs)
+        self.assertIn("jsCore", task_configs)
+
+    def test_no_build_exists(self):
+        task_configs = {"aggregation": {"build_variant": "linux-64-debug"}}
+        evg_api = MagicMock()
+        evg_api.version_by_id.return_value.build_by_variant.side_effect = KeyError
+        build_variant_config = MagicMock()
+        version_id = "version_id"
+        under_test.remove_task_configs_already_in_build(task_configs, evg_api, build_variant_config,
+                                                        version_id)
+
+        self.assertIn("aggregation", task_configs)
+
+    def test_no_tasks_already_in_build(self):
+        task_configs = {"aggregation": {"build_variant": "linux-64-debug"}}
+        evg_api = MagicMock()
+        evg_api.version_by_id.return_value.build_by_variant.return_value.get_tasks.return_value = []
+        build_variant_config = MagicMock()
+        version_id = "version_id"
+        under_test.remove_task_configs_already_in_build(task_configs, evg_api, build_variant_config,
+                                                        version_id)
+
+        self.assertIn("aggregation", task_configs)

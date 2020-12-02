@@ -30,7 +30,6 @@
 #include "mongo/platform/basic.h"
 
 
-#include "mongo/db/background.h"
 #include "mongo/db/catalog/capped_utils.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
@@ -120,7 +119,7 @@ public:
         Lock::CollectionLock collLock(opCtx, toNs, MODE_X);
 
         if (!repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, toNs)) {
-            uasserted(ErrorCodes::NotMaster,
+            uasserted(ErrorCodes::NotWritablePrimary,
                       str::stream() << "Not primary while cloning collection " << from << " to "
                                     << to << " (as capped)");
         }
@@ -150,6 +149,11 @@ public:
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
+
+    bool collectsResourceConsumptionMetrics() const override {
+        return true;
+    }
+
     std::string help() const override {
         return "{ convertToCapped:<fromCollectionName>, size:<sizeInBytes> }";
     }

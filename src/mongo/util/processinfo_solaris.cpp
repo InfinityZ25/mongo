@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include <boost/filesystem.hpp>
 #include <boost/none.hpp>
@@ -122,10 +122,6 @@ int ProcessInfo::getVirtualMemorySize() {
 int ProcessInfo::getResidentSize() {
     ProcPsinfo p;
     return static_cast<int>(p.psinfo.pr_rssize / 1024);
-}
-
-double ProcessInfo::getSystemMemoryPressurePercentage() {
-    return 0.0;
 }
 
 void ProcessInfo::getExtraInfo(BSONObjBuilder& info) {

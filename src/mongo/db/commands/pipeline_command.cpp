@@ -43,6 +43,10 @@ class PipelineCommand final : public Command {
 public:
     PipelineCommand() : Command("aggregate") {}
 
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
+
     /**
      * It's not known until after parsing whether or not an aggregation command is an explain
      * request, because it might include the `explain: true` field (ie. aggregation explains do not
@@ -72,10 +76,18 @@ public:
         auto privileges = uassertStatusOK(
             AuthorizationSession::get(opCtx->getClient())
                 ->getPrivilegesForAggregate(
-                    aggregationRequest.getNamespaceString(), opMsgRequest.body, false));
+                    aggregationRequest.getNamespaceString(), aggregationRequest, false));
 
         return std::make_unique<Invocation>(
             this, opMsgRequest, std::move(aggregationRequest), std::move(privileges));
+    }
+
+    bool shouldAffectReadConcernCounter() const override {
+        return true;
+    }
+
+    bool collectsResourceConsumptionMetrics() const override {
+        return true;
     }
 
     class Invocation final : public CommandInvocation {

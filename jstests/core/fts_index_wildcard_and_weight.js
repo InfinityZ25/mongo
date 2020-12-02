@@ -1,7 +1,9 @@
 // Test that on a text index that matches all fields does not use a weight from a named field.
 // This test was designed to reproduce SERVER-45363.
-// @tags: [requires_fcv_44]
 //
+// @tags: [
+//   sbe_incompatible,
+// ]
 (function() {
 "use strict";
 var coll = db.getCollection(jsTestName());

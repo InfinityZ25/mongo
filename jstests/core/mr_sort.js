@@ -5,13 +5,14 @@
 //   # mapReduce does not support afterClusterTime.
 //   does_not_support_causal_consistency,
 //   does_not_support_stepdowns,
+//   sbe_incompatible,
 //   uses_map_reduce_with_temp_collections,
 // ]
 
 t = db.mr_sort;
 t.drop();
 
-t.ensureIndex({x: 1});
+t.createIndex({x: 1});
 
 t.insert({x: 1});
 t.insert({x: 10});

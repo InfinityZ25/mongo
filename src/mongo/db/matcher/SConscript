@@ -19,6 +19,9 @@ env.Library(
 env.Library(
     target='expressions',
     source=[
+        'match_expression_util.cpp',
+        'doc_validation_error.cpp',
+        'doc_validation_util.cpp',
         'expression.cpp',
         'expression_algo.cpp',
         'expression_array.cpp',
@@ -56,7 +59,7 @@ env.Library(
         'schema/expression_internal_schema_xor.cpp',
         'schema/json_pointer.cpp',
         'schema/json_schema_parser.cpp',
-        env.Idlc('schema/encrypt_schema.idl')[0],
+        'schema/encrypt_schema.idl',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -65,9 +68,9 @@ env.Library(
         '$BUILD_DIR/mongo/db/fts/fts_query_noop',
         '$BUILD_DIR/mongo/db/geo/geometry',
         '$BUILD_DIR/mongo/db/geo/geoparser',
+        '$BUILD_DIR/mongo/db/pipeline/expression_context',
         '$BUILD_DIR/mongo/db/query/collation/collator_interface',
         '$BUILD_DIR/mongo/db/query/query_knobs',
-        '$BUILD_DIR/mongo/db/pipeline/expression_context',
         '$BUILD_DIR/mongo/idl/idl_parser',
         '$BUILD_DIR/mongo/util/regex_util',
         '$BUILD_DIR/third_party/shim_pcrecpp',
@@ -83,19 +86,26 @@ env.Library(
         'expression_where.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/db/concurrency/lock_manager',
-        '$BUILD_DIR/mongo/db/fts/base_fts',
-        '$BUILD_DIR/mongo/scripting/scripting_server',
-        'expressions',
         '$BUILD_DIR/mongo/db/catalog/collection',
         '$BUILD_DIR/mongo/db/catalog/index_catalog',
         '$BUILD_DIR/mongo/db/catalog_raii',
+        '$BUILD_DIR/mongo/db/concurrency/lock_manager',
+        '$BUILD_DIR/mongo/db/exec/js_function',
+        '$BUILD_DIR/mongo/db/fts/base_fts',
+        '$BUILD_DIR/mongo/scripting/scripting_server',
+        'expressions',
     ],
+    LIBDEPS_TYPEINFO=[
+        '$BUILD_DIR/mongo/db/index/index_access_methods'
+    ]
 )
 
 env.CppUnitTest(
     target='db_matcher_test',
     source=[
+        'match_expression_util_test.cpp',
+        'doc_validation_error_json_schema_test.cpp',
+        'doc_validation_error_test.cpp',
         'expression_algo_test.cpp',
         'expression_always_boolean_test.cpp',
         'expression_array_test.cpp',

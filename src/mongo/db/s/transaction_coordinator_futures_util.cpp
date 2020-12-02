@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kTransaction
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTransaction
 
 #include "mongo/platform/basic.h"
 
@@ -106,7 +106,7 @@ Future<executor::TaskExecutor::ResponseStatus> AsyncWorkScheduler::scheduleRemot
             auto requestOpMsg =
                 OpMsgRequest::fromDBAndBody(NamespaceString::kAdminDb, commandObj).serialize();
             const auto replyOpMsg = OpMsg::parseOwned(
-                service->getServiceEntryPoint()->handleRequest(opCtx, requestOpMsg).response);
+                service->getServiceEntryPoint()->handleRequest(opCtx, requestOpMsg).get().response);
 
             // Document sequences are not yet being used for responses.
             invariant(replyOpMsg.sequences.empty());
@@ -226,7 +226,7 @@ Future<AsyncWorkScheduler::HostAndShard> AsyncWorkScheduler::_targetHostAsync(
     const ShardId& shardId,
     const ReadPreferenceSetting& readPref,
     OperationContextFn operationContextFn) {
-    return scheduleWork([this, shardId, readPref, operationContextFn](OperationContext* opCtx) {
+    return scheduleWork([shardId, readPref, operationContextFn](OperationContext* opCtx) {
         operationContextFn(opCtx);
         const auto shardRegistry = Grid::get(opCtx)->shardRegistry();
         const auto shard = uassertStatusOK(shardRegistry->getShard(opCtx, shardId));
@@ -236,12 +236,10 @@ Future<AsyncWorkScheduler::HostAndShard> AsyncWorkScheduler::_targetHostAsync(
             hangWhileTargetingRemoteHost.pauseWhileSet(opCtx);
         }
 
-        return shard->getTargeter()
-            ->findHostWithMaxWait(readPref, Seconds(20))
-            .thenRunOn(_executor)
-            .then([this, shard](HostAndPort host) {
-                return HostAndShard{host, std::move(shard)};
-            });
+        // TODO (SERVER-51247): Return a SemiFuture<HostAndShard> rather than using a blocking call
+        return HostAndShard{
+            shard->getTargeter()->findHostWithMaxWait(readPref, Seconds(20)).get(opCtx),
+            std::move(shard)};
     });
 }
 

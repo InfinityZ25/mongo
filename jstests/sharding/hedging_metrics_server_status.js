@@ -1,6 +1,5 @@
-/*
+/**
  * Tests hedging metrics in the serverStatus output.
- * @tags: [requires_fcv_44]
  */
 (function() {
 "use strict";
@@ -73,7 +72,8 @@ const st = new ShardingTest({
             "failpoint.sdamServerSelectorIgnoreLatencyWindow": tojson({mode: "alwaysOn"}),
             // Force the mongos to send requests to hosts in alphabetical order of host names.
             "failpoint.networkInterfaceSendRequestsToTargetHostsInAlphabeticalOrder":
-                tojson({mode: "alwaysOn"})
+                tojson({mode: "alwaysOn"}),
+            maxTimeMSForHedgedReads: 500
         }
     }],
     shards: 1,
@@ -92,10 +92,10 @@ st.ensurePrimaryShard(dbName, st.shard0.shardName);
 const replicaSetMonitorProtocol =
     assert.commandWorked(st.s.adminCommand({getParameter: 1, replicaSetMonitorProtocol: 1}))
         .replicaSetMonitorProtocol;
-let serverSelectorFailPoint = configureFailPoint(st.s,
-                                                 replicaSetMonitorProtocol === "scanning"
-                                                     ? "scanningServerSelectorIgnoreLatencyWindow"
-                                                     : "sdamServerSelectorIgnoreLatencyWindow");
+
+assert(replicaSetMonitorProtocol === "streamable" || replicaSetMonitorProtocol === "sdam");
+
+let serverSelectorFailPoint = configureFailPoint(st.s, "sdamServerSelectorIgnoreLatencyWindow");
 
 // Force the mongos to send requests to hosts in alphabetical order of host names.
 let sendRequestsFailPoint =

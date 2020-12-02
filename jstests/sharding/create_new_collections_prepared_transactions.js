@@ -3,7 +3,6 @@
 //
 // @tags: [
 //   requires_find_command,
-//   requires_fcv_44,
 //   requires_sharding,
 //   uses_multi_shard_transaction,
 //   uses_transactions,
@@ -50,15 +49,17 @@ session.startTransaction({writeConcern: {w: "majority"}});
 assert.commandWorked(sessionDBShard0.createCollection(newCollName));
 assert.commandWorked(sessionDBShard2.createCollection(newCollName));
 
-// TODO(SERVER-46796) Replace NoSuchTransaction with OperationNotSupportedInTransaction
-assert.commandFailedWithCode(session.commitTransaction_forTesting(), ErrorCodes.NoSuchTransaction);
+assert.commandFailedWithCode(session.commitTransaction_forTesting(),
+                             ErrorCodes.OperationNotSupportedInTransaction);
 
 jsTest.log("Testing collection creation in a single-shard write transaction.");
+// TODO (SERVER-48340): Re-enable the single-write-shard transaction commit optimization.
 session.startTransaction({writeConcern: {w: "majority"}});
 assert.commandWorked(sessionDBShard0.createCollection(newCollName));
 doc2 = sessionDBShard2.getCollection(collName).findOne({_id: 4});
 assert.eq(doc2._id, 4);
-assert.commandWorked(session.commitTransaction_forTesting());
+assert.commandFailedWithCode(session.commitTransaction_forTesting(),
+                             ErrorCodes.OperationNotSupportedInTransaction);
 
 st.stop();
 })();

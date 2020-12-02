@@ -7,14 +7,15 @@ env = env.Clone()
 env.Library(
     target='transport_layer_common',
     source=[
-        'ismaster_metrics.cpp',
-        'service_entry_point_utils.cpp',
+        'hello_metrics.cpp',
         'session.cpp',
         'transport_layer.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/service_context',
+        '$BUILD_DIR/mongo/db/wire_version',
+        '$BUILD_DIR/mongo/util/net/ssl_manager',
     ],
 )
 
@@ -43,8 +44,8 @@ tlEnv.Library(
         'transport_layer',
     ],
     LIBDEPS_PRIVATE=[
-        'service_executor',
         '$BUILD_DIR/third_party/shim_asio',
+        'service_executor',
     ],
 )
 
@@ -52,15 +53,15 @@ tlEnv.Library(
     target='transport_layer',
     source=[
         'transport_layer_asio.cpp',
-        env.Idlc('transport_options.idl')[0],
+        'transport_options.idl',
     ],
     LIBDEPS=[
-        'transport_layer_common',
         '$BUILD_DIR/mongo/base/system_error',
         '$BUILD_DIR/mongo/db/auth/authentication_restriction',
         '$BUILD_DIR/mongo/db/server_options_core',
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/stats/counters',
+        'transport_layer_common',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/idl/server_parameter',
@@ -85,16 +86,19 @@ env.Library(
 tlEnv.Library(
     target='service_executor',
     source=[
-        'service_executor_adaptive.cpp',
+        'service_executor_fixed.cpp',
         'service_executor_reserved.cpp',
         'service_executor_synchronous.cpp',
-        env.Idlc('service_executor.idl')[0],
+        'service_executor_utils.cpp',
+        'service_executor.idl',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/service_context',
     ],
     LIBDEPS_PRIVATE=[
+        "$BUILD_DIR/mongo/db/server_options_core",
         "$BUILD_DIR/mongo/idl/server_parameter",
+        "$BUILD_DIR/mongo/util/concurrency/thread_pool",
         "$BUILD_DIR/mongo/util/processinfo",
         '$BUILD_DIR/third_party/shim_asio',
         'transport_layer_common',
@@ -149,7 +153,7 @@ zlibEnv.Library(
 env.Library(
     target='message_compressor_options_client',
     source=[
-        env.Idlc('message_compressor_options_client.idl')[0],
+        'message_compressor_options_client.idl',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -160,7 +164,7 @@ env.Library(
 env.Library(
     target='message_compressor_options_server',
     source=[
-        env.Idlc('message_compressor_options_server.idl')[0],
+        'message_compressor_options_server.idl',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -175,10 +179,9 @@ tlEnv.CppUnitTest(
         'message_compressor_registry_test.cpp',
         'transport_layer_asio_test.cpp',
         'service_executor_test.cpp',
-        # Disable this test until SERVER-30475 and associated build failure tickets are resolved.
-        # 'service_executor_adaptive_test.cpp',
         'max_conns_override_test.cpp',
-        'service_state_machine_test.cpp',
+        # TODO: service_state_machine test to be re-written in SERVER-50141.
+        # 'service_state_machine_test.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -188,7 +191,6 @@ tlEnv.CppUnitTest(
         '$BUILD_DIR/mongo/rpc/rpc',
         '$BUILD_DIR/mongo/unittest/unittest',
         '$BUILD_DIR/mongo/util/clock_source_mock',
-        '$BUILD_DIR/mongo/util/net/socket',
         '$BUILD_DIR/third_party/shim_asio',
         'message_compressor',
         'message_compressor_options_server',
@@ -206,12 +208,12 @@ tlEnv.CppIntegrationTest(
         'transport_layer_asio_integration_test.cpp',
     ],
     LIBDEPS=[
-        'transport_layer_egress_init',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/client/async_client',
         '$BUILD_DIR/mongo/executor/task_executor_interface',
         '$BUILD_DIR/mongo/util/net/network',
         '$BUILD_DIR/mongo/util/version_impl',
         '$BUILD_DIR/third_party/shim_asio',
+        'transport_layer_egress_init',
     ],
 )

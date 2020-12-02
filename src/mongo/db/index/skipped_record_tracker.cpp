@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
 
 #include "mongo/db/index/skipped_record_tracker.h"
 
@@ -41,9 +41,28 @@ namespace {
 static constexpr StringData kRecordIdField = "recordId"_sd;
 }
 
-void SkippedRecordTracker::deleteTemporaryTable(OperationContext* opCtx) {
+SkippedRecordTracker::SkippedRecordTracker(IndexCatalogEntry* indexCatalogEntry)
+    : SkippedRecordTracker(nullptr, indexCatalogEntry, boost::none) {}
+
+SkippedRecordTracker::SkippedRecordTracker(OperationContext* opCtx,
+                                           IndexCatalogEntry* indexCatalogEntry,
+                                           boost::optional<StringData> ident)
+    : _indexCatalogEntry(indexCatalogEntry) {
+    if (!ident) {
+        return;
+    }
+
+    // Only initialize the table when resuming an index build if an ident already exists. Otherwise,
+    // lazily initialize table when we record the first document.
+    _skippedRecordsTable =
+        opCtx->getServiceContext()->getStorageEngine()->makeTemporaryRecordStoreFromExistingIdent(
+            opCtx, ident.get());
+}
+
+void SkippedRecordTracker::finalizeTemporaryTable(OperationContext* opCtx,
+                                                  TemporaryRecordStore::FinalizationAction action) {
     if (_skippedRecordsTable) {
-        _skippedRecordsTable->deleteTemporaryTable(opCtx);
+        _skippedRecordsTable->finalizeTemporaryTable(opCtx, action);
     }
 }
 
@@ -80,7 +99,7 @@ bool SkippedRecordTracker::areAllRecordsApplied(OperationContext* opCtx) const {
 }
 
 Status SkippedRecordTracker::retrySkippedRecords(OperationContext* opCtx,
-                                                 const Collection* collection) {
+                                                 const CollectionPtr& collection) {
     dassert(opCtx->lockState()->isCollectionLockedForMode(collection->ns(), MODE_X));
     if (!_skippedRecordsTable) {
         return Status::OK();
@@ -88,7 +107,10 @@ Status SkippedRecordTracker::retrySkippedRecords(OperationContext* opCtx,
 
     InsertDeleteOptions options;
     collection->getIndexCatalog()->prepareInsertDeleteOptions(
-        opCtx, _indexCatalogEntry->descriptor(), &options);
+        opCtx,
+        _indexCatalogEntry->getNSSFromCatalog(opCtx),
+        _indexCatalogEntry->descriptor(),
+        &options);
     options.fromIndexBuilder = true;
 
     // This should only be called when constraints are being enforced, on a primary. It does not
@@ -129,9 +151,8 @@ Status SkippedRecordTracker::retrySkippedRecords(OperationContext* opCtx,
                 // Because constraint enforcement is set, this will throw if there are any indexing
                 // errors, instead of writing back to the skipped records table, which would
                 // normally happen if constraints were relaxed.
-                InsertResult result;
                 auto status = _indexCatalogEntry->accessMethod()->insert(
-                    opCtx, skippedDoc, skippedRecordId, options, &result);
+                    opCtx, collection, skippedDoc, skippedRecordId, options, nullptr, nullptr);
                 if (!status.isOK()) {
                     return status;
                 }
@@ -154,7 +175,7 @@ Status SkippedRecordTracker::retrySkippedRecords(OperationContext* opCtx,
 
     int logLevel = (resolved > 0) ? 0 : 1;
     LOGV2_DEBUG(23883,
-                logSeverityV1toV2(logLevel).toInt(),
+                logLevel,
                 "index build: reapplied {resolved} skipped records for index: "
                 "{indexCatalogEntry_descriptor_indexName}",
                 "resolved"_attr = resolved,

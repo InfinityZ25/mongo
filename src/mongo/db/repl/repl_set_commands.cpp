@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #define LOGV2_FOR_HEARTBEATS(ID, DLEVEL, MESSAGE, ...) \
     LOGV2_DEBUG_OPTIONS(                               \
@@ -47,7 +47,6 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/server_status_metric.h"
-#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/lasterror.h"
@@ -78,7 +77,7 @@ namespace repl {
 using std::string;
 using std::stringstream;
 
-static const std::string kReplSetReconfigNss = "local.replset.reconfig";
+constexpr StringData kInternalIncludeNewlyAddedFieldName = "$_internalIncludeNewlyAdded"_sd;
 
 class ReplExecutorSSM : public ServerStatusMetric {
 public:
@@ -135,20 +134,6 @@ public:
 
             uassertStatusOK(status);
             return true;
-        } else if (cmdObj.hasElement("waitForDrainFinish")) {
-            long long timeoutMillis;
-            auto status = bsonExtractIntegerField(cmdObj, "waitForDrainFinish", &timeoutMillis);
-            uassertStatusOK(status);
-            Milliseconds timeout(timeoutMillis);
-            LOGV2(21575,
-                  "replSetTest: waiting {timeout} for applier buffer to finish draining",
-                  "replSetTest: waiting for applier buffer to finish draining",
-                  "timeout"_attr = timeout);
-
-            status = replCoord->waitForDrainFinish(timeout);
-
-            uassertStatusOK(status);
-            return true;
         } else if (cmdObj.hasElement("getLastStableRecoveryTimestamp")) {
             boost::optional<Timestamp> ts =
                 StorageInterface::get(getGlobalServiceContext())
@@ -158,7 +143,7 @@ public:
             }
             return true;
         } else if (cmdObj.hasElement("restartHeartbeats")) {
-            replCoord->restartHeartbeats_forTest();
+            replCoord->restartScheduledHeartbeats_forTest();
             return true;
         }
 
@@ -207,7 +192,21 @@ public:
         bool wantCommitmentStatus;
         uassertStatusOK(bsonExtractBooleanFieldWithDefault(
             cmdObj, "commitmentStatus", false, &wantCommitmentStatus));
-        ReplicationCoordinator::get(opCtx)->processReplSetGetConfig(&result, wantCommitmentStatus);
+
+        if (cmdObj[kInternalIncludeNewlyAddedFieldName]) {
+            uassert(ErrorCodes::InvalidOptions,
+                    "The '$_internalIncludeNewlyAdded' option is only supported when testing"
+                    " commands are enabled",
+                    getTestCommandsEnabled());
+        }
+
+        bool includeNewlyAdded;
+        uassertStatusOK(bsonExtractBooleanFieldWithDefault(
+            cmdObj, kInternalIncludeNewlyAddedFieldName, false, &includeNewlyAdded));
+
+        ReplicationCoordinator::get(opCtx)->processReplSetGetConfig(
+            &result, wantCommitmentStatus, includeNewlyAdded);
+
         return true;
     }
 
@@ -432,8 +431,8 @@ public:
                 // Convert the error code to be more specific.
                 uasserted(ErrorCodes::CurrentConfigNotCommittedYet, status.reason());
             } else if (status == ErrorCodes::PrimarySteppedDown) {
-                // Return NotMaster since the command has no side effect yet.
-                status = {ErrorCodes::NotMaster, status.reason()};
+                // Return NotWritablePrimary since the command has no side effect yet.
+                status = {ErrorCodes::NotWritablePrimary, status.reason()};
             }
             uassertStatusOK(status);
         }
@@ -661,19 +660,12 @@ public:
             replCoord->processReplSetMetadata(metadata);
         }
 
-        // In the case of an update from a member with an invalid replica set config,
-        // we return our current config version.
-        long long configVersion = -1;
-
         UpdatePositionArgs args;
 
         status = args.initialize(cmdObj);
         if (status.isOK()) {
-            status = replCoord->processReplSetUpdatePosition(args, &configVersion);
+            status = replCoord->processReplSetUpdatePosition(args);
 
-            if (status == ErrorCodes::InvalidReplicaSetConfig) {
-                result.append("configVersion", configVersion);
-            }
             // TODO convert to uassertStatusOK once SERVER-34806 is done.
             return CommandHelpers::appendCommandStatusNoThrow(result, status);
         } else {

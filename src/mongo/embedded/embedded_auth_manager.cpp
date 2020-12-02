@@ -74,11 +74,13 @@ public:
         UASSERT_NOT_IMPLEMENTED;
     }
 
-    Status getRoleDescription(OperationContext*,
-                              const RoleName&,
-                              PrivilegeFormat,
-                              AuthenticationRestrictionsFormat,
-                              BSONObj*) override {
+    Status rolesExist(OperationContext*, const std::vector<RoleName>&) override {
+        UASSERT_NOT_IMPLEMENTED;
+    }
+
+    StatusWith<ResolvedRoleData> resolveRoles(OperationContext*,
+                                              const std::vector<RoleName>&,
+                                              ResolveRoleOption) override {
         UASSERT_NOT_IMPLEMENTED;
     }
 
@@ -86,7 +88,14 @@ public:
                                const std::vector<RoleName>&,
                                PrivilegeFormat,
                                AuthenticationRestrictionsFormat,
-                               BSONObj*) override {
+                               std::vector<BSONObj>*) override {
+        UASSERT_NOT_IMPLEMENTED;
+    }
+
+    Status getRolesAsUserFragment(OperationContext*,
+                                  const std::vector<RoleName>&,
+                                  AuthenticationRestrictionsFormat,
+                                  BSONObj*) override {
         UASSERT_NOT_IMPLEMENTED;
     }
 
@@ -126,7 +135,7 @@ public:
     }
 
     void logOp(OperationContext*,
-               const char*,
+               StringData,
                const NamespaceString&,
                const BSONObj&,
                const BSONObj*) override { /* do nothing*/

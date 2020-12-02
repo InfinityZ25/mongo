@@ -36,6 +36,7 @@
 
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/stage_types.h"
 #include "mongo/util/container_size_helper.h"
 #include "mongo/util/time_support.h"
@@ -54,6 +55,8 @@ struct SpecificStats {
     virtual SpecificStats* clone() const = 0;
 
     virtual uint64_t estimateObjectSizeInBytes() const = 0;
+
+    virtual void accumulate(PlanSummaryStats& summary) const {}
 };
 
 // Every stage has CommonStats.
@@ -112,14 +115,15 @@ struct CommonStats {
 };
 
 // The universal container for a stage's stats.
-struct PlanStageStats {
-    PlanStageStats(const CommonStats& c, StageType t) : stageType(t), common(c) {}
+template <typename C, typename T = void*>
+struct BasePlanStageStats {
+    BasePlanStageStats(const C& c, T t = {}) : stageType(t), common(c) {}
 
     /**
      * Make a deep copy.
      */
-    PlanStageStats* clone() const {
-        PlanStageStats* stats = new PlanStageStats(common, stageType);
+    BasePlanStageStats<C, T>* clone() const {
+        auto stats = new BasePlanStageStats<C, T>(common, stageType);
         if (specific.get()) {
             stats->specific.reset(specific->clone());
         }
@@ -144,22 +148,27 @@ struct PlanStageStats {
             sizeof(*this);
     }
 
-    // See query/stage_type.h
-    StageType stageType;
+    T stageType;
 
     // Stats exported by implementing the PlanStage interface.
-    CommonStats common;
+    C common;
 
     // Per-stage place to stash additional information
     std::unique_ptr<SpecificStats> specific;
 
+    // Per-stage additional debug info which is opaque to the caller. Callers should not attempt to
+    // process/read this BSONObj other than for dumping the results to logs or back to the user.
+    BSONObj debugInfo;
+
     // The stats of the node's children.
-    std::vector<std::unique_ptr<PlanStageStats>> children;
+    std::vector<std::unique_ptr<BasePlanStageStats<C, T>>> children;
 
 private:
-    PlanStageStats(const PlanStageStats&) = delete;
-    PlanStageStats& operator=(const PlanStageStats&) = delete;
+    BasePlanStageStats(const BasePlanStageStats<C, T>&) = delete;
+    BasePlanStageStats& operator=(const BasePlanStageStats<C, T>&) = delete;
 };
+
+using PlanStageStats = BasePlanStageStats<CommonStats, StageType>;
 
 struct AndHashStats : public SpecificStats {
     AndHashStats() = default;
@@ -607,14 +616,24 @@ struct ProjectionStats : public SpecificStats {
 
 struct SortStats : public SpecificStats {
     SortStats() = default;
+    SortStats(uint64_t limit, uint64_t maxMemoryUsageBytes)
+        : limit(limit), maxMemoryUsageBytes(maxMemoryUsageBytes) {}
 
-    SpecificStats* clone() const final {
+    SpecificStats* clone() const {
         SortStats* specific = new SortStats(*this);
         return specific;
     }
 
     uint64_t estimateObjectSizeInBytes() const {
         return sortPattern.objsize() + sizeof(*this);
+    }
+
+    void accumulate(PlanSummaryStats& summary) const final {
+        summary.hasSortStage = true;
+
+        if (spills > 0) {
+            summary.usedDisk = true;
+        }
     }
 
     // The pattern according to which we are sorting.
@@ -633,8 +652,11 @@ struct SortStats : public SpecificStats {
     // disk use is allowed.
     uint64_t totalDataSizeBytes = 0u;
 
-    // Whether we spilled data to disk during the execution of this query.
-    bool wasDiskUsed = false;
+    // The number of keys that we've sorted.
+    uint64_t keysSorted = 0u;
+
+    // The number of times that we spilled data to disk during the execution of this query.
+    uint64_t spills = 0u;
 };
 
 struct MergeSortStats : public SpecificStats {
@@ -720,7 +742,7 @@ struct NearStats : public SpecificStats {
 };
 
 struct UpdateStats : public SpecificStats {
-    UpdateStats() : nMatched(0), nModified(0), isModUpdate(false), inserted(false) {}
+    UpdateStats() : nMatched(0), nModified(0), isModUpdate(false), nUpserted(0) {}
 
     SpecificStats* clone() const final {
         return new UpdateStats(*this);
@@ -739,8 +761,8 @@ struct UpdateStats : public SpecificStats {
     // True iff this is a $mod update.
     bool isModUpdate;
 
-    // Is this an {upsert: true} update that did an insert?
-    bool inserted;
+    // Will be 1 if this is an {upsert: true} update that did an insert, 0 otherwise.
+    size_t nUpserted;
 
     // The object that was inserted. This is an empty document if no insert was performed.
     BSONObj objInserted;

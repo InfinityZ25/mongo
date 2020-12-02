@@ -29,8 +29,6 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/client/replica_set_monitor_manager.h"
-#include "mongo/client/scanning_replica_set_monitor.h"
-#include "mongo/client/scanning_replica_set_monitor_internal.h"
 #include "mongo/client/streamable_replica_set_monitor.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/network_interface_factory.h"
@@ -66,7 +64,15 @@ class ReplicaSetMonitorFixture : public mongo::unittest::Test {
 public:
     constexpr static Milliseconds kTimeout{5000};
 
+    void resetIsInternalClient(bool isInternalClient) {
+        WireSpec::Specification newSpec = *WireSpec::instance().get();
+        newSpec.isInternalClient = isInternalClient;
+        WireSpec::instance().reset(std::move(newSpec));
+    }
+
     void setUp() override {
+        resetIsInternalClient(true);
+
         net = makeNetworkInterface("ReplicaSetMonintorTest");
 
         auto tp = std::make_unique<NetworkInterfaceThreadPool>(net.get());
@@ -77,15 +83,13 @@ public:
 
         replSetUri = uassertStatusOK(MongoURI::parse(getReplSetConnectionString()));
         numNodes = replSetUri.getServers().size();
-
-        WireSpec::instance().isInternalClient = true;
     };
 
     void tearDown() override {
         executor->shutdown();
         executor.reset();
 
-        WireSpec::instance().isInternalClient = false;
+        resetIsInternalClient(false);
     };
 
 
@@ -147,27 +151,12 @@ protected:
 };
 
 TEST_F(ReplicaSetMonitorFixture, StreamableRSMWireVersion) {
-    auto rsm = StreamableReplicaSetMonitor::make(replSetUri, executor, connectionManager);
-
-    // TODO (SERVER-47639): Make this test use getHostOrRefresh and remove the failpoint below.
-    // Wait until isMaster requests are sent and the TopologyDescription is finalized.
-    FailPointEnableBlock fpb("topologyDescriptionInstallServerDescription");
-    rsm->init();
-    fpb->waitForTimesEntered(fpb.initialTimesEntered() + numNodes);
-
-    ASSERT_EQ(rsm->getMinWireVersion(), WireVersion::LATEST_WIRE_VERSION);
-    ASSERT_EQ(rsm->getMaxWireVersion(), WireVersion::LATEST_WIRE_VERSION);
-}
-
-TEST_F(ReplicaSetMonitorFixture, ScanningRSMWireVersion) {
-    auto state = std::make_shared<ScanningReplicaSetMonitor::SetState>(
-        replSetUri, &notifier, executor.get());
-    auto rsm = std::make_shared<ScanningReplicaSetMonitor>(state);
+    auto rsm = ReplicaSetMonitorManager::get()->getOrCreateMonitor(replSetUri);
 
     // Schedule isMaster requests and wait for the responses.
-    rsm->init();
     auto primaryFuture =
-        rsm->getHostOrRefresh(ReadPreferenceSetting(mongo::ReadPreference::PrimaryOnly));
+        rsm->getHostOrRefresh(ReadPreferenceSetting(mongo::ReadPreference::PrimaryOnly),
+                              CancelationToken::uncancelable());
     primaryFuture.get();
 
     ASSERT_EQ(rsm->getMinWireVersion(), WireVersion::LATEST_WIRE_VERSION);

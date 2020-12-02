@@ -1,6 +1,8 @@
 // Reproduces simple test for SERVER-2832
 //
-// @tags: [requires_fastcount]
+// @tags: [
+//   requires_fastcount,
+// ]
 
 // The setup to reproduce was/is to create a set of points where the
 // "expand" portion of the geo-lookup expands the 2d range in only one
@@ -9,7 +11,7 @@
 t = db.geo_fiddly_box;
 
 t.drop();
-t.ensureIndex({loc: "2d"});
+t.createIndex({loc: "2d"});
 
 t.insert({"loc": [3, 1]});
 t.insert({"loc": [3, 0.5]});
@@ -33,7 +35,7 @@ step = 1;
 numItems = 0;
 
 t.drop();
-t.ensureIndex({loc: "2d"}, {max: max + epsilon / 2, min: min - epsilon / 2});
+t.createIndex({loc: "2d"}, {max: max + epsilon / 2, min: min - epsilon / 2});
 
 for (var x = min; x <= max; x += step) {
     for (var y = min; y <= max; y += step) {

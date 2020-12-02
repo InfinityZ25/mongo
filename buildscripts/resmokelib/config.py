@@ -46,10 +46,10 @@ DEFAULT_GENNY_EXECUTABLE = os.path.normpath("genny/build/src/driver/genny")
 # Names below correspond to how they are specified via the command line or in the options YAML file.
 DEFAULTS = {
     "always_use_log_files": False,
-    "is_asan_build": False,
     "archive_limit_mb": 5000,
     "archive_limit_tests": 10,
     "base_port": 20000,
+    "backup_on_restart_dir": None,
     "buildlogger_url": "https://logkeeper.mongodb.org",
     "continue_on_failure": False,
     "dbpath_prefix": None,
@@ -58,15 +58,19 @@ DEFAULTS = {
     "exclude_with_any_tags": None,
     "flow_control": None,
     "flow_control_tickets": None,
+    "fuzz_mongod_configs": False,
+    "config_fuzz_seed": None,
     "genny_executable": None,
     "include_with_any_tags": None,
     "install_dir": None,
     "jobs": 1,
+    "logger_file": "console",
     "mongo_executable": None,
     "mongod_executable": None,
-    "mongod_set_parameters": None,
+    "mongod_set_parameters": [],
     "mongos_executable": None,
-    "mongos_set_parameters": None,
+    "mongos_set_parameters": [],
+    "mrlog": None,
     "no_journal": False,
     "num_clients_per_fixture": 1,
     "perf_report_file": None,
@@ -75,6 +79,7 @@ DEFAULTS = {
     "repeat_tests_max": None,
     "repeat_tests_min": None,
     "repeat_tests_secs": None,
+    "replay_file": None,
     "report_failure_status": "fail",
     "report_file": None,
     "seed": int(time.time() * 256),  # Taken from random.py code in Python 2.7.
@@ -89,8 +94,11 @@ DEFAULTS = {
     "majority_read_concern": None,  # Default is set on the commandline.
     "storage_engine": None,
     "storage_engine_cache_size_gb": None,
+    "suite_files": "with_server",
     "tag_file": None,
+    "test_files": [],
     "transport_layer": None,
+    "user_friendly_output": None,
     "mixed_bin_versions": None,
     "linear_chain": None,
     "num_replset_nodes": None,
@@ -112,6 +120,10 @@ DEFAULTS = {
     "variant_name": None,
     "version_id": None,
 
+    # Cedar options.
+    "cedar_url": "cedar.mongodb.com",
+    "cedar_rpc_port": "7070",
+
     # WiredTiger options.
     "wt_coll_config": None,
     "wt_engine_config": None,
@@ -124,7 +136,10 @@ DEFAULTS = {
     "benchmark_repetitions": None,
 
     # Config Dir
-    "config_dir": "buildscripts/resmokeconfig"
+    "config_dir": "buildscripts/resmokeconfig",
+
+    # UndoDB options
+    "undo_recorder_path": None
 }
 
 _SuiteOptions = collections.namedtuple("_SuiteOptions", [
@@ -231,15 +246,18 @@ ARCHIVE_LIMIT_MB = None
 # The limit number of tests to archive for an Evergreen task.
 ARCHIVE_LIMIT_TESTS = None
 
-# True if resmoke is running against and ASAN build.
-IS_ASAN_BUILD = None
-
 # The starting port number to use for mongod and mongos processes spawned by resmoke.py and the
 # mongo shell.
 BASE_PORT = None
 
 # The root url of the buildlogger server.
 BUILDLOGGER_URL = None
+
+# URL to connect to the Cedar service.
+CEDAR_URL = None
+
+# Cedar gRPC service port.
+CEDAR_RPC_PORT = None
 
 # Root directory for where resmoke.py puts directories containing data files of mongod's it starts,
 # as well as those started by individual tests.
@@ -297,6 +315,9 @@ EXCLUDED_TAG = "__TEMPORARILY_DISABLED__"
 # If true, then a test failure or error will cause resmoke.py to exit and not run any more tests.
 FAIL_FAST = None
 
+FUZZ_MONGOD_CONFIGS = False
+CONFIG_FUZZ_SEED = None
+
 # Executable file for genny, passed in as a command line arg.
 GENNY_EXECUTABLE = None
 
@@ -311,6 +332,9 @@ INTERNAL_PARAMS = []
 # If set, then resmoke.py starts the specified number of Job instances to run tests.
 JOBS = None
 
+# Yaml file that specified logging configuration.
+LOGGER_FILE = None
+
 # Where to find the MONGO*_EXECUTABLE binaries
 INSTALL_DIR = None
 
@@ -321,13 +345,13 @@ MONGO_EXECUTABLE = None
 MONGOD_EXECUTABLE = None
 
 # The --setParameter options passed to mongod.
-MONGOD_SET_PARAMETERS = None
+MONGOD_SET_PARAMETERS = []
 
 # The path to the mongos executable used by resmoke.py.
 MONGOS_EXECUTABLE = None
 
 # The --setParameter options passed to mongos.
-MONGOS_SET_PARAMETERS = None
+MONGOS_SET_PARAMETERS = []
 
 # If true, then all mongod's started by resmoke.py and by the mongo shell will not have journaling
 # enabled.
@@ -387,6 +411,10 @@ SHUFFLE = None
 # or subprocess32 module to spawn threads. If jasper, resmoke uses the jasper module.
 SPAWN_USING = None
 
+# The connection string to the jasper service, populated when the service is
+# initialized in TestRunner.
+JASPER_CONNECTION_STR = None
+
 # If true, the launching of jobs is staggered in resmoke.py.
 STAGGER_JOBS = None
 
@@ -398,6 +426,9 @@ MIXED_BIN_VERSIONS = None
 
 # Specifies the number of replica set members in a ReplicaSetFixture.
 NUM_REPLSET_NODES = None
+
+# Specifies the number of replica sets in a MultiReplicaSetFixture.
+NUM_REPLSETS = None
 
 # Specifies the number of shards in a ShardedClusterFixture.
 NUM_SHARDS = None
@@ -420,8 +451,14 @@ STORAGE_ENGINE = None
 # storage engine cache size.
 STORAGE_ENGINE_CACHE_SIZE = None
 
+# Yaml suites that specify how tests should be executed.
+SUITE_FILES = None
+
 # The tag file to use that associates tests with tags.
 TAG_FILE = None
+
+# The test files to execute.
+TEST_FILES = None
 
 # If set, then mongod/mongos's started by resmoke.py will use the specified transport layer.
 TRANSPORT_LAYER = None
@@ -443,6 +480,9 @@ BENCHMARK_FILTER = None
 BENCHMARK_LIST_TESTS = None
 BENCHMARK_MIN_TIME = None
 BENCHMARK_REPETITIONS = None
+
+# UndoDB options
+UNDO_RECORDER_PATH = None
 
 ##
 # Internally used configuration options that aren't exposed to the user
@@ -476,3 +516,6 @@ EXTERNAL_SUITE_SELECTORS = (DEFAULT_BENCHMARK_TEST_LIST, DEFAULT_UNIT_TEST_LIST,
 CONFIG_DIR = None
 NAMED_SUITES = None
 LOGGER_DIR = None
+
+# Generated logging config for the current invocation.
+LOGGING_CONFIG: dict = {}

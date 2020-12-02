@@ -33,12 +33,19 @@
 #include <memory>
 
 #include "mongo/base/status.h"
+#include "mongo/config.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/wire_version.h"
 #include "mongo/transport/session.h"
+#include "mongo/transport/ssl_connection_context.h"
 #include "mongo/util/functional.h"
 #include "mongo/util/future.h"
 #include "mongo/util/out_of_line_executor.h"
 #include "mongo/util/time_support.h"
+
+#ifdef MONGO_CONFIG_SSL
+#include "mongo/util/net/ssl_manager.h"
+#endif
 
 namespace mongo {
 
@@ -76,16 +83,20 @@ public:
 
     friend class Session;
 
+    explicit TransportLayer(const WireSpec& wireSpec) : _wireSpec(wireSpec) {}
+
     virtual ~TransportLayer() = default;
 
     virtual StatusWith<SessionHandle> connect(HostAndPort peer,
                                               ConnectSSLMode sslMode,
                                               Milliseconds timeout) = 0;
 
-    virtual Future<SessionHandle> asyncConnect(HostAndPort peer,
-                                               ConnectSSLMode sslMode,
-                                               const ReactorHandle& reactor,
-                                               Milliseconds timeout) = 0;
+    virtual Future<SessionHandle> asyncConnect(
+        HostAndPort peer,
+        ConnectSSLMode sslMode,
+        const ReactorHandle& reactor,
+        Milliseconds timeout,
+        std::shared_ptr<const SSLConnectionContext> transientSSLContext) = 0;
 
     /**
      * Start the TransportLayer. After this point, the TransportLayer will begin accepting active
@@ -115,8 +126,28 @@ public:
         return opCtx->getServiceContext()->makeBaton(opCtx);
     }
 
-protected:
-    TransportLayer() = default;
+    std::shared_ptr<const WireSpec::Specification> getWireSpec() const {
+        return _wireSpec.get();
+    }
+
+#ifdef MONGO_CONFIG_SSL
+    /** Rotate the in-use certificates for new connections. */
+    virtual Status rotateCertificates(std::shared_ptr<SSLManagerInterface> manager,
+                                      bool asyncOCSPStaple) = 0;
+
+    /**
+     * Creates a transient SSL context using targeted (non default) SSL params.
+     * @param transientSSLParams overrides any value in stored SSLConnectionContext.
+     * @param optionalManager provides an optional SSL manager, otherwise the default one will be
+     * used.
+     */
+    virtual StatusWith<std::shared_ptr<const transport::SSLConnectionContext>>
+    createTransientSSLContext(const TransientSSLParams& transientSSLParams,
+                              const SSLManagerInterface* optionalManager) = 0;
+#endif
+
+private:
+    const WireSpec& _wireSpec;
 };
 
 class ReactorTimer {

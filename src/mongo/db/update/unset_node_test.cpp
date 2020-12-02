@@ -57,7 +57,7 @@ DEATH_TEST_REGEX(UnsetNodeTest,
 
 DEATH_TEST_REGEX_F(UnsetNodeTest,
                    ApplyToRootFails,
-                   R"#(Invariant failure.*!updateNodeApplyParams.pathTaken->empty\(\))#") {
+                   R"#(Invariant failure.*!updateNodeApplyParams.pathTaken.*empty\(\))#") {
     auto update = fromjson("{$unset: {}}");
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     UnsetNode node;
@@ -89,7 +89,8 @@ TEST_F(UnsetNodeTest, UnsetNoOp) {
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{b: 5}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+
+    assertOplogEntryIsNoop();
     ASSERT_EQUALS(getModifiedPaths(), "{a}");
 }
 
@@ -101,14 +102,15 @@ TEST_F(UnsetNodeTest, UnsetNoOpDottedPath) {
 
     mutablebson::Document doc(fromjson("{a: 5}"));
     setPathToCreate("b");
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 5}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+
+    assertOplogEntryIsNoop();
     ASSERT_EQUALS(getModifiedPaths(), "{a.b}");
 }
 
@@ -120,14 +122,15 @@ TEST_F(UnsetNodeTest, UnsetNoOpThroughArray) {
 
     mutablebson::Document doc(fromjson("{a:[{b:1}]}"));
     setPathToCreate("b");
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a:[{b:1}]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+
+    assertOplogEntryIsNoop();
     ASSERT_EQUALS(getModifiedPaths(), "{a.b}");
 }
 
@@ -145,7 +148,8 @@ TEST_F(UnsetNodeTest, UnsetNoOpEmptyDoc) {
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+
+    assertOplogEntryIsNoop();
     ASSERT_EQUALS(getModifiedPaths(), "{a}");
 }
 
@@ -156,14 +160,15 @@ TEST_F(UnsetNodeTest, UnsetTopLevelPath) {
     ASSERT_OK(node.init(update["$unset"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 5}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$unset: {a: true}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$unset: {a: true}}"), fromjson("{$v: 2, diff: {d: {a: false}}}"));
     ASSERT_EQUALS(getModifiedPaths(), "{a}");
 }
 
@@ -174,14 +179,16 @@ TEST_F(UnsetNodeTest, UnsetNestedPath) {
     ASSERT_OK(node.init(update["$unset"]["a.b.c"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: {b: {c: 6}}}}"));
-    setPathTaken("a.b.c");
+    setPathTaken(makeRuntimeUpdatePathForTest("a.b.c"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]["b"]["c"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {b: {}}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$unset: {'a.b.c': true}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$unset: {'a.b.c': true}}"),
+                     fromjson("{$v: 2, diff: {sa: {sb: {d: {c: false}}}}}"));
     ASSERT_EQUALS(getModifiedPaths(), "{a.b.c}");
 }
 
@@ -192,14 +199,16 @@ TEST_F(UnsetNodeTest, UnsetObject) {
     ASSERT_OK(node.init(update["$unset"]["a.b"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: {b: {c: 6}}}}"));
-    setPathTaken("a.b");
+    setPathTaken(makeRuntimeUpdatePathForTest("a.b"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$unset: {'a.b': true}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$unset: {'a.b': true}}"),
+                     fromjson("{$v: 2, diff: {sa: {d: {b: false}}}}"));
     ASSERT_EQUALS(getModifiedPaths(), "{a.b}");
 }
 
@@ -210,14 +219,16 @@ TEST_F(UnsetNodeTest, UnsetArrayElement) {
     ASSERT_OK(node.init(update["$unset"]["a.0"], expCtx));
 
     mutablebson::Document doc(fromjson("{a:[1], b:1}"));
-    setPathTaken("a.0");
+    setPathTaken(makeRuntimeUpdatePathForTest("a.0"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"][0]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a:[null], b:1}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$unset: {'a.0': true}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$set: {'a.0': null}}"),
+                     fromjson("{$v: 2, diff: {sa: {a: true, u0: null}}}"));
     ASSERT_EQUALS(getModifiedPaths(), "{a.0}");
 }
 
@@ -228,7 +239,7 @@ TEST_F(UnsetNodeTest, UnsetPositional) {
     ASSERT_OK(node.init(update["$unset"]["a.$"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: [0, 1, 2]}"));
-    setPathTaken("a.1");
+    setPathTaken(makeRuntimeUpdatePathForTest("a.1"));
     setMatchedField("1");
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"][1]), getUpdateNodeApplyParams());
@@ -236,7 +247,9 @@ TEST_F(UnsetNodeTest, UnsetPositional) {
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [0, null, 2]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$unset: {'a.1': true}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$set: {'a.1': null}}"),
+                     fromjson("{$v: 2, diff: {sa: {a: true, u1: null}}}"));
     ASSERT_EQUALS(getModifiedPaths(), "{a.1}");
 }
 
@@ -247,14 +260,15 @@ TEST_F(UnsetNodeTest, UnsetEntireArray) {
     ASSERT_OK(node.init(update["$unset"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: [0, 1, 2]}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$unset: {a: true}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$unset: {a: true}}"), fromjson("{$v: 2, diff: {d: {a: false}}}"));
     ASSERT_EQUALS(getModifiedPaths(), "{a}");
 }
 
@@ -265,14 +279,16 @@ TEST_F(UnsetNodeTest, UnsetFromObjectInArray) {
     ASSERT_OK(node.init(update["$unset"]["a.0.b"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: [{b: 1}]}"));
-    setPathTaken("a.0.b");
+    setPathTaken(makeRuntimeUpdatePathForTest("a.0.b"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"][0]["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a:[{}]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$unset: {'a.0.b': true}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$unset: {'a.0.b': true}}"),
+                     fromjson("{$v: 2, diff: {sa: {a: true, s0: {d: {b: false}}}}}"));
     ASSERT_EQUALS(getModifiedPaths(), "{a.0.b}");
 }
 
@@ -283,14 +299,16 @@ TEST_F(UnsetNodeTest, CanUnsetInvalidField) {
     ASSERT_OK(node.init(update["$unset"]["a.$.$b"], expCtx));
 
     mutablebson::Document doc(fromjson("{b: 1, a: [{$b: 1}]}"));
-    setPathTaken("a.0.$b");
+    setPathTaken(makeRuntimeUpdatePathForTest("a.0.$b"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"][0]["$b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{b: 1, a: [{}]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$unset: {'a.0.$b': true}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$unset: {'a.0.$b': true}}"),
+                     fromjson("{$v: 2, diff: {sa: {a: true, s0: {d: {$b: false}}}}}"));
     ASSERT_EQUALS(getModifiedPaths(), "{a.0.$b}");
 }
 
@@ -301,7 +319,7 @@ TEST_F(UnsetNodeTest, ApplyNoIndexDataNoLogBuilder) {
     ASSERT_OK(node.init(update["$unset"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 5}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     setLogBuilderToNull();
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
@@ -318,14 +336,15 @@ TEST_F(UnsetNodeTest, ApplyDoesNotAffectIndexes) {
     ASSERT_OK(node.init(update["$unset"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 5}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("b");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$unset: {a: true}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$unset: {a: true}}"), fromjson("{$v: 2, diff: {d: {a: false}}}"));
     ASSERT_EQUALS(getModifiedPaths(), "{a}");
 }
 
@@ -336,14 +355,16 @@ TEST_F(UnsetNodeTest, ApplyFieldWithDot) {
     ASSERT_OK(node.init(update["$unset"]["a.b"], expCtx));
 
     mutablebson::Document doc(fromjson("{'a.b':4, a: {b: 2}}"));
-    setPathTaken("a.b");
+    setPathTaken(makeRuntimeUpdatePathForTest("a.b"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{'a.b':4, a: {}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$unset: {'a.b': true}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$unset: {'a.b': true}}"),
+                     fromjson("{$v: 2, diff: {sa: {d: {b: false}}}}"));
     ASSERT_EQUALS(getModifiedPaths(), "{a.b}");
 }
 
@@ -354,7 +375,7 @@ TEST_F(UnsetNodeTest, ApplyCannotRemoveRequiredPartOfDBRef) {
     ASSERT_OK(node.init(update["$unset"]["a.$id"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: {$ref: 'c', $id: 0}}"));
-    setPathTaken("a.$id");
+    setPathTaken(makeRuntimeUpdatePathForTest("a.$id"));
     ASSERT_THROWS_CODE_AND_WHAT(
         node.apply(getApplyParams(doc.root()["a"]["$id"]), getUpdateNodeApplyParams()),
         AssertionException,
@@ -369,7 +390,7 @@ TEST_F(UnsetNodeTest, ApplyCanRemoveRequiredPartOfDBRefIfValidateForStorageIsFal
     ASSERT_OK(node.init(update["$unset"]["a.$id"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: {$ref: 'c', $id: 0}}"));
-    setPathTaken("a.$id");
+    setPathTaken(makeRuntimeUpdatePathForTest("a.$id"));
     addIndexedPath("a");
     setValidateForStorage(false);
     auto result = node.apply(getApplyParams(doc.root()["a"]["$id"]), getUpdateNodeApplyParams());
@@ -379,7 +400,9 @@ TEST_F(UnsetNodeTest, ApplyCanRemoveRequiredPartOfDBRefIfValidateForStorageIsFal
                                     << "c"));
     ASSERT_EQUALS(updated, doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$unset: {'a.$id': true}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$unset: {'a.$id': true}}"),
+                     fromjson("{$v: 2, diff: {sa: {d: {$id: false}}}}"));
     ASSERT_EQUALS(getModifiedPaths(), "{a.$id}");
 }
 
@@ -390,7 +413,7 @@ TEST_F(UnsetNodeTest, ApplyCannotRemoveImmutablePath) {
     ASSERT_OK(node.init(update["$unset"]["a.b"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: {b: 1}}"));
-    setPathTaken("a.b");
+    setPathTaken(makeRuntimeUpdatePathForTest("a.b"));
     addImmutablePath("a.b");
     ASSERT_THROWS_CODE_AND_WHAT(
         node.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams()),
@@ -406,7 +429,7 @@ TEST_F(UnsetNodeTest, ApplyCannotRemovePrefixOfImmutablePath) {
     ASSERT_OK(node.init(update["$unset"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: {b: 1}}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addImmutablePath("a.b");
     ASSERT_THROWS_CODE_AND_WHAT(
         node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams()),
@@ -422,7 +445,7 @@ TEST_F(UnsetNodeTest, ApplyCannotRemoveSuffixOfImmutablePath) {
     ASSERT_OK(node.init(update["$unset"]["a.b.c"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: {b: {c: 1}}}"));
-    setPathTaken("a.b.c");
+    setPathTaken(makeRuntimeUpdatePathForTest("a.b.c"));
     addImmutablePath("a.b");
     ASSERT_THROWS_CODE_AND_WHAT(
         node.apply(getApplyParams(doc.root()["a"]["b"]["c"]), getUpdateNodeApplyParams()),
@@ -439,7 +462,7 @@ TEST_F(UnsetNodeTest, ApplyCanRemoveImmutablePathIfNoop) {
 
     mutablebson::Document doc(fromjson("{a: {b: 1}}"));
     setPathToCreate("c");
-    setPathTaken("a.b");
+    setPathTaken(makeRuntimeUpdatePathForTest("a.b"));
     addImmutablePath("a.b");
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
@@ -447,7 +470,8 @@ TEST_F(UnsetNodeTest, ApplyCanRemoveImmutablePathIfNoop) {
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {b: 1}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+
+    assertOplogEntryIsNoop();
     ASSERT_EQUALS(getModifiedPaths(), "{a.b.c}");
 }
 

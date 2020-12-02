@@ -45,8 +45,6 @@ namespace mongo {
  * 3. (n, 0), n > 0 - invalid configuration.
  * 4. (n, m), n > 0, m > 0 - normal sharded collection version.
  *
- * TODO: This is a "manual type" but, even so, still needs to comform to what's
- * expected from types.
  */
 struct ChunkVersion {
 public:
@@ -56,12 +54,11 @@ public:
      */
     static constexpr StringData kShardVersionField = "shardVersion"_sd;
 
-    ChunkVersion() : _combined(0), _epoch(OID()), _canThrowSSVOnIgnored(false) {}
-
     ChunkVersion(uint32_t major, uint32_t minor, const OID& epoch)
         : _combined(static_cast<uint64_t>(minor) | (static_cast<uint64_t>(major) << 32)),
-          _epoch(epoch),
-          _canThrowSSVOnIgnored(false) {}
+          _epoch(epoch) {}
+
+    ChunkVersion() : ChunkVersion(0, 0, OID()) {}
 
     static StatusWith<ChunkVersion> parseFromCommand(const BSONObj& obj) {
         return parseWithField(obj, kShardVersionField);
@@ -107,40 +104,25 @@ public:
     static StatusWith<ChunkVersion> parseLegacyWithField(const BSONObj& obj, StringData field);
 
     /**
-     * Indicates a dropped collection. All components are zeroes (OID is zero time, zero
-     * machineId/inc).
-     */
-    static ChunkVersion DROPPED() {
-        return ChunkVersion(0, 0, OID());
-    }
-
-    /**
-     * Indicates that the collection is not sharded. Same as DROPPED.
+     * Indicates that the collection is not sharded.
      */
     static ChunkVersion UNSHARDED() {
-        return ChunkVersion(0, 0, OID());
+        return ChunkVersion();
     }
 
     /**
      * Indicates that the shard version checking must be skipped.
      */
     static ChunkVersion IGNORED() {
-        ChunkVersion version = ChunkVersion();
+        ChunkVersion version;
         version._epoch.init(Date_t(), true);  // ignored OID is zero time, max machineId/inc
+        version._canThrowSSVOnIgnored = true;
         return version;
     }
 
     static bool isIgnoredVersion(const ChunkVersion& version) {
         return version.majorVersion() == 0 && version.minorVersion() == 0 &&
             version.epoch() == IGNORED().epoch();
-    }
-
-    /**
-     * Indicates that the shard version checking must be skipped but StaleShardVersion error
-     * must be thrown if the metadata is not loaded
-     */
-    void canThrowSSVOnIgnored() {
-        _canThrowSSVOnIgnored = true;
     }
 
     void incMajor() {
@@ -184,9 +166,6 @@ public:
         return _epoch;
     }
 
-    const bool getCanThrowSSVOnIgnored() const {
-        return _canThrowSSVOnIgnored;
-    }
     //
     // Explicit comparison operators - versions with epochs have non-trivial comparisons.
     // > < operators do not check epoch cases.  Generally if using == we need to handle
@@ -264,11 +243,11 @@ private:
     uint64_t _combined;
     OID _epoch;
 
-    /**
-     * Temporary flag to indicate shards that a router is able to process and retry
-     * multi-write operations. This should be removed by 4.4
-     */
-    bool _canThrowSSVOnIgnored;
+    // Temporary flag to indicate shards that a router is able to process and retry multi-write
+    // operations
+    //
+    // TODO (SERVER-53099): Once 5.0 is last stable, get rid of this field
+    bool _canThrowSSVOnIgnored{false};
 };
 
 inline std::ostream& operator<<(std::ostream& s, const ChunkVersion& v) {

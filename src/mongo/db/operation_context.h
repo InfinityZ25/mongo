@@ -36,6 +36,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/locker.h"
 #include "mongo/db/logical_session_id.h"
+#include "mongo/db/query/datetime/date_time_support.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/write_unit_of_work.h"
@@ -46,6 +47,7 @@
 #include "mongo/transport/session.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/decorable.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/interruptible.h"
 #include "mongo/util/lockable_adapter.h"
 #include "mongo/util/time_support.h"
@@ -62,6 +64,19 @@ class StringData;
 namespace repl {
 class UnreplicatedWritesBlock;
 }  // namespace repl
+
+// Enabling the maxTimeAlwaysTimeOut fail point will cause any query or command run with a
+// valid non-zero max time to fail immediately.  Any getmore operation on a cursor already
+// created with a valid non-zero max time will also fail immediately.
+//
+// This fail point cannot be used with the maxTimeNeverTimeOut fail point.
+extern FailPoint maxTimeAlwaysTimeOut;
+
+// Enabling the maxTimeNeverTimeOut fail point will cause the server to never time out any
+// query, command, or getmore operation, regardless of whether a max time is set.
+//
+// This fail point cannot be used with the maxTimeAlwaysTimeOut fail point.
+extern FailPoint maxTimeNeverTimeOut;
 
 /**
  * This class encompasses the state required by an operation and lives from the time a network
@@ -185,6 +200,12 @@ public:
     void setOperationKey(OperationKey opKey);
 
     /**
+     * Removes the operation UUID associated with this operation.
+     * DO NOT call this function outside `~OperationContext()` and `killAndDelistOperation()`.
+     */
+    void releaseOperationKey();
+
+    /**
      * Returns the session ID associated with this operation, if there is one.
      */
     const boost::optional<LogicalSessionId>& getLogicalSessionId() const {
@@ -259,6 +280,27 @@ public:
      */
     bool writesAreReplicated() const {
         return _writesAreReplicated;
+    }
+
+    /**
+     * Returns true if the operation is running lock-free.
+     */
+    bool isLockFreeReadsOp() const {
+        return _isLockFreeReadsOp;
+    }
+
+    /**
+     * Returns true if operations' durations should be added to serverStatus latency metrics.
+     */
+    bool shouldIncrementLatencyStats() const {
+        return _shouldIncrementLatencyStats;
+    }
+
+    /**
+     * Sets the shouldIncrementLatencyStats flag.
+     */
+    void setShouldIncrementLatencyStats(bool shouldIncrementLatencyStats) {
+        _shouldIncrementLatencyStats = shouldIncrementLatencyStats;
     }
 
     void markKillOnClientDisconnect();
@@ -387,10 +429,46 @@ public:
     }
 
     /**
+     * Sets that this operation should always get killed during stepDown and stepUp, regardless of
+     * whether or not it's taken a write lock.
+     */
+    void setAlwaysInterruptAtStepDownOrUp() {
+        _alwaysInterruptAtStepDownOrUp.store(true);
+    }
+
+    /**
+     * Indicates that this operation should always get killed during stepDown and stepUp, regardless
+     * of whether or not it's taken a write lock.
+     */
+    bool shouldAlwaysInterruptAtStepDownOrUp() {
+        return _alwaysInterruptAtStepDownOrUp.load();
+    }
+
+    /**
+     * Clears metadata associated with a multi-document transaction.
+     */
+    void resetMultiDocumentTransactionState() {
+        invariant(_inMultiDocumentTransaction);
+        invariant(!_writeUnitOfWork);
+        invariant(_ruState == WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
+        _inMultiDocumentTransaction = false;
+        _isStartingMultiDocumentTransaction = false;
+        _lsid = boost::none;
+        _txnNumber = boost::none;
+    }
+
+    /**
      * Returns whether this operation is starting a multi-document transaction.
      */
     bool isStartingMultiDocumentTransaction() const {
         return _isStartingMultiDocumentTransaction;
+    }
+
+    /**
+     * Returns whether this operation is continuing (not starting) a multi-document transaction.
+     */
+    bool isContinuingMultiDocumentTransaction() const {
+        return inMultiDocumentTransaction() && !isStartingMultiDocumentTransaction();
     }
 
     /**
@@ -508,8 +586,16 @@ private:
         _writesAreReplicated = writesAreReplicated;
     }
 
+    /**
+     * Set whether or not the operation is running lock-free.
+     */
+    void setIsLockFreeReadsOp(bool isLockFreeReadsOp) {
+        _isLockFreeReadsOp = isLockFreeReadsOp;
+    }
+
     friend class WriteUnitOfWork;
     friend class repl::UnreplicatedWritesBlock;
+    friend class LockFreeReadsBlock;
 
     Client* const _client;
 
@@ -562,9 +648,15 @@ private:
     Timer _elapsedTime;
 
     bool _writesAreReplicated = true;
+    bool _isLockFreeReadsOp = false;
+    bool _shouldIncrementLatencyStats = true;
     bool _shouldParticipateInFlowControl = true;
     bool _inMultiDocumentTransaction = false;
     bool _isStartingMultiDocumentTransaction = false;
+
+    // If true, this OpCtx will get interrupted during replica set stepUp and stepDown, regardless
+    // of what locks it's taken.
+    AtomicWord<bool> _alwaysInterruptAtStepDownOrUp{false};
 
     // If populated, this is an owned singleton BSONObj whose only field, 'comment', is a copy of
     // the 'comment' field from the input command object.
@@ -573,6 +665,12 @@ private:
     // Whether this operation is an exhaust command.
     bool _exhaust = false;
 };
+
+// Gets a TimeZoneDatabase pointer from the ServiceContext.
+inline const TimeZoneDatabase* getTimeZoneDatabase(OperationContext* opCtx) {
+    return opCtx && opCtx->getServiceContext() ? TimeZoneDatabase::get(opCtx->getServiceContext())
+                                               : nullptr;
+}
 
 namespace repl {
 /**
@@ -598,4 +696,29 @@ private:
     const bool _shouldReplicateWrites;
 };
 }  // namespace repl
+
+/**
+ * RAII-style class to indicate the operation is lock-free and code should behave accordingly.
+ */
+class LockFreeReadsBlock {
+    LockFreeReadsBlock(const LockFreeReadsBlock&) = delete;
+    LockFreeReadsBlock& operator=(const LockFreeReadsBlock&) = delete;
+
+public:
+    LockFreeReadsBlock(OperationContext* opCtx)
+        : _opCtx(opCtx), _previousLockFreeReadsSetting(opCtx->isLockFreeReadsOp()) {
+        opCtx->setIsLockFreeReadsOp(true);
+    }
+
+    ~LockFreeReadsBlock() {
+        _opCtx->setIsLockFreeReadsOp(_previousLockFreeReadsSetting);
+    }
+
+private:
+    OperationContext* _opCtx;
+
+    // Used to re-set the value on the operation context upon destruction that was originally set.
+    const bool _previousLockFreeReadsSetting;
+};
+
 }  // namespace mongo

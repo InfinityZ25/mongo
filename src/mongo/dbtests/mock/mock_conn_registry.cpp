@@ -73,6 +73,16 @@ bool MockConnRegistry::removeServer(const std::string& hostName) {
     return _registry.erase(hostName) == 1;
 }
 
+MockRemoteDBServer* const MockConnRegistry::getMockRemoteDBServer(
+    const std::string& hostName) const {
+    stdx::lock_guard lk(_registryMutex);
+    auto iter = _registry.find(hostName);
+    if (iter == _registry.end())
+        return nullptr;
+
+    return iter->second;
+}
+
 void MockConnRegistry::clear() {
     stdx::lock_guard<Latch> sl(_registryMutex);
     _registry.clear();
@@ -89,12 +99,15 @@ MockConnRegistry::MockConnHook::MockConnHook(MockConnRegistry* registry) : _regi
 MockConnRegistry::MockConnHook::~MockConnHook() {}
 
 std::unique_ptr<mongo::DBClientBase> MockConnRegistry::MockConnHook::connect(
-    const ConnectionString& connString, std::string& errmsg, double socketTimeout) {
+    const ConnectionString& connString,
+    std::string& errmsg,
+    double socketTimeout,
+    const ClientAPIVersionParameters* apiParameters) {
     const string hostName(connString.toString());
     auto conn = _registry->connect(hostName);
 
     if (!conn->connect(hostName.c_str(), StringData(), errmsg)) {
-        // mimic ConnectionString::connect for MASTER type connection to return NULL
+        // mimic ConnectionString::connect for kStandalone type connection to return NULL
         // if the destination is unreachable.
         return nullptr;
     }

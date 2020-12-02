@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/db/repl/oplog_fetcher_mock.h"
 
@@ -48,7 +48,11 @@ OplogFetcherMock::OplogFetcherMock(
     EnqueueDocumentsFn enqueueDocumentsFn,
     OnShutdownCallbackFn onShutdownCallbackFn,
     const int batchSize,
-    StartingPoint startingPoint)
+    StartingPoint startingPoint,
+    BSONObj filter,
+    ReadConcernArgs readConcern,
+    bool requestResumeToken,
+    StringData name)
     : OplogFetcher(executor,
                    lastFetched,
                    std::move(source),
@@ -61,9 +65,13 @@ OplogFetcherMock::OplogFetcherMock(
                    // Pass a dummy EnqueueDocumentsFn to the base OplogFetcher.
                    [](const auto& a1, const auto& a2, const auto& a3) { return Status::OK(); },
                    // Pass a dummy OnShutdownCallbackFn to the base OplogFetcher.
-                   [](const auto& a) {},
+                   [](const auto& a, const int b) {},
                    batchSize,
-                   startingPoint),
+                   startingPoint,
+                   filter,
+                   readConcern,
+                   requestResumeToken,
+                   name),
       _oplogFetcherRestartDecision(std::move(oplogFetcherRestartDecision)),
       _onShutdownCallbackFn(std::move(onShutdownCallbackFn)),
       _enqueueDocumentsFn(std::move(enqueueDocumentsFn)),
@@ -78,7 +86,9 @@ OplogFetcherMock::~OplogFetcherMock() {
     }
 }
 
-void OplogFetcherMock::receiveBatch(CursorId cursorId, OplogFetcher::Documents documents) {
+void OplogFetcherMock::receiveBatch(CursorId cursorId,
+                                    OplogFetcher::Documents documents,
+                                    boost::optional<Timestamp> resumeToken) {
     {
         stdx::lock_guard<Latch> lock(_mutex);
         if (!_isActive_inlock()) {
@@ -99,25 +109,28 @@ void OplogFetcherMock::receiveBatch(CursorId cursorId, OplogFetcher::Documents d
         return;
     }
 
+    auto info = validateResult.getValue();
+    if (resumeToken) {
+        info.resumeToken = *resumeToken;
+    }
+
+    // Enqueue documents in a separate thread with a different client than the test thread. This
+    // is to avoid interfering the thread local client in the test thread.
+    Status status = Status::OK();
+    stdx::thread enqueueDocumentThread([&]() {
+        Client::initThread("enqueueDocumentThread");
+        status = _enqueueDocumentsFn(documents.cbegin(), documents.cend(), info);
+    });
+    // Wait until the enqueue finishes.
+    enqueueDocumentThread.join();
+
+    // Shutdown the OplogFetcher with error if enqueue fails.
+    if (!status.isOK()) {
+        shutdownWith(status);
+        return;
+    }
+
     if (!documents.empty()) {
-        auto info = validateResult.getValue();
-
-        // Enqueue documents in a separate thread with a different client than the test thread. This
-        // is to avoid interfering the thread local client in the test thread.
-        Status status = Status::OK();
-        stdx::thread enqueueDocumentThread([&]() {
-            Client::initThread("enqueueDocumentThread");
-            status = _enqueueDocumentsFn(documents.cbegin(), documents.cend(), info);
-        });
-        // Wait until the enqueue finishes.
-        enqueueDocumentThread.join();
-
-        // Shutdown the OplogFetcher with error if enqueue fails.
-        if (!status.isOK()) {
-            shutdownWith(status);
-            return;
-        }
-
         // Update lastFetched to the last oplog entry enqueued.
         auto lastDocRes = OpTime::parseFromOplogEntry(documents.back());
         if (!lastDocRes.isOK()) {
@@ -210,7 +223,7 @@ void OplogFetcherMock::_finishCallback(Status status) {
     invariant(isActive());
 
     // Call _onShutdownCallbackFn outside of the mutex.
-    _onShutdownCallbackFn(status);
+    _onShutdownCallbackFn(status, ReplicationProcess::kUninitializedRollbackId);
 
     decltype(_onShutdownCallbackFn) onShutdownCallbackFn;
     decltype(_oplogFetcherRestartDecision) oplogFetcherRestartDecision;

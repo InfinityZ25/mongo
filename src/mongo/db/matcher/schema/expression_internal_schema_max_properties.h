@@ -40,10 +40,12 @@ namespace mongo {
 class InternalSchemaMaxPropertiesMatchExpression final
     : public InternalSchemaNumPropertiesMatchExpression {
 public:
-    explicit InternalSchemaMaxPropertiesMatchExpression(long long numProperties)
+    explicit InternalSchemaMaxPropertiesMatchExpression(
+        long long numProperties, clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : InternalSchemaNumPropertiesMatchExpression(MatchType::INTERNAL_SCHEMA_MAX_PROPERTIES,
                                                      numProperties,
-                                                     "$_internalSchemaMaxProperties") {}
+                                                     "$_internalSchemaMaxProperties",
+                                                     std::move(annotation)) {}
 
     bool matches(const MatchableDocument* doc, MatchDetails* details) const final {
         BSONObj obj = doc->toBSON();
@@ -59,12 +61,20 @@ public:
     }
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const final {
-        auto maxProperties =
-            std::make_unique<InternalSchemaMaxPropertiesMatchExpression>(numProperties());
+        auto maxProperties = std::make_unique<InternalSchemaMaxPropertiesMatchExpression>(
+            numProperties(), _errorAnnotation);
         if (getTag()) {
             maxProperties->setTag(getTag()->clone());
         }
-        return std::move(maxProperties);
+        return maxProperties;
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
     }
 };
 }  // namespace mongo

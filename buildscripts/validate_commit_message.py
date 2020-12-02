@@ -32,13 +32,30 @@ import os
 import re
 import subprocess
 import sys
+import logging
 
-VALID_PATTERNS = [
-    re.compile(r"^Fix lint$"),  # Allow "Fix lint" as the sole commit summary
-    re.compile(r'^(Revert ["\']?)?(EVG|SERVER|WT)-[0-9]+'),  # These are public tickets
-    re.compile(r'^Import (wiredtiger|tools):'),  # These are public tickets
-]
-PRIVATE_PATTERNS = [re.compile(r"^[A-Z]+-[0-9]+")]
+LOGGER = logging.getLogger(__name__)
+
+COMMON_PUBLIC_PATTERN = r'''
+    ((?P<revert>Revert)\s+[\"\']?)?                         # Revert (optional)
+    ((?P<ticket>(?:EVG|SERVER|WT)-[0-9]+)[\"\']?\s*)               # ticket identifier
+    (?P<body>(?:(?!\(cherry\spicked\sfrom).)*)?             # To also capture the body
+    (?P<backport>\(cherry\spicked\sfrom.*)?                 # back port (optional)
+    '''
+"""Common Public pattern format."""
+
+COMMON_LINT_PATTERN = r'(?P<lint>Fix\slint)'
+"""Common Lint pattern format."""
+
+COMMON_IMPORT_PATTERN = r'(?P<imported>Import\s(wiredtiger|tools):\s.*)'
+"""Common Import pattern format."""
+
+COMMON_PRIVATE_PATTERN = r'''
+    ((?P<revert>Revert)\s+[\"\']?)?                                     # Revert (optional)
+    ((?P<ticket>[A-Z]+-[0-9]+)[\"\']?\s*)                               # ticket identifier
+    (?P<body>(?:(?!('\s(into\s'(([^/]+))/(([^:]+)):(([^']+))'))).)*)?   # To also capture the body
+'''
+"""Common Private pattern format."""
 
 STATUS_OK = 0
 STATUS_ERROR = 1
@@ -46,18 +63,63 @@ STATUS_ERROR = 1
 GIT_SHOW_COMMAND = ["git", "show", "-1", "-s", "--format=%s"]
 
 
+def new_patch_description(pattern: str) -> str:
+    """
+    Wrap the pattern to conform to the new commit queue patch description format.
+
+    Add the commit queue prefix and suffix to the pattern. The format looks like:
+
+    Commit Queue Merge: '<commit message>' into '<owner>/<repo>:<branch>'
+
+    :param pattern: The pattern to wrap.
+    :return: A pattern to match the new format for the patch description.
+    """
+    return (r"""^((?P<commitqueue>Commit\sQueue\sMerge:)\s')"""
+            f'{pattern}'
+            # r"""('\s(?P<into>into\s'((?P<owner>[^/]+))/((?P<repo>[^:]+)):((?P<branch>[^']+))'))"""
+            )
+
+
+def old_patch_description(pattern: str) -> str:
+    """
+    Wrap the pattern to conform to the new commit queue patch description format.
+
+    Just add a start anchor. The format looks like:
+
+    <commit message>
+
+    :param pattern: The pattern to wrap.
+    :return: A pattern to match the old format for the patch description.
+    """
+    return r'^' f'{pattern}'
+
+
+# NOTE: re.VERBOSE is for visibility / debugging. As such significant white space must be
+# escaped (e.g ' ' to \s).
+VALID_PATTERNS = [
+    re.compile(new_patch_description(COMMON_PUBLIC_PATTERN), re.MULTILINE | re.DOTALL | re.VERBOSE),
+    re.compile(old_patch_description(COMMON_PUBLIC_PATTERN), re.MULTILINE | re.DOTALL | re.VERBOSE),
+    re.compile(new_patch_description(COMMON_LINT_PATTERN), re.MULTILINE | re.DOTALL | re.VERBOSE),
+    re.compile(old_patch_description(COMMON_LINT_PATTERN), re.MULTILINE | re.DOTALL | re.VERBOSE),
+    re.compile(new_patch_description(COMMON_IMPORT_PATTERN), re.MULTILINE | re.DOTALL | re.VERBOSE),
+    re.compile(old_patch_description(COMMON_IMPORT_PATTERN), re.MULTILINE | re.DOTALL | re.VERBOSE),
+]
+"""valid public patterns."""
+
+PRIVATE_PATTERNS = [
+    re.compile(
+        new_patch_description(COMMON_PRIVATE_PATTERN), re.MULTILINE | re.DOTALL | re.VERBOSE),
+    re.compile(
+        old_patch_description(COMMON_PRIVATE_PATTERN), re.MULTILINE | re.DOTALL | re.VERBOSE),
+]
+"""private patterns."""
+
+
 def main(argv=None):
     """Execute Main function to validate commit messages."""
     parser = argparse.ArgumentParser(
         usage="Validate the commit message. "
         "It validates the latest message when no arguments are provided.")
-    parser.add_argument(
-        "-i",
-        action="store_true",
-        dest="ignore_warnings",
-        help="Ignore all warnings.",
-        default=False,
-    )
     parser.add_argument(
         "message",
         metavar="commit message",
@@ -74,15 +136,14 @@ def main(argv=None):
         message = " ".join(args.message)
 
     if any(valid_pattern.match(message) for valid_pattern in VALID_PATTERNS):
-        status = STATUS_OK
-    elif any(private_pattern.match(message) for private_pattern in PRIVATE_PATTERNS):
-        print("ERROR: found a reference to a private project\n{message}".format(message=message))
-        status = STATUS_ERROR
+        return STATUS_OK
     else:
-        print("{message_type}: found a commit without a ticket\n{message}".format(
-            message_type="WARNING" if args.ignore_warnings else "ERROR", message=message))
-        status = STATUS_OK if args.ignore_warnings else STATUS_ERROR
-    return status
+        if any(private_pattern.match(message) for private_pattern in PRIVATE_PATTERNS):
+            error_type = "Found a reference to a private project"
+        else:
+            error_type = "Found a commit without a ticket"
+        LOGGER.error(f"{error_type}\n{message}")  # pylint: disable=logging-fstring-interpolation
+        return STATUS_ERROR
 
 
 if __name__ == "__main__":

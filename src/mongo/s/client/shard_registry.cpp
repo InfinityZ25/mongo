@@ -27,62 +27,46 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/s/client/shard_registry.h"
 
-#include <memory>
-#include <set>
-
-#include "mongo/bson/bsonobj.h"
-#include "mongo/bson/util/bson_extract.h"
-#include "mongo/client/connection_string.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/db/client.h"
 #include "mongo/db/logical_time_metadata_hook.h"
-#include "mongo/db/operation_context.h"
-#include "mongo/db/server_options.h"
-#include "mongo/executor/network_connection_hook.h"
+#include "mongo/db/vector_clock.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/network_interface_thread_pool.h"
-#include "mongo/executor/task_executor.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/logv2/log.h"
-#include "mongo/platform/mutex.h"
 #include "mongo/rpc/metadata/egress_metadata_hook_list.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_shard.h"
-#include "mongo/s/client/shard.h"
-#include "mongo/s/client/shard_factory.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/concurrency/with_lock.h"
-#include "mongo/util/map_util.h"
-#include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
 
-using std::set;
-using std::shared_ptr;
-using std::string;
-using std::unique_ptr;
-using std::vector;
-
-using executor::NetworkInterface;
-using executor::NetworkInterfaceThreadPool;
-using executor::TaskExecutor;
-using executor::TaskExecutorPool;
-using executor::ThreadPoolTaskExecutor;
-using CallbackArgs = TaskExecutor::CallbackArgs;
-using CallbackHandle = TaskExecutor::CallbackHandle;
-
-
 namespace {
+
 const Seconds kRefreshPeriod(30);
+
+/**
+ * Whether or not the actual topologyTime should be used.  When this is false, the
+ * topologyTime part of the cache's Time will stay fixed and not advance.
+ */
+bool useActualTopologyTime() {
+    return serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+        serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
+            ServerGlobalParams::FeatureCompatibility::Version::kVersion47);
+}
+
 }  // namespace
+
+using CallbackArgs = executor::TaskExecutor::CallbackArgs;
 
 const ShardId ShardRegistry::kConfigServerShardId = ShardId("config");
 
@@ -91,133 +75,149 @@ ShardRegistry::ShardRegistry(std::unique_ptr<ShardFactory> shardFactory,
                              std::vector<ShardRemovalHook> shardRemovalHooks)
     : _shardFactory(std::move(shardFactory)),
       _initConfigServerCS(configServerCS),
-      _shardRemovalHooks(std::move(shardRemovalHooks)) {}
+      _shardRemovalHooks(std::move(shardRemovalHooks)),
+      _threadPool([] {
+          ThreadPool::Options options;
+          options.poolName = "ShardRegistry";
+          options.minThreads = 0;
+          options.maxThreads = 1;
+          return options;
+      }()) {
+    invariant(_initConfigServerCS.isValid());
+    _threadPool.startup();
+}
 
 ShardRegistry::~ShardRegistry() {
     shutdown();
 }
 
-void ShardRegistry::shutdown() {
-    if (_executor && !_isShutdown) {
-        LOGV2_DEBUG(22723, 1, "Shutting down task executor for reloading shard registry");
-        _executor->shutdown();
-        _executor->join();
-        _isShutdown = true;
-    }
-}
+void ShardRegistry::init(ServiceContext* service) {
+    invariant(!_isInitialized.load());
 
-ConnectionString ShardRegistry::getConfigServerConnectionString() const {
-    return getConfigShard()->getConnString();
-}
+    invariant(!_service);
+    _service = service;
 
-StatusWith<shared_ptr<Shard>> ShardRegistry::getShard(OperationContext* opCtx,
-                                                      const ShardId& shardId) {
-    // If we know about the shard, return it.
-    auto shard = _data.findShard(shardId);
-    if (shard) {
-        return shard;
-    }
+    auto lookupFn = [this](OperationContext* opCtx,
+                           const Singleton& key,
+                           const Cache::ValueHandle& cachedData,
+                           const Time& timeInStore) {
+        return _lookup(opCtx, key, cachedData, timeInStore);
+    };
 
-    // If we can't find the shard, attempt to reload the ShardRegistry.
-    bool didReload = reload(opCtx);
-    shard = _data.findShard(shardId);
+    _cache =
+        std::make_unique<Cache>(_cacheMutex, _service, _threadPool, lookupFn, 1 /* cacheSize */);
 
-    // If we found the shard, return it.
-    if (shard) {
-        return shard;
+    LOGV2_DEBUG(5123000,
+                1,
+                "Initializing ShardRegistry",
+                "configServers"_attr = _initConfigServerCS.toString());
+    {
+        stdx::lock_guard<Latch> lk(_mutex);
+        _configShardData = ShardRegistryData::createWithConfigShardOnly(
+            _shardFactory->createShard(kConfigServerShardId, _initConfigServerCS));
+        _latestConnStrings[_initConfigServerCS.getSetName()] = _initConfigServerCS;
     }
 
-    // If we did not find the shard but performed the reload
-    // ourselves, return, because it means the shard does not exist.
-    if (didReload) {
-        return {ErrorCodes::ShardNotFound, str::stream() << "Shard " << shardId << " not found"};
+    _isInitialized.store(true);
+}
+
+ShardRegistry::Cache::LookupResult ShardRegistry::_lookup(OperationContext* opCtx,
+                                                          const Singleton& key,
+                                                          const Cache::ValueHandle& cachedData,
+                                                          const Time& timeInStore) {
+    invariant(key == _kSingleton);
+    invariant(cachedData, "ShardRegistry::_lookup called but the cache is empty");
+
+    LOGV2_DEBUG(4620250,
+                2,
+                "Starting ShardRegistry::_lookup",
+                "cachedData"_attr = cachedData->toBSON(),
+                "cachedData.getTime()"_attr = cachedData.getTime().toBSON(),
+                "timeInStore"_attr = timeInStore.toBSON());
+
+    // Check if we need to refresh from the configsvrs.  If so, then do that and get the results,
+    // otherwise (this is a lookup only to incorporate updated connection strings from the RSM),
+    // then get the equivalent values from the previously cached data.
+    auto [returnData,
+          returnTopologyTime,
+          returnForceReloadIncrement,
+          removedShards,
+          fetchedFromConfigServers] = [&]()
+        -> std::tuple<ShardRegistryData, Timestamp, Increment, ShardRegistryData::ShardMap, bool> {
+        if (timeInStore.topologyTime > cachedData.getTime().topologyTime ||
+            timeInStore.forceReloadIncrement > cachedData.getTime().forceReloadIncrement) {
+            auto [reloadedData, maxTopologyTime] =
+                ShardRegistryData::createFromCatalogClient(opCtx, _shardFactory.get());
+            if (!useActualTopologyTime()) {
+                // If not using the actual topology time, then just use the topologyTime currently
+                // in the cache, instead of the maximum topologyTime value from config.shards.  This
+                // is necessary during upgrade/downgrade when topologyTime might not be gossiped by
+                // all nodes (and so isn't being used).
+                maxTopologyTime = cachedData.getTime().topologyTime;
+            }
+
+            auto [mergedData, removedShards] =
+                ShardRegistryData::mergeExisting(*cachedData, reloadedData);
+
+            return {
+                mergedData, maxTopologyTime, timeInStore.forceReloadIncrement, removedShards, true};
+        } else {
+            return {*cachedData,
+                    cachedData.getTime().topologyTime,
+                    cachedData.getTime().forceReloadIncrement,
+                    {},
+                    false};
+        }
+    }();
+
+    // Always apply the latest conn strings.
+    auto [latestConnStrings, rsmIncrementForConnStrings] = _getLatestConnStrings();
+
+    for (const auto& latestConnString : latestConnStrings) {
+        auto shard = returnData.findByRSName(latestConnString.first.toString());
+        if (shard == nullptr || shard->getConnString() == latestConnString.second) {
+            continue;
+        }
+
+        auto newData = ShardRegistryData::createFromExisting(
+            returnData, latestConnString.second, _shardFactory.get());
+        returnData = newData;
     }
 
-    // If we did not perform the reload ourselves (because there was a concurrent reload), force a
-    // reload again to ensure that we have seen data at least as up to date as our first reload.
-    reload(opCtx);
-    shard = _data.findShard(shardId);
+    // Remove RSMs that are not in the catalog any more.
+    for (auto& pair : removedShards) {
+        auto& shardId = pair.first;
+        auto& shard = pair.second;
+        invariant(shard);
 
-    if (shard) {
-        return shard;
-    }
-
-    return {ErrorCodes::ShardNotFound, str::stream() << "Shard " << shardId << " not found"};
-}
-
-shared_ptr<Shard> ShardRegistry::getShardNoReload(const ShardId& shardId) {
-    return _data.findShard(shardId);
-}
-
-shared_ptr<Shard> ShardRegistry::getShardForHostNoReload(const HostAndPort& host) {
-    return _data.findByHostAndPort(host);
-}
-
-shared_ptr<Shard> ShardRegistry::getConfigShard() const {
-    auto shard = _data.getConfigShard();
-    invariant(shard);
-    return shard;
-}
-
-unique_ptr<Shard> ShardRegistry::createConnection(const ConnectionString& connStr) const {
-    return _shardFactory->createUniqueShard(ShardId("<unnamed>"), connStr);
-}
-
-shared_ptr<Shard> ShardRegistry::lookupRSName(const string& name) const {
-    return _data.findByRSName(name);
-}
-
-void ShardRegistry::getAllShardIdsNoReload(vector<ShardId>* all) const {
-    std::set<ShardId> seen;
-    _data.getAllShardIds(seen);
-    all->assign(seen.begin(), seen.end());
-}
-
-void ShardRegistry::getAllShardIds(OperationContext* opCtx, vector<ShardId>* all) {
-    getAllShardIdsNoReload(all);
-    if (all->empty()) {
-        bool didReload = reload(opCtx);
-        getAllShardIdsNoReload(all);
-        // If we didn't do the reload ourselves, we should retry to ensure
-        // that the reload is actually initiated while we're executing this
-        if (!didReload && all->empty()) {
-            reload(opCtx);
-            getAllShardIdsNoReload(all);
+        auto name = shard->getConnString().getSetName();
+        ReplicaSetMonitor::remove(name);
+        _removeReplicaSet(name);
+        for (auto& callback : _shardRemovalHooks) {
+            // Run callbacks asynchronously.
+            // TODO SERVER-50906: Consider running these callbacks synchronously.
+            ExecutorFuture<void>(Grid::get(opCtx)->getExecutorPool()->getFixedExecutor())
+                .getAsync([=](const Status&) { callback(shardId); });
         }
     }
+
+    // The registry is "up" once there has been a successful lookup from the config servers.
+    if (fetchedFromConfigServers) {
+        _isUp.store(true);
+    }
+
+    Time returnTime{returnTopologyTime, rsmIncrementForConnStrings, returnForceReloadIncrement};
+    LOGV2_DEBUG(4620251,
+                2,
+                "Finished ShardRegistry::_lookup",
+                "returnData"_attr = returnData.toBSON(),
+                "returnTime"_attr = returnTime);
+    return Cache::LookupResult{returnData, returnTime};
 }
 
-int ShardRegistry::getNumShards() const {
-    std::set<ShardId> seen;
-    _data.getAllShardIds(seen);
-    return seen.size();
-}
-
-void ShardRegistry::toBSON(BSONObjBuilder* result) const {
-    _data.toBSON(result);
-}
-
-void ShardRegistry::updateReplSetHosts(const ConnectionString& newConnString) {
-    invariant(newConnString.type() == ConnectionString::SET ||
-              newConnString.type() == ConnectionString::CUSTOM);  // For dbtests
-
-    // to prevent update config shard connection string during init
-    stdx::unique_lock<Latch> lock(_reloadMutex);
-    _data.rebuildShardIfExists(newConnString, _shardFactory.get());
-}
-
-void ShardRegistry::init() {
-    stdx::unique_lock<Latch> reloadLock(_reloadMutex);
-    invariant(_initConfigServerCS.isValid());
-    auto configShard =
-        _shardFactory->createShard(ShardRegistry::kConfigServerShardId, _initConfigServerCS);
-    _data.addConfigShard(configShard);
-    // set to invalid so it cant be started more than once.
-    _initConfigServerCS = ConnectionString();
-}
-
-void ShardRegistry::startup(OperationContext* opCtx) {
-    // startup() must be called only once
+void ShardRegistry::startupPeriodicReloader(OperationContext* opCtx) {
+    invariant(_isInitialized.load());
+    // startupPeriodicReloader() must be called only once
     invariant(!_executor);
 
     auto hookList = std::make_unique<rpc::EgressMetadataHookList>();
@@ -226,16 +226,17 @@ void ShardRegistry::startup(OperationContext* opCtx) {
     // construct task executor
     auto net = executor::makeNetworkInterface("ShardRegistryUpdater", nullptr, std::move(hookList));
     auto netPtr = net.get();
-    _executor = std::make_unique<ThreadPoolTaskExecutor>(
-        std::make_unique<NetworkInterfaceThreadPool>(netPtr), std::move(net));
+    _executor = std::make_unique<executor::ThreadPoolTaskExecutor>(
+        std::make_unique<executor::NetworkInterfaceThreadPool>(netPtr), std::move(net));
     LOGV2_DEBUG(22724, 1, "Starting up task executor for periodic reloading of ShardRegistry");
     _executor->startup();
 
     auto status =
-        _executor->scheduleWork([this](const CallbackArgs& cbArgs) { _internalReload(cbArgs); });
+        _executor->scheduleWork([this](const CallbackArgs& cbArgs) { _periodicReload(cbArgs); });
 
     if (status.getStatus() == ErrorCodes::ShutdownInProgress) {
-        LOGV2_DEBUG(22725, 1, "Cant schedule Shard Registry reload. Executor shutdown in progress");
+        LOGV2_DEBUG(
+            22725, 1, "Can't schedule Shard Registry reload. Executor shutdown in progress");
         return;
     }
 
@@ -247,7 +248,27 @@ void ShardRegistry::startup(OperationContext* opCtx) {
     }
 }
 
-void ShardRegistry::_internalReload(const CallbackArgs& cbArgs) {
+void ShardRegistry::shutdownPeriodicReloader() {
+    if (_executor) {
+        LOGV2_DEBUG(22723, 1, "Shutting down task executor for reloading shard registry");
+        _executor->shutdown();
+        _executor->join();
+        _executor.reset();
+    }
+}
+
+void ShardRegistry::shutdown() {
+    shutdownPeriodicReloader();
+
+    if (!_isShutdown.load()) {
+        LOGV2_DEBUG(4620235, 1, "Shutting down shard registry");
+        _threadPool.shutdown();
+        _threadPool.join();
+        _isShutdown.store(true);
+    }
+}
+
+void ShardRegistry::_periodicReload(const CallbackArgs& cbArgs) {
     LOGV2_DEBUG(22726, 1, "Reloading shardRegistry");
     if (!cbArgs.status.isOK()) {
         LOGV2_WARNING(22734,
@@ -261,21 +282,26 @@ void ShardRegistry::_internalReload(const CallbackArgs& cbArgs) {
 
     auto opCtx = tc->makeOperationContext();
 
+    auto refreshPeriod = kRefreshPeriod;
+
     try {
         reload(opCtx.get());
     } catch (const DBException& e) {
+        if (e.code() == ErrorCodes::ReadConcernMajorityNotAvailableYet) {
+            refreshPeriod = Seconds(1);
+        }
         LOGV2(22727,
               "Error running periodic reload of shard registry caused by {error}; will retry after "
               "{shardRegistryReloadInterval}",
               "Error running periodic reload of shard registry",
               "error"_attr = redact(e),
-              "shardRegistryReloadInterval"_attr = kRefreshPeriod);
+              "shardRegistryReloadInterval"_attr = refreshPeriod);
     }
 
     // reschedule itself
     auto status =
-        _executor->scheduleWorkAt(_executor->now() + kRefreshPeriod,
-                                  [this](const CallbackArgs& cbArgs) { _internalReload(cbArgs); });
+        _executor->scheduleWorkAt(_executor->now() + refreshPeriod,
+                                  [this](const CallbackArgs& cbArgs) { _periodicReload(cbArgs); });
 
     if (status.getStatus() == ErrorCodes::ShutdownInProgress) {
         LOGV2_DEBUG(
@@ -291,83 +317,163 @@ void ShardRegistry::_internalReload(const CallbackArgs& cbArgs) {
     }
 }
 
+ConnectionString ShardRegistry::getConfigServerConnectionString() const {
+    return getConfigShard()->getConnString();
+}
+
+std::shared_ptr<Shard> ShardRegistry::getConfigShard() const {
+    stdx::lock_guard<Latch> lk(_mutex);
+    return _configShardData.findShard(kConfigServerShardId);
+}
+
+StatusWith<std::shared_ptr<Shard>> ShardRegistry::getShard(OperationContext* opCtx,
+                                                           const ShardId& shardId) {
+    // First check if this is a non config shard lookup
+    // This call will may be blocking if there is an ongoing or a need of a cache rebuild
+    if (auto shard = _getData(opCtx)->findShard(shardId)) {
+        return shard;
+    }
+
+    // then check if this is a config shard (this call is blocking in any case)
+    {
+        stdx::lock_guard<Latch> lk(_mutex);
+        if (auto shard = _configShardData.findShard(shardId)) {
+            return shard;
+        }
+    }
+
+    // Reload and try again if the shard was not in the registry
+    reload(opCtx);
+    if (auto shard = _getData(opCtx)->findShard(shardId)) {
+        return shard;
+    }
+
+    return {ErrorCodes::ShardNotFound, str::stream() << "Shard " << shardId << " not found"};
+}
+
+void ShardRegistry::getAllShardIds(OperationContext* opCtx, std::vector<ShardId>* all) {
+    std::set<ShardId> seen;
+    auto data = _getData(opCtx);
+    data->getAllShardIds(seen);
+    if (seen.empty()) {
+        reload(opCtx);
+        data = _getData(opCtx);
+        data->getAllShardIds(seen);
+    }
+    all->assign(seen.begin(), seen.end());
+}
+
+int ShardRegistry::getNumShards(OperationContext* opCtx) {
+    std::set<ShardId> seen;
+    auto data = _getData(opCtx);
+    data->getAllShardIds(seen);
+    return seen.size();
+}
+
+std::pair<std::vector<ShardRegistry::LatestConnStrings::value_type>, ShardRegistry::Increment>
+ShardRegistry::_getLatestConnStrings() const {
+    stdx::unique_lock<Latch> lock(_mutex);
+    return {{_latestConnStrings.begin(), _latestConnStrings.end()}, _rsmIncrement.load()};
+}
+
+void ShardRegistry::_removeReplicaSet(const std::string& setName) {
+    stdx::lock_guard<Latch> lk(_mutex);
+    _latestConnStrings.erase(setName);
+}
+
+void ShardRegistry::updateReplSetHosts(const ConnectionString& givenConnString,
+                                       ConnectionStringUpdateType updateType) {
+    invariant(givenConnString.type() == ConnectionString::ConnectionType::kReplicaSet ||
+              givenConnString.type() == ConnectionString::ConnectionType::kCustom);  // For dbtests
+
+    auto setName = givenConnString.getSetName();
+
+    {
+        stdx::lock_guard<Latch> lk(_mutex);
+
+        ConnectionString newConnString =
+            (updateType == ConnectionStringUpdateType::kPossible &&
+             _latestConnStrings.find(setName) != _latestConnStrings.end())
+            ? _latestConnStrings[setName].makeUnionWith(givenConnString)
+            : givenConnString;
+
+        LOGV2_DEBUG(5123001,
+                    1,
+                    "Updating ShardRegistry connection string",
+                    "updateType"_attr = updateType == ConnectionStringUpdateType::kPossible
+                        ? "possible"
+                        : "confirmed",
+                    "currentConnString"_attr = _latestConnStrings[setName].toString(),
+                    "givenConnString"_attr = givenConnString.toString(),
+                    "newConnString"_attr = newConnString.toString());
+
+        _latestConnStrings[setName] = newConnString;
+
+        if (auto shard = _configShardData.findByRSName(setName)) {
+            auto newData = ShardRegistryData::createFromExisting(
+                _configShardData, newConnString, _shardFactory.get());
+            _configShardData = newData;
+
+        } else {
+            auto value = _rsmIncrement.addAndFetch(1);
+            LOGV2_DEBUG(4620252,
+                        2,
+                        "Incrementing the RSM timestamp after receiving updated connection string",
+                        "newConnString"_attr = newConnString,
+                        "newRSMIncrement"_attr = value);
+        }
+    }
+
+    // Schedule a lookup, to incorporate the new connection string.
+    _getDataAsync()
+        .thenRunOn(Grid::get(_service)->getExecutorPool()->getFixedExecutor())
+        .ignoreValue()
+        .getAsync([](const Status& status) {
+            if (!status.isOK()) {
+                LOGV2(4620201,
+                      "Error running reload of ShardRegistry for RSM update, caused by {error}",
+                      "Error running reload of ShardRegistry for RSM update",
+                      "error"_attr = redact(status));
+            }
+        });
+}
+
+std::unique_ptr<Shard> ShardRegistry::createConnection(const ConnectionString& connStr) const {
+    return _shardFactory->createUniqueShard(ShardId("<unnamed>"), connStr);
+}
+
 bool ShardRegistry::isUp() const {
-    stdx::unique_lock<Latch> reloadLock(_reloadMutex);
-    return _isUp;
+    return _isUp.load();
+}
+
+void ShardRegistry::toBSON(BSONObjBuilder* result) const {
+    BSONObjBuilder map;
+    BSONObjBuilder hosts;
+    BSONObjBuilder connStrings;
+    auto data = _getCachedData();
+    data->toBSON(&map, &hosts, &connStrings);
+    {
+        stdx::lock_guard<Latch> lk(_mutex);
+        _configShardData.toBSON(&map, &hosts, &connStrings);
+    }
+    result->append("map", map.obj());
+    result->append("hosts", hosts.obj());
+    result->append("connStrings", connStrings.obj());
 }
 
 bool ShardRegistry::reload(OperationContext* opCtx) {
-    stdx::unique_lock<Latch> reloadLock(_reloadMutex);
+    // Make the next acquire do a lookup.
+    auto value = _forceReloadIncrement.addAndFetch(1);
+    LOGV2_DEBUG(4620253, 2, "Forcing ShardRegistry reload", "newForceReloadIncrement"_attr = value);
 
-    if (_reloadState == ReloadState::Reloading) {
-        // Another thread is already in the process of reloading so no need to do duplicate work.
-        // There is also an issue if multiple threads are allowed to call getAllShards()
-        // simultaneously because there is no good way to determine which of the threads has the
-        // more recent version of the data.
-        try {
-            opCtx->waitForConditionOrInterrupt(
-                _inReloadCV, reloadLock, [&] { return _reloadState != ReloadState::Reloading; });
-        } catch (const DBException& e) {
-            LOGV2_DEBUG(22729,
-                        1,
-                        "Error reloading shard registry caused by {error}",
-                        "Error reloading shard registry",
-                        "error"_attr = redact(e));
-            return false;
-        }
+    // Force it to actually happen now.
+    _getData(opCtx);
 
-        if (_reloadState == ReloadState::Idle) {
-            return false;
-        }
-        // else proceed to reload since an error occured on the last reload attempt.
-        invariant(_reloadState == ReloadState::Failed);
-    }
-
-    _reloadState = ReloadState::Reloading;
-    reloadLock.unlock();
-
-    auto nextReloadState = ReloadState::Failed;
-
-    auto failGuard = makeGuard([&] {
-        if (!reloadLock.owns_lock()) {
-            reloadLock.lock();
-        }
-        _reloadState = nextReloadState;
-        _inReloadCV.notify_all();
-    });
-
-    ShardRegistryData currData(opCtx, _shardFactory.get());
-    currData.addConfigShard(_data.getConfigShard());
-    _data.swapAndMerge(currData);
-
-    // Remove RSMs that are not in the catalog any more.
-    std::set<ShardId> removedShardIds;
-    currData.getAllShardIds(removedShardIds);
-    _data.shardIdSetDifference(removedShardIds);
-
-    for (auto& shardId : removedShardIds) {
-        auto shard = currData.findByShardId(shardId);
-        invariant(shard);
-
-        auto name = shard->getConnString().getSetName();
-        ReplicaSetMonitor::remove(name);
-        for (auto& callback : _shardRemovalHooks) {
-            // Run callbacks asynchronously.
-            ExecutorFuture<void>(Grid::get(opCtx)->getExecutorPool()->getFixedExecutor())
-                .getAsync([=](const Status&) { callback(shardId); });
-        }
-    }
-
-    nextReloadState = ReloadState::Idle;
-    // first successful reload means that registry is up
-    _isUp = true;
     return true;
 }
 
 void ShardRegistry::clearEntries() {
-    ShardRegistryData empty;
-    empty.addConfigShard(_data.getConfigShard());
-    _data.swap(empty);
+    _cache->invalidateAll();
 }
 
 void ShardRegistry::updateReplicaSetOnConfigServer(ServiceContext* serviceContext,
@@ -377,7 +483,8 @@ void ShardRegistry::updateReplicaSetOnConfigServer(ServiceContext* serviceContex
     auto opCtx = tc->makeOperationContext();
     auto const grid = Grid::get(opCtx.get());
 
-    std::shared_ptr<Shard> s = grid->shardRegistry()->lookupRSName(connStr.getSetName());
+    std::shared_ptr<Shard> s =
+        grid->shardRegistry()->_getShardForRSNameNoReload(connStr.getSetName());
     if (!s) {
         LOGV2_DEBUG(22730,
                     1,
@@ -411,9 +518,109 @@ void ShardRegistry::updateReplicaSetOnConfigServer(ServiceContext* serviceContex
     }
 }
 
+// Inserts the initial empty ShardRegistryData into the cache, if the cache is empty.
+void ShardRegistry::_initializeCacheIfNecessary() const {
+    if (!_cache->peekLatestCached(_kSingleton)) {
+        stdx::lock_guard<Latch> lk(_mutex);
+        if (!_cache->peekLatestCached(_kSingleton)) {
+            _cache->insertOrAssign(_kSingleton, {}, Date_t::now(), Time());
+        }
+    }
+}
+
+SharedSemiFuture<ShardRegistry::Cache::ValueHandle> ShardRegistry::_getDataAsync() {
+    _initializeCacheIfNecessary();
+
+    // If the forceReloadIncrement is 0, then we've never done a lookup, so we should be sure to do
+    // one now.
+    Increment uninitializedIncrement{0};
+    _forceReloadIncrement.compareAndSwap(&uninitializedIncrement, 1);
+
+    // Update the time the cache should be aiming for.
+    auto now = VectorClock::get(_service)->getTime();
+    // The topologyTime should be advanced to either the actual topologyTime (if it is being
+    // gossiped), or else the previously cached topologyTime value (so that this part of the cache's
+    // time doesn't advance, if topologyTime isn't being gossiped).
+    Timestamp topologyTime = useActualTopologyTime()
+        ? now.topologyTime().asTimestamp()
+        : _cache->peekLatestCached(_kSingleton).getTime().topologyTime;
+    _cache->advanceTimeInStore(
+        _kSingleton, Time(topologyTime, _rsmIncrement.load(), _forceReloadIncrement.load()));
+
+    return _cache->acquireAsync(_kSingleton, CacheCausalConsistency::kLatestKnown);
+}
+
+ShardRegistry::Cache::ValueHandle ShardRegistry::_getData(OperationContext* opCtx) {
+    return _getDataAsync().get(opCtx);
+}
+
+// TODO SERVER-50206: Remove usage of these non-causally consistent accessors.
+
+ShardRegistry::Cache::ValueHandle ShardRegistry::_getCachedData() const {
+    _initializeCacheIfNecessary();
+    return _cache->peekLatestCached(_kSingleton);
+}
+
+std::shared_ptr<Shard> ShardRegistry::getShardNoReload(const ShardId& shardId) const {
+    // First check if this is a config shard lookup.
+    {
+        stdx::lock_guard<Latch> lk(_mutex);
+        if (auto shard = _configShardData.findShard(shardId)) {
+            return shard;
+        }
+    }
+    auto data = _getCachedData();
+    return data->findShard(shardId);
+}
+
+std::shared_ptr<Shard> ShardRegistry::getShardForHostNoReload(const HostAndPort& host) const {
+    // First check if this is a config shard lookup.
+    {
+        stdx::lock_guard<Latch> lk(_mutex);
+        if (auto shard = _configShardData.findByHostAndPort(host)) {
+            return shard;
+        }
+    }
+    auto data = _getCachedData();
+    return data->findByHostAndPort(host);
+}
+
+void ShardRegistry::getAllShardIdsNoReload(std::vector<ShardId>* all) const {
+    std::set<ShardId> seen;
+    auto data = _getCachedData();
+    data->getAllShardIds(seen);
+    all->assign(seen.begin(), seen.end());
+}
+
+int ShardRegistry::getNumShardsNoReload() const {
+    std::set<ShardId> seen;
+    auto data = _getCachedData();
+    data->getAllShardIds(seen);
+    return seen.size();
+}
+
+std::shared_ptr<Shard> ShardRegistry::_getShardForRSNameNoReload(const std::string& name) const {
+    // First check if this is a config shard lookup.
+    {
+        stdx::lock_guard<Latch> lk(_mutex);
+        if (auto shard = _configShardData.findByRSName(name)) {
+            return shard;
+        }
+    }
+    auto data = _getCachedData();
+    return data->findByRSName(name);
+}
+
 ////////////// ShardRegistryData //////////////////
 
-ShardRegistryData::ShardRegistryData(OperationContext* opCtx, ShardFactory* shardFactory) {
+ShardRegistryData ShardRegistryData::createWithConfigShardOnly(std::shared_ptr<Shard> configShard) {
+    ShardRegistryData data;
+    data._addShard(configShard);
+    return data;
+}
+
+std::pair<ShardRegistryData, Timestamp> ShardRegistryData::createFromCatalogClient(
+    OperationContext* opCtx, ShardFactory* shardFactory) {
     auto const catalogClient = Grid::get(opCtx)->catalogClient();
 
     auto readConcern = repl::ReadConcernLevel::kMajorityReadConcern;
@@ -444,6 +651,7 @@ ShardRegistryData::ShardRegistryData(OperationContext* opCtx, ShardFactory* shar
     // Do this before re-taking the mutex to avoid deadlock with the ReplicaSetMonitor updating
     // hosts for a given shard.
     std::vector<std::tuple<std::string, ConnectionString>> shardsInfo;
+    Timestamp maxTopologyTime;
     for (const auto& shardType : shards) {
         // This validation should ideally go inside the ShardType::validate call. However, doing
         // it there would prevent us from loading previously faulty shard hosts, which might have
@@ -457,9 +665,15 @@ ShardRegistryData::ShardRegistryData(OperationContext* opCtx, ShardFactory* shar
             continue;
         }
 
+        if (auto thisTopologyTime = shardType.getTopologyTime();
+            maxTopologyTime < thisTopologyTime) {
+            maxTopologyTime = thisTopologyTime;
+        }
+
         shardsInfo.push_back(std::make_tuple(shardType.getName(), shardHostStatus.getValue()));
     }
 
+    ShardRegistryData data;
     for (auto& shardInfo : shardsInfo) {
         if (std::get<0>(shardInfo) == "config") {
             continue;
@@ -468,97 +682,87 @@ ShardRegistryData::ShardRegistryData(OperationContext* opCtx, ShardFactory* shar
         auto shard = shardFactory->createShard(std::move(std::get<0>(shardInfo)),
                                                std::move(std::get<1>(shardInfo)));
 
-        _addShard(WithLock::withoutLock(), std::move(shard), false);
+        data._addShard(std::move(shard));
     }
+    return {data, maxTopologyTime};
 }
 
-void ShardRegistryData::swap(ShardRegistryData& other) {
-    stdx::lock_guard<Latch> lk(_mutex);
-    _shardIdLookup.swap(other._shardIdLookup);
-    _rsLookup.swap(other._rsLookup);
-    _hostLookup.swap(other._hostLookup);
-    _connStringLookup.swap(other._connStringLookup);
-    _configShard.swap(other._configShard);
-}
+std::pair<ShardRegistryData, ShardRegistryData::ShardMap> ShardRegistryData::mergeExisting(
+    const ShardRegistryData& alreadyCachedData, const ShardRegistryData& configServerData) {
+    ShardRegistryData mergedData(configServerData);
 
-void ShardRegistryData::swapAndMerge(ShardRegistryData& other) {
-    stdx::lock_guard<Latch> lk(_mutex);
-    _rsLookup.swap(other._rsLookup);
-    _configShard.swap(other._configShard);
-    _shardIdLookup.swap(other._shardIdLookup);
+    // For connstrings and hosts, prefer values from alreadyCachedData to whatever might have been
+    // fetched from the configsvrs.
+    for (auto it = alreadyCachedData._connStringLookup.begin();
+         it != alreadyCachedData._connStringLookup.end();
+         ++it) {
+        mergedData._connStringLookup[it->first] = it->second;
+    }
+    for (auto it = alreadyCachedData._hostLookup.begin(); it != alreadyCachedData._hostLookup.end();
+         ++it) {
+        mergedData._hostLookup[it->first] = it->second;
+    }
 
-    for (auto it = other._connStringLookup.begin(); it != other._connStringLookup.end(); ++it) {
-        auto res = _connStringLookup.find(it->first);
-        if (res == _connStringLookup.end()) {
-            _connStringLookup[it->first] = it->second;
+    // Find the shards that are no longer present.
+    ShardMap removedShards;
+    for (auto i = alreadyCachedData._shardIdLookup.begin();
+         i != alreadyCachedData._shardIdLookup.end();
+         ++i) {
+        invariant(i->second);
+        if (mergedData._shardIdLookup.find(i->second->getId()) == mergedData._shardIdLookup.end()) {
+            removedShards[i->second->getId()] = i->second;
         }
     }
 
-    for (auto it = other._hostLookup.begin(); it != other._hostLookup.end(); ++it) {
-        auto res = _hostLookup.find(it->first);
-        if (res == _hostLookup.end()) {
-            _hostLookup[it->first] = it->second;
-        }
+    return {mergedData, removedShards};
+}
+
+ShardRegistryData ShardRegistryData::createFromExisting(const ShardRegistryData& existingData,
+                                                        const ConnectionString& newConnString,
+                                                        ShardFactory* shardFactory) {
+    ShardRegistryData data(existingData);
+
+    auto it = data._rsLookup.find(newConnString.getSetName());
+    if (it == data._rsLookup.end()) {
+        return data;
     }
+    invariant(it->second);
+    auto updatedShard = shardFactory->createShard(it->second->getId(), newConnString);
+    data._addShard(updatedShard);
+
+    return data;
 }
 
-shared_ptr<Shard> ShardRegistryData::getConfigShard() const {
-    stdx::lock_guard<Latch> lk(_mutex);
-    return _configShard;
-}
-
-void ShardRegistryData::addConfigShard(std::shared_ptr<Shard> shard) {
-    stdx::lock_guard<Latch> lk(_mutex);
-    _configShard = shard;
-    _addShard(lk, shard, true);
-}
-
-shared_ptr<Shard> ShardRegistryData::findByRSName(const string& name) const {
-    stdx::lock_guard<Latch> lk(_mutex);
+std::shared_ptr<Shard> ShardRegistryData::findByRSName(const std::string& name) const {
     auto i = _rsLookup.find(name);
     return (i != _rsLookup.end()) ? i->second : nullptr;
 }
 
-shared_ptr<Shard> ShardRegistryData::findByHostAndPort(const HostAndPort& hostAndPort) const {
-    stdx::lock_guard<Latch> lk(_mutex);
-    return _findByHostAndPort(lk, hostAndPort);
-}
-
-shared_ptr<Shard> ShardRegistryData::findByShardId(const ShardId& shardId) const {
-    stdx::lock_guard<Latch> lk(_mutex);
-    return _findByShardId(lk, shardId);
-}
-
-shared_ptr<Shard> ShardRegistryData::_findByConnectionString(
-    WithLock, const ConnectionString& connectionString) const {
+std::shared_ptr<Shard> ShardRegistryData::_findByConnectionString(
+    const ConnectionString& connectionString) const {
     auto i = _connStringLookup.find(connectionString);
     return (i != _connStringLookup.end()) ? i->second : nullptr;
 }
 
-shared_ptr<Shard> ShardRegistryData::_findByHostAndPort(WithLock,
-                                                        const HostAndPort& hostAndPort) const {
-    return mapFindWithDefault(_hostLookup, hostAndPort);
+std::shared_ptr<Shard> ShardRegistryData::findByHostAndPort(const HostAndPort& hostAndPort) const {
+    auto i = _hostLookup.find(hostAndPort);
+    return (i != _hostLookup.end()) ? i->second : nullptr;
 }
 
-shared_ptr<Shard> ShardRegistryData::_findByShardId(WithLock, ShardId const& shardId) const {
+std::shared_ptr<Shard> ShardRegistryData::_findByShardId(const ShardId& shardId) const {
     auto i = _shardIdLookup.find(shardId);
     return (i != _shardIdLookup.end()) ? i->second : nullptr;
 }
 
-shared_ptr<Shard> ShardRegistryData::findShard(ShardId const& shardId) const {
-    stdx::lock_guard<Latch> lk(_mutex);
-    return _findShard(lk, shardId);
-}
-
-shared_ptr<Shard> ShardRegistryData::_findShard(WithLock lk, ShardId const& shardId) const {
-    auto shard = _findByShardId(lk, shardId);
+std::shared_ptr<Shard> ShardRegistryData::findShard(const ShardId& shardId) const {
+    auto shard = _findByShardId(shardId);
     if (shard) {
         return shard;
     }
 
     StatusWith<ConnectionString> swConnString = ConnectionString::parse(shardId.toString());
     if (swConnString.isOK()) {
-        shard = _findByConnectionString(lk, swConnString.getValue());
+        shard = _findByConnectionString(swConnString.getValue());
         if (shard) {
             return shard;
         }
@@ -566,7 +770,7 @@ shared_ptr<Shard> ShardRegistryData::_findShard(WithLock lk, ShardId const& shar
 
     StatusWith<HostAndPort> swHostAndPort = HostAndPort::parse(shardId.toString());
     if (swHostAndPort.isOK()) {
-        shard = _findByHostAndPort(lk, swHostAndPort.getValue());
+        shard = findByHostAndPort(swHostAndPort.getValue());
         if (shard) {
             return shard;
         }
@@ -575,32 +779,14 @@ shared_ptr<Shard> ShardRegistryData::_findShard(WithLock lk, ShardId const& shar
     return nullptr;
 }
 
-void ShardRegistryData::toBSON(BSONObjBuilder* result) const {
-    std::vector<std::shared_ptr<Shard>> shards;
-    {
-        stdx::lock_guard<Latch> lk(_mutex);
-        shards.reserve(_shardIdLookup.size());
-        for (auto&& shard : _shardIdLookup) {
-            shards.emplace_back(shard.second);
-        }
-    }
-
-    std::sort(std::begin(shards),
-              std::end(shards),
-              [](const std::shared_ptr<Shard>& lhs, const std::shared_ptr<Shard>& rhs) {
-                  return lhs->getId() < rhs->getId();
-              });
-
-    BSONObjBuilder mapBob(result->subobjStart("map"));
-    for (auto&& shard : shards) {
-        // Intentionally calling getConnString while not holding ShardRegistryData::_mutex
-        // because it can take ReplicaSetMonitor::SetState::mutex if it's ShardRemote.
-        mapBob.append(shard->getId(), shard->getConnString().toString());
+void ShardRegistryData::getAllShards(std::vector<std::shared_ptr<Shard>>& result) const {
+    result.reserve(_shardIdLookup.size());
+    for (auto&& shard : _shardIdLookup) {
+        result.emplace_back(shard.second);
     }
 }
 
 void ShardRegistryData::getAllShardIds(std::set<ShardId>& seen) const {
-    stdx::lock_guard<Latch> lk(_mutex);
     for (auto i = _shardIdLookup.begin(); i != _shardIdLookup.end(); ++i) {
         const auto& s = i->second;
         if (s->getId().toString() == "config") {
@@ -610,67 +796,16 @@ void ShardRegistryData::getAllShardIds(std::set<ShardId>& seen) const {
     }
 }
 
-void ShardRegistryData::shardIdSetDifference(std::set<ShardId>& diff) const {
-    stdx::lock_guard<Latch> lk(_mutex);
-    for (auto i = _shardIdLookup.begin(); i != _shardIdLookup.end(); ++i) {
-        invariant(i->second);
-        auto res = diff.find(i->second->getId());
-        if (res != diff.end()) {
-            diff.erase(res);
-        }
-    }
-}
-
-void ShardRegistryData::rebuildShardIfExists(const ConnectionString& newConnString,
-                                             ShardFactory* factory) {
-    stdx::unique_lock<Latch> updateConnStringLock(_mutex);
-    auto it = _rsLookup.find(newConnString.getSetName());
-    if (it == _rsLookup.end()) {
-        return;
-    }
-
-    _rebuildShard(updateConnStringLock, newConnString, factory);
-}
-
-
-void ShardRegistryData::_rebuildShard(WithLock lk,
-                                      ConnectionString const& newConnString,
-                                      ShardFactory* factory) {
-    auto it = _rsLookup.find(newConnString.getSetName());
-    invariant(it->second);
-    auto shard = factory->createShard(it->second->getId(), newConnString);
-    _addShard(lk, shard, true);
-    if (shard->isConfig()) {
-        _configShard = shard;
-    }
-}
-
-void ShardRegistryData::_addShard(WithLock lk,
-                                  std::shared_ptr<Shard> const& shard,
-                                  bool useOriginalCS) {
+void ShardRegistryData::_addShard(std::shared_ptr<Shard> shard) {
     const ShardId shardId = shard->getId();
+    const ConnectionString connString = shard->getConnString();
 
-    const ConnectionString connString =
-        useOriginalCS ? shard->originalConnString() : shard->getConnString();
-
-    auto currentShard = _findShard(lk, shardId);
+    auto currentShard = findShard(shardId);
     if (currentShard) {
-        auto oldConnString = currentShard->originalConnString();
-
-        if (oldConnString.toString() != connString.toString()) {
-            LOGV2(22732,
-                  "Updating shard registry connection string for shard {shardId} to "
-                  "{newShardConnectionString} from {oldShardConnectionString}",
-                  "Updating shard connection string on shard registry",
-                  "shardId"_attr = currentShard->getId(),
-                  "newShardConnectionString"_attr = connString,
-                  "oldShardConnectionString"_attr = oldConnString);
-        }
-
-        for (const auto& host : oldConnString.getServers()) {
+        for (const auto& host : connString.getServers()) {
             _hostLookup.erase(host);
         }
-        _connStringLookup.erase(oldConnString);
+        _connStringLookup.erase(connString);
     }
 
     _shardIdLookup[shard->getId()] = shard;
@@ -682,10 +817,10 @@ void ShardRegistryData::_addShard(WithLock lk,
                 "Adding new shard to shard registry",
                 "shardId"_attr = shard->getId(),
                 "shardConnectionString"_attr = connString);
-    if (connString.type() == ConnectionString::SET) {
+    if (connString.type() == ConnectionString::ConnectionType::kReplicaSet) {
         _rsLookup[connString.getSetName()] = shard;
-    } else if (connString.type() == ConnectionString::CUSTOM) {
-        // CUSTOM connection strings (ie "$dummy:10000) become DBDirectClient connections which
+    } else if (connString.type() == ConnectionString::ConnectionType::kCustom) {
+        // kCustom connection strings (ie "$dummy:10000) become DBDirectClient connections which
         // always return "localhost" as their response to getServerAddress().  This is just for
         // making dbtest work.
         _shardIdLookup[ShardId("localhost")] = shard;
@@ -697,6 +832,72 @@ void ShardRegistryData::_addShard(WithLock lk,
     for (const HostAndPort& hostAndPort : connString.getServers()) {
         _hostLookup[hostAndPort] = shard;
     }
+}
+
+void ShardRegistryData::toBSON(BSONObjBuilder* map,
+                               BSONObjBuilder* hosts,
+                               BSONObjBuilder* connStrings) const {
+    std::vector<std::shared_ptr<Shard>> shards;
+    getAllShards(shards);
+
+    std::sort(std::begin(shards),
+              std::end(shards),
+              [](std::shared_ptr<const Shard> lhs, std::shared_ptr<const Shard> rhs) {
+                  return lhs->getId() < rhs->getId();
+              });
+
+    if (map) {
+        for (auto&& shard : shards) {
+            map->append(shard->getId(), shard->getConnString().toString());
+        }
+    }
+
+    if (hosts) {
+        for (const auto& hostIt : _hostLookup) {
+            hosts->append(hostIt.first.toString(), hostIt.second->getId());
+        }
+    }
+
+    if (connStrings) {
+        for (const auto& connStringIt : _connStringLookup) {
+            connStrings->append(connStringIt.first.toString(), connStringIt.second->getId());
+        }
+    }
+}
+
+void ShardRegistryData::toBSON(BSONObjBuilder* result) const {
+    std::vector<std::shared_ptr<Shard>> shards;
+    getAllShards(shards);
+
+    std::sort(std::begin(shards),
+              std::end(shards),
+              [](std::shared_ptr<const Shard> lhs, std::shared_ptr<const Shard> rhs) {
+                  return lhs->getId() < rhs->getId();
+              });
+
+    BSONObjBuilder mapBob(result->subobjStart("map"));
+    for (auto&& shard : shards) {
+        mapBob.append(shard->getId(), shard->getConnString().toString());
+    }
+    mapBob.done();
+
+    BSONObjBuilder hostsBob(result->subobjStart("hosts"));
+    for (const auto& hostIt : _hostLookup) {
+        hostsBob.append(hostIt.first.toString(), hostIt.second->getId());
+    }
+    hostsBob.done();
+
+    BSONObjBuilder connStringsBob(result->subobjStart("connStrings"));
+    for (const auto& connStringIt : _connStringLookup) {
+        connStringsBob.append(connStringIt.first.toString(), connStringIt.second->getId());
+    }
+    connStringsBob.done();
+}
+
+BSONObj ShardRegistryData::toBSON() const {
+    BSONObjBuilder bob;
+    toBSON(&bob);
+    return bob.obj();
 }
 
 }  // namespace mongo

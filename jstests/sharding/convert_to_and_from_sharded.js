@@ -36,14 +36,14 @@ var priConn = replShard.getPrimary();
 
 // Starting a brand new replica set without '--shardsvr' will cause the FCV to be written as the
 // latest available for that binary. This poses a problem when this test is run in the mixed
-// version suite because mongos will be 'last-stable' and if this node is of the latest binary,
+// version suite because mongos will be 'last-lts' and if this node is of the latest binary,
 // it will report itself as the 'latest' FCV, which would cause mongos to refuse to connect to
 // it and shutdown.
 //
 // In order to work around this, in the mixed version suite, be pessimistic and always set this
-// node to the 'last-stable' FCV
+// node to the 'last-lts' FCV
 if (jsTestOptions().shardMixedBinVersions) {
-    assert.commandWorked(priConn.adminCommand({setFeatureCompatibilityVersion: lastStableFCV}));
+    assert.commandWorked(priConn.adminCommand({setFeatureCompatibilityVersion: lastLTSFCV}));
     replShard.awaitReplication();
 }
 
@@ -61,10 +61,6 @@ for (var x = 0; x < NUM_NODES; x++) {
 
 replShard.awaitNodesAgreeOnPrimary();
 assert.commandWorked(st.s.adminCommand({addShard: replShard.getURL()}));
-
-priConn = replShard.getPrimary();
-checkBasicCRUD(priConn.getDB('test').unsharded);
-checkBasicCRUD(priConn.getDB('test').sharded);
 
 checkBasicCRUD(st.s.getDB('test').unsharded);
 checkBasicCRUD(st.s.getDB('test').sharded);
@@ -111,9 +107,6 @@ checkBasicCRUD(st.s.getDB('test').unsharded);
 checkBasicCRUD(st.s.getDB('test').sharded);
 
 st.stop();
-
-checkBasicCRUD(priConn.getDB('test').unsharded);
-checkBasicCRUD(priConn.getDB('test').sharded);
 
 jsTest.log('About to restart repl w/o shardsvr');
 

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -92,7 +92,7 @@ StatusWith<IndexNameObjs> getIndexNameObjs(OperationContext* opCtx,
 }
 
 Status rebuildIndexesOnCollection(OperationContext* opCtx,
-                                  Collection* collection,
+                                  const CollectionPtr& collection,
                                   const std::vector<BSONObj>& indexSpecs,
                                   RepairData repair) {
     // Skip the rest if there are no indexes to rebuild.

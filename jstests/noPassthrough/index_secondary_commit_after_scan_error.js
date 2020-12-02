@@ -3,7 +3,8 @@
  * the primary eventually. If we get a commitIndexBuild oplog entry instead, the secondary should
  * crash.
  * @tags: [
- *     requires_replication,
+ *   requires_replication,
+ *   live_record_incompatible,
  * ]
  */
 (function() {
@@ -27,14 +28,6 @@ const nodes = rst.startSet();
 rst.initiate();
 
 const primary = rst.getPrimary();
-
-// This test requires index builds to start on the createIndexes oplog entry and expects index
-// builds to be interrupted when the primary steps down.
-if (!IndexBuildTest.supportsTwoPhaseIndexBuild(primary)) {
-    jsTestLog('Two phase index builds not supported, skipping test.');
-    rst.stopSet();
-    return;
-}
 
 const testDB = primary.getDB('test');
 const coll = testDB.getCollection('test');
@@ -86,8 +79,7 @@ assert.soon(function() {
 });
 
 // Secondary should crash on receiving the unexpected commitIndexBuild oplog entry.
-const fassertProcessExitCode = _isWindows() ? MongoRunner.EXIT_ABRUPT : MongoRunner.EXIT_ABORT;
-assert.eq(fassertProcessExitCode, res.exitCode);
+assert.eq(MongoRunner.EXIT_ABORT, res.exitCode);
 assert(rawMongoProgramOutput().match('Fatal assertion.*4698902'),
        'Index build should have aborted secondary due to unexpected commitIndexBuild oplog entry.');
 

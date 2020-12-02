@@ -7,22 +7,25 @@ var getLeastRecentOp;
 var waitForAllMembers;
 var reconfig;
 var awaitOpTime;
-var startSetIfSupportsReadMajority;
 var waitUntilAllNodesCaughtUp;
 var waitForState;
 var reInitiateWithoutThrowingOnAbortedMember;
 var awaitRSClientHosts;
 var getLastOpTime;
+var getFirstOplogEntry;
 var setLogVerbosity;
 var stopReplicationAndEnforceNewPrimaryToCatchUp;
 var setFailPoint;
 var clearFailPoint;
 var isConfigCommitted;
-var waitForConfigReplication;
 var assertSameConfigContent;
+var getConfigWithNewlyAdded;
 var isMemberNewlyAdded;
+var replConfigHasNewlyAddedMembers;
 var waitForNewlyAddedRemovalForNodeToBeCommitted;
 var assertVoteCount;
+var disconnectSecondaries;
+var reconnectSecondaries;
 
 (function() {
 "use strict";
@@ -146,7 +149,7 @@ reconnect = function(conn) {
 };
 
 getLatestOp = function(server) {
-    server.getDB("admin").getMongo().setSlaveOk();
+    server.getDB("admin").getMongo().setSecondaryOk();
     var log = server.getDB("local")['oplog.rs'];
     var cursor = log.find({}).sort({'$natural': -1}).limit(1);
     if (cursor.hasNext()) {
@@ -156,7 +159,7 @@ getLatestOp = function(server) {
 };
 
 getLeastRecentOp = function({server, readConcern}) {
-    server.getDB("admin").getMongo().setSlaveOk();
+    server.getDB("admin").getMongo().setSecondaryOk();
     const oplog = server.getDB("local").oplog.rs;
     const cursor = oplog.find().sort({$natural: 1}).limit(1).readConcern(readConcern);
     if (cursor.hasNext()) {
@@ -171,7 +174,7 @@ waitForAllMembers = function(master, timeout) {
     assert.soon(function() {
         var state = null;
         try {
-            state = master.getSisterDB("admin").runCommand({replSetGetStatus: 1});
+            state = master.getSiblingDB("admin").runCommand({replSetGetStatus: 1});
             failCount = 0;
         } catch (e) {
             // Connection can get reset on replica set failover causing a socket exception
@@ -198,25 +201,59 @@ waitForAllMembers = function(master, timeout) {
 };
 
 /**
- * Run a 'replSetReconfig' command with one retry.
+ * Run a 'replSetReconfig' command with one retry on NodeNotFound and multiple retries on
+ * ConfigurationInProgress, CurrentConfigNotCommittedYet, and
+ * NewReplicaSetConfigurationIncompatible.
  */
 function reconfigWithRetry(primary, config, force) {
-    var admin = primary.getDB("admin");
+    const admin = primary.getDB("admin");
     force = force || false;
-    var reconfigCommand = {
+    let reconfigCommand = {
         replSetReconfig: config,
         force: force,
         maxTimeMS: ReplSetTest.kDefaultTimeoutMS
     };
-    var res = admin.runCommand(reconfigCommand);
 
-    // Retry reconfig if quorum check failed because not enough voting nodes responded.
-    if (!res.ok && res.code === ErrorCodes.NodeNotFound) {
-        print("Replset reconfig failed because quorum check failed. Retry reconfig once. " +
-              "Error: " + tojson(res));
-        res = admin.runCommand(reconfigCommand);
-    }
-    assert.commandWorked(res);
+    assert.soon(function() {
+        const newVersion =
+            assert.commandWorked(admin.runCommand({replSetGetConfig: 1})).config.version + 1;
+        reconfigCommand.replSetReconfig.version = newVersion;
+        let res = admin.runCommand(reconfigCommand);
+
+        // Retry reconfig if quorum check failed because not enough voting nodes responded. One
+        // reason for this is if the connections used for heartbeats get closed on the destination
+        // node.
+        if (!res.ok && res.code === ErrorCodes.NodeNotFound) {
+            print("Replset reconfig failed because quorum check failed. Retry reconfig once. " +
+                  "Error: " + tojson(res));
+            res = admin.runCommand(reconfigCommand);
+        }
+
+        // Always retry on these errors, even if we already retried on NodeNotFound.
+        if (!res.ok &&
+            (res.code === ErrorCodes.ConfigurationInProgress ||
+             res.code === ErrorCodes.CurrentConfigNotCommittedYet)) {
+            print("Replset reconfig failed since another configuration is in progress. Retry.");
+            // Retry.
+            return false;
+        }
+
+        // Always retry on NewReplicaSetConfigurationIncompatible, if the current config version is
+        // higher than the requested one.
+        if (!res.ok && res.code === ErrorCodes.NewReplicaSetConfigurationIncompatible) {
+            const curVersion =
+                assert.commandWorked(admin.runCommand({replSetGetConfig: 1})).config.version;
+            if (curVersion >= newVersion) {
+                print("Replset reconfig failed since the config version was too low. Retry. " +
+                      "Error: " + tojson(res));
+                // Retry.
+                return false;
+            }
+        }
+
+        assert.commandWorked(res);
+        return true;
+    });
 }
 
 /**
@@ -354,8 +391,10 @@ function autoReconfig(rst, targetConfig) {
  * @param config - the desired target config. After this function returns, the
  * given replica set should be in 'config', except with a higher version.
  * @param force - should this be a 'force' reconfig or not.
+ * @param doNotWaitForMembers - if set, we will skip waiting for all members to be in primary,
+ *     secondary, or arbiter states
  */
-reconfig = function(rst, config, force) {
+reconfig = function(rst, config, force, doNotWaitForMembers) {
     "use strict";
     var primary = rst.getPrimary();
     config = rst._updateConfigIfNotDurable(config);
@@ -372,7 +411,9 @@ reconfig = function(rst, config, force) {
     }
 
     var primaryAdminDB = rst.getPrimary().getDB("admin");
-    waitForAllMembers(primaryAdminDB);
+    if (!doNotWaitForMembers) {
+        waitForAllMembers(primaryAdminDB);
+    }
     return primaryAdminDB;
 };
 
@@ -463,19 +504,6 @@ waitForState = function(node, state) {
     // happens before or after the replSetTest command above returns is racy, so to ensure that
     // the connection to 'node' is usable after this function returns, reconnect it first.
     reconnect(node);
-};
-
-/**
- * Starts each node in the given replica set if the storage engine supports readConcern
- *'majority'.
- * Returns true if the replica set was started successfully and false otherwise.
- *
- * @param replSetTest - The instance of {@link ReplSetTest} to start
- * @param options - The options passed to {@link ReplSetTest.startSet}
- */
-startSetIfSupportsReadMajority = function(replSetTest, options) {
-    replSetTest.startSet(options);
-    return replSetTest.nodes[0].adminCommand("serverStatus").storageEngine.supportsCommittedReads;
 };
 
 /**
@@ -599,6 +627,29 @@ getLastOpTime = function(conn) {
 };
 
 /**
+ * Returns the oldest oplog entry.
+ */
+getFirstOplogEntry = function(conn) {
+    let firstEntry;
+    // The query plan may yield between the cursor establishment and iterating to retrieve the first
+    // result. During this yield it's possible for the oplog to "roll over" or shrink. This is rare,
+    // but if these both happen the cursor will be unable to resume after yielding and return a
+    // "CappedPositionLost" error. This can be safely retried.
+    assert.soon(() => {
+        try {
+            firstEntry = conn.getDB('local').oplog.rs.find().sort({$natural: 1}).limit(1)[0];
+            return true;
+        } catch (e) {
+            if (e.code == ErrorCodes.CappedPositionLost) {
+                return false;
+            }
+            throw e;
+        }
+    });
+    return firstEntry;
+};
+
+/**
  * Set log verbosity on all given nodes.
  * e.g. setLogVerbosity(replTest.nodes, { "replication": {"verbosity": 3} });
  */
@@ -631,7 +682,8 @@ stopReplicationAndEnforceNewPrimaryToCatchUp = function(rst, node) {
     const latestOpOnOldPrimary = getLatestOp(oldPrimary);
 
     // New primary wins immediately, but needs to catch up.
-    const newPrimary = rst.stepUpNoAwaitReplication(node);
+    const newPrimary =
+        rst.stepUp(node, {awaitReplicationBeforeStepUp: false, awaitWritablePrimary: false});
     const latestOpOnNewPrimary = getLatestOp(newPrimary);
     // Check this node is not writable.
     assert.eq(newPrimary.getDB("test").isMaster().ismaster, false);
@@ -676,27 +728,6 @@ isConfigCommitted = function(node) {
 };
 
 /**
- * Wait until the config on the primary becomes committed.
- */
-waitForConfigReplication = function(primary, nodes) {
-    const nodeHosts = nodes == null ? "all nodes" : tojson(nodes.map((n) => n.host));
-    jsTestLog("Waiting for the config on " + primary.host + " to replicate to " + nodeHosts);
-    assert.soon(function() {
-        const res = primary.adminCommand({replSetGetStatus: 1});
-        const primaryMember = res.members.find((m) => m.self);
-        function hasSameConfig(member) {
-            return member.configVersion === primaryMember.configVersion &&
-                member.configTerm === primaryMember.configTerm;
-        }
-        let members = res.members;
-        if (nodes != null) {
-            members = res.members.filter((m) => nodes.some((node) => m.name === node.host));
-        }
-        return members.every((m) => hasSameConfig(m));
-    });
-};
-
-/**
  * Asserts that replica set config A is the same as replica set config B ignoring the 'version' and
  * 'term' field.
  */
@@ -716,58 +747,91 @@ assertSameConfigContent = function(configA, configB) {
     configB.term = termB;
 };
 
-isMemberNewlyAdded = function(node, memberIndex, force = false) {
-    // The in-memory config will not include the 'newlyAdded' field, so we must consult the on-disk
-    // version. However, the in-memory config is updated after the config is persisted to disk, so
-    // we must confirm that the in-memory config agrees with the on-disk config, before returning
-    // true or false.
-    const configInMemory = assert.commandWorked(node.adminCommand({replSetGetConfig: 1})).config;
+/**
+ * Returns the result of 'replSetGetConfig' with the test-parameter specified that indicates to
+ * include 'newlyAdded' fields.
+ */
+getConfigWithNewlyAdded = function(node) {
+    return assert.commandWorked(
+        node.adminCommand({replSetGetConfig: 1, $_internalIncludeNewlyAdded: true}));
+};
 
-    const versionSetInMemory = configInMemory.hasOwnProperty("version");
-    const termSetInMemory = configInMemory.hasOwnProperty("term");
+/**
+ * @param memberIndex is optional. If not provided, then it will return true even if
+ * a single member in the replSet config has "newlyAdded" field.
+ */
+isMemberNewlyAdded = function(node, memberIndex) {
+    const config = getConfigWithNewlyAdded(node).config;
 
-    // Since the term is not set in a force reconfig, we skip the check for the term if
-    // 'force=true'.
-    if (!versionSetInMemory || (!termSetInMemory && !force)) {
-        throw new Error("isMemberNewlyAdded: in-memory config has no version or term: " +
-                        tojsononeline(configInMemory));
+    const allMembers = (memberIndex === undefined);
+    assert(allMembers || (memberIndex >= 0 && memberIndex < config.members.length),
+           "memberIndex should be between 0 and " + (config.members.length - 1) +
+               ", but memberIndex is " + memberIndex);
+
+    var hasNewlyAdded = (index) => {
+        const memberConfig = config.members[index];
+        if (memberConfig.hasOwnProperty("newlyAdded")) {
+            assert(memberConfig["newlyAdded"] === true, config);
+            return true;
+        }
+        return false;
+    };
+
+    if (allMembers) {
+        for (let i = 0; i < config.members.length; i++) {
+            if (hasNewlyAdded(i))
+                return true;
+        }
+        return false;
     }
 
-    const configOnDisk = node.getDB("local").system.replset.findOne();
-    const termSetOnDisk = configOnDisk.hasOwnProperty("term");
+    return hasNewlyAdded(memberIndex);
+};
 
-    const isVersionSetCorrectly = (configOnDisk.version === configInMemory.version);
-    const isTermSetCorrectly =
-        ((!termSetInMemory && !termSetOnDisk) || (configOnDisk.term === configInMemory.term));
-
-    if (!isVersionSetCorrectly || !isTermSetCorrectly) {
-        throw new error(
-            "isMemberNewlyAdded: in-memory config version/term does not match on-disk config." +
-            " in-memory: " + tojsononeline(configInMemory) +
-            ", on-disk: " + tojsononeline(configOnDisk));
-    }
-
-    const memberConfigOnDisk = configOnDisk.members[memberIndex];
-    if (memberConfigOnDisk.hasOwnProperty("newlyAdded")) {
-        assert(memberConfigOnDisk["newlyAdded"] === true, () => tojson(configOnDisk));
-        return true;
-    }
-    return false;
+// Returns true if at least one member in the repl set config contains "newlyAdded" field.
+replConfigHasNewlyAddedMembers = function(conn) {
+    return isMemberNewlyAdded(conn);
 };
 
 waitForNewlyAddedRemovalForNodeToBeCommitted = function(node, memberIndex, force = false) {
     jsTestLog("Waiting for member " + memberIndex + " to no longer be 'newlyAdded'");
     assert.soonNoExcept(function() {
         return !isMemberNewlyAdded(node, memberIndex, force) && isConfigCommitted(node);
-    }, () => tojson(node.getDB("local").system.replset.findOne()));
+    }, getConfigWithNewlyAdded(node).config);
 };
 
-assertVoteCount = function(
-    node, {votingMembersCount, majorityVoteCount, writableVotingMembersCount, writeMajorityCount}) {
+assertVoteCount = function(node, {
+    votingMembersCount,
+    majorityVoteCount,
+    writableVotingMembersCount,
+    writeMajorityCount,
+    totalMembersCount
+}) {
     const status = assert.commandWorked(node.adminCommand({replSetGetStatus: 1}));
-    assert.eq(status["votingMembersCount"], votingMembersCount, tojson(status));
-    assert.eq(status["majorityVoteCount"], majorityVoteCount, tojson(status));
-    assert.eq(status["writableVotingMembersCount"], writableVotingMembersCount, tojson(status));
-    assert.eq(status["writeMajorityCount"], writeMajorityCount, tojson(status));
+    assert.eq(status["votingMembersCount"], votingMembersCount, status);
+    assert.eq(status["majorityVoteCount"], majorityVoteCount, status);
+    assert.eq(status["writableVotingMembersCount"], writableVotingMembersCount, status);
+    assert.eq(status["writeMajorityCount"], writeMajorityCount, status);
+    assert.eq(status["members"].length, totalMembersCount, status);
+};
+
+disconnectSecondaries = function(rst, secondariesDown) {
+    for (let i = 1; i <= secondariesDown; i++) {
+        for (const node of rst.nodes) {
+            if (node !== rst.nodes[i]) {
+                node.disconnect(rst.nodes[i]);
+            }
+        }
+    }
+};
+
+reconnectSecondaries = function(rst) {
+    for (const node of rst.nodes) {
+        for (const node2 of rst.nodes) {
+            if (node2 !== node) {
+                node2.reconnect(node);
+            }
+        }
+    }
 };
 }());

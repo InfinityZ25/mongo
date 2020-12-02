@@ -1,5 +1,8 @@
 // Ensure you can't shard on an array key
-// @tags: [uses_transactions, uses_multi_shard_transaction, requires_fcv_44]
+// @tags: [
+//   uses_multi_shard_transaction,
+//   uses_transactions,
+// ]
 (function() {
 'use strict';
 
@@ -68,7 +71,7 @@ value = coll.findOne({i: 1});
 assert.commandWorked(coll.remove(Object.extend(value, {i: 1})));
 assert.eq(coll.find().itcount(), 0);
 
-coll.ensureIndex({_id: 1, i: 1, j: 1});
+coll.createIndex({_id: 1, i: 1, j: 1});
 // Can insert document that will make index into a multi-key as long as it's not part of shard
 // key.
 coll.remove({});
@@ -116,7 +119,7 @@ for (var i = 0; i < 10; i++) {
     assert.commandWorked(coll.insert({i: [i, i + 1]}));
 }
 
-coll.ensureIndex({_id: 1, i: 1});
+coll.createIndex({_id: 1, i: 1});
 
 try {
     st.shardColl(coll, {_id: 1, i: 1}, {_id: ObjectId(), i: 1});
@@ -133,7 +136,7 @@ for (var i = 0; i < 10; i++) {
     assert.commandWorked(coll.insert({i: i}));
 }
 
-coll.ensureIndex({_id: 1, i: 1});
+coll.createIndex({_id: 1, i: 1});
 
 st.shardColl(coll, {_id: 1, i: 1}, {_id: ObjectId(), i: 1});
 

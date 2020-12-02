@@ -8,7 +8,7 @@ load("jstests/replsets/rslib.js");
 (function() {
 "use strict";
 
-// TODO SERVER-35447: Multiple users cannot be authenticated on one connection within a session.
+// Multiple users cannot be authenticated on one connection within a session.
 TestData.disableImplicitSessions = true;
 
 var name = "rs_auth1";
@@ -72,21 +72,23 @@ assert.eq(result, 1, "login failed");
 print("Initializing replSet with config: " + tojson(rs.getReplSetConfig()));
 result = m.getDB("admin").runCommand({replSetInitiate: rs.getReplSetConfig()});
 assert.eq(result.ok, 1, "couldn't initiate: " + tojson(result));
+rs.awaitNodesAgreeOnPrimaryNoAuth();
+
 m.getDB('admin').logout();  // In case this node doesn't become primary, make sure its not auth'd
 
-var master = rs.getPrimary();
+var primary = rs.getPrimary();
 rs.awaitSecondaryNodes();
-var mId = rs.getNodeId(master);
-var slave = rs._slaves[0];
-assert.eq(1, master.getDB("admin").auth("foo", "bar"));
-assert.commandWorked(master.getDB("test").foo.insert(
+var mId = rs.getNodeId(primary);
+var secondary = rs.getSecondary();
+assert.eq(1, primary.getDB("admin").auth("foo", "bar"));
+assert.commandWorked(primary.getDB("test").foo.insert(
     {x: 1}, {writeConcern: {w: 3, wtimeout: ReplSetTest.kDefaultTimeoutMS}}));
 
 print("try some legal and illegal reads");
-var r = master.getDB("test").foo.findOne();
+var r = primary.getDB("test").foo.findOne();
 assert.eq(r.x, 1);
 
-slave.setSlaveOk();
+secondary.setSecondaryOk();
 
 function doQueryOn(p) {
     var error = assert.throws(function() {
@@ -96,23 +98,23 @@ function doQueryOn(p) {
     assert.gt(error.indexOf("command find requires authentication"), -1, "error was non-auth");
 }
 
-doQueryOn(slave);
-master.adminCommand({logout: 1});
+doQueryOn(secondary);
+primary.adminCommand({logout: 1});
 
 print("unauthorized:");
-printjson(master.adminCommand({replSetGetStatus: 1}));
+printjson(primary.adminCommand({replSetGetStatus: 1}));
 
-doQueryOn(master);
+doQueryOn(primary);
 
-result = slave.getDB("test").auth("bar", "baz");
+result = secondary.getDB("test").auth("bar", "baz");
 assert.eq(result, 1);
 
-r = slave.getDB("test").foo.findOne();
+r = secondary.getDB("test").foo.findOne();
 assert.eq(r.x, 1);
 
 print("add some data");
-master.getDB("test").auth("bar", "baz");
-var bulk = master.getDB("test").foo.initializeUnorderedBulkOp();
+primary.getDB("test").auth("bar", "baz");
+var bulk = primary.getDB("test").foo.initializeUnorderedBulkOp();
 for (var i = 0; i < 1000; i++) {
     bulk.insert({x: i, foo: "bar"});
 }
@@ -121,11 +123,11 @@ assert.commandWorked(bulk.execute({w: 3, wtimeout: ReplSetTest.kDefaultTimeoutMS
 print("fail over");
 rs.stop(mId);
 
-master = rs.getPrimary();
+primary = rs.getPrimary();
 
 print("add some more data 1");
-master.getDB("test").auth("bar", "baz");
-bulk = master.getDB("test").foo.initializeUnorderedBulkOp();
+primary.getDB("test").auth("bar", "baz");
+bulk = primary.getDB("test").foo.initializeUnorderedBulkOp();
 for (var i = 0; i < 1000; i++) {
     bulk.insert({x: i, foo: "bar"});
 }
@@ -133,10 +135,10 @@ assert.commandWorked(bulk.execute({w: 2}));
 
 print("resync");
 rs.restart(mId, {"keyFile": key1_600});
-master = rs.getPrimary();
+primary = rs.getPrimary();
 
 print("add some more data 2");
-bulk = master.getDB("test").foo.initializeUnorderedBulkOp();
+bulk = primary.getDB("test").foo.initializeUnorderedBulkOp();
 for (var i = 0; i < 1000; i++) {
     bulk.insert({x: i, foo: "bar"});
 }
@@ -151,22 +153,22 @@ var conn = MongoRunner.runMongod({
     keyFile: key2_600
 });
 
-master.getDB("admin").auth("foo", "bar");
-var config = master.getDB("local").system.replset.findOne();
+primary.getDB("admin").auth("foo", "bar");
+var config = primary.getDB("local").system.replset.findOne();
 config.members.push({_id: 3, host: rs.host + ":" + port[3]});
 config.version++;
 try {
-    master.adminCommand({replSetReconfig: config});
+    primary.adminCommand({replSetReconfig: config});
 } catch (e) {
     print("error: " + e);
 }
-master = rs.getPrimary();
-master.getDB("admin").auth("foo", "bar");
+primary = rs.getPrimary();
+primary.getDB("admin").auth("foo", "bar");
 
 print("shouldn't ever sync");
 for (var i = 0; i < 10; i++) {
     print("iteration: " + i);
-    var results = master.adminCommand({replSetGetStatus: 1});
+    var results = primary.adminCommand({replSetGetStatus: 1});
     printjson(results);
     assert(results.members[3].state != 2);
     sleep(1000);
@@ -186,7 +188,7 @@ var conn = MongoRunner.runMongod({
 
 wait(function() {
     try {
-        var results = master.adminCommand({replSetGetStatus: 1});
+        var results = primary.adminCommand({replSetGetStatus: 1});
         printjson(results);
         return results.members[3].state == 2;
     } catch (e) {
@@ -198,10 +200,12 @@ wait(function() {
 print("make sure it has the config, too");
 assert.soon(function() {
     for (var i in rs.nodes) {
-        rs.nodes[i].setSlaveOk();
+        rs.nodes[i].setSecondaryOk();
         rs.nodes[i].getDB("admin").auth("foo", "bar");
         config = rs.nodes[i].getDB("local").system.replset.findOne();
-        if (config.version != 2) {
+        // We expect the config version to be 3 due to the initial config and then the
+        // 'newlyAdded' removal reconfig.
+        if (config.version !== 3) {
             return false;
         }
     }

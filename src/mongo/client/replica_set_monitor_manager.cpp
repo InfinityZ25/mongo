@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -51,7 +51,7 @@
 #include "mongo/logv2/log.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/rpc/metadata/egress_metadata_hook_list.h"
-#include "mongo/util/map_util.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 
@@ -89,12 +89,11 @@ Status ReplicaSetMonitorManagerNetworkConnectionHook::validateHost(
             if (publisher) {
                 try {
                     if (isMasterReply.status.isOK()) {
-                        publisher->onServerHandshakeCompleteEvent(isMasterReply.elapsedMillis.get(),
-                                                                  remoteHost.toString(),
-                                                                  isMasterReply.data);
+                        publisher->onServerHandshakeCompleteEvent(
+                            *isMasterReply.elapsed, remoteHost, isMasterReply.data);
                     } else {
                         publisher->onServerHandshakeFailedEvent(
-                            remoteHost.toString(), isMasterReply.status, isMasterReply.data);
+                            remoteHost, isMasterReply.status, isMasterReply.data);
                     }
                 } catch (const DBException& exception) {
                     LOGV2_ERROR(4712101,
@@ -171,7 +170,7 @@ shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorManager::getOrCreateMonitor(
 }
 
 shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorManager::getOrCreateMonitor(const MongoURI& uri) {
-    invariant(uri.type() == ConnectionString::SET);
+    invariant(uri.type() == ConnectionString::ConnectionType::kReplicaSet);
     stdx::lock_guard<Latch> lk(_mutex);
     uassert(ErrorCodes::ShutdownInProgress,
             str::stream() << "Unable to get monitor for '" << uri << "' due to shutdown",
@@ -199,6 +198,7 @@ shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorManager::getOrCreateMonitor(const
         newMonitor = StreamableReplicaSetMonitor::make(uri, getExecutor(), _getConnectionManager());
     }
     _monitors[setName] = newMonitor;
+    _numMonitorsCreated++;
     return newMonitor;
 }
 
@@ -237,6 +237,7 @@ void ReplicaSetMonitorManager::removeMonitor(StringData setName) {
         _monitors.erase(it);
         LOGV2(20187,
               "Removed ReplicaSetMonitor for replica set {replicaSet}",
+              "Removed ReplicaSetMonitor for replica set",
               "replicaSet"_attr = setName);
     }
 }
@@ -286,6 +287,8 @@ void ReplicaSetMonitorManager::report(BSONObjBuilder* builder, bool forFTDC) {
     // ShardRegistry's mutex due to the ReplicaSetMonitor's AsynchronousConfigChangeHook
     // potentially calling ShardRegistry::updateConfigServerConnectionString.
     auto setNames = getAllSetNames();
+
+    builder->appendNumber("numReplicaSetMonitorsCreated", _numMonitorsCreated);
 
     BSONObjBuilder setStats(
         builder->subobjStart(forFTDC ? "replicaSetPingTimesMillis" : "replicaSets"));

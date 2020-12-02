@@ -1,4 +1,7 @@
 // check that we don't crash if an index used by an earlier or clause is dropped
+// @tags: [
+//   sbe_incompatible,
+// ]
 
 // Dropping an index kills all cursors on the indexed namespace, not just those
 // cursors using the dropped index.  This test is to serve as a reminder that
@@ -13,8 +16,8 @@ load("jstests/libs/fixture_helpers.js");  // For FixtureHelpers.
 const t = db.jstests_ord;
 t.drop();
 
-t.ensureIndex({a: 1});
-t.ensureIndex({b: 1});
+t.createIndex({a: 1});
+t.createIndex({b: 1});
 
 for (let i = 0; i < 80; ++i) {
     t.save({a: 1});

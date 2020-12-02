@@ -33,7 +33,7 @@ ServerDescriptionPtr ServerDescriptionBuilder::instance() const {
     return _instance;
 }
 
-ServerDescriptionBuilder& ServerDescriptionBuilder::withAddress(const ServerAddress& address) {
+ServerDescriptionBuilder& ServerDescriptionBuilder::withAddress(const HostAndPort& address) {
     _instance->_address = address;
     return *this;
 }
@@ -43,7 +43,7 @@ ServerDescriptionBuilder& ServerDescriptionBuilder::withError(const std::string&
     return *this;
 }
 
-ServerDescriptionBuilder& ServerDescriptionBuilder::withRtt(const IsMasterRTT& rtt) {
+ServerDescriptionBuilder& ServerDescriptionBuilder::withRtt(const HelloRTT& rtt) {
     _instance->_rtt = rtt;
     return *this;
 }
@@ -72,23 +72,23 @@ ServerDescriptionBuilder& ServerDescriptionBuilder::withMaxWireVersion(int maxVe
     return *this;
 }
 
-ServerDescriptionBuilder& ServerDescriptionBuilder::withMe(const ServerAddress& me) {
-    _instance->_me = std::string(me);
+ServerDescriptionBuilder& ServerDescriptionBuilder::withMe(const HostAndPort& me) {
+    _instance->_me = me;
     return *this;
 }
 
-ServerDescriptionBuilder& ServerDescriptionBuilder::withHost(const ServerAddress& host) {
-    _instance->_hosts.emplace(boost::to_lower_copy(host));
+ServerDescriptionBuilder& ServerDescriptionBuilder::withHost(const HostAndPort& host) {
+    _instance->_hosts.emplace(host);
     return *this;
 }
 
-ServerDescriptionBuilder& ServerDescriptionBuilder::withPassive(const ServerAddress& passive) {
-    _instance->_passives.emplace(boost::to_lower_copy(passive));
+ServerDescriptionBuilder& ServerDescriptionBuilder::withPassive(const HostAndPort& passive) {
+    _instance->_passives.emplace(passive);
     return *this;
 }
 
-ServerDescriptionBuilder& ServerDescriptionBuilder::withArbiter(const ServerAddress& arbiter) {
-    _instance->_arbiters.emplace(boost::to_lower_copy(arbiter));
+ServerDescriptionBuilder& ServerDescriptionBuilder::withArbiter(const HostAndPort& arbiter) {
+    _instance->_arbiters.emplace(arbiter);
     return *this;
 }
 
@@ -113,7 +113,7 @@ ServerDescriptionBuilder& ServerDescriptionBuilder::withElectionId(const OID& el
     return *this;
 }
 
-ServerDescriptionBuilder& ServerDescriptionBuilder::withPrimary(const ServerAddress& primary) {
+ServerDescriptionBuilder& ServerDescriptionBuilder::withPrimary(const HostAndPort& primary) {
     _instance->_primary = primary;
     return *this;
 }
@@ -133,16 +133,6 @@ ServerDescriptionBuilder& ServerDescriptionBuilder::withLogicalSessionTimeoutMin
 ServerDescriptionBuilder& ServerDescriptionBuilder::withTopologyVersion(
     TopologyVersion topologyVersion) {
     _instance->_topologyVersion = topologyVersion;
-    return *this;
-}
-
-ServerDescriptionBuilder& ServerDescriptionBuilder::withPoolResetCounter(int poolResetCounter) {
-    _instance->_poolResetCounter = poolResetCounter;
-    return *this;
-}
-
-ServerDescriptionBuilder& ServerDescriptionBuilder::withStreamable(bool isStreamable) {
-    _instance->_streamable = isStreamable;
     return *this;
 }
 };  // namespace mongo::sdam

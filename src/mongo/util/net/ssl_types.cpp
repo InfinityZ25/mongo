@@ -35,21 +35,6 @@
 
 namespace mongo {
 
-namespace {
-
-const transport::Session::Decoration<SSLPeerInfo> peerInfoForSession =
-    transport::Session::declareDecoration<SSLPeerInfo>();
-
-}  // namespace
-
-SSLPeerInfo& SSLPeerInfo::forSession(const transport::SessionHandle& session) {
-    return peerInfoForSession(session.get());
-}
-
-const SSLPeerInfo& SSLPeerInfo::forSession(const transport::ConstSessionHandle& session) {
-    return peerInfoForSession(session.get());
-}
-
 const SSLParams& getSSLGlobalParams() {
     return sslGlobalParams;
 }

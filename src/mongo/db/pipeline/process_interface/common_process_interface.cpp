@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -47,7 +47,6 @@
 #include "mongo/db/service_context.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/mutex.h"
-#include "mongo/s/catalog_cache.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/net/socket_utils.h"
 
@@ -132,6 +131,8 @@ std::vector<BSONObj> CommonProcessInterface::getCurrentOps(
         userMode == CurrentOpUserMode::kIncludeAll) {
         _reportCurrentOpsForTransactionCoordinators(
             opCtx, sessionMode == MongoProcessInterface::CurrentOpSessionsMode::kIncludeIdle, &ops);
+
+        _reportCurrentOpsForPrimaryOnlyServices(opCtx, connMode, sessionMode, &ops);
     }
 
     return ops;
@@ -139,12 +140,12 @@ std::vector<BSONObj> CommonProcessInterface::getCurrentOps(
 
 std::vector<FieldPath> CommonProcessInterface::collectDocumentKeyFieldsActingAsRouter(
     OperationContext* opCtx, const NamespaceString& nss) const {
-    if (auto chunkManager =
-            uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss))
-                .cm()) {
-        return _shardKeyToDocumentKeyFields(
-            chunkManager->getShardKeyPattern().getKeyPatternFields());
+    const auto cm =
+        uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
+    if (cm.isSharded()) {
+        return _shardKeyToDocumentKeyFields(cm.getShardKeyPattern().getKeyPatternFields());
     }
+
     // We have no evidence this collection is sharded, so the document key is just _id.
     return {"_id"};
 }
@@ -163,8 +164,8 @@ void CommonProcessInterface::updateClientOperationTime(OperationContext* opCtx) 
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     if (replCoord) {
         auto operationTime = OperationTimeTracker::get(opCtx)->getMaxOperationTime();
-        repl::OpTime opTime(operationTime.asTimestamp(), replCoord->getTerm());
-        repl::ReplClientInfo::forClient(opCtx->getClient()).setLastProxyWriteOpTimeForward(opTime);
+        repl::ReplClientInfo::forClient(opCtx->getClient())
+            .setLastProxyWriteTimestampForward(operationTime.asTimestamp());
     }
 }
 
@@ -185,15 +186,11 @@ bool CommonProcessInterface::keyPatternNamesExactPaths(const BSONObj& keyPattern
 
 boost::optional<ChunkVersion> CommonProcessInterface::refreshAndGetCollectionVersion(
     const boost::intrusive_ptr<ExpressionContext>& expCtx, const NamespaceString& nss) const {
-    const bool forceRefreshFromThisThread = false;
-    auto routingInfo = uassertStatusOK(
-        Grid::get(expCtx->opCtx)
-            ->catalogCache()
-            ->getCollectionRoutingInfoWithRefresh(expCtx->opCtx, nss, forceRefreshFromThisThread));
-    if (auto chunkManager = routingInfo.cm()) {
-        return chunkManager->getVersion();
-    }
-    return boost::none;
+    const auto cm = uassertStatusOK(Grid::get(expCtx->opCtx)
+                                        ->catalogCache()
+                                        ->getCollectionRoutingInfoWithRefresh(expCtx->opCtx, nss));
+
+    return cm.isSharded() ? boost::make_optional(cm.getVersion()) : boost::none;
 }
 
 std::vector<FieldPath> CommonProcessInterface::_shardKeyToDocumentKeyFields(

@@ -41,6 +41,7 @@
 #include "mongo/db/repl/abstract_async_component.h"
 #include "mongo/db/repl/data_replicator_external_state.h"
 #include "mongo/db/repl/repl_set_config.h"
+#include "mongo/db/repl/replication_process.h"
 #include "mongo/util/fail_point.h"
 
 namespace mongo {
@@ -84,10 +85,13 @@ public:
      * The status will be Status::OK() if we have processed the last batch of operations from the
      * cursor.
      *
+     * rbid will be set to the rollback id of the oplog query metadata for the first batch fetched
+     * from the sync source.
+     *
      * This function will be called 0 times if startup() fails and at most once after startup()
      * returns success.
      */
-    using OnShutdownCallbackFn = std::function<void(const Status& shutdownStatus)>;
+    using OnShutdownCallbackFn = std::function<void(const Status& shutdownStatus, int rbid)>;
 
     /**
      * Container for BSON documents extracted from cursor results.
@@ -111,6 +115,7 @@ public:
         size_t toApplyDocumentCount = 0;
         size_t toApplyDocumentBytes = 0;
         OpTime lastDocument = OpTime();
+        Timestamp resumeToken = Timestamp();
     };
 
     /**
@@ -173,7 +178,11 @@ public:
                  EnqueueDocumentsFn enqueueDocumentsFn,
                  OnShutdownCallbackFn onShutdownCallbackFn,
                  const int batchSize,
-                 StartingPoint startingPoint = StartingPoint::kSkipFirstDoc);
+                 StartingPoint startingPoint = StartingPoint::kSkipFirstDoc,
+                 BSONObj filter = BSONObj(),
+                 ReadConcernArgs readConcern = ReadConcernArgs(),
+                 bool requestResumeToken = false,
+                 StringData name = "oplog fetcher"_sd);
 
     virtual ~OplogFetcher();
 
@@ -189,6 +198,11 @@ public:
         Timestamp lastTS,
         StartingPoint startingPoint = StartingPoint::kSkipFirstDoc);
 
+    /**
+     * Allows the OplogFetcher to use an already-established connection from the caller.  Ownership
+     * of the connection is taken by the OplogFetcher.  Must be called before startup.
+     */
+    void setConnection(std::unique_ptr<DBClientConnection>&& _connectedClient);
 
     /**
      * Prints out the status and settings of the oplog fetcher.
@@ -346,6 +360,27 @@ private:
      */
     Milliseconds _getRetriedFindMaxTime() const;
 
+    /**
+     * Checks the first batch of results from query.
+     * 'documents' are the first batch of results returned from tailing the remote oplog.
+     * 'remoteLastOpApplied' is the last OpTime applied on the sync source.
+     * 'remoteRBID' is a RollbackId for the sync source returned in this oplog query.
+     *
+     * Returns TooStaleToSyncFromSource if we are too stale to sync from our source.
+     * Returns OplogStartMissing if we should go into rollback.
+     */
+    Status _checkRemoteOplogStart(const OplogFetcher::Documents& documents,
+                                  OpTime remoteLastOpApplied,
+                                  int remoteRBID);
+
+    /**
+     * Distinguishes between needing to rollback and being too stale to sync from our sync source.
+     * This will be called when we check the first batch of results and our last fetched optime does
+     * not equal the first document in that batch. This function should never return Status::OK().
+     */
+    Status _checkTooStaleToSyncFromSource(const OpTime lastFetched,
+                                          const OpTime firstOpTimeInDocument);
+
     // Protects member data of this OplogFetcher.
     mutable Mutex _mutex = MONGO_MAKE_LATCH("OplogFetcher::_mutex");
 
@@ -355,7 +390,8 @@ private:
     // Namespace of the oplog to read.
     const NamespaceString _nss = NamespaceString::kRsOplogNamespace;
 
-    // Rollback ID that the sync source is required to have after the first batch.
+    // Rollback ID that the sync source is required to have after the first batch. If the value is
+    // uninitialized, the oplog fetcher has not contacted the sync source yet.
     int _requiredRBID;
 
     // Indicates whether the current batch is the first received via this cursor.
@@ -405,11 +441,89 @@ private:
     // Indicates if we want to skip the first document during oplog fetching or not.
     StartingPoint _startingPoint;
 
+    // Predicate with additional filtering to be done on oplog entries.
+    BSONObj _queryFilter;
+
+    // Read concern to use for reading the oplog.  Empty read concern means we use a default
+    // of "afterClusterTime: Timestamp(0,1)".
+    ReadConcernArgs _queryReadConcern;
+
+    // Specifies if the oplog fetcher should request a resume token and provide it to
+    // _enqueueDocumentsFn.
+    const bool _requestResumeToken;
+
     // Handle to currently scheduled _runQuery task.
     executor::TaskExecutor::CallbackHandle _runQueryHandle;
 
-    int _lastBatchElapsedMS;
+    int _lastBatchElapsedMS = 0;
 };
+
+class OplogFetcherFactory {
+public:
+    virtual ~OplogFetcherFactory() = default;
+    virtual std::unique_ptr<OplogFetcher> operator()(
+        executor::TaskExecutor* executor,
+        OpTime lastFetched,
+        HostAndPort source,
+        ReplSetConfig config,
+        std::unique_ptr<OplogFetcher::OplogFetcherRestartDecision> oplogFetcherRestartDecision,
+        int requiredRBID,
+        bool requireFresherSyncSource,
+        DataReplicatorExternalState* dataReplicatorExternalState,
+        OplogFetcher::EnqueueDocumentsFn enqueueDocumentsFn,
+        OplogFetcher::OnShutdownCallbackFn onShutdownCallbackFn,
+        const int batchSize,
+        OplogFetcher::StartingPoint startingPoint = OplogFetcher::StartingPoint::kSkipFirstDoc,
+        BSONObj filter = BSONObj(),
+        ReadConcernArgs readConcern = ReadConcernArgs(),
+        bool requestResumeToken = false,
+        StringData name = "oplog fetcher"_sd) const = 0;
+};
+
+template <class T>
+class OplogFetcherFactoryImpl : public OplogFetcherFactory {
+public:
+    std::unique_ptr<OplogFetcher> operator()(
+        executor::TaskExecutor* executor,
+        OpTime lastFetched,
+        HostAndPort source,
+        ReplSetConfig config,
+        std::unique_ptr<OplogFetcher::OplogFetcherRestartDecision> oplogFetcherRestartDecision,
+        int requiredRBID,
+        bool requireFresherSyncSource,
+        DataReplicatorExternalState* dataReplicatorExternalState,
+        OplogFetcher::EnqueueDocumentsFn enqueueDocumentsFn,
+        OplogFetcher::OnShutdownCallbackFn onShutdownCallbackFn,
+        const int batchSize,
+        OplogFetcher::StartingPoint startingPoint = OplogFetcher::StartingPoint::kSkipFirstDoc,
+        BSONObj filter = BSONObj(),
+        ReadConcernArgs readConcern = ReadConcernArgs(),
+        bool requestResumeToken = false,
+        StringData name = "oplog_fetcher"_sd) const final {
+        return std::make_unique<T>(executor,
+                                   lastFetched,
+                                   source,
+                                   config,
+                                   std::move(oplogFetcherRestartDecision),
+                                   requiredRBID,
+                                   requireFresherSyncSource,
+                                   dataReplicatorExternalState,
+                                   std::move(enqueueDocumentsFn),
+                                   std::move(onShutdownCallbackFn),
+                                   batchSize,
+                                   startingPoint,
+                                   std::move(filter),
+                                   std::move(readConcern),
+                                   requestResumeToken,
+                                   name);
+    }
+
+    static std::unique_ptr<OplogFetcherFactory> get() {
+        return std::make_unique<OplogFetcherFactoryImpl<T>>();
+    }
+};
+
+typedef OplogFetcherFactoryImpl<OplogFetcher> CreateOplogFetcherFn;
 
 }  // namespace repl
 }  // namespace mongo

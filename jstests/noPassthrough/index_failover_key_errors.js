@@ -27,12 +27,6 @@ const primary = rst.getPrimary();
 const testDB = primary.getDB('test');
 const coll = testDB.getCollection('test');
 
-if (!IndexBuildTest.supportsTwoPhaseIndexBuild(primary)) {
-    jsTestLog('Two phase index builds not enabled, skipping test.');
-    rst.stopSet();
-    return;
-}
-
 // Insert a document that cannot be indexed because it causes a CannotIndexParallelArrays error
 // code.
 const badDoc = {
@@ -60,6 +54,7 @@ const secondary = rst.getSecondary();
 const secondaryDB = secondary.getDB(testDB.getName());
 const secondaryColl = secondaryDB.getCollection(coll.getName());
 IndexBuildTest.waitForIndexBuildToStart(secondaryDB);
+rst.awaitReplication();
 IndexBuildTest.assertIndexes(secondaryColl, 2, ["_id_"], ["a_1_b_1"], {includeBuildUUIDs: true});
 
 // Step down the primary.
@@ -91,6 +86,7 @@ assert.neq(primary.port, newPrimary.port);
 // entry from the new primary.
 jsTestLog("waiting for index build to stop on old primary");
 IndexBuildTest.waitForIndexBuildToStop(testDB);
+rst.awaitReplication();
 IndexBuildTest.assertIndexes(coll, 1, ['_id_']);
 
 // Check that index was not built on the new primary.

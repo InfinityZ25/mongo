@@ -27,13 +27,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplicationInitialSync
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationInitialSync
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/base/string_data.h"
 #include "mongo/db/commands/list_collections_filter.h"
 #include "mongo/db/repl/database_cloner.h"
+#include "mongo/db/repl/database_cloner_common.h"
 #include "mongo/db/repl/database_cloner_gen.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
@@ -47,7 +48,8 @@ DatabaseCloner::DatabaseCloner(const std::string& dbName,
                                DBClientConnection* client,
                                StorageInterface* storageInterface,
                                ThreadPool* dbPool)
-    : BaseCloner("DatabaseCloner"_sd, sharedData, source, client, storageInterface, dbPool),
+    : InitialSyncBaseCloner(
+          "DatabaseCloner"_sd, sharedData, source, client, storageInterface, dbPool),
       _dbName(dbName),
       _listCollectionsStage("listCollections", this, &DatabaseCloner::listCollectionsStage) {
     invariant(!dbName.empty());
@@ -56,11 +58,6 @@ DatabaseCloner::DatabaseCloner(const std::string& dbName,
 
 BaseCloner::ClonerStages DatabaseCloner::getStages() {
     return {&_listCollectionsStage};
-}
-
-/* static */
-CollectionOptions DatabaseCloner::parseCollectionOptions(const BSONObj& obj) {
-    return uassertStatusOK(CollectionOptions::parse(obj, CollectionOptions::parseForStorage));
 }
 
 void DatabaseCloner::preStage() {
@@ -156,12 +153,11 @@ void DatabaseCloner::postStage() {
                         "Collection clone failed",
                         "namespace"_attr = sourceNss,
                         "error"_attr = collStatus.toString());
-            setInitialSyncFailedStatus(
-                {ErrorCodes::InitialSyncFailure,
-                 collStatus
-                     .withContext(str::stream()
-                                  << "Error cloning collection '" << sourceNss.toString() << "'")
-                     .toString()});
+            setSyncFailedStatus({ErrorCodes::InitialSyncFailure,
+                                 collStatus
+                                     .withContext(str::stream() << "Error cloning collection '"
+                                                                << sourceNss.toString() << "'")
+                                     .toString()});
         }
         {
             stdx::lock_guard<Latch> lk(_mutex);

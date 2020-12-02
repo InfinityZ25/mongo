@@ -34,6 +34,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/storage/ident.h"
 #include "mongo/db/storage/index_entry_comparison.h"
 #include "mongo/db/storage/key_string.h"
 
@@ -44,17 +45,17 @@ namespace mongo {
 class BSONObjBuilder;
 class BucketDeletionNotification;
 class SortedDataBuilderInterface;
-struct ValidateResults;
+struct IndexValidateResults;
 
 /**
  * This is the uniform interface for storing indexes and supporting point queries as well as range
  * queries. The actual implementation is up to the storage engine. All the storage engines must
  * support an index key size up to the maximum document size.
  */
-class SortedDataInterface {
+class SortedDataInterface : public Ident {
 public:
-    SortedDataInterface(KeyString::Version keyStringVersion, Ordering ordering)
-        : _keyStringVersion(keyStringVersion), _ordering(ordering) {}
+    SortedDataInterface(StringData ident, KeyString::Version keyStringVersion, Ordering ordering)
+        : Ident(ident), _keyStringVersion(keyStringVersion), _ordering(ordering) {}
 
     virtual ~SortedDataInterface() {}
 
@@ -132,7 +133,7 @@ public:
      */
     virtual void fullValidate(OperationContext* opCtx,
                               long long* numKeysOut,
-                              ValidateResults* fullResults) const = 0;
+                              IndexValidateResults* fullResults) const = 0;
 
     virtual bool appendCustomStats(OperationContext* opCtx,
                                    BSONObjBuilder* output,
@@ -147,6 +148,11 @@ public:
      * @see IndexAccessMethod::getSpaceUsedBytes
      */
     virtual long long getSpaceUsedBytes(OperationContext* opCtx) const = 0;
+
+    /**
+     * The number of unused free bytes consumed by this index on disk.
+     */
+    virtual long long getFreeStorageBytes(OperationContext* opCtx) const = 0;
 
     /**
      * Return true if 'this' index is empty, and false otherwise.

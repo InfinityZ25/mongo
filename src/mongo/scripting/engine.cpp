@@ -27,21 +27,23 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/scripting/engine.h"
 
+#include <algorithm>
 #include <boost/filesystem/operations.hpp>
-#include <cctype>
 
+#include "mongo/base/string_data.h"
 #include "mongo/client/dbclient_base.h"
 #include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
 #include "mongo/scripting/dbdirectclient_factory.h"
+#include "mongo/util/ctype.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/file.h"
 #include "mongo/util/text.h"
@@ -207,8 +209,10 @@ void Scope::storedFuncMod(OperationContext* opCtx) {
 
 void Scope::validateObjectIdString(const string& str) {
     uassert(10448, "invalid object id: length", str.size() == 24);
-    for (size_t i = 0; i < str.size(); i++)
-        uassert(10430, "invalid object id: not hex", std::isxdigit(str.at(i)));
+    auto isAllHex = [](StringData s) {
+        return std::all_of(s.begin(), s.end(), [](char c) { return ctype::isXdigit(c); });
+    };
+    uassert(10430, "invalid object id: not hex", isAllHex(str));
 }
 
 void Scope::loadStored(OperationContext* opCtx, bool ignoreNotConnected) {
@@ -229,7 +233,7 @@ void Scope::loadStored(OperationContext* opCtx, bool ignoreNotConnected) {
     auto directDBClient = DBDirectClientFactory::get(opCtx).create(opCtx);
 
     unique_ptr<DBClientCursor> c =
-        directDBClient->query(coll, Query(), 0, 0, nullptr, QueryOption_SlaveOk, 0);
+        directDBClient->query(coll, Query(), 0, 0, nullptr, QueryOption_SecondaryOk, 0);
     massert(16669, "unable to get db client cursor from query", c.get());
 
     set<string> thisTime;
@@ -249,6 +253,7 @@ void Scope::loadStored(OperationContext* opCtx, bool ignoreNotConnected) {
                 v.type() != BSONType::CodeWScope);
 
         if (MONGO_unlikely(mr_killop_test_fp.shouldFail())) {
+            LOGV2(5062200, "Pausing mr_killop_test_fp for system.js entry", "entryName"_attr = n);
 
             /* This thread sleep makes the interrupts in the test come in at a time
              *  where the js misses the interrupt and throw an exception instead of
@@ -350,28 +355,66 @@ class ScopeCache {
 public:
     void release(const string& poolName, const std::shared_ptr<Scope>& scope) {
         stdx::lock_guard<Latch> lk(_mutex);
+        // Catch, log, and rethrow any exception, but catch under the lock so we can read our fields
+        // when writing the log message. Also, track a few pieces of info for the log message.
+        bool didClearPools = false;
+        bool wasScopeTooOld = false;
+        bool didScopeHaveError = false;
+        bool hitPoolSizeLimit = false;
+        bool successfullyResetScope = false;
+        try {
+            if (scope->hasOutOfMemoryException()) {
+                // make some room
+                didClearPools = true;
+                LOGV2_INFO(22777, "Clearing all idle JS contexts due to out of memory");
+                _pools.clear();
+                return;
+            }
 
-        if (scope->hasOutOfMemoryException()) {
-            // make some room
-            LOGV2(22777, "Clearing all idle JS contexts due to out of memory");
-            _pools.clear();
-            return;
+            if (Date_t::now() - scope->getCreateTime() > kMaxScopeReuseTime) {
+                wasScopeTooOld = true;
+                return;  // too old to save
+            }
+
+            if (!scope->getError().empty()) {
+                didScopeHaveError = true;
+                return;  // not saving errored scopes
+            }
+
+            if (_pools.size() >= kMaxPoolSize) {
+                hitPoolSizeLimit = true;
+                // prefer to keep recently-used scopes
+                _pools.pop_back();
+            }
+
+            scope->reset();
+            successfullyResetScope = true;
+            ScopeAndPool toStore = {scope, poolName};
+            _pools.push_front(toStore);
+        } catch (const DBException& e) {
+            LOGV2_ERROR(5182700,
+                        "DBException in ScopeCache::release",
+                        "exception"_attr = e,
+                        "_pools.size()"_attr = _pools.size(),
+                        "poolName"_attr = poolName,
+                        "didClearPools"_attr = didClearPools,
+                        "wasScopeTooOld"_attr = wasScopeTooOld,
+                        "didScopeHaveError"_attr = didScopeHaveError,
+                        "hitPoolSizeLimit"_attr = hitPoolSizeLimit,
+                        "successfullyResetScope"_attr = successfullyResetScope);
+            std::terminate();
+        } catch (...) {
+            LOGV2_ERROR(5182701,
+                        "Exception (not a DBException) in ScopeCache::release",
+                        "_pools.size()"_attr = _pools.size(),
+                        "poolName"_attr = poolName,
+                        "didClearPools"_attr = didClearPools,
+                        "wasScopeTooOld"_attr = wasScopeTooOld,
+                        "didScopeHaveError"_attr = didScopeHaveError,
+                        "hitPoolSizeLimit"_attr = hitPoolSizeLimit,
+                        "successfullyResetScope"_attr = successfullyResetScope);
+            std::terminate();
         }
-
-        if (Date_t::now() - scope->getCreateTime() > kMaxScopeReuseTime)
-            return;  // too old to save
-
-        if (!scope->getError().empty())
-            return;  // not saving errored scopes
-
-        if (_pools.size() >= kMaxPoolSize) {
-            // prefer to keep recently-used scopes
-            _pools.pop_back();
-        }
-
-        scope->reset();
-        ScopeAndPool toStore = {scope, poolName};
-        _pools.push_front(toStore);
     }
 
     std::shared_ptr<Scope> tryAcquire(OperationContext* opCtx, const string& poolName) {
@@ -424,7 +467,17 @@ public:
         : _pool(pool), _real(real) {}
 
     virtual ~PooledScope() {
-        scopeCache.release(_pool, _real);
+        try {
+            scopeCache.release(_pool, _real);
+        } catch (const DBException& e) {
+            LOGV2_ERROR(
+                5182702, "DBException in ~PooledScope", "exception"_attr = e, "_pool"_attr = _pool);
+            std::terminate();
+        } catch (...) {
+            LOGV2_ERROR(
+                5182703, "Exception (not DBException) in ~PooledScope", "_pool"_attr = _pool);
+            std::terminate();
+        }
     }
 
     // wrappers for the derived (_real) scope
@@ -577,7 +630,7 @@ unique_ptr<Scope> ScriptEngine::getPooledScope(OperationContext* opCtx,
     return p;
 }
 
-void (*ScriptEngine::_connectCallback)(DBClientBase&) = nullptr;
+void (*ScriptEngine::_connectCallback)(DBClientBase&, StringData) = nullptr;
 
 ScriptEngine* getGlobalScriptEngine() {
     if (hasGlobalServiceContext())
@@ -614,12 +667,13 @@ bool hasJSReturn(const string& code) {
 
     // return is at start OR preceded by space
     // AND return is not followed by digit or letter
-    return (x == 0 || isspace(code[x - 1])) && !(isalpha(code[x + 6]) || isdigit(code[x + 6]));
+    return (x == 0 || ctype::isSpace(code[x - 1])) &&
+        !(ctype::isAlpha(code[x + 6]) || ctype::isDigit(code[x + 6]));
 }
 
 const char* jsSkipWhiteSpace(const char* raw) {
     while (raw[0]) {
-        while (isspace(*raw)) {
+        while (ctype::isSpace(*raw)) {
             ++raw;
         }
         if (raw[0] != '/' || raw[1] != '/')

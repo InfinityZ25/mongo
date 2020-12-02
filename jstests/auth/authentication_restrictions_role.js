@@ -6,7 +6,7 @@
 (function() {
 'use strict';
 
-// TODO SERVER-35447: Multiple users cannot be authenticated on one connection within a session.
+// Multiple users cannot be authenticated on one connection within a session.
 TestData.disableImplicitSessions = true;
 
 function testRestrictionCreationAndEnforcement(
@@ -35,7 +35,7 @@ function testRestrictionCreationAndEnforcement(
         createRole: "role2",
         roles: [],
         privileges: [],
-        authenticationRestrictions: [{clientSource: ["127.0.0.1"]}]
+        authenticationRestrictions: [{clientSource: ["127.0.0.1/32"]}]
     }));
     assert(Object.keys(admin.system.roles.findOne({role: "role2"}))
                .includes("authenticationRestrictions"));

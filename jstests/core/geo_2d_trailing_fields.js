@@ -1,10 +1,11 @@
 // Tests for predicates which can use the trailing field of a 2d index.
+// @tags: [
+//   sbe_incompatible,
+// ]
 (function() {
 "use strict";
 
 const coll = db.geo_2d_trailing_fields;
-
-const isMaster = assert.commandWorked(db.adminCommand({isMaster: 1}));
 
 coll.drop();
 assert.commandWorked(coll.createIndex({a: "2d", b: 1}));

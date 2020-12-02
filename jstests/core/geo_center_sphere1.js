@@ -1,4 +1,8 @@
-// @tags: [requires_fastcount, assumes_balancer_off]
+// @tags: [
+//   assumes_balancer_off,
+//   requires_fastcount,
+//   sbe_incompatible,
+// ]
 
 t = db.geo_center_sphere1;
 
@@ -41,7 +45,7 @@ function test(index) {
     assert.commandWorked(bulk.execute());
 
     if (index) {
-        t.ensureIndex({loc: index});
+        t.createIndex({loc: index});
     }
 
     for (i = 0; i < searches.length; i++) {

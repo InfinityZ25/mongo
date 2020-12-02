@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kTransaction
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTransaction
 
 #include "mongo/platform/basic.h"
@@ -40,10 +39,10 @@
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/commands/txn_two_phase_commit_cmds_gen.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/transaction_validation.h"
+#include "mongo/db/vector_clock.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
@@ -134,7 +133,6 @@ BSONObjBuilder appendFieldsForStartTransaction(BSONObj cmd,
         appendReadConcernForTxn(std::move(cmd), readConcernArgs, atClusterTime);
 
     BSONObjBuilder bob(std::move(cmdWithReadConcern));
-
     if (doAppendStartTransaction) {
         bob.append(OperationSessionInfoFromClient::kStartTransactionFieldName, true);
     }
@@ -323,6 +321,7 @@ void TransactionRouter::Observer::_reportTransactionState(OperationContext* opCt
         BSONObjBuilder parametersBuilder(builder->subobjStart("parameters"));
         parametersBuilder.append("txnNumber", o().txnNumber);
         parametersBuilder.append("autocommit", false);
+
         if (!o().readConcernArgs.isEmpty()) {
             o().readConcernArgs.appendInfo(&parametersBuilder);
         }
@@ -423,6 +422,9 @@ BSONObj TransactionRouter::Participant::attachTxnFieldsIfNeeded(
     bool mustStartTransaction = isFirstStatementInThisParticipant && !isTransactionCommand(cmdName);
 
     if (!mustStartTransaction) {
+        dassert(!cmd.hasField(APIParameters::kAPIVersionFieldName));
+        dassert(!cmd.hasField(APIParameters::kAPIStrictFieldName));
+        dassert(!cmd.hasField(APIParameters::kAPIDeprecationErrorsFieldName));
         dassert(!cmd.hasField(repl::ReadConcernArgs::kReadConcernFieldName));
     }
 
@@ -630,6 +632,7 @@ TransactionRouter::Participant& TransactionRouter::Router::_createParticipant(
 
     SharedTransactionOptions sharedOptions = {
         o().txnNumber,
+        o().apiParameters,
         o().readConcernArgs,
         o().atClusterTime ? boost::optional<LogicalTime>(o().atClusterTime->getTime())
                           : boost::none};
@@ -857,9 +860,10 @@ void TransactionRouter::Router::setDefaultAtClusterTime(OperationContext* opCtx)
         return;
     }
 
-    auto defaultTime = LogicalClock::get(opCtx)->getClusterTime();
-    _setAtClusterTime(
-        opCtx, repl::ReadConcernArgs::get(opCtx).getArgsAfterClusterTime(), defaultTime);
+    const auto defaultTime = VectorClock::get(opCtx)->getTime();
+    _setAtClusterTime(opCtx,
+                      repl::ReadConcernArgs::get(opCtx).getArgsAfterClusterTime(),
+                      defaultTime.clusterTime());
 }
 
 void TransactionRouter::Router::_setAtClusterTime(
@@ -904,10 +908,14 @@ void TransactionRouter::Router::beginOrContinueTxn(OperationContext* opCtx,
                                         << _sessionId() << " already started");
             }
             case TransactionActions::kContinue: {
+                uassert(4937701,
+                        "Only the first command in a transaction may specify API parameters",
+                        !APIParameters::get(opCtx).getParamsPassed());
                 uassert(ErrorCodes::InvalidOptions,
                         "Only the first command in a transaction may specify a readConcern",
                         repl::ReadConcernArgs::get(opCtx).isEmpty());
 
+                APIParameters::get(opCtx) = o().apiParameters;
                 repl::ReadConcernArgs::get(opCtx) = o().readConcernArgs;
 
                 ++p().latestStmtId;
@@ -915,6 +923,9 @@ void TransactionRouter::Router::beginOrContinueTxn(OperationContext* opCtx,
                 break;
             }
             case TransactionActions::kCommit:
+                uassert(4937702,
+                        "Only the first command in a transaction may specify API parameters",
+                        !APIParameters::get(opCtx).getParamsPassed());
                 ++p().latestStmtId;
                 _onContinue(opCtx);
                 break;
@@ -935,6 +946,7 @@ void TransactionRouter::Router::beginOrContinueTxn(OperationContext* opCtx,
 
                 {
                     stdx::lock_guard<Client> lk(*opCtx->getClient());
+                    o(lk).apiParameters = APIParameters::get(opCtx);
                     o(lk).readConcernArgs = readConcernArgs;
                 }
 
@@ -1152,31 +1164,6 @@ BSONObj TransactionRouter::Router::_commitTransaction(
         return sendCommitDirectlyToShards(opCtx, readOnlyShards);
     }
 
-    if (writeShards.size() == 1) {
-        LOGV2_DEBUG(22894,
-                    3,
-                    "{sessionId}:{txnNumber} Committing single-write-shard transaction with "
-                    "{numReadOnlyShards} read-only shards, write shard: {writeShardId}",
-                    "Committing single-write-shard transaction",
-                    "sessionId"_attr = _sessionId().getId(),
-                    "txnNumber"_attr = o().txnNumber,
-                    "numReadOnlyShards"_attr = readOnlyShards.size(),
-                    "writeShardId"_attr = writeShards.front());
-        {
-            stdx::lock_guard<Client> lk(*opCtx->getClient());
-            o(lk).commitType = CommitType::kSingleWriteShard;
-            _onStartCommit(lk, opCtx);
-        }
-
-        const auto readOnlyShardsResponse = sendCommitDirectlyToShards(opCtx, readOnlyShards);
-
-        if (!getStatusFromCommandResult(readOnlyShardsResponse).isOK() ||
-            !getWriteConcernStatusFromCommandResult(readOnlyShardsResponse).isOK()) {
-            return readOnlyShardsResponse;
-        }
-        return sendCommitDirectlyToShards(opCtx, writeShards);
-    }
-
     {
         stdx::lock_guard<Client> lk(*opCtx->getClient());
         o(lk).commitType = CommitType::kTwoPhaseCommit;
@@ -1216,6 +1203,8 @@ BSONObj TransactionRouter::Router::abortTransaction(OperationContext* opCtx) {
                 "txnNumber"_attr = o().txnNumber,
                 "numParticipantShards"_attr = o().participants.size());
 
+    // Omit API parameters from abortTransaction.
+    IgnoreAPIParametersBlock ignoreApiParametersBlock(opCtx);
     const auto responses = gatherResponses(opCtx,
                                            NamespaceString::kAdminDb,
                                            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
@@ -1341,6 +1330,7 @@ void TransactionRouter::Router::_resetRouterState(OperationContext* opCtx,
     o(lk).participants.clear();
     o(lk).coordinatorId.reset();
     p().recoveryShardId.reset();
+    o(lk).apiParameters = {};
     o(lk).readConcernArgs = {};
     o(lk).atClusterTime.reset();
     o(lk).abortCause = std::string();
@@ -1400,6 +1390,7 @@ void TransactionRouter::Router::_logSlowTransaction(OperationContext* opCtx,
     parametersBuilder.append("txnNumber", o().txnNumber);
     parametersBuilder.append("autocommit", false);
 
+    o().apiParameters.appendInfo(&parametersBuilder);
     if (!o().readConcernArgs.isEmpty()) {
         o().readConcernArgs.appendInfo(&parametersBuilder);
     }
@@ -1460,80 +1451,6 @@ void TransactionRouter::Router::_logSlowTransaction(OperationContext* opCtx,
               duration_cast<Milliseconds>(timingStats.getDuration(tickSource, curTicks)));
 
     LOGV2(51805, "transaction", attrs);
-}
-
-std::string TransactionRouter::Router::_transactionInfoForLog(
-    OperationContext* opCtx, TerminationCause terminationCause) const {
-    StringBuilder sb;
-
-    BSONObjBuilder parametersBuilder;
-
-    BSONObjBuilder lsidBuilder(parametersBuilder.subobjStart("lsid"));
-    _sessionId().serialize(&lsidBuilder);
-    lsidBuilder.doneFast();
-
-    parametersBuilder.append("txnNumber", o().txnNumber);
-    parametersBuilder.append("autocommit", false);
-
-    if (!o().readConcernArgs.isEmpty()) {
-        o().readConcernArgs.appendInfo(&parametersBuilder);
-    }
-
-    sb << "parameters:" << parametersBuilder.obj().toString() << ",";
-
-    if (_atClusterTimeHasBeenSet()) {
-        sb << " globalReadTimestamp:" << o().atClusterTime->getTime().toString() << ",";
-    }
-
-    if (o().commitType != CommitType::kRecoverWithToken) {
-        // We don't know the participants if we're recovering the commit.
-        sb << " numParticipants:" << o().participants.size() << ",";
-    }
-
-    if (o().commitType == CommitType::kTwoPhaseCommit) {
-        dassert(o().coordinatorId);
-        sb << " coordinator:" << *o().coordinatorId << ",";
-    }
-
-    auto tickSource = opCtx->getServiceContext()->getTickSource();
-    auto curTicks = tickSource->getTicks();
-
-    if (terminationCause == TerminationCause::kCommitted) {
-        sb << " terminationCause:committed,";
-
-        dassert(o().metricsTracker->commitHasStarted());
-        dassert(o().commitType != CommitType::kNotInitiated);
-        dassert(o().abortCause.empty());
-    } else {
-        sb << " terminationCause:aborted,";
-
-        dassert(!o().abortCause.empty());
-        sb << " abortCause:" << o().abortCause << ",";
-    }
-
-    const auto& timingStats = o().metricsTracker->getTimingStats();
-
-    if (o().metricsTracker->commitHasStarted()) {
-        dassert(o().commitType != CommitType::kNotInitiated);
-        sb << " commitType:" << commitTypeToString(o().commitType) << ",";
-
-        sb << " commitDurationMicros:"
-           << durationCount<Microseconds>(timingStats.getCommitDuration(tickSource, curTicks))
-           << ",";
-    }
-
-    sb << " timeActiveMicros:"
-       << durationCount<Microseconds>(timingStats.getTimeActiveMicros(tickSource, curTicks)) << ",";
-
-    sb << " timeInactiveMicros:"
-       << durationCount<Microseconds>(timingStats.getTimeInactiveMicros(tickSource, curTicks))
-       << ",";
-
-    // Total duration of the transaction. Logged at the end of the line for consistency with slow
-    // command logging.
-    sb << " " << duration_cast<Milliseconds>(timingStats.getDuration(tickSource, curTicks));
-
-    return sb.str();
 }
 
 void TransactionRouter::Router::_onImplicitAbort(OperationContext* opCtx, const Status& status) {

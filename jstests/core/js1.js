@@ -1,8 +1,7 @@
 // @tags: [
-//     requires_non_retryable_writes,
-//
-//     # Uses $where operator
-//     requires_scripting
+//   requires_non_retryable_writes,
+//   # Uses $where operator
+//   requires_scripting,
 // ]
 
 t = db.jstests_js1;

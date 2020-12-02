@@ -55,6 +55,7 @@ public:
     void shutdown() override;
     void join() override;
     SharedSemiFuture<void> joinAsync() override;
+    bool isShuttingDown() const override;
     void appendDiagnosticBSON(BSONObjBuilder* builder) const override;
     Date_t now() override;
     StatusWith<EventHandle> makeEvent() override;
@@ -82,7 +83,7 @@ public:
 
 private:
     // Not owned by us.
-    executor::TaskExecutor* _executor;
+    AtomicWord<executor::TaskExecutor*> _executor;
 };
 
 }  // namespace unittest

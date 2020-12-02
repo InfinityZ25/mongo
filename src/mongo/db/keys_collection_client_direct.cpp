@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -41,7 +41,6 @@
 #include "mongo/client/read_preference.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/keys_collection_document.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
@@ -84,7 +83,8 @@ StatusWith<std::vector<KeysCollectionDocument>> KeysCollectionClientDirect::getN
     queryBuilder.append("purpose", purpose);
     queryBuilder.append("expiresAt", BSON("$gt" << newerThanThis.asTimestamp()));
 
-    auto readConcern = serverGlobalParams.enableMajorityReadConcern && useMajority
+    auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
+    auto readConcern = storageEngine->supportsReadConcernMajority() && useMajority
         ? repl::ReadConcernLevel::kMajorityReadConcern
         : repl::ReadConcernLevel::kLocalReadConcern;
 

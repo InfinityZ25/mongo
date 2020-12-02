@@ -1,4 +1,7 @@
 # -*- mode: python -*-
+
+from site_scons.mongo import insort_wrapper
+
 Import("env")
 
 env = env.Clone()
@@ -31,21 +34,16 @@ ftdcEnv.Library(
 )
 
 platform_libs = []
-
 if env.TargetOSIs('linux'):
-    platform_libs = [
-        '$BUILD_DIR/mongo/util/procparser'
-    ]
+    platform_libs.append('$BUILD_DIR/mongo/util/procparser')
 elif env.TargetOSIs('windows'):
-    platform_libs = [
-        '$BUILD_DIR/mongo/util/perfctr_collect'
-    ]
+    platform_libs.append('$BUILD_DIR/mongo/util/perfctr_collect')
 
 env.Library(
     target='ftdc_server',
     source=[
         'ftdc_server.cpp',
-        env.Idlc('ftdc_server.idl')[0],
+        'ftdc_server.idl',
         'ftdc_system_stats.cpp',
         'ftdc_system_stats_${TARGET_OS}.cpp',
     ],
@@ -57,6 +55,9 @@ env.Library(
     ] + platform_libs,
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/idl/server_parameter',
+    ],
+    LIBDEPS_TAGS=[
+        'lint-allow-non-alphabetic',
     ],
 )
 
@@ -75,6 +76,9 @@ env.Library(
         '$BUILD_DIR/mongo/db/auth/auth',
         '$BUILD_DIR/mongo/db/auth/authprivilege',
     ],
+    LIBDEPS_TYPEINFO=[
+        '$BUILD_DIR/mongo/rpc/rpc',
+    ]
 )
 
 env.Library(

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -86,8 +86,7 @@ void DurableViewCatalog::onSystemViewsCollectionDrop(OperationContext* opCtx,
     if (db) {
         // If the 'system.views' collection is dropped, we need to clear the in-memory state of the
         // view catalog.
-        ViewCatalog* viewCatalog = ViewCatalog::get(db);
-        viewCatalog->clear();
+        ViewCatalog::get(db)->clear();
     }
 }
 
@@ -111,8 +110,8 @@ void DurableViewCatalogImpl::_iterate(OperationContext* opCtx,
                                       ViewCatalogLookupBehavior lookupBehavior) {
     invariant(opCtx->lockState()->isCollectionLockedForMode(_db->getSystemViewsName(), MODE_IS));
 
-    Collection* systemViews =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, _db->getSystemViewsName());
+    CollectionPtr systemViews = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
+        opCtx, _db->getSystemViewsName());
     if (!systemViews) {
         return;
     }
@@ -136,14 +135,15 @@ BSONObj DurableViewCatalogImpl::_validateViewDefinition(OperationContext* opCtx,
     // Check the document is valid BSON, with only the expected fields.
     // Use the latest BSON validation version. Existing view definitions are allowed to contain
     // decimal data even if decimal is disabled.
-    fassert(40224, validateBSON(recordData.data(), recordData.size(), BSONVersion::kLatest));
+    fassert(40224, validateBSON(recordData.data(), recordData.size()));
     BSONObj viewDefinition = recordData.toBson();
 
     bool valid = true;
 
     for (const BSONElement& e : viewDefinition) {
         std::string name(e.fieldName());
-        valid &= name == "_id" || name == "viewOn" || name == "pipeline" || name == "collation";
+        valid &= name == "_id" || name == "viewOn" || name == "pipeline" || name == "collation" ||
+            name == "timeseries";
     }
 
     const auto viewName = viewDefinition["_id"].str();
@@ -169,6 +169,9 @@ BSONObj DurableViewCatalogImpl::_validateViewDefinition(OperationContext* opCtx,
     valid &= (!viewDefinition.hasField("collation") ||
               viewDefinition["collation"].type() == BSONType::Object);
 
+    valid &= !viewDefinition.hasField("timeseries") ||
+        viewDefinition["timeseries"].type() == BSONType::Object;
+
     uassert(ErrorCodes::InvalidViewDefinition,
             str::stream() << "found invalid view definition " << viewDefinition["_id"]
                           << " while reading '" << _db->getSystemViewsName() << "'",
@@ -186,8 +189,8 @@ void DurableViewCatalogImpl::upsert(OperationContext* opCtx,
     NamespaceString systemViewsNs(_db->getSystemViewsName());
     dassert(opCtx->lockState()->isCollectionLockedForMode(systemViewsNs, MODE_X));
 
-    Collection* systemViews =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, systemViewsNs);
+    const CollectionPtr& systemViews =
+        CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, systemViewsNs);
     invariant(systemViews);
 
     const bool requireIndex = false;
@@ -197,9 +200,9 @@ void DurableViewCatalogImpl::upsert(OperationContext* opCtx,
     if (!id.isValid() || !systemViews->findDoc(opCtx, id, &oldView)) {
         LOGV2_DEBUG(22544,
                     2,
-                    "insert view {view} into {db_getSystemViewsName}",
+                    "Insert view to system views catalog",
                     "view"_attr = view,
-                    "db_getSystemViewsName"_attr = _db->getSystemViewsName());
+                    "viewCatalog"_attr = _db->getSystemViewsName());
         uassertStatusOK(
             systemViews->insertDocument(opCtx, InsertStatement(view), &CurOp::get(opCtx)->debug()));
     } else {
@@ -218,8 +221,8 @@ void DurableViewCatalogImpl::remove(OperationContext* opCtx, const NamespaceStri
     dassert(opCtx->lockState()->isDbLockedForMode(_db->name(), MODE_IX));
     dassert(opCtx->lockState()->isCollectionLockedForMode(name, MODE_IX));
 
-    Collection* systemViews =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, _db->getSystemViewsName());
+    CollectionPtr systemViews = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
+        opCtx, _db->getSystemViewsName());
     dassert(opCtx->lockState()->isCollectionLockedForMode(systemViews->ns(), MODE_X));
 
     if (!systemViews)
@@ -231,9 +234,9 @@ void DurableViewCatalogImpl::remove(OperationContext* opCtx, const NamespaceStri
 
     LOGV2_DEBUG(22545,
                 2,
-                "remove view {name} from {db_getSystemViewsName}",
-                "name"_attr = name,
-                "db_getSystemViewsName"_attr = _db->getSystemViewsName());
+                "Remove view from system views catalog",
+                "view"_attr = name,
+                "viewCatalog"_attr = _db->getSystemViewsName());
     systemViews->deleteDocument(opCtx, kUninitializedStmtId, id, &CurOp::get(opCtx)->debug());
 }
 }  // namespace mongo

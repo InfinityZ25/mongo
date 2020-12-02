@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplicationInitialSync
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationInitialSync
 
 #include "mongo/platform/basic.h"
 
@@ -38,6 +38,7 @@
 #include "mongo/db/repl/replication_consistency_markers_gen.h"
 #include "mongo/db/repl/replication_consistency_markers_impl.h"
 #include "mongo/logv2/log.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/assert_util.h"
 namespace mongo {
 namespace repl {
@@ -47,7 +48,8 @@ AllDatabaseCloner::AllDatabaseCloner(InitialSyncSharedData* sharedData,
                                      DBClientConnection* client,
                                      StorageInterface* storageInterface,
                                      ThreadPool* dbPool)
-    : BaseCloner("AllDatabaseCloner"_sd, sharedData, source, client, storageInterface, dbPool),
+    : InitialSyncBaseCloner(
+          "AllDatabaseCloner"_sd, sharedData, source, client, storageInterface, dbPool),
       _connectStage("connect", this, &AllDatabaseCloner::connectStage),
       _getInitialSyncIdStage("getInitialSyncId", this, &AllDatabaseCloner::getInitialSyncIdStage),
       _listDatabasesStage("listDatabases", this, &AllDatabaseCloner::listDatabasesStage) {}
@@ -74,12 +76,12 @@ Status AllDatabaseCloner::ensurePrimaryOrSecondary(
             return member.getHostAndPort() == source;
         });
     if (syncSourceIter == memberData.end()) {
-        Status status(ErrorCodes::NotMasterOrSecondary,
+        Status status(ErrorCodes::NotPrimaryOrSecondary,
                       str::stream() << "Sync source " << getSource()
                                     << " has been removed from the replication configuration.");
         stdx::lock_guard<InitialSyncSharedData> lk(*getSharedData());
         // Setting the status in the shared data will cancel the initial sync.
-        getSharedData()->setInitialSyncStatusIfOK(lk, status);
+        getSharedData()->setStatusIfOK(lk, status);
         return status;
     }
 
@@ -89,14 +91,14 @@ Status AllDatabaseCloner::ensurePrimaryOrSecondary(
     // we also check to see if it has a sync source.  A node in STARTUP2 will not have a sync
     // source unless it is in initial sync.
     if (syncSourceIter->getState().startup2() && !syncSourceIter->getSyncSource().empty()) {
-        Status status(ErrorCodes::NotMasterOrSecondary,
+        Status status(ErrorCodes::NotPrimaryOrSecondary,
                       str::stream() << "Sync source " << getSource() << " has been resynced.");
         stdx::lock_guard<InitialSyncSharedData> lk(*getSharedData());
         // Setting the status in the shared data will cancel the initial sync.
-        getSharedData()->setInitialSyncStatusIfOK(lk, status);
+        getSharedData()->setStatusIfOK(lk, status);
         return status;
     }
-    return Status(ErrorCodes::NotMasterOrSecondary,
+    return Status(ErrorCodes::NotPrimaryOrSecondary,
                   str::stream() << "Cannot connect because sync source " << getSource()
                                 << " is neither primary nor secondary.");
 }
@@ -131,12 +133,6 @@ BaseCloner::AfterStageBehavior AllDatabaseCloner::getInitialSyncIdStage() {
         return kContinueNormally;
     auto initialSyncId = getClient()->findOne(
         ReplicationConsistencyMarkersImpl::kDefaultInitialSyncIdNamespace.toString(), Query());
-    // TODO(SERVER-47150): Remove this "if" and allow the uassert to fail.
-    if (initialSyncId.isEmpty()) {
-        stdx::lock_guard<InitialSyncSharedData> lk(*getSharedData());
-        getSharedData()->setInitialSyncSourceId(lk, UUID::gen());
-        return kContinueNormally;
-    }
     uassert(ErrorCodes::InitialSyncFailure,
             "Cannot retrieve sync source initial sync ID",
             !initialSyncId.isEmpty());
@@ -150,7 +146,6 @@ BaseCloner::AfterStageBehavior AllDatabaseCloner::getInitialSyncIdStage() {
 }
 
 BaseCloner::AfterStageBehavior AllDatabaseCloner::listDatabasesStage() {
-    BSONObj res;
     auto databasesArray = getClient()->getDatabaseInfos(BSONObj(), true /* nameOnly */);
     for (const auto& dbBSON : databasesArray) {
         if (!dbBSON.hasField("name")) {
@@ -186,10 +181,29 @@ void AllDatabaseCloner::postStage() {
     {
         stdx::lock_guard<Latch> lk(_mutex);
         _stats.databasesCloned = 0;
+        _stats.databasesToClone = _databases.size();
         _stats.databaseStats.reserve(_databases.size());
         for (const auto& dbName : _databases) {
             _stats.databaseStats.emplace_back();
             _stats.databaseStats.back().dbname = dbName;
+
+            BSONObj res;
+            getClient()->runCommand(dbName, BSON("dbStats" << 1), res);
+            // It is possible for the call to 'dbStats' to fail if the sync source contains invalid
+            // views. We should not fail initial sync in this case due to the situation where the
+            // replica set may have lost majority availability and therefore have no access to a
+            // primary to fix the view definitions. Instead, we simply skip recording the data size
+            // metrics.
+            if (auto status = getStatusFromCommandResult(res); status.isOK()) {
+                _stats.dataSize += res.getField("dataSize").safeNumberLong();
+            } else {
+                LOGV2_DEBUG(4786301,
+                            1,
+                            "Skipping the recording of initial sync data size metrics due "
+                            "to failure in the 'dbStats' command",
+                            "db"_attr = dbName,
+                            "status"_attr = status);
+            }
         }
     }
     for (const auto& dbName : _databases) {
@@ -219,7 +233,7 @@ void AllDatabaseCloner::postStage() {
                           "dbNumber"_attr = (_stats.databasesCloned + 1),
                           "totalDbs"_attr = _databases.size(),
                           "error"_attr = dbStatus.toString());
-            setInitialSyncFailedStatus(dbStatus);
+            setSyncFailedStatus(dbStatus);
             return;
         }
         if (StringData(dbName).equalCaseInsensitive("admin")) {
@@ -241,7 +255,7 @@ void AllDatabaseCloner::postStage() {
                             "Validation failed on 'admin' db due to {error}",
                             "Validation failed on 'admin' db",
                             "error"_attr = adminStatus);
-                setInitialSyncFailedStatus(adminStatus);
+                setSyncFailedStatus(adminStatus);
                 return;
             }
         }
@@ -250,6 +264,7 @@ void AllDatabaseCloner::postStage() {
             _stats.databaseStats[_stats.databasesCloned] = _currentDatabaseCloner->getStats();
             _currentDatabaseCloner = nullptr;
             _stats.databasesCloned++;
+            _stats.databasesToClone--;
         }
     }
 }
@@ -268,6 +283,7 @@ std::string AllDatabaseCloner::toString() const {
     return str::stream() << "initial sync --"
                          << " active:" << isActive(lk) << " status:" << getStatus(lk).toString()
                          << " source:" << getSource()
+                         << " db cloners remaining:" << _stats.databasesToClone
                          << " db cloners completed:" << _stats.databasesCloned;
 }
 
@@ -282,6 +298,7 @@ BSONObj AllDatabaseCloner::Stats::toBSON() const {
 }
 
 void AllDatabaseCloner::Stats::append(BSONObjBuilder* builder) const {
+    builder->appendNumber("databasesToClone", databasesToClone);
     builder->appendNumber("databasesCloned", databasesCloned);
     for (auto&& db : databaseStats) {
         BSONObjBuilder dbBuilder(builder->subobjStart(db.dbname));

@@ -73,6 +73,10 @@ public:
         return _expression.get();
     }
 
+    const MatchExpression* getMatchExpression() const {
+        return _expression.get();
+    }
+
 private:
     BSONObj _pattern;
 

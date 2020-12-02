@@ -10,8 +10,8 @@ env.Library(
         'sharding_catalog_client.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/db/write_concern_options',
         '$BUILD_DIR/mongo/db/keys_collection_document',
+        '$BUILD_DIR/mongo/db/write_concern_options',
     ],
 )
 
@@ -128,15 +128,15 @@ env.CppUnitTest(
     source=[
         'dist_lock_catalog_impl_test.cpp',
         'replset_dist_lock_manager_test.cpp',
-        'sharding_catalog_test.cpp',
+        'sharding_catalog_client_test.cpp',
         'sharding_catalog_write_retry_test.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/auth/authmocks',
+        '$BUILD_DIR/mongo/db/s/shard_server_test_fixture',
         '$BUILD_DIR/mongo/db/storage/duplicate_key_error_info',
         '$BUILD_DIR/mongo/s/catalog/dist_lock_catalog_mock',
         '$BUILD_DIR/mongo/s/catalog/sharding_catalog_client_mock',
-        '$BUILD_DIR/mongo/s/shard_server_test_fixture',
         '$BUILD_DIR/mongo/s/sharding_router_test_fixture',
         'dist_lock_catalog_impl',
         'replset_dist_lock_manager',

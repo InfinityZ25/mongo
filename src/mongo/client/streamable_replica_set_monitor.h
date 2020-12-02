@@ -39,12 +39,12 @@
 #include "mongo/client/replica_set_change_notifier.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/client/sdam/sdam.h"
-#include "mongo/client/server_is_master_monitor.h"
+#include "mongo/client/server_discovery_monitor.h"
 #include "mongo/client/server_ping_monitor.h"
 #include "mongo/client/streamable_replica_set_monitor_error_handler.h"
 #include "mongo/executor/egress_tag_closer.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/logger/log_component.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/net/hostandport.h"
@@ -63,7 +63,7 @@ using ReplicaSetMonitorPtr = std::shared_ptr<ReplicaSetMonitor>;
  *
  * All methods perform the required synchronization to allow callers from multiple threads.
  */
-class StreamableReplicaSetMonitor
+class StreamableReplicaSetMonitor final
     : public ReplicaSetMonitor,
       public sdam::TopologyListener,
       public std::enable_shared_from_this<StreamableReplicaSetMonitor> {
@@ -81,21 +81,23 @@ public:
                                 std::shared_ptr<executor::TaskExecutor> executor,
                                 std::shared_ptr<executor::EgressTagCloser> connectionManager);
 
-    void init();
+    ~StreamableReplicaSetMonitor() override;
 
-    void drop();
+    void init() override;
+
+    void drop() override;
 
     static ReplicaSetMonitorPtr make(const MongoURI& uri,
                                      std::shared_ptr<executor::TaskExecutor> executor,
                                      std::shared_ptr<executor::EgressTagCloser> connectionCloser);
 
     SemiFuture<HostAndPort> getHostOrRefresh(const ReadPreferenceSetting& readPref,
-                                             Milliseconds maxWait = kDefaultFindHostTimeout);
+                                             const CancelationToken& cancelToken) override;
 
     SemiFuture<std::vector<HostAndPort>> getHostsOrRefresh(
-        const ReadPreferenceSetting& readPref, Milliseconds maxWait = kDefaultFindHostTimeout);
+        const ReadPreferenceSetting& readPref, const CancelationToken& cancelToken) override;
 
-    HostAndPort getMasterOrUassert();
+    HostAndPort getPrimaryOrUassert() override;
 
     void failedHost(const HostAndPort& host, const Status& status) override;
     void failedHostPreHandshake(const HostAndPort& host,
@@ -105,27 +107,27 @@ public:
                                  const Status& status,
                                  BSONObj bson) override;
 
-    bool isPrimary(const HostAndPort& host) const;
+    bool isPrimary(const HostAndPort& host) const override;
 
-    bool isHostUp(const HostAndPort& host) const;
+    bool isHostUp(const HostAndPort& host) const override;
 
-    int getMinWireVersion() const;
+    int getMinWireVersion() const override;
 
-    int getMaxWireVersion() const;
+    int getMaxWireVersion() const override;
 
-    std::string getName() const;
+    std::string getName() const override;
 
-    std::string getServerAddress() const;
+    std::string getServerAddress() const override;
 
-    const MongoURI& getOriginalUri() const;
+    const MongoURI& getOriginalUri() const override;
 
     sdam::TopologyEventsPublisherPtr getEventsPublisher();
 
-    bool contains(const HostAndPort& server) const;
+    bool contains(const HostAndPort& server) const override;
 
-    void appendInfo(BSONObjBuilder& b, bool forFTDC = false) const;
+    void appendInfo(BSONObjBuilder& b, bool forFTDC = false) const override;
 
-    bool isKnownToHaveGoodPrimary() const;
+    bool isKnownToHaveGoodPrimary() const override;
     void runScanForMockReplicaSet() override;
 
 private:
@@ -134,13 +136,53 @@ private:
         std::shared_ptr<StreamableReplicaSetMonitor::StreamableReplicaSetMonitorQueryProcessor>;
 
     struct HostQuery {
-        Date_t deadline;
-        executor::TaskExecutor::CallbackHandle deadlineHandle;
+        ~HostQuery() {
+            invariant(hasBeenResolved());
+        }
+
+        bool hasBeenResolved() {
+            return done.load();
+        }
+
+        /**
+         * Tries to mark the query as done and resolve its promise with an error status, and returns
+         * whether or not it was able to do so.
+         */
+        bool tryCancel(Status status) {
+            invariant(!status.isOK());
+            auto wasAlreadyDone = done.swap(true);
+            if (!wasAlreadyDone) {
+                promise.setError(status);
+                deadlineCancelSource.cancel();
+            }
+            return !wasAlreadyDone;
+        }
+
+        /**
+         * Tries to mark the query as done and resolve its promise with a successful result, and
+         * returns whether or not it was able to do so.
+         */
+        bool tryResolveWithSuccess(std::vector<HostAndPort>&& result) {
+            auto wasAlreadyDone = done.swap(true);
+            if (!wasAlreadyDone) {
+                promise.emplaceValue(std::move(result));
+                deadlineCancelSource.cancel();
+            }
+            return !wasAlreadyDone;
+        }
+
+        CancelationSource deadlineCancelSource;
+
         ReadPreferenceSetting criteria;
-        Date_t start = Date_t::now();
-        bool done = false;
+
+        // Used to compute latency.
+        Date_t start;
+
+        AtomicWord<bool> done{false};
+
         Promise<std::vector<HostAndPort>> promise;
     };
+
     using HostQueryPtr = std::shared_ptr<HostQuery>;
 
     // Information collected from the primary ServerDescription to be published via the
@@ -152,7 +194,14 @@ private:
     };
 
     SemiFuture<std::vector<HostAndPort>> _enqueueOutstandingQuery(
-        WithLock, const ReadPreferenceSetting& criteria, const Date_t& deadline);
+        WithLock,
+        const ReadPreferenceSetting& criteria,
+        const CancelationToken& cancelToken,
+        const Date_t& deadline);
+
+    // Removes the query pointed to by iter and returns an iterator to the next item in the list.
+    std::list<HostQueryPtr>::iterator _eraseQueryFromOutstandingQueries(
+        WithLock, std::list<HostQueryPtr>::iterator iter);
 
     std::vector<HostAndPort> _extractHosts(
         const std::vector<sdam::ServerDescriptionPtr>& serverDescriptions);
@@ -162,29 +211,27 @@ private:
     boost::optional<std::vector<HostAndPort>> _getHosts(const ReadPreferenceSetting& criteria);
 
     // Incoming Events
-    void onTopologyDescriptionChangedEvent(UUID topologyId,
-                                           sdam::TopologyDescriptionPtr previousDescription,
+    void onTopologyDescriptionChangedEvent(sdam::TopologyDescriptionPtr previousDescription,
                                            sdam::TopologyDescriptionPtr newDescription) override;
 
-    void onServerHeartbeatSucceededEvent(const sdam::ServerAddress& hostAndPort,
+    void onServerHeartbeatSucceededEvent(const HostAndPort& hostAndPort,
                                          const BSONObj reply) override;
 
-    void onServerHandshakeFailedEvent(const sdam::ServerAddress& address,
+    void onServerHandshakeFailedEvent(const HostAndPort& address,
                                       const Status& status,
                                       const BSONObj reply) override;
 
     void onServerHeartbeatFailureEvent(Status errorStatus,
-                                       const ServerAddress& hostAndPort,
+                                       const HostAndPort& hostAndPort,
                                        const BSONObj reply) override;
 
-    void onServerPingFailedEvent(const sdam::ServerAddress& hostAndPort,
-                                 const Status& status) override;
+    void onServerPingFailedEvent(const HostAndPort& hostAndPort, const Status& status) override;
 
-    void onServerPingSucceededEvent(sdam::IsMasterRTT durationMS,
-                                    const sdam::ServerAddress& hostAndPort) override;
+    void onServerPingSucceededEvent(sdam::HelloRTT durationMS,
+                                    const HostAndPort& hostAndPort) override;
 
-    void onServerHandshakeCompleteEvent(sdam::IsMasterRTT durationMs,
-                                        const ServerAddress& hostAndPort,
+    void onServerHandshakeCompleteEvent(sdam::HelloRTT durationMs,
+                                        const HostAndPort& hostAndPort,
                                         const BSONObj reply) override;
 
     // Get a pointer to the current primary's ServerDescription
@@ -200,12 +247,8 @@ private:
     std::string _logPrefix();
 
     void _failOutstandingWithStatus(WithLock, Status status);
-    bool _hasMembershipChange(sdam::TopologyDescriptionPtr oldDescription,
-                              sdam::TopologyDescriptionPtr newDescription);
-    void _setConfirmedNotifierState(WithLock, const ServerDescriptionPtr& primaryDescription);
 
-    Status _makeUnsatisfiedReadPrefError(const ReadPreferenceSetting& criteria) const;
-    Status _makeReplicaSetMonitorRemovedError() const;
+    void _setConfirmedNotifierState(WithLock, const ServerDescriptionPtr& primaryDescription);
 
     // Try to satisfy the outstanding queries for this instance with the given topology information.
     void _processOutstanding(const TopologyDescriptionPtr& topologyDescription);
@@ -226,7 +269,7 @@ private:
     sdam::ServerSelectorPtr _serverSelector;
     sdam::TopologyEventsPublisherPtr _eventsPublisher;
     std::unique_ptr<StreamableReplicaSetMonitorErrorHandler> _errorHandler;
-    ServerIsMasterMonitorPtr _isMasterMonitor;
+    ServerDiscoveryMonitorPtr _serverDiscoveryMonitor;
     std::shared_ptr<ServerPingMonitor> _pingMonitor;
 
     // This object will be registered as a TopologyListener if there are
@@ -241,12 +284,10 @@ private:
     AtomicWord<bool> _isDropped{true};
 
     mutable Mutex _mutex = MONGO_MAKE_LATCH("ReplicaSetMonitor");
-    std::vector<HostQueryPtr> _outstandingQueries;
+    std::list<HostQueryPtr> _outstandingQueries;
     boost::optional<ChangeNotifierState> _confirmedNotifierState;
     mutable PseudoRandom _random;
 
-    static inline const auto kServerSelectionConfig =
-        sdam::ServerSelectionConfiguration::defaultConfiguration();
     static constexpr auto kDefaultLogLevel = 0;
     static constexpr auto kLowerLogLevel = 1;
     static constexpr auto kLogPrefix = "[ReplicaSetMonitor]";

@@ -1,7 +1,9 @@
 // @tags: [
 //   requires_getmore,
 //   requires_non_retryable_writes,
+//   sbe_incompatible,
 //   uses_multiple_connections,
+//   uses_parallel_shell,
 // ]
 
 // SERVER-2009 Count odd numbered entries while updating and deleting even numbered entries.
@@ -11,7 +13,7 @@
 
 const t = db.jstests_remove9;
 t.drop();
-t.ensureIndex({i: 1});
+t.createIndex({i: 1});
 
 const bulk = t.initializeUnorderedBulkOp();
 for (let i = 0; i < 1000; ++i) {

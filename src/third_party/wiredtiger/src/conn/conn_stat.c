@@ -73,7 +73,6 @@ __wt_conn_stat_init(WT_SESSION_IMPL *session)
     conn = S2C(session);
     stats = conn->stats;
 
-    __wt_async_stats_update(session);
     __wt_cache_stats_update(session);
     __wt_txn_stats_update(session);
 
@@ -164,8 +163,7 @@ __statlog_config(WT_SESSION_IMPL *session, const char **cfg, bool *runp)
              */
             if (!WT_PREFIX_MATCH(k.str, "file:") && !WT_PREFIX_MATCH(k.str, "lsm:"))
                 WT_ERR_MSG(session, EINVAL,
-                  "statistics_log sources configuration only "
-                  "supports objects of type \"file\" or "
+                  "statistics_log sources configuration only supports objects of type \"file\" or "
                   "\"lsm\"");
             WT_ERR(__wt_strndup(session, k.str, k.len, &sources[cnt]));
         }
@@ -596,7 +594,7 @@ __statlog_server(void *arg)
 
     if (0) {
 err:
-        WT_PANIC_MSG(session, ret, "statistics log server error");
+        WT_IGNORE_RET(__wt_panic(session, ret, "statistics log server error"));
     }
     __wt_buf_free(session, &path);
     __wt_buf_free(session, &tmp);
@@ -683,7 +681,6 @@ __wt_statlog_destroy(WT_SESSION_IMPL *session, bool is_close)
 {
     WT_CONNECTION_IMPL *conn;
     WT_DECL_RET;
-    WT_SESSION *wt_session;
 
     conn = S2C(session);
 
@@ -705,8 +702,7 @@ __wt_statlog_destroy(WT_SESSION_IMPL *session, bool is_close)
 
     /* Close the server thread's session. */
     if (conn->stat_session != NULL) {
-        wt_session = &conn->stat_session->iface;
-        WT_TRET(wt_session->close(wt_session, NULL));
+        WT_TRET(__wt_session_close_internal(conn->stat_session));
         conn->stat_session = NULL;
     }
 

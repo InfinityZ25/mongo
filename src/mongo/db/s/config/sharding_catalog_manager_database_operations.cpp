@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 
@@ -38,15 +38,17 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/vector_clock.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard.h"
-#include "mongo/s/database_version_helpers.h"
+#include "mongo/s/database_version.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_id.h"
 #include "mongo/s/shard_util.h"
+#include "mongo/s/sharded_collections_ddl_parameters_gen.h"
 
 namespace mongo {
 namespace {
@@ -158,9 +160,18 @@ DatabaseType ShardingCatalogManager::createDatabase(OperationContext* opCtx,
                 primaryShard.isValid() ? primaryShard
                                        : selectShardForNewDatabase(opCtx, shardRegistry)));
 
+            boost::optional<Timestamp> clusterTime;
+            if (feature_flags::gShardingFullDDLSupport.isEnabled(
+                    serverGlobalParams.featureCompatibility)) {
+                const auto now = VectorClock::get(opCtx)->getTime();
+                clusterTime = now.clusterTime().asTimestamp();
+            }
+
             // Pick a primary shard for the new database.
-            DatabaseType db(
-                dbName.toString(), shardPtr->getId(), false, databaseVersion::makeNew());
+            DatabaseType db(dbName.toString(),
+                            shardPtr->getId(),
+                            false,
+                            DatabaseVersion(UUID::gen(), clusterTime));
 
             LOGV2(21938,
                   "Registering new database {db} in sharding catalog",
@@ -306,7 +317,7 @@ Status ShardingCatalogManager::commitMovePrimary(OperationContext* opCtx,
 
     auto const currentDatabaseVersion = dbType.getVersion();
 
-    newDbType.setVersion(databaseVersion::makeIncremented(currentDatabaseVersion));
+    newDbType.setVersion(currentDatabaseVersion.makeUpdated());
 
     auto updateQueryBuilder = BSONObjBuilder(BSON(DatabaseType::name << dbname));
     updateQueryBuilder.append(DatabaseType::version.name(), currentDatabaseVersion.toBSON());

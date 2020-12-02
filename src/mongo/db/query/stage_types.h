@@ -29,7 +29,19 @@
 
 #pragma once
 
+#include <cstdint>
+
+#include "mongo/base/string_data.h"
+
 namespace mongo {
+/**
+ * This type acts as an identifier for a node in a query plan tree, such as a 'QuerySolution' tree
+ * or an 'sbe::PlanStage' tree.
+ *
+ * An id of 0 is used to represent the absence of an explicitly assigned id.
+ */
+using PlanNodeId = uint32_t;
+static constexpr PlanNodeId kEmptyPlanNodeId = 0u;
 
 /**
  * These map to implementations of the PlanStage interface, all of which live in db/exec/
@@ -39,6 +51,10 @@ enum StageType {
     STAGE_AND_SORTED,
     STAGE_CACHED_PLAN,
     STAGE_COLLSCAN,
+
+    // A virtual scan stage that simulates a collection scan and doesn't depend on underlying
+    // storage.
+    STAGE_VIRTUAL_SCAN,
 
     // This stage sits at the root of the query tree and counts up the number of results
     // returned by its child.
@@ -70,6 +86,8 @@ enum StageType {
     STAGE_IXSCAN,
     STAGE_LIMIT,
 
+    STAGE_MOCK,
+
     // Implements iterating over one or more RecordStore::Cursor.
     STAGE_MULTI_ITERATOR,
 
@@ -80,10 +98,6 @@ enum StageType {
     STAGE_PROJECTION_DEFAULT,
     STAGE_PROJECTION_COVERED,
     STAGE_PROJECTION_SIMPLE,
-
-    // Stages for running aggregation pipelines.
-    STAGE_CHANGE_STREAM_PROXY,
-    STAGE_PIPELINE_PROXY,
 
     STAGE_QUEUED_DATA,
     STAGE_RECORD_STORE_FAST_COUNT,
@@ -132,4 +146,5 @@ inline bool isSortStageType(StageType stageType) {
     }
 }
 
+StringData stageTypeToString(StageType stageType);
 }  // namespace mongo

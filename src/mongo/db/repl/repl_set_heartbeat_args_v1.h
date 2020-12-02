@@ -115,6 +115,13 @@ public:
     }
 
     /**
+     * Gets the id of the node the sender believes to be primary or -1 if it is not known.
+     */
+    long long getPrimaryId() const {
+        return _primaryId;
+    }
+
+    /**
      * Returns whether or not the sender is checking for emptiness.
      */
     bool hasCheckEmpty() const {
@@ -143,8 +150,9 @@ public:
     void setHeartbeatVersion(long long newVal);
     void setSenderId(long long newVal);
     void setSenderHost(const HostAndPort& newVal);
-    void setSetName(const std::string& newVal);
+    void setSetName(StringData newVal);
     void setTerm(long long newVal);
+    void setPrimaryId(long long primaryId);
     void setCheckEmpty();
 
     /**
@@ -157,12 +165,15 @@ public:
     void addToBSON(BSONObjBuilder* builder) const;
 
 private:
+    static const long long kEmptyPrimaryId = -1;
+
     // look at the body of the isInitialized() function to see which fields are mandatory
     long long _configVersion = -1;
     long long _configTerm = OpTime::kUninitializedTerm;
     long long _heartbeatVersion = -1;
     long long _senderId = -1;
     long long _term = -1;
+    long long _primaryId = kEmptyPrimaryId;
     bool _checkEmpty = false;
     bool _hasSender = false;
     bool _hasHeartbeatVersion = false;

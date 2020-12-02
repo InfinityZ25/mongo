@@ -61,66 +61,60 @@ Document fromBson(BSONObj obj) {
     return Document(obj);
 }
 
-/** Check binary equality, ensuring use of the same numeric types. */
-static void assertBinaryEqual(const BSONObj& expected, const BSONObj& actual) {
-    ASSERT_BSONOBJ_EQ(expected, actual);
-    ASSERT(expected.binaryEqual(actual));
-}
-
 namespace FieldPath {
 
 /** The provided field path does not pass validation. */
 class Invalid {
 public:
     void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        ASSERT_THROWS(ExpressionFieldPath::create(expCtx, ""), AssertionException);
+        auto expCtx = ExpressionContextForTest{};
+        ASSERT_THROWS(ExpressionFieldPath::deprecatedCreate(&expCtx, ""), AssertionException);
     }
 };
 
 TEST(FieldPath, NoOptimizationForRootFieldPathWithDottedPath) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto expCtx = ExpressionContextForTest{};
     intrusive_ptr<ExpressionFieldPath> expression =
-        ExpressionFieldPath::parse(expCtx, "$$ROOT.x.y", expCtx->variablesParseState);
+        ExpressionFieldPath::parse(&expCtx, "$$ROOT.x.y", expCtx.variablesParseState);
 
     // An attempt to optimize returns the Expression itself.
     ASSERT_EQUALS(expression, expression->optimize());
 }
 
 TEST(FieldPath, NoOptimizationForCurrentFieldPathWithDottedPath) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto expCtx = ExpressionContextForTest{};
     intrusive_ptr<ExpressionFieldPath> expression =
-        ExpressionFieldPath::parse(expCtx, "$$CURRENT.x.y", expCtx->variablesParseState);
+        ExpressionFieldPath::parse(&expCtx, "$$CURRENT.x.y", expCtx.variablesParseState);
 
     // An attempt to optimize returns the Expression itself.
     ASSERT_EQUALS(expression, expression->optimize());
 }
 
 TEST(FieldPath, RemoveOptimizesToMissingValue) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto expCtx = ExpressionContextForTest{};
     intrusive_ptr<ExpressionFieldPath> expression =
-        ExpressionFieldPath::parse(expCtx, "$$REMOVE", expCtx->variablesParseState);
+        ExpressionFieldPath::parse(&expCtx, "$$REMOVE", expCtx.variablesParseState);
 
     auto optimizedExpr = expression->optimize();
 
     ASSERT_VALUE_EQ(
         Value(),
-        optimizedExpr->evaluate(Document(BSON("x" << BSON("y" << 123))), &expCtx->variables));
+        optimizedExpr->evaluate(Document(BSON("x" << BSON("y" << 123))), &expCtx.variables));
 }
 
 TEST(FieldPath, NoOptimizationOnNormalPath) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a");
+    auto expCtx = ExpressionContextForTest{};
+    intrusive_ptr<Expression> expression = ExpressionFieldPath::deprecatedCreate(&expCtx, "a");
     // An attempt to optimize returns the Expression itself.
     ASSERT_EQUALS(expression, expression->optimize());
 }
 
 TEST(FieldPath, OptimizeOnVariableWithConstantScalarValue) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto varId = expCtx->variablesParseState.defineVariable("userVar");
-    expCtx->variables.setConstantValue(varId, Value(123));
+    auto expCtx = ExpressionContextForTest{};
+    auto varId = expCtx.variablesParseState.defineVariable("userVar");
+    expCtx.variables.setConstantValue(varId, Value(123));
 
-    auto expr = ExpressionFieldPath::parse(expCtx, "$$userVar", expCtx->variablesParseState);
+    auto expr = ExpressionFieldPath::parse(&expCtx, "$$userVar", expCtx.variablesParseState);
     ASSERT_TRUE(dynamic_cast<ExpressionFieldPath*>(expr.get()));
 
     auto optimizedExpr = expr->optimize();
@@ -128,11 +122,11 @@ TEST(FieldPath, OptimizeOnVariableWithConstantScalarValue) {
 }
 
 TEST(FieldPath, OptimizeOnVariableWithConstantArrayValue) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto varId = expCtx->variablesParseState.defineVariable("userVar");
-    expCtx->variables.setConstantValue(varId, Value(BSON_ARRAY(1 << 2 << 3)));
+    auto expCtx = ExpressionContextForTest{};
+    auto varId = expCtx.variablesParseState.defineVariable("userVar");
+    expCtx.variables.setConstantValue(varId, Value(BSON_ARRAY(1 << 2 << 3)));
 
-    auto expr = ExpressionFieldPath::parse(expCtx, "$$userVar", expCtx->variablesParseState);
+    auto expr = ExpressionFieldPath::parse(&expCtx, "$$userVar", expCtx.variablesParseState);
     ASSERT_TRUE(dynamic_cast<ExpressionFieldPath*>(expr.get()));
 
     auto optimizedExpr = expr->optimize();
@@ -142,11 +136,11 @@ TEST(FieldPath, OptimizeOnVariableWithConstantArrayValue) {
 }
 
 TEST(FieldPath, OptimizeToEmptyArrayOnNumericalPathComponentAndConstantArrayValue) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto varId = expCtx->variablesParseState.defineVariable("userVar");
-    expCtx->variables.setConstantValue(varId, Value(BSON_ARRAY(1 << 2 << 3)));
+    auto expCtx = ExpressionContextForTest{};
+    auto varId = expCtx.variablesParseState.defineVariable("userVar");
+    expCtx.variables.setConstantValue(varId, Value(BSON_ARRAY(1 << 2 << 3)));
 
-    auto expr = ExpressionFieldPath::parse(expCtx, "$$userVar.1", expCtx->variablesParseState);
+    auto expr = ExpressionFieldPath::parse(&expCtx, "$$userVar.1", expCtx.variablesParseState);
     ASSERT_TRUE(dynamic_cast<ExpressionFieldPath*>(expr.get()));
 
     auto optimizedExpr = expr->optimize();
@@ -156,11 +150,11 @@ TEST(FieldPath, OptimizeToEmptyArrayOnNumericalPathComponentAndConstantArrayValu
 }
 
 TEST(FieldPath, OptimizeOnVariableWithConstantValueAndDottedPath) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto varId = expCtx->variablesParseState.defineVariable("userVar");
-    expCtx->variables.setConstantValue(varId, Value(Document{{"x", Document{{"y", 123}}}}));
+    auto expCtx = ExpressionContextForTest{};
+    auto varId = expCtx.variablesParseState.defineVariable("userVar");
+    expCtx.variables.setConstantValue(varId, Value(Document{{"x", Document{{"y", 123}}}}));
 
-    auto expr = ExpressionFieldPath::parse(expCtx, "$$userVar.x.y", expCtx->variablesParseState);
+    auto expr = ExpressionFieldPath::parse(&expCtx, "$$userVar.x.y", expCtx.variablesParseState);
     ASSERT_TRUE(dynamic_cast<ExpressionFieldPath*>(expr.get()));
 
     auto optimizedExpr = expr->optimize();
@@ -170,10 +164,10 @@ TEST(FieldPath, OptimizeOnVariableWithConstantValueAndDottedPath) {
 }
 
 TEST(FieldPath, NoOptimizationOnVariableWithNoValue) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->variablesParseState.defineVariable("userVar");
+    auto expCtx = ExpressionContextForTest{};
+    expCtx.variablesParseState.defineVariable("userVar");
 
-    auto expr = ExpressionFieldPath::parse(expCtx, "$$userVar", expCtx->variablesParseState);
+    auto expr = ExpressionFieldPath::parse(&expCtx, "$$userVar", expCtx.variablesParseState);
     ASSERT_TRUE(dynamic_cast<ExpressionFieldPath*>(expr.get()));
 
     auto optimizedExpr = expr->optimize();
@@ -181,11 +175,11 @@ TEST(FieldPath, NoOptimizationOnVariableWithNoValue) {
 }
 
 TEST(FieldPath, NoOptimizationOnVariableWithMissingValue) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto varId = expCtx->variablesParseState.defineVariable("userVar");
-    expCtx->variables.setValue(varId, Value());
+    auto expCtx = ExpressionContextForTest{};
+    auto varId = expCtx.variablesParseState.defineVariable("userVar");
+    expCtx.variables.setValue(varId, Value());
 
-    auto expr = ExpressionFieldPath::parse(expCtx, "$$userVar", expCtx->variablesParseState);
+    auto expr = ExpressionFieldPath::parse(&expCtx, "$$userVar", expCtx.variablesParseState);
     ASSERT_TRUE(dynamic_cast<ExpressionFieldPath*>(expr.get()));
 
     auto optimizedExpr = expr->optimize();
@@ -193,11 +187,11 @@ TEST(FieldPath, NoOptimizationOnVariableWithMissingValue) {
 }
 
 TEST(FieldPath, ScalarVariableWithDottedFieldPathOptimizesToConstantMissingValue) {
-    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    auto varId = expCtx->variablesParseState.defineVariable("userVar");
-    expCtx->variables.setConstantValue(varId, Value(123));
+    auto expCtx = ExpressionContextForTest{};
+    auto varId = expCtx.variablesParseState.defineVariable("userVar");
+    expCtx.variables.setConstantValue(varId, Value(123));
 
-    auto expr = ExpressionFieldPath::parse(expCtx, "$$userVar.x.y", expCtx->variablesParseState);
+    auto expr = ExpressionFieldPath::parse(&expCtx, "$$userVar.x.y", expCtx.variablesParseState);
     ASSERT_TRUE(dynamic_cast<ExpressionFieldPath*>(expr.get()));
 
     auto optimizedExpr = expr->optimize();
@@ -210,8 +204,9 @@ TEST(FieldPath, ScalarVariableWithDottedFieldPathOptimizesToConstantMissingValue
 class Dependencies {
 public:
     void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b");
+        auto expCtx = ExpressionContextForTest{};
+        intrusive_ptr<Expression> expression =
+            ExpressionFieldPath::deprecatedCreate(&expCtx, "a.b");
         DepsTracker dependencies;
         expression->addDependencies(&dependencies);
         ASSERT_EQUALS(1U, dependencies.fields.size());
@@ -225,9 +220,10 @@ public:
 class Missing {
 public:
     void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a");
-        assertBinaryEqual(fromjson("{}"), toBson(expression->evaluate({}, &expCtx->variables)));
+        auto expCtx = ExpressionContextForTest{};
+        intrusive_ptr<Expression> expression = ExpressionFieldPath::deprecatedCreate(&expCtx, "a");
+        ASSERT_BSONOBJ_BINARY_EQ(fromjson("{}"),
+                                 toBson(expression->evaluate({}, &expCtx.variables)));
     }
 };
 
@@ -235,11 +231,11 @@ public:
 class Present {
 public:
     void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a");
-        assertBinaryEqual(
+        auto expCtx = ExpressionContextForTest{};
+        intrusive_ptr<Expression> expression = ExpressionFieldPath::deprecatedCreate(&expCtx, "a");
+        ASSERT_BSONOBJ_BINARY_EQ(
             fromjson("{'':123}"),
-            toBson(expression->evaluate(fromBson(BSON("a" << 123)), &expCtx->variables)));
+            toBson(expression->evaluate(fromBson(BSON("a" << 123)), &expCtx.variables)));
     }
 };
 
@@ -247,11 +243,12 @@ public:
 class NestedBelowNull {
 public:
     void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b");
-        assertBinaryEqual(
+        auto expCtx = ExpressionContextForTest{};
+        intrusive_ptr<Expression> expression =
+            ExpressionFieldPath::deprecatedCreate(&expCtx, "a.b");
+        ASSERT_BSONOBJ_BINARY_EQ(
             fromjson("{}"),
-            toBson(expression->evaluate(fromBson(fromjson("{a:null}")), &expCtx->variables)));
+            toBson(expression->evaluate(fromBson(fromjson("{a:null}")), &expCtx.variables)));
     }
 };
 
@@ -259,11 +256,12 @@ public:
 class NestedBelowUndefined {
 public:
     void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b");
-        assertBinaryEqual(
+        auto expCtx = ExpressionContextForTest{};
+        intrusive_ptr<Expression> expression =
+            ExpressionFieldPath::deprecatedCreate(&expCtx, "a.b");
+        ASSERT_BSONOBJ_BINARY_EQ(
             fromjson("{}"),
-            toBson(expression->evaluate(fromBson(fromjson("{a:undefined}")), &expCtx->variables)));
+            toBson(expression->evaluate(fromBson(fromjson("{a:undefined}")), &expCtx.variables)));
     }
 };
 
@@ -271,11 +269,12 @@ public:
 class NestedBelowMissing {
 public:
     void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b");
-        assertBinaryEqual(
+        auto expCtx = ExpressionContextForTest{};
+        intrusive_ptr<Expression> expression =
+            ExpressionFieldPath::deprecatedCreate(&expCtx, "a.b");
+        ASSERT_BSONOBJ_BINARY_EQ(
             fromjson("{}"),
-            toBson(expression->evaluate(fromBson(fromjson("{z:1}")), &expCtx->variables)));
+            toBson(expression->evaluate(fromBson(fromjson("{z:1}")), &expCtx.variables)));
     }
 };
 
@@ -283,11 +282,12 @@ public:
 class NestedBelowInt {
 public:
     void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b");
-        assertBinaryEqual(
+        auto expCtx = ExpressionContextForTest{};
+        intrusive_ptr<Expression> expression =
+            ExpressionFieldPath::deprecatedCreate(&expCtx, "a.b");
+        ASSERT_BSONOBJ_BINARY_EQ(
             fromjson("{}"),
-            toBson(expression->evaluate(fromBson(BSON("a" << 2)), &expCtx->variables)));
+            toBson(expression->evaluate(fromBson(BSON("a" << 2)), &expCtx.variables)));
     }
 };
 
@@ -295,11 +295,12 @@ public:
 class NestedValue {
 public:
     void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b");
-        assertBinaryEqual(BSON("" << 55),
-                          toBson(expression->evaluate(fromBson(BSON("a" << BSON("b" << 55))),
-                                                      &expCtx->variables)));
+        auto expCtx = ExpressionContextForTest{};
+        intrusive_ptr<Expression> expression =
+            ExpressionFieldPath::deprecatedCreate(&expCtx, "a.b");
+        ASSERT_BSONOBJ_BINARY_EQ(BSON("" << 55),
+                                 toBson(expression->evaluate(fromBson(BSON("a" << BSON("b" << 55))),
+                                                             &expCtx.variables)));
     }
 };
 
@@ -307,11 +308,12 @@ public:
 class NestedBelowEmptyObject {
 public:
     void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b");
-        assertBinaryEqual(
+        auto expCtx = ExpressionContextForTest{};
+        intrusive_ptr<Expression> expression =
+            ExpressionFieldPath::deprecatedCreate(&expCtx, "a.b");
+        ASSERT_BSONOBJ_BINARY_EQ(
             fromjson("{}"),
-            toBson(expression->evaluate(fromBson(BSON("a" << BSONObj())), &expCtx->variables)));
+            toBson(expression->evaluate(fromBson(BSON("a" << BSONObj())), &expCtx.variables)));
     }
 };
 
@@ -319,11 +321,12 @@ public:
 class NestedBelowEmptyArray {
 public:
     void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b");
-        assertBinaryEqual(
+        auto expCtx = ExpressionContextForTest{};
+        intrusive_ptr<Expression> expression =
+            ExpressionFieldPath::deprecatedCreate(&expCtx, "a.b");
+        ASSERT_BSONOBJ_BINARY_EQ(
             BSON("" << BSONArray()),
-            toBson(expression->evaluate(fromBson(BSON("a" << BSONArray())), &expCtx->variables)));
+            toBson(expression->evaluate(fromBson(BSON("a" << BSONArray())), &expCtx.variables)));
     }
 };
 
@@ -331,11 +334,12 @@ public:
 class NestedBelowArrayWithNull {
 public:
     void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b");
-        assertBinaryEqual(
+        auto expCtx = ExpressionContextForTest{};
+        intrusive_ptr<Expression> expression =
+            ExpressionFieldPath::deprecatedCreate(&expCtx, "a.b");
+        ASSERT_BSONOBJ_BINARY_EQ(
             fromjson("{'':[]}"),
-            toBson(expression->evaluate(fromBson(fromjson("{a:[null]}")), &expCtx->variables)));
+            toBson(expression->evaluate(fromBson(fromjson("{a:[null]}")), &expCtx.variables)));
     }
 };
 
@@ -343,11 +347,12 @@ public:
 class NestedBelowArrayWithUndefined {
 public:
     void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b");
-        assertBinaryEqual(fromjson("{'':[]}"),
-                          toBson(expression->evaluate(fromBson(fromjson("{a:[undefined]}")),
-                                                      &expCtx->variables)));
+        auto expCtx = ExpressionContextForTest{};
+        intrusive_ptr<Expression> expression =
+            ExpressionFieldPath::deprecatedCreate(&expCtx, "a.b");
+        ASSERT_BSONOBJ_BINARY_EQ(
+            fromjson("{'':[]}"),
+            toBson(expression->evaluate(fromBson(fromjson("{a:[undefined]}")), &expCtx.variables)));
     }
 };
 
@@ -355,11 +360,12 @@ public:
 class NestedBelowArrayWithInt {
 public:
     void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b");
-        assertBinaryEqual(
+        auto expCtx = ExpressionContextForTest{};
+        intrusive_ptr<Expression> expression =
+            ExpressionFieldPath::deprecatedCreate(&expCtx, "a.b");
+        ASSERT_BSONOBJ_BINARY_EQ(
             fromjson("{'':[]}"),
-            toBson(expression->evaluate(fromBson(fromjson("{a:[1]}")), &expCtx->variables)));
+            toBson(expression->evaluate(fromBson(fromjson("{a:[1]}")), &expCtx.variables)));
     }
 };
 
@@ -367,11 +373,12 @@ public:
 class NestedWithinArray {
 public:
     void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b");
-        assertBinaryEqual(
+        auto expCtx = ExpressionContextForTest{};
+        intrusive_ptr<Expression> expression =
+            ExpressionFieldPath::deprecatedCreate(&expCtx, "a.b");
+        ASSERT_BSONOBJ_BINARY_EQ(
             fromjson("{'':[9]}"),
-            toBson(expression->evaluate(fromBson(fromjson("{a:[{b:9}]}")), &expCtx->variables)));
+            toBson(expression->evaluate(fromBson(fromjson("{a:[{b:9}]}")), &expCtx.variables)));
     }
 };
 
@@ -379,12 +386,14 @@ public:
 class MultipleArrayValues {
 public:
     void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b");
-        assertBinaryEqual(fromjson("{'':[9,20]}"),
-                          toBson(expression->evaluate(
-                              fromBson(fromjson("{a:[{b:9},null,undefined,{g:4},{b:20},{}]}")),
-                              &expCtx->variables)));
+        auto expCtx = ExpressionContextForTest{};
+        intrusive_ptr<Expression> expression =
+            ExpressionFieldPath::deprecatedCreate(&expCtx, "a.b");
+        ASSERT_BSONOBJ_BINARY_EQ(
+            fromjson("{'':[9,20]}"),
+            toBson(expression->evaluate(
+                fromBson(fromjson("{a:[{b:9},null,undefined,{g:4},{b:20},{}]}")),
+                &expCtx.variables)));
     }
 };
 
@@ -392,15 +401,17 @@ public:
 class ExpandNestedArrays {
 public:
     void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b.c");
-        assertBinaryEqual(fromjson("{'':[[1,2],3,[4],[[5]],[6,7]]}"),
-                          toBson(expression->evaluate(fromBson(fromjson("{a:[{b:[{c:1},{c:2}]},"
-                                                                        "{b:{c:3}},"
-                                                                        "{b:[{c:4}]},"
-                                                                        "{b:[{c:[5]}]},"
-                                                                        "{b:{c:[6,7]}}]}")),
-                                                      &expCtx->variables)));
+        auto expCtx = ExpressionContextForTest{};
+        intrusive_ptr<Expression> expression =
+            ExpressionFieldPath::deprecatedCreate(&expCtx, "a.b.c");
+        ASSERT_BSONOBJ_BINARY_EQ(
+            fromjson("{'':[[1,2],3,[4],[[5]],[6,7]]}"),
+            toBson(expression->evaluate(fromBson(fromjson("{a:[{b:[{c:1},{c:2}]},"
+                                                          "{b:{c:3}},"
+                                                          "{b:[{c:4}]},"
+                                                          "{b:[{c:[5]}]},"
+                                                          "{b:{c:[6,7]}}]}")),
+                                        &expCtx.variables)));
     }
 };
 
@@ -408,11 +419,12 @@ public:
 class AddToBsonObj {
 public:
     void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b.c");
-        assertBinaryEqual(BSON("foo"
-                               << "$a.b.c"),
-                          BSON("foo" << expression->serialize(false)));
+        auto expCtx = ExpressionContextForTest{};
+        intrusive_ptr<Expression> expression =
+            ExpressionFieldPath::deprecatedCreate(&expCtx, "a.b.c");
+        ASSERT_BSONOBJ_BINARY_EQ(BSON("foo"
+                                      << "$a.b.c"),
+                                 BSON("foo" << expression->serialize(false)));
     }
 };
 
@@ -420,11 +432,12 @@ public:
 class AddToBsonArray {
 public:
     void run() {
-        intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-        intrusive_ptr<Expression> expression = ExpressionFieldPath::create(expCtx, "a.b.c");
+        auto expCtx = ExpressionContextForTest{};
+        intrusive_ptr<Expression> expression =
+            ExpressionFieldPath::deprecatedCreate(&expCtx, "a.b.c");
         BSONArrayBuilder bab;
         bab << expression->serialize(false);
-        assertBinaryEqual(BSON_ARRAY("$a.b.c"), bab.arr());
+        ASSERT_BSONOBJ_BINARY_EQ(BSON_ARRAY("$a.b.c"), bab.arr());
     }
 };
 

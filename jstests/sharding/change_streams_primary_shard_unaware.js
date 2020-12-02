@@ -7,19 +7,12 @@
 //     blacklist_from_rhel_67_s390x,
 //     requires_persistence,
 //     uses_change_streams,
+//     requires_majority_read_concern
 // ]
 (function() {
 "use strict";
 
 load('jstests/libs/change_stream_util.js');  // For ChangeStreamTest.
-
-// For supportsMajorityReadConcern().
-load("jstests/multiVersion/libs/causal_consistency_helpers.js");
-
-if (!supportsMajorityReadConcern()) {
-    jsTestLog("Skipping test since storage engine doesn't support majority read concern.");
-    return;
-}
 
 // Returns true if the shard is aware that the collection is sharded.
 function isShardAware(shard, coll) {
@@ -27,6 +20,12 @@ function isShardAware(shard, coll) {
     assert.commandWorked(res);
     return res.metadata.collVersion != undefined;
 }
+
+// Disable checking for index consistency to ensure that the config server doesn't trigger a
+// StaleShardVersion exception on shard0 and cause it to refresh its sharding metadata.
+const nodeOptions = {
+    setParameter: {enableShardedIndexConsistencyCheck: false}
+};
 
 const testName = "change_streams_primary_shard_unaware";
 const st = new ShardingTest({
@@ -37,6 +36,7 @@ const st = new ShardingTest({
         // Use a higher frequency for periodic noops to speed up the test.
         setParameter: {periodicNoopIntervalSecs: 1, writePeriodicNoops: true},
     },
+    other: {configOptions: nodeOptions}
 });
 
 const mongosDB = st.s0.getDB(testName);
@@ -133,7 +133,7 @@ cst.assertNextChangesEqual({
         fullDocument: {_id: 1, a: 1, b: 1},
         ns: {db: mongosDB.getName(), coll: mongosColl.getName()},
         operationType: "update",
-        updateDescription: {removedFields: [], updatedFields: {b: 1}}
+        updateDescription: {removedFields: [], updatedFields: {b: 1}, truncatedArrays: []}
     }]
 });
 mongos1ChangeDoc = cstMongos1.getOneChange(cursorMongos1);

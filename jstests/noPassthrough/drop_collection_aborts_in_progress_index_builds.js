@@ -9,12 +9,6 @@ load("jstests/noPassthrough/libs/index_build.js");
 const mongodOptions = {};
 const conn = MongoRunner.runMongod(mongodOptions);
 
-if (!IndexBuildTest.supportsTwoPhaseIndexBuild(conn)) {
-    jsTest.log("Not running because two phase index builds are not supported.");
-    MongoRunner.stopMongod(conn);
-    return;
-}
-
 const dbName = "drop_collection_aborts_in_progress_index_builds";
 const collName = "test";
 
@@ -50,7 +44,7 @@ const awaitDrop = startParallelShell(() => {
 }, conn.port);
 
 try {
-    checkLog.contains(testDB.getMongo(), "About to abort all index builders on collection");
+    checkLog.containsJson(testDB.getMongo(), 23879);  // "About to abort all index builders"
 } finally {
     IndexBuildTest.resumeIndexBuilds(testDB.getMongo());
 }

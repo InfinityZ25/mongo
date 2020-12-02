@@ -1,4 +1,8 @@
-// @tags: [does_not_support_stepdowns, requires_getmore, requires_profiling]
+// @tags: [
+//   does_not_support_stepdowns,
+//   requires_getmore,
+//   requires_profiling,
+// ]
 
 // Confirms that a listIndexes command and subsequent getMores of its cursor are profiled correctly.
 
@@ -15,7 +19,7 @@ const numIndexes = 5;
 for (let i = 0; i < numIndexes; ++i) {
     let indexSpec = {};
     indexSpec["fakeField_" + i] = 1;
-    assert.commandWorked(testColl.ensureIndex(indexSpec));
+    assert.commandWorked(testColl.createIndex(indexSpec));
 }
 
 testDB.setProfilingLevel(2);

@@ -19,13 +19,13 @@ var rs = new ReplSetTest({name: 'testSet', nodes: 3, nodeOptions: {verbose: 2}})
 var nodes = rs.startSet();
 rs.initiate();
 
-var master = rs.getPrimary();
+var primary = rs.getPrimary();
 
 var everyoneOkSoon = function() {
     var status;
     assert.soon(function() {
         var ok = true;
-        status = master.adminCommand({replSetGetStatus: 1});
+        status = primary.adminCommand({replSetGetStatus: 1});
 
         if (!status.members) {
             return false;
@@ -50,12 +50,12 @@ var checkPrimaryIs = function(node) {
         var ok = true;
 
         try {
-            status = master.adminCommand({replSetGetStatus: 1});
+            status = primary.adminCommand({replSetGetStatus: 1});
         } catch (e) {
             print(e);
             print("nreplsets_priority1.js checkPrimaryIs reconnecting");
-            reconnect(master);
-            status = master.adminCommand({replSetGetStatus: 1});
+            reconnect(primary);
+            status = primary.adminCommand({replSetGetStatus: 1});
         }
 
         var str = "goal: " + node.host + "==1 states: ";
@@ -92,7 +92,7 @@ everyoneOkSoon();
 jsTestLog("replsets_priority1.js initial sync");
 
 // intial sync
-master.getDB("foo").bar.insert({x: 1});
+primary.getDB("foo").bar.insert({x: 1});
 rs.awaitReplication();
 
 jsTestLog("replsets_priority1.js starting loop");
@@ -103,8 +103,8 @@ for (var i = 0; i < n; i++) {
 
     var max = null;
     var second = null;
-    master = rs.getPrimary();
-    var config = master.getDB("local").system.replset.findOne();
+    primary = rs.getPrimary();
+    var config = primary.getDB("local").system.replset.findOne();
 
     var version = config.version;
     config.version++;
@@ -129,26 +129,27 @@ for (var i = 0; i < n; i++) {
     }
 
     jsTestLog("replsets_priority1.js max is " + max.host + " with priority " + max.priority +
-              ", reconfiguring on " + master.host);
+              ", reconfiguring on " + primary.host);
 
-    assert.soon(() => isConfigCommitted(master));
-    assert.commandWorked(master.adminCommand({replSetReconfig: config}));
+    assert.soon(() => isConfigCommitted(primary));
+    assert.commandWorked(primary.adminCommand({replSetReconfig: config}));
 
-    jsTestLog("replsets_priority1.js wait for 2 slaves");
+    jsTestLog("replsets_priority1.js wait for 2 secondaries");
 
     assert.soon(function() {
         rs.getPrimary();
-        return rs._slaves.length == 2;
-    }, "2 slaves");
+        return rs.getSecondaries().length == 2;
+    }, "2 secondaries");
 
     jsTestLog("replsets_priority1.js wait for new config version " + config.version);
 
     assert.soon(function() {
         var versions = [0, 0];
-        rs._slaves[0].setSlaveOk();
-        versions[0] = rs._slaves[0].getDB("local").system.replset.findOne().version;
-        rs._slaves[1].setSlaveOk();
-        versions[1] = rs._slaves[1].getDB("local").system.replset.findOne().version;
+        var secondaries = rs.getSecondaries();
+        secondaries[0].setSecondaryOk();
+        versions[0] = secondaries[0].getDB("local").system.replset.findOne().version;
+        secondaries[1].setSecondaryOk();
+        versions[1] = secondaries[1].getDB("local").system.replset.findOne().version;
         return versions[0] == config.version && versions[1] == config.version;
     });
 
@@ -169,7 +170,7 @@ for (var i = 0; i < n; i++) {
 
     rs.stop(max._id);
 
-    master = rs.getPrimary();
+    primary = rs.getPrimary();
 
     jsTestLog("killed max primary.  Checking statuses.");
 
@@ -177,15 +178,15 @@ for (var i = 0; i < n; i++) {
     checkPrimaryIs(second);
 
     // Wait for election oplog entry to be replicated, to avoid rollbacks later on.
-    let liveSlaves = rs.nodes.filter(function(node) {
+    let liveSecondaries = rs.nodes.filter(function(node) {
         return node.host !== max.host && node.host !== second.host;
     });
-    rs.awaitReplication(null, null, liveSlaves);
+    rs.awaitReplication(null, null, liveSecondaries);
 
     jsTestLog("restart max " + max._id);
 
     rs.restart(max._id);
-    master = rs.getPrimary();
+    primary = rs.getPrimary();
 
     jsTestLog("max restarted.  Checking statuses.");
     checkPrimaryIs(max);

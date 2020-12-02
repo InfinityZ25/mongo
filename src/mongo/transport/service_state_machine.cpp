@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -45,7 +45,7 @@
 #include "mongo/rpc/op_msg.h"
 #include "mongo/transport/message_compressor_manager.h"
 #include "mongo/transport/service_entry_point.h"
-#include "mongo/transport/service_executor_task_names.h"
+#include "mongo/transport/service_executor_synchronous.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/util/assert_util.h"
@@ -55,6 +55,7 @@
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/net/socket_exception.h"
+#include "mongo/util/net/ssl_peer_info.h"
 #include "mongo/util/quick_exit.h"
 
 namespace mongo {
@@ -300,11 +301,11 @@ ServiceStateMachine::ServiceStateMachine(ServiceContext* svcContext,
       _sep{svcContext->getServiceEntryPoint()},
       _transportMode(transportMode),
       _serviceContext(svcContext),
-      _serviceExecutor(_serviceContext->getServiceExecutor()),
       _sessionHandle(session),
       _threadName{str::stream() << "conn" << _session()->id()},
       _dbClient{svcContext->makeClient(_threadName, std::move(session))},
-      _dbClientPtr{_dbClient.get()} {}
+      _dbClientPtr{_dbClient.get()},
+      _serviceExecutor(transport::ServiceExecutorSynchronous::get(_serviceContext)) {}
 
 const transport::SessionHandle& ServiceStateMachine::_session() const {
     return _sessionHandle;
@@ -375,17 +376,16 @@ void ServiceStateMachine::_sourceCallback(Status status) {
         // If this callback doesn't own the ThreadGuard, then we're being called recursively,
         // and the executor shouldn't start a new thread to process the message - it can use this
         // one just after this returns.
-        return _scheduleNextWithGuard(std::move(guard),
-                                      ServiceExecutor::kMayRecurse,
-                                      transport::ServiceExecutorTaskName::kSSMProcessMessage);
+        return _scheduleNextWithGuard(std::move(guard), ServiceExecutor::kMayRecurse);
     } else if (ErrorCodes::isInterruption(status.code()) ||
                ErrorCodes::isNetworkError(status.code())) {
         LOGV2_DEBUG(
             22986,
             2,
-            "Session from {remote} encountered a network error during SourceMessage: {status}",
+            "Session from {remote} encountered a network error during SourceMessage: {error}",
+            "Session from remote encountered a network error during SourceMessage",
             "remote"_attr = remote,
-            "status"_attr = status);
+            "error"_attr = status);
         _state.store(State::EndSession);
     } else if (status == TransportLayer::TicketSessionClosedStatus) {
         // Our session may have been closed internally.
@@ -396,11 +396,10 @@ void ServiceStateMachine::_sourceCallback(Status status) {
         _state.store(State::EndSession);
     } else {
         LOGV2(22988,
-              "Error receiving request from client: {status}. Ending connection from {remote} "
-              "(connection id: {session_id})",
-              "status"_attr = status,
+              "Error receiving request from client. Ending connection from remote",
+              "error"_attr = status,
               "remote"_attr = remote,
-              "session_id"_attr = _session()->id());
+              "connectionId"_attr = _session()->id());
         _state.store(State::EndSession);
     }
 
@@ -423,25 +422,22 @@ void ServiceStateMachine::_sinkCallback(Status status) {
     // scheduleNext() to unwind the stack and do the next step.
     if (!status.isOK()) {
         LOGV2(22989,
-              "Error sending response to client: {status}. Ending connection from {session_remote} "
-              "(connection id: {session_id})",
-              "status"_attr = status,
-              "session_remote"_attr = _session()->remote(),
-              "session_id"_attr = _session()->id());
+              "Error sending response to client. Ending connection from remote",
+              "error"_attr = status,
+              "remote"_attr = _session()->remote(),
+              "connectionId"_attr = _session()->id());
         _state.store(State::EndSession);
         return _runNextInGuard(std::move(guard));
     } else if (_inExhaust) {
         _state.store(State::Process);
         return _scheduleNextWithGuard(std::move(guard),
                                       ServiceExecutor::kDeferredTask |
-                                          ServiceExecutor::kMayYieldBeforeSchedule,
-                                      transport::ServiceExecutorTaskName::kSSMExhaustMessage);
+                                          ServiceExecutor::kMayYieldBeforeSchedule);
     } else {
         _state.store(State::Source);
         return _scheduleNextWithGuard(std::move(guard),
                                       ServiceExecutor::kDeferredTask |
-                                          ServiceExecutor::kMayYieldBeforeSchedule,
-                                      transport::ServiceExecutorTaskName::kSSMSourceMessage);
+                                          ServiceExecutor::kMayYieldBeforeSchedule);
     }
 }
 
@@ -472,60 +468,68 @@ void ServiceStateMachine::_processMessage(ThreadGuard guard) {
 
     // The handleRequest is implemented in a subclass for mongod/mongos and actually all the
     // database work for this request.
-    DbResponse dbresponse = _sep->handleRequest(opCtx.get(), _inMessage);
+    _sep->handleRequest(opCtx.get(), _inMessage)
+        .then([this,
+               &compressorMgr = compressorMgr,
+               opCtx = std::move(opCtx),
+               guard = std::move(guard)](DbResponse dbresponse) mutable -> void {
+            // opCtx must be killed and delisted here so that the operation cannot show up in
+            // currentOp results after the response reaches the client. The destruction is postponed
+            // for later to mitigate its performance impact on the critical path of execution.
+            _serviceContext->killAndDelistOperation(opCtx.get(),
+                                                    ErrorCodes::OperationIsKilledAndDelisted);
+            invariant(!_killedOpCtx);
+            _killedOpCtx = std::move(opCtx);
 
-    // opCtx must be destroyed here so that the operation cannot show
-    // up in currentOp results after the response reaches the client
-    opCtx.reset();
+            // Format our response, if we have one
+            Message& toSink = dbresponse.response;
+            if (!toSink.empty()) {
+                invariant(!OpMsg::isFlagSet(_inMessage, OpMsg::kMoreToCome));
+                invariant(!OpMsg::isFlagSet(toSink, OpMsg::kChecksumPresent));
 
-    // Format our response, if we have one
-    Message& toSink = dbresponse.response;
-    if (!toSink.empty()) {
-        invariant(!OpMsg::isFlagSet(_inMessage, OpMsg::kMoreToCome));
-        invariant(!OpMsg::isFlagSet(toSink, OpMsg::kChecksumPresent));
-
-        // Update the header for the response message.
-        toSink.header().setId(nextMessageId());
-        toSink.header().setResponseToMsgId(_inMessage.header().getId());
-        if (OpMsg::isFlagSet(_inMessage, OpMsg::kChecksumPresent)) {
+                // Update the header for the response message.
+                toSink.header().setId(nextMessageId());
+                toSink.header().setResponseToMsgId(_inMessage.header().getId());
+                if (OpMsg::isFlagSet(_inMessage, OpMsg::kChecksumPresent)) {
 #ifdef MONGO_CONFIG_SSL
-            if (!SSLPeerInfo::forSession(_session()).isTLS) {
-                OpMsg::appendChecksum(&toSink);
-            }
+                    if (!SSLPeerInfo::forSession(_session()).isTLS) {
+                        OpMsg::appendChecksum(&toSink);
+                    }
 #else
-            OpMsg::appendChecksum(&toSink);
+                    OpMsg::appendChecksum(&toSink);
 #endif
-        }
+                }
 
-        // If the incoming message has the exhaust flag set, then we bypass the normal RPC behavior.
-        // We will sink the response to the network, but we also synthesize a new request, as if we
-        // sourced a new message from the network. This new request is sent to the database once
-        // again to be processed. This cycle repeats as long as the command indicates the exhaust
-        // stream should continue.
-        _inMessage = makeExhaustMessage(_inMessage, &dbresponse);
-        _inExhaust = !_inMessage.empty();
+                // If the incoming message has the exhaust flag set, then we bypass the normal RPC
+                // behavior. We will sink the response to the network, but we also synthesize a new
+                // request, as if we sourced a new message from the network. This new request is
+                // sent to the database once again to be processed. This cycle repeats as long as
+                // the command indicates the exhaust stream should continue.
+                _inMessage = makeExhaustMessage(_inMessage, &dbresponse);
+                _inExhaust = !_inMessage.empty();
 
-        networkCounter.hitLogicalOut(toSink.size());
+                networkCounter.hitLogicalOut(toSink.size());
 
-        if (_compressorId) {
-            auto swm = compressorMgr.compressMessage(toSink, &_compressorId.value());
-            uassertStatusOK(swm.getStatus());
-            toSink = swm.getValue();
-        }
+                if (_compressorId) {
+                    auto swm = compressorMgr.compressMessage(toSink, &_compressorId.value());
+                    uassertStatusOK(swm.getStatus());
+                    toSink = swm.getValue();
+                }
 
-        TrafficRecorder::get(_serviceContext)
-            .observe(_sessionHandle, _serviceContext->getPreciseClockSource()->now(), toSink);
+                TrafficRecorder::get(_serviceContext)
+                    .observe(
+                        _sessionHandle, _serviceContext->getPreciseClockSource()->now(), toSink);
 
-        _sinkMessage(std::move(guard), std::move(toSink));
+                _sinkMessage(std::move(guard), std::move(toSink));
 
-    } else {
-        _state.store(State::Source);
-        _inMessage.reset();
-        _inExhaust = false;
-        return _scheduleNextWithGuard(std::move(guard),
-                                      ServiceExecutor::kDeferredTask,
-                                      transport::ServiceExecutorTaskName::kSSMSourceMessage);
-    }
+            } else {
+                _state.store(State::Source);
+                _inMessage.reset();
+                _inExhaust = false;
+                return _scheduleNextWithGuard(std::move(guard), ServiceExecutor::kDeferredTask);
+            }
+        })
+        .get();
 }
 
 void ServiceStateMachine::runNext() {
@@ -540,6 +544,12 @@ void ServiceStateMachine::_runNextInGuard(ThreadGuard guard) {
     if (curState == State::Created) {
         curState = State::Source;
         _state.store(curState);
+    }
+
+    // Destroy the opCtx (already killed) here, to potentially use the delay between clients'
+    // requests to hide the destruction cost.
+    if (MONGO_likely(_killedOpCtx)) {
+        _killedOpCtx.reset();
     }
 
     // Make sure the current Client got set correctly
@@ -562,8 +572,9 @@ void ServiceStateMachine::_runNextInGuard(ThreadGuard guard) {
         return;
     } catch (const DBException& e) {
         LOGV2(22990,
-              "DBException handling request, closing client connection: {e}",
-              "e"_attr = redact(e));
+              "DBException handling request, closing client connection: {error}",
+              "DBException handling request, closing client connection",
+              "error"_attr = redact(e));
     }
     // No need to catch std::exception, as std::terminate will be called when the exception bubbles
     // to the top of the stack
@@ -576,10 +587,8 @@ void ServiceStateMachine::_runNextInGuard(ThreadGuard guard) {
 }
 
 void ServiceStateMachine::start(Ownership ownershipModel) {
-    _scheduleNextWithGuard(ThreadGuard(this),
-                           transport::ServiceExecutor::kEmptyFlags,
-                           transport::ServiceExecutorTaskName::kSSMStartSession,
-                           ownershipModel);
+    _scheduleNextWithGuard(
+        ThreadGuard(this), transport::ServiceExecutor::kEmptyFlags, ownershipModel);
 }
 
 void ServiceStateMachine::setServiceExecutor(ServiceExecutor* executor) {
@@ -588,7 +597,6 @@ void ServiceStateMachine::setServiceExecutor(ServiceExecutor* executor) {
 
 void ServiceStateMachine::_scheduleNextWithGuard(ThreadGuard guard,
                                                  transport::ServiceExecutor::ScheduleFlags flags,
-                                                 transport::ServiceExecutorTaskName taskName,
                                                  Ownership ownershipModel) {
     auto func = [ssm = shared_from_this(), ownershipModel] {
         ThreadGuard guard(ssm.get());
@@ -597,7 +605,7 @@ void ServiceStateMachine::_scheduleNextWithGuard(ThreadGuard guard,
         ssm->_runNextInGuard(std::move(guard));
     };
     guard.release();
-    Status status = _serviceExecutor->schedule(std::move(func), flags, taskName);
+    Status status = _serviceExecutor->scheduleTask(std::move(func), flags);
     if (status.isOK()) {
         return;
     }
@@ -628,8 +636,8 @@ void ServiceStateMachine::terminateIfTagsDontMatch(transport::Session::TagMask t
     // set, then skip the termination check.
     if ((sessionTags & tags) || (sessionTags & transport::Session::kPending)) {
         LOGV2(22991,
-              "Skip closing connection for connection # {session_id}",
-              "session_id"_attr = _session()->id());
+              "Skip closing connection for connection",
+              "connectionId"_attr = _session()->id());
         return;
     }
 
@@ -648,9 +656,10 @@ ServiceStateMachine::State ServiceStateMachine::state() {
 void ServiceStateMachine::_terminateAndLogIfError(Status status) {
     if (!status.isOK()) {
         LOGV2_WARNING_OPTIONS(22993,
-                              {logComponentV1toV2(logger::LogComponent::kExecutor)},
-                              "Terminating session due to error: {status}",
-                              "status"_attr = status);
+                              {logv2::LogComponent::kExecutor},
+                              "Terminating session due to error: {error}",
+                              "Terminating session due to error",
+                              "error"_attr = status);
         terminate();
     }
 }
@@ -667,15 +676,22 @@ void ServiceStateMachine::_cleanupExhaustResources() noexcept try {
         // Fire and forget. This is a best effort attempt to immediately clean up the exhaust
         // cursor. If the killCursors request fails here for any reasons, it will still be
         // cleaned up once the cursor times out.
-        _sep->handleRequest(opCtx.get(), makeKillCursorsMessage(cursorId));
+        _sep->handleRequest(opCtx.get(), makeKillCursorsMessage(cursorId)).get();
     }
 } catch (const DBException& e) {
     LOGV2(22992,
-          "Error cleaning up resources for exhaust requests: {e_toStatus}",
-          "e_toStatus"_attr = e.toStatus());
+          "Error cleaning up resources for exhaust requests: {error}",
+          "Error cleaning up resources for exhaust requests",
+          "error"_attr = e.toStatus());
 }
 
 void ServiceStateMachine::_cleanupSession(ThreadGuard guard) {
+    // Ensure the delayed destruction of opCtx always happens before doing the cleanup.
+    if (MONGO_likely(_killedOpCtx)) {
+        _killedOpCtx.reset();
+    }
+    invariant(!_killedOpCtx);
+
     _cleanupExhaustResources();
 
     _state.store(State::Ended);

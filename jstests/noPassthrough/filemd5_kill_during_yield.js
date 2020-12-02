@@ -4,13 +4,15 @@
 (function() {
 "use strict";
 
+load("jstests/libs/curop_helpers.js");  // For waitForCurOpByFailPoint().
+
 const conn = MongoRunner.runMongod();
 assert.neq(null, conn);
 const db = conn.getDB("test");
 db.fs.chunks.drop();
 assert.commandWorked(db.fs.chunks.insert({files_id: 1, n: 0, data: new BinData(0, "64string")}));
 assert.commandWorked(db.fs.chunks.insert({files_id: 1, n: 1, data: new BinData(0, "test")}));
-db.fs.chunks.ensureIndex({files_id: 1, n: 1});
+db.fs.chunks.createIndex({files_id: 1, n: 1});
 
 const kFailPointName = "waitInFilemd5DuringManualYield";
 assert.commandWorked(db.adminCommand({configureFailPoint: kFailPointName, mode: "alwaysOn"}));
@@ -21,23 +23,10 @@ const failingMD5Shell =
                        conn.port);
 
 // Wait for filemd5 to manually yield and hang.
-let opId;
-assert.soon(
-    () => {
-        const filter = {ns: "test.fs.chunks", "command.filemd5": 1, failpointMsg: kFailPointName};
-        const result =
-            db.getSiblingDB("admin").aggregate([{$currentOp: {}}, {$match: filter}]).toArray();
+const curOps =
+    waitForCurOpByFailPoint(db, "test.fs.chunks", kFailPointName, {"command.filemd5": 1});
 
-        if (result.length === 1) {
-            opId = result[0].opid;
-
-            return true;
-        }
-
-        return false;
-    },
-    () => "Failed to find operation in currentOp() output: " +
-        tojson(db.currentOp({"ns": coll.getFullName()})));
+const opId = curOps[0].opid;
 
 // Kill the operation, then disable the failpoint so the command recognizes it's been killed.
 assert.commandWorked(db.killOp(opId));

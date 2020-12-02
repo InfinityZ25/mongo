@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #ifdef _WIN32
 
@@ -79,11 +79,9 @@ void doMinidumpWithException(struct _EXCEPTION_POINTERS* exceptionInfo) {
 
     std::wstring dumpName(moduleFileName);
 
-    std::string currentTime = terseCurrentTime(false);
-
     dumpName += L".";
 
-    dumpName += toWideString(currentTime.c_str());
+    dumpName += toWideStringFromStringData(terseCurrentTimeForFilename());
 
     dumpName += L".mdmp";
 

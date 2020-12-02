@@ -26,7 +26,7 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include <fstream>
 #include <iostream>
@@ -40,13 +40,14 @@
 
 #include "mongo/bson/json.h"
 #include "mongo/client/sdam/json_test_arg_parser.h"
+#include "mongo/client/sdam/sdam_configuration_parameters_gen.h"
 #include "mongo/client/sdam/server_description_builder.h"
 #include "mongo/client/sdam/server_selector.h"
 #include "mongo/client/sdam/topology_manager.h"
-#include "mongo/logger/logger.h"
 #include "mongo/logv2/log.h"
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/util/clock_source_mock.h"
+#include "mongo/util/ctype.h"
 #include "mongo/util/options_parser/environment.h"
 #include "mongo/util/options_parser/option_section.h"
 #include "mongo/util/options_parser/options_parser.h"
@@ -73,16 +74,9 @@ using namespace mongo::sdam;
 
 namespace mongo::sdam {
 
-std::string emphasize(const std::string text) {
-    std::stringstream output;
-    const auto border = std::string(3, '#');
-    output << border << " " << text << " " << border << std::endl;
-    return output.str();
-}
-
-std::ostream& operator<<(std::ostream& os, const std::vector<std::string>& input) {
+std::ostream& operator<<(std::ostream& os, const std::vector<HostAndPort>& input) {
     for (auto const& i : input) {
-        os << i << " ";
+        os << i.toString() << " ";
     }
     return os;
 }
@@ -105,6 +99,10 @@ public:
     virtual TestCaseResult execute() = 0;
 
     virtual const std::string& FilePath() const = 0;
+
+    virtual bool errorIsExpected() {
+        return false;
+    }
 };
 
 /**
@@ -119,8 +117,7 @@ public:
     ~JsonRttTestCase() = default;
 
     TestCaseResult execute() {
-        LOGV2(
-            4333500, "{testFilePath}", "testFilePath"_attr = emphasize("Running " + _testFilePath));
+        LOGV2(4333500, "### Running Test ###", "testFilePath"_attr = _testFilePath);
 
         ServerDescriptionPtr updatedServerDescription;
         if (_serverDescription) {
@@ -130,18 +127,18 @@ public:
             auto clockSource = std::make_unique<ClockSourceMock>();
             updatedServerDescription = std::make_shared<ServerDescription>(
                 ServerDescription(clockSource.get(),
-                                  IsMasterOutcome(ServerAddress("dummy"),
-                                                  BSON("ok" << 1 << "setname"
-                                                            << "replSet"
-                                                            << "ismaster" << true),
-                                                  IsMasterRTT(Milliseconds(_newRtt)))));
+                                  HelloOutcome(HostAndPort("dummy"),
+                                               BSON("ok" << 1 << "setname"
+                                                         << "replSet"
+                                                         << "ismaster" << true),
+                                               HelloRTT(Milliseconds(_newRtt)))));
         }
 
         TestCaseResult result{{}, _testFilePath};
         validateNewAvgRtt(&result, updatedServerDescription);
 
         if (!result.Success()) {
-            LOGV2(4333501, "Test {testFilePath} failed.", "testFilePath"_attr = _testFilePath);
+            LOGV2(4333501, "Test failed", "testFilePath"_attr = _testFilePath);
         }
 
         return result;
@@ -154,10 +151,7 @@ public:
 private:
     void parseTest(fs::path testFilePath) {
         _testFilePath = testFilePath.string();
-        LOGV2(4333502, "");
-        LOGV2(4333503,
-              "{testFilePath}",
-              "testFilePath"_attr = emphasize("Parsing " + testFilePath.string()));
+        LOGV2(4333503, "### Parsing Test ###", "testFilePath"_attr = testFilePath.string());
         {
             std::ifstream testFile(_testFilePath);
             std::ostringstream json;
@@ -171,7 +165,7 @@ private:
         std::string origRttAsString = _jsonTest.getStringField("avg_rtt_ms");
         if (origRttAsString.compare("NULL") != 0) {
             auto serverDescription = ServerDescriptionBuilder()
-                                         .withAddress("dummy")
+                                         .withAddress(HostAndPort("dummy"))
                                          .withType(ServerType::kRSPrimary)
                                          .instance();
             auto origAvgRtt = Milliseconds(_jsonTest["avg_rtt_ms"].numberInt());
@@ -217,23 +211,47 @@ private:
 class JsonServerSelectionTestCase : public JsonTestCase {
 public:
     JsonServerSelectionTestCase(fs::path testFilePath) {
-        parseTest(testFilePath);
+        try {
+            parseTest(testFilePath);
+        } catch (const DBException& ex) {
+            _parseError = TestCaseResult{{std::make_pair("error while parsing", ex.toString())},
+                                         testFilePath.string()};
+        }
     }
     ~JsonServerSelectionTestCase() = default;
 
     TestCaseResult execute() {
-        LOGV2(
-            4333504, "{testFilePath}", "testFilePath"_attr = emphasize("Running " + _testFilePath));
-
-        SdamServerSelector serverSelector(
-            sdam::ServerSelectionConfiguration::defaultConfiguration());
-        auto selectedServers = serverSelector.selectServers(_topologyDescription, _readPreference);
+        LOGV2(4333504, "### Running Test ###", "testFilePath"_attr = _testFilePath);
+        if (_parseError)
+            return *_parseError;
 
         TestCaseResult result{{}, _testFilePath};
-        validateServersInLatencyWindow(&result, selectedServers);
 
-        if (!result.Success()) {
-            LOGV2(4333505, "Test {testFilePath} failed.", "testFilePath"_attr = _testFilePath);
+        try {
+            SdamServerSelector serverSelector(
+                SdamConfiguration(std::vector<HostAndPort>{HostAndPort("foo:1234")}));
+            auto selectedServers =
+                serverSelector.selectServers(_topologyDescription, _readPreference);
+
+            std::vector<std::string> selectedHosts;
+            if (selectedServers) {
+                std::transform((*selectedServers).begin(),
+                               (*selectedServers).end(),
+                               std::back_inserter(selectedHosts),
+                               [](const ServerDescriptionPtr& server) {
+                                   return server->getAddress().toString();
+                               });
+            }
+            LOGV2(5017006, "Servers selected", "servers"_attr = selectedHosts);
+
+            validateServersInLatencyWindow(&result, selectedServers);
+        } catch (const DBException& ex) {
+            auto errorDescription = std::make_pair("exception", ex.toString());
+            result.errorDescriptions.push_back(errorDescription);
+        }
+
+        if (!result.Success() && !_errorExpected) {
+            LOGV2(4333505, "Test failed", "testFilePath"_attr = _testFilePath);
         }
 
         return result;
@@ -243,13 +261,14 @@ public:
         return _testFilePath;
     }
 
+    bool errorIsExpected() {
+        return _errorExpected;
+    }
+
 private:
     void parseTest(fs::path testFilePath) {
         _testFilePath = testFilePath.string();
-        LOGV2(4333506, "");
-        LOGV2(4333507,
-              "{testFilePath}",
-              "testFilePath"_attr = emphasize("Parsing " + testFilePath.string()));
+        LOGV2(4333507, "### Parsing Test ###", "testFilePath"_attr = testFilePath.string());
         {
             std::ifstream testFile(_testFilePath);
             std::ostringstream json;
@@ -257,67 +276,129 @@ private:
             _jsonTest = fromjson(json.str());
         }
 
+        // Do this first to save the state
+        if (_jsonTest.hasField("error")) {
+            LOGV2(5017004, "Expecting test case to generate an error.");
+            _errorExpected = _jsonTest.getBoolField("error");
+        }
+
         // The json tests pass in capitalized keywords for mode, but the server only accepts
         // lowercased keywords. Also, change the key "tags_set" to "tags".
+        // This can throw for test cases that have invalid read preferences.
         auto readPrefObj = _jsonTest.getObjectField("read_preference");
         std::string mode = readPrefObj.getStringField("mode");
-        mode[0] = std::tolower(mode[0]);
+        mode[0] = ctype::toLower(mode[0]);
         auto tagSetsObj = readPrefObj["tag_sets"];
         auto tags = tagSetsObj ? BSONArray(readPrefObj["tag_sets"].Obj()) : BSONArray();
 
-        BSONObj readPref = BSON("mode" << mode << "tags" << tags);
-        _readPreference = uassertStatusOK(ReadPreferenceSetting::fromInnerBSON(readPref));
 
-        // Parse the TopologyDescription and inLatencyWindow objects
         auto topologyDescriptionObj = _jsonTest.getObjectField("topology_description");
-
-        std::vector<ServerDescriptionPtr> serverDescriptions;
-        std::vector<ServerAddress> serverAddresses;
-        const std::vector<BSONElement>& bsonServers = topologyDescriptionObj["servers"].Array();
-        for (auto bsonServer : bsonServers) {
-            auto server = bsonServer.Obj();
-
-            auto serverType = uassertStatusOK(parseServerType(server.getStringField("type")));
-            auto serverDescription = ServerDescriptionBuilder()
-                                         .withAddress(server.getStringField("address"))
-                                         .withType(serverType)
-                                         .withRtt(Milliseconds(server["avg_rtt_ms"].numberInt()))
-                                         .withMinWireVersion(8)
-                                         .withMaxWireVersion(9);
-
-            auto tagsObj = server.getObjectField("tags");
-            const auto keys = tagsObj.getFieldNames<std::set<std::string>>();
-            for (const auto key : keys) {
-                serverDescription.withTag(key, tagsObj.getStringField(key));
-            }
-
-            serverDescriptions.push_back(serverDescription.instance());
-            serverAddresses.push_back(server.getStringField("address"));
-        }
-
         TopologyType initType =
             uassertStatusOK(parseTopologyType(topologyDescriptionObj.getStringField("type")));
         boost::optional<std::string> setName = boost::none;
         if (initType == TopologyType::kReplicaSetNoPrimary || initType == TopologyType::kSingle)
             setName = "replset";
 
-        boost::optional<std::vector<ServerAddress>> seedList = boost::none;
+        int maxStalenessSeconds = 0;
+        if (readPrefObj.hasField("maxStalenessSeconds")) {
+            maxStalenessSeconds = readPrefObj.getIntField("maxStalenessSeconds");
+        }
+
+        BSONObj readPref =
+            BSON("mode" << mode << "tags" << tags << "maxStalenessSeconds" << maxStalenessSeconds);
+        auto stalenessParseResult = ReadPreferenceSetting::fromInnerBSON(readPref);
+        if (!_errorExpected &&
+            stalenessParseResult.getStatus().code() == ErrorCodes::MaxStalenessOutOfRange &&
+            (initType == TopologyType::kUnknown || initType == TopologyType::kSingle ||
+             initType == TopologyType::kSharded)) {
+            // Drivers tests expect no error for invalid maxStaleness values for Unknown, Single,
+            // and Sharded topology types. The server code doesn't allow read preferences to be
+            // created for invalid values for maxStaleness, so ignore it.
+            readPref = BSON("mode" << mode << "tags" << tags << "maxStalenessSeconds" << 0);
+            stalenessParseResult = ReadPreferenceSetting::fromInnerBSON(readPref);
+        } else if (_errorExpected && maxStalenessSeconds == 0 &&
+                   readPrefObj.hasField("maxStalenessSeconds")) {
+            // Generate an error to pass test cases that set max staleness to zero since the server
+            // interprets this as no maxStaleness is specified.
+            uassert(ErrorCodes::MaxStalenessOutOfRange, "max staleness should be >= 0", false);
+        }
+        _readPreference = uassertStatusOK(stalenessParseResult);
+        LOGV2(5017007, "Read Preference", "value"_attr = _readPreference);
+
+        if (_jsonTest.hasField("heartbeatFrequencyMS")) {
+            sdamHeartBeatFrequencyMs = _jsonTest.getIntField("heartbeatFrequencyMS");
+            LOGV2(5017003, "Set heartbeatFrequencyMs", "value"_attr = sdamHeartBeatFrequencyMs);
+        }
+
+        std::vector<ServerDescriptionPtr> serverDescriptions;
+        std::vector<HostAndPort> serverAddresses;
+        const std::vector<BSONElement>& bsonServers = topologyDescriptionObj["servers"].Array();
+
+        for (auto bsonServer : bsonServers) {
+            auto server = bsonServer.Obj();
+
+            int maxWireVersion = 9;
+            if (server.hasField("maxWireVersion")) {
+                maxWireVersion = server["maxWireVersion"].numberInt();
+            }
+
+            auto serverType = uassertStatusOK(parseServerType(server.getStringField("type")));
+            auto serverDescription = ServerDescriptionBuilder()
+                                         .withAddress(HostAndPort(server.getStringField("address")))
+                                         .withType(serverType)
+                                         .withRtt(Milliseconds(server["avg_rtt_ms"].numberInt()))
+                                         .withMinWireVersion(5)
+                                         .withMaxWireVersion(maxWireVersion);
+
+            if (server.hasField("lastWrite")) {
+                auto lastWriteDate =
+                    server.getObjectField("lastWrite").getIntField("lastWriteDate");
+                serverDescription.withLastWriteDate(Date_t::fromMillisSinceEpoch(lastWriteDate));
+            }
+
+            if (server.hasField("lastUpdateTime")) {
+                auto lastUpdateTime = server.getIntField("lastUpdateTime");
+                serverDescription.withLastUpdateTime(Date_t::fromMillisSinceEpoch(lastUpdateTime));
+            }
+
+            auto tagsObj = server.getObjectField("tags");
+            const auto keys = tagsObj.getFieldNames<std::set<std::string>>();
+            for (const auto& key : keys) {
+                serverDescription.withTag(key, tagsObj.getStringField(key));
+            }
+
+            serverDescriptions.push_back(serverDescription.instance());
+            LOGV2(5017002,
+                  "Server Description",
+                  "description"_attr = serverDescriptions.back()->toBson());
+            serverAddresses.push_back(HostAndPort(server.getStringField("address")));
+        }
+
+
+        boost::optional<std::vector<HostAndPort>> seedList = boost::none;
         if (serverAddresses.size() > 0)
             seedList = serverAddresses;
 
-        auto config = SdamConfiguration(
-            seedList, initType, SdamConfiguration::kDefaultHeartbeatFrequencyMs, setName);
+        auto config = SdamConfiguration(seedList,
+                                        initType,
+                                        Milliseconds{sdamHeartBeatFrequencyMs},
+                                        Milliseconds{sdamConnectTimeoutMs},
+                                        Milliseconds{sdamLocalThreshholdMs},
+                                        setName);
         _topologyDescription = std::make_shared<TopologyDescription>(config);
 
-        const std::vector<BSONElement>& bsonLatencyWindow = _jsonTest["in_latency_window"].Array();
-        for (const auto& serverDescription : serverDescriptions) {
-            _topologyDescription->installServerDescription(serverDescription);
+        if (_jsonTest.hasField("in_latency_window")) {
+            const std::vector<BSONElement>& bsonLatencyWindow =
+                _jsonTest["in_latency_window"].Array();
+            for (const auto& serverDescription : serverDescriptions) {
+                _topologyDescription->installServerDescription(serverDescription);
 
-            for (auto bsonServer : bsonLatencyWindow) {
-                auto server = bsonServer.Obj();
-                if (serverDescription->getAddress() ==
-                    ServerAddress(server.getStringField("address"))) {
-                    _inLatencyWindow.push_back(serverDescription);
+                for (auto bsonServer : bsonLatencyWindow) {
+                    auto server = bsonServer.Obj();
+                    if (serverDescription->getAddress() ==
+                        HostAndPort(server.getStringField("address"))) {
+                        _inLatencyWindow.push_back(serverDescription);
+                    }
                 }
             }
         }
@@ -326,50 +407,38 @@ private:
     void validateServersInLatencyWindow(
         TestCaseResult* result,
         boost::optional<std::vector<ServerDescriptionPtr>> selectedServers) {
-        if (!selectedServers && _inLatencyWindow.size() > 0) {
+        // Compare the server addresses of each server in the selectedServers and
+        // _inLatencyWindow vectors. We do not need to compare the entire server description
+        // because we only need to make sure that the correct server was chosen and are not
+        // manipulating the ServerDescriptions at all.
+        std::vector<HostAndPort> selectedHostAndPorts;
+        std::vector<HostAndPort> expectedHostAndPorts;
+
+        auto extractHost = [](const ServerDescriptionPtr& s) { return s->getAddress(); };
+        if (selectedServers) {
+            std::transform(selectedServers->begin(),
+                           selectedServers->end(),
+                           std::back_inserter(selectedHostAndPorts),
+                           extractHost);
+        }
+        std::transform(_inLatencyWindow.begin(),
+                       _inLatencyWindow.end(),
+                       std::back_inserter(expectedHostAndPorts),
+                       extractHost);
+
+        std::sort(selectedHostAndPorts.begin(), selectedHostAndPorts.end());
+        std::sort(expectedHostAndPorts.begin(), expectedHostAndPorts.end());
+        if (!std::equal(selectedHostAndPorts.begin(),
+                        selectedHostAndPorts.end(),
+                        expectedHostAndPorts.begin(),
+                        expectedHostAndPorts.end())) {
             std::stringstream errorMessage;
-            errorMessage << "did not select any servers, but expected '" << _inLatencyWindow.size()
+            errorMessage << "selected servers with addresses '" << selectedHostAndPorts
+                         << "' server(s), but expected '" << expectedHostAndPorts
                          << "' to be selected.";
             auto errorDescription = std::make_pair("servers in latency window", errorMessage.str());
             result->errorDescriptions.push_back(errorDescription);
-        } else if (selectedServers && selectedServers->size() != _inLatencyWindow.size()) {
-            std::stringstream errorMessage;
-            errorMessage << "selected '" << selectedServers->size() << "' server(s), but expected '"
-                         << _inLatencyWindow.size() << "' to be selected.";
-            auto errorDescription = std::make_pair("servers in latency window", errorMessage.str());
-            result->errorDescriptions.push_back(errorDescription);
-        } else {
-            // Compare the server addresses of each server in the selectedServers and
-            // _inLatencyWindow vectors. We do not need to compare the entire server description
-            // because we only need to make sure that the correct server was chosen and are not
-            // manipulating the ServerDescriptions at all.
-            std::vector<std::string> selectedServerAddresses;
-            std::vector<std::string> expectedServerAddresses;
-
-            auto selectedServersIt = selectedServers->begin();
-            for (auto expectedServersIt = _inLatencyWindow.begin();
-                 expectedServersIt != _inLatencyWindow.end();
-                 ++expectedServersIt) {
-                selectedServerAddresses.push_back((*selectedServersIt)->getAddress());
-                expectedServerAddresses.push_back((*expectedServersIt)->getAddress());
-
-                selectedServersIt++;
-            }
-
-            std::sort(selectedServerAddresses.begin(), selectedServerAddresses.end());
-            std::sort(expectedServerAddresses.begin(), expectedServerAddresses.end());
-            if (!std::equal(selectedServerAddresses.begin(),
-                            selectedServerAddresses.end(),
-                            expectedServerAddresses.begin())) {
-                std::stringstream errorMessage;
-                errorMessage << "selected servers with addresses '" << selectedServerAddresses
-                             << "' server(s), but expected '" << expectedServerAddresses
-                             << "' to be selected.";
-                auto errorDescription =
-                    std::make_pair("servers in latency window", errorMessage.str());
-                result->errorDescriptions.push_back(errorDescription);
-                return;
-            }
+            return;
         }
     }
 
@@ -378,6 +447,8 @@ private:
     TopologyDescriptionPtr _topologyDescription;
     ReadPreferenceSetting _readPreference;
     std::vector<ServerDescriptionPtr> _inLatencyWindow;
+    boost::optional<TestCaseResult> _parseError;
+    bool _errorExpected = false;
 };
 
 /**
@@ -392,29 +463,59 @@ public:
         std::vector<JsonTestCase::TestCaseResult> results;
         const auto testFiles = getTestFiles();
         for (auto jsonTest : testFiles) {
-            auto testCase = [jsonTest]() -> std::unique_ptr<JsonTestCase> {
-                if (jsonTest.string().find("/rtt/")) {
-                    return std::make_unique<JsonRttTestCase>(jsonTest);
-                }
-                return std::make_unique<JsonServerSelectionTestCase>(jsonTest);
-            }();
+            int restoreHeartBeatFrequencyMs = sdamHeartBeatFrequencyMs;
 
+            std::unique_ptr<JsonTestCase> testCase;
             try {
-                LOGV2(4333508,
-                      "{testFilePath}",
-                      "testFilePath"_attr = emphasize("Executing " + testCase->FilePath()));
-                results.push_back(testCase->execute());
+                testCase = [jsonTest]() -> std::unique_ptr<JsonTestCase> {
+                    if (jsonTest.string().find("/rtt/") != std::string::npos ||
+                        jsonTest.string().find("\\rtt\\") != std::string::npos) {
+                        return std::make_unique<JsonRttTestCase>(jsonTest);
+                    }
+                    return std::make_unique<JsonServerSelectionTestCase>(jsonTest);
+                }();
+                LOGV2(
+                    4333508, "### Executing Test ###", "testFilePath"_attr = testCase->FilePath());
+                auto executionResult = testCase->execute();
+                if (testCase->errorIsExpected() && executionResult.Success()) {
+                    auto errorDescription =
+                        std::make_pair("failure expected", "Expected test to fail, but it didn't");
+                    executionResult.errorDescriptions.push_back(errorDescription);
+                } else if (testCase->errorIsExpected() && !executionResult.Success()) {
+                    // clear the errors, so that it's treated as a success
+                    executionResult.errorDescriptions.clear();
+                }
+                results.push_back(executionResult);
             } catch (const DBException& ex) {
-                std::stringstream error;
-                error << "Exception while executing " << jsonTest.string() << ": " << ex.toString();
-                std::string errorStr = error.str();
-                results.push_back(JsonTestCase::TestCaseResult{
-                    {std::make_pair("exception", errorStr)}, jsonTest.string()});
-                std::cerr << errorStr;
+                if (!testCase || !testCase->errorIsExpected()) {
+                    std::stringstream error;
+                    error << "Exception while executing " << jsonTest.string() << ": "
+                          << ex.toString();
+                    std::string errorStr = error.str();
+                    results.push_back(JsonTestCase::TestCaseResult{
+                        {std::make_pair("exception", errorStr)}, jsonTest.string()});
+                    std::cerr << errorStr;
+                }
             }
+
+            // use default value of sdamHeartBeatFrequencyMs unless the test explicitly sets it.
+            sdamHeartBeatFrequencyMs = restoreHeartBeatFrequencyMs;
         }
         return results;
     }
+
+    std::string collectErrorStr(const std::vector<JsonTestCase::TestErrors>& errors) {
+        std::string result;
+        for (size_t i = 0; i < errors.size(); ++i) {
+            auto error = errors[i];
+            result = result + error.first + " - " + error.second;
+            if (i != errors.size() - 1) {
+                result += "; ";
+            }
+        }
+        return result;
+    }
+
 
     int report(std::vector<JsonTestCase::TestCaseResult> results) {
         int numTestCases = results.size();
@@ -425,24 +526,23 @@ public:
                 results.begin(), results.end(), [](const JsonTestCase::TestCaseResult& result) {
                     return !result.Success();
                 })) {
-            LOGV2(4333509,
-                  "{Failed_Test_Results}",
-                  "Failed_Test_Results"_attr = emphasize("Failed Test Results"));
+            LOGV2(4333509, "### Failed Test Results ###");
         }
 
-        for (const auto result : results) {
+        for (const auto& result : results) {
             auto file = result.file;
             if (result.Success()) {
                 ++numSuccess;
             } else {
-                LOGV2(4333510, "{testFilePath}", "testFilePath"_attr = emphasize(file));
-                LOGV2(4333511, "error in file: {file}", "file"_attr = file);
+                LOGV2(4333510,
+                      "### Failed Test File ###",
+                      "testFilePath"_attr = file,
+                      "errors"_attr = collectErrorStr(result.errorDescriptions));
                 ++numFailed;
-                LOGV2(4333512, "");
             }
         }
         LOGV2(4333513,
-              "{numTestCases} test cases; {numSuccess} success; {numFailed} failed.",
+              "Results summary",
               "numTestCases"_attr = numTestCases,
               "numSuccess"_attr = numSuccess,
               "numFailed"_attr = numFailed);
@@ -482,7 +582,7 @@ private:
             } else {
                 LOGV2_DEBUG(4333514,
                             2,
-                            "'{filePath}' skipped due to filter configuration.",
+                            "Test skipped due to filter configuration",
                             "filePath"_attr = filePath.string());
             }
         }
@@ -497,8 +597,8 @@ private:
 int main(int argc, char* argv[]) {
     ArgParser args(argc, argv);
 
-    ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-        ::mongo::logger::LogSeverity::Debug(args.Verbose()));
+    ::mongo::logv2::LogManager::global().getGlobalSettings().setMinimumLoggedSeverity(
+        MONGO_LOGV2_DEFAULT_COMPONENT, ::mongo::logv2::LogSeverity::Debug(args.Verbose()));
     args.LogParams();
 
     ServerSelectionJsonTestRunner testRunner(args.SourceDirectory(), args.TestFilters());

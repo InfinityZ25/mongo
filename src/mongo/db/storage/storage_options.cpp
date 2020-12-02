@@ -56,6 +56,9 @@ void StorageGlobalParams::reset() {
     readOnly = false;
     groupCollections = false;
     oplogMinRetentionHours.store(0.0);
+    allowOplogTruncation = true;
+    disableLockFreeReads = true;
+    checkpointDelaySecs = 0;
 }
 
 StorageGlobalParams storageGlobalParams;

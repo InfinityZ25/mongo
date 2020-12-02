@@ -1,4 +1,8 @@
-// @tags: [requires_getmore, assumes_balancer_off]
+// @tags: [
+//   assumes_balancer_off,
+//   requires_getmore,
+//   sbe_incompatible,
+// ]
 
 t = db.index_check2;
 t.drop();
@@ -28,7 +32,7 @@ assert.eq(120, t.find(q1).itcount(), "q1 a");
 assert.eq(120, t.find(q2).itcount(), "q2 a");
 assert.eq(60, t.find(q3).itcount(), "q3 a");
 
-t.ensureIndex({tags: 1});
+t.createIndex({tags: 1});
 
 assert.eq(120, t.find(q1).itcount(), "q1 a");
 assert.eq(120, t.find(q2).itcount(), "q2 a");

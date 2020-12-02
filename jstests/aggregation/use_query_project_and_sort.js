@@ -4,7 +4,9 @@
 //
 // Relies on the ability to push leading $sorts down to the query system, so cannot wrap pipelines
 // in $facet stages:
-// @tags: [do_not_wrap_aggregations_in_facets]
+// @tags: [
+//   do_not_wrap_aggregations_in_facets,
+// ]
 (function() {
 "use strict";
 

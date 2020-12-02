@@ -73,6 +73,7 @@ public:
     void shutdown() override;
     void join() override;
     SharedSemiFuture<void> joinAsync() override;
+    bool isShuttingDown() const override;
     void appendDiagnosticBSON(BSONObjBuilder* b) const override;
     Date_t now() override;
     StatusWith<EventHandle> makeEvent() override;
@@ -198,7 +199,8 @@ private:
     /**
      * Executes the callback specified by "cbState". Will not mark cbState as finished.
      */
-    void runCallbackExhaust(std::shared_ptr<CallbackState> cbState);
+    void runCallbackExhaust(std::shared_ptr<CallbackState> cbState,
+                            WorkQueue::iterator expectedExhaustIter);
 
     bool _inShutdown_inlock() const;
     void _setState_inlock(State newState);

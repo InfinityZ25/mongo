@@ -31,6 +31,7 @@
 
 #include "mongo/db/pipeline/sharded_agg_helpers.h"
 #include "mongo/s/query/sharded_agg_test_fixture.h"
+#include "mongo/s/stale_shard_version_helpers.h"
 
 namespace mongo {
 namespace {
@@ -172,7 +173,8 @@ TEST_F(DispatchShardPipelineTest, DispatchShardPipelineDoesNotRetryOnStaleConfig
 
     // Mock out an error response.
     onCommand([&](const executor::RemoteCommandRequest& request) {
-        return Status{ErrorCodes::StaleShardVersion, "Mock error: shard version mismatch"};
+        return createErrorCursorResponse(
+            {Status{ErrorCodes::StaleShardVersion, "Mock error: shard version mismatch"}});
     });
     future.default_timed_get();
 }
@@ -193,15 +195,15 @@ TEST_F(DispatchShardPipelineTest, WrappedDispatchDoesRetryOnStaleConfigError) {
     const bool hasChangeStream = false;
     auto future = launchAsync([&] {
         // Shouldn't throw.
-        auto results = sharded_agg_helpers::shardVersionRetry(
-            operationContext(),
-            Grid::get(getServiceContext())->catalogCache(),
-            kTestAggregateNss,
-            "dispatch shard pipeline"_sd,
-            [&]() {
-                return sharded_agg_helpers::dispatchShardPipeline(
-                    serializedCommand, hasChangeStream, pipeline->clone());
-            });
+        auto results =
+            shardVersionRetry(operationContext(),
+                              Grid::get(getServiceContext())->catalogCache(),
+                              kTestAggregateNss,
+                              "dispatch shard pipeline"_sd,
+                              [&]() {
+                                  return sharded_agg_helpers::dispatchShardPipeline(
+                                      serializedCommand, hasChangeStream, pipeline->clone());
+                              });
         ASSERT_EQ(results.remoteCursors.size(), 1UL);
         ASSERT(!bool(results.splitPipeline));
     });
@@ -209,13 +211,15 @@ TEST_F(DispatchShardPipelineTest, WrappedDispatchDoesRetryOnStaleConfigError) {
     // Mock out one error response, then expect a refresh of the sharding catalog for that
     // namespace, then mock out a successful response.
     onCommand([&](const executor::RemoteCommandRequest& request) {
-        return Status{ErrorCodes::StaleShardVersion, "Mock error: shard version mismatch"};
+        return createErrorCursorResponse(
+            Status{ErrorCodes::StaleShardVersion, "Mock error: shard version mismatch"});
     });
 
     // Mock the expected config server queries.
     const OID epoch = OID::gen();
+    const UUID uuid = UUID::gen();
     const ShardKeyPattern shardKeyPattern(BSON("_id" << 1));
-    expectGetCollection(kTestAggregateNss, epoch, shardKeyPattern);
+    expectGetCollection(kTestAggregateNss, epoch, uuid, shardKeyPattern);
     expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
         ChunkVersion version(1, 0, epoch);
 

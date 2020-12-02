@@ -21,7 +21,7 @@ var request;
 var result;
 var batch;
 
-var maxWriteBatchSize = db.isMaster().maxWriteBatchSize;
+var maxWriteBatchSize = db.hello().maxWriteBatchSize;
 
 function resultOK(result) {
     return result.ok && !('code' in result) && !('errmsg' in result) && !('errInfo' in result) &&
@@ -231,12 +231,11 @@ assert.eq(1, coll.count());
 //
 //
 // Unique index tests
-coll.remove({});
-coll.ensureIndex({a: 1}, {unique: true});
 
 //
 // Upsert fail due to duplicate key index, w:1, ordered:true
-coll.remove({});
+coll.drop();
+coll.createIndex({a: 1}, {unique: true});
 request = {
     update: coll.getName(),
     updates: [
@@ -266,7 +265,8 @@ assert.eq(1, coll.count({_id: result.upserted[1]._id}));
 
 //
 // Upsert fail due to duplicate key index, w:1, ordered:false
-coll.remove({});
+coll.drop();
+coll.createIndex({a: 1}, {unique: true});
 request = {
     update: coll.getName(),
     updates: [

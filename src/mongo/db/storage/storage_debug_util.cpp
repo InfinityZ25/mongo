@@ -27,12 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/storage/storage_debug_util.h"
 
+#include "mongo/db/catalog/validate_results.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/storage/key_string.h"
@@ -74,8 +75,7 @@ void printKeyString(const RecordId& recordId,
 
 void printCollectionAndIndexTableEntries(OperationContext* opCtx, const NamespaceString& nss) {
     invariant(!opCtx->lockState()->isLocked());
-    AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-    Collection* coll = autoColl.getCollection();
+    AutoGetCollection coll(opCtx, nss, MODE_IS);
 
     LOGV2(51807, "Dumping collection table and index tables' entries for debugging...");
 
@@ -128,31 +128,11 @@ void printCollectionAndIndexTableEntries(OperationContext* opCtx, const Namespac
 }
 
 void printValidateResults(const ValidateResults& results) {
-    std::stringstream ss;
+    BSONObjBuilder resultObj;
 
-    ss << "ValidateResults:\nValid: " << results.valid << "\n"
-       << "Errors:\n";
+    results.appendToResultObj(resultObj, /*debugging=*/true);
 
-    for (const std::string& error : results.errors) {
-        ss << "\t" << error << "\n";
-    }
-
-    ss << "Warnings:\n";
-    for (const std::string& warning : results.warnings) {
-        ss << "\t" << warning << "\n";
-    }
-
-    ss << "Extra index entries:\n";
-    for (const BSONObj& obj : results.extraIndexEntries) {
-        ss << "\t" << obj << "\n";
-    }
-
-    ss << "Missing index entries:\n";
-    for (const BSONObj& obj : results.missingIndexEntries) {
-        ss << "\t" << obj << "\n";
-    }
-
-    LOGV2(51812, "{results_string}", "results_string"_attr = ss.str());
+    LOGV2(51812, "Results", "results"_attr = resultObj.done());
 }
 
 }  // namespace StorageDebugUtil

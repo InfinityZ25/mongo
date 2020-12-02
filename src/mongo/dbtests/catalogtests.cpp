@@ -46,16 +46,13 @@ namespace mongo {
 namespace {
 
 bool collectionExists(OperationContext* opCtx, NamespaceString nss) {
-    return CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss) != nullptr;
+    return CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss) != nullptr;
 }
 
 class ConcurrentCreateCollectionTest {
 public:
     void run() {
         auto serviceContext = getGlobalServiceContext();
-        if (!serviceContext->getStorageEngine()->supportsDocLocking()) {
-            return;
-        }
 
         NamespaceString competingNss("test.competingCollection");
 

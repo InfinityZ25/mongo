@@ -76,6 +76,20 @@ public:
      */
     static BSONObj addProtocolVersion(const BSONObj& configDoc, int protocolVersion);
 
+    /**
+     * Helpers to construct a config.
+     */
+    static BSONObj member(int id, std::string host, int votes = 1) {
+        return BSON("_id" << id << "host" << host << "votes" << votes << "priority" << votes);
+    }
+
+    static BSONObj configWithMembers(int version, long long term, BSONArray members) {
+        return BSON("_id"
+                    << "mySet"
+                    << "protocolVersion" << 1 << "version" << version << "term" << term << "members"
+                    << members);
+    }
+
 protected:
     ReplCoordTest();
     virtual ~ReplCoordTest();
@@ -112,13 +126,11 @@ protected:
         getReplCoord()->setMyLastAppliedOpTimeAndWallTime({opTime, wallTime});
     }
 
-    void replCoordSetMyLastAppliedOpTimeForward(const OpTime& opTime,
-                                                ReplicationCoordinator::DataConsistency consistency,
-                                                Date_t wallTime = Date_t()) {
+    void replCoordSetMyLastAppliedOpTimeForward(const OpTime& opTime, Date_t wallTime = Date_t()) {
         if (wallTime == Date_t()) {
             wallTime = Date_t() + Seconds(opTime.getSecs());
         }
-        getReplCoord()->setMyLastAppliedOpTimeAndWallTimeForward({opTime, wallTime}, consistency);
+        getReplCoord()->setMyLastAppliedOpTimeAndWallTimeForward({opTime, wallTime});
     }
 
     void replCoordSetMyLastDurableOpTime(const OpTime& opTime, Date_t wallTime = Date_t()) {

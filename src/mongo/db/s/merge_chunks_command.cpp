@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -37,11 +37,11 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/field_parser.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/db/vector_clock.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/client/shard_registry.h"
@@ -77,8 +77,8 @@ void mergeChunks(OperationContext* opCtx,
                  const BSONObj& minKey,
                  const BSONObj& maxKey,
                  const OID& expectedEpoch) {
-    const std::string whyMessage = str::stream()
-        << "merging chunks in " << nss.ns() << " from " << minKey << " to " << maxKey;
+    const std::string whyMessage = str::stream() << "merging chunks in " << nss.ns() << " from "
+                                                 << redact(minKey) << " to " << redact(maxKey);
     auto scopedDistLock = uassertStatusOKWithContext(
         Grid::get(opCtx)->catalogClient()->getDistLockManager()->lock(
             opCtx, nss.ns(), whyMessage, DistLockManager::kSingleLockAttemptTimeout),
@@ -90,7 +90,7 @@ void mergeChunks(OperationContext* opCtx,
 
     // We now have the collection distributed lock, refresh metadata to latest version and sanity
     // check
-    forceShardFilteringMetadataRefresh(opCtx, nss, true /* forceRefreshFromThisThread */);
+    onShardVersionMismatch(opCtx, nss, boost::none);
 
     const auto metadataBeforeMerge = [&] {
         AutoGetCollection autoColl(opCtx, nss, MODE_IS);
@@ -196,11 +196,12 @@ void mergeChunks(OperationContext* opCtx,
     //
     // Run _configsvrCommitChunkMerge.
     //
+    const auto currentTime = VectorClock::get(opCtx)->getTime();
     MergeChunkRequest request{nss,
                               shardingState->shardId().toString(),
                               epoch,
                               chunkBoundaries,
-                              LogicalClock::get(opCtx)->getClusterTime().asTimestamp()};
+                              currentTime.clusterTime().asTimestamp()};
 
     auto configCmdObj =
         request.toConfigCommandBSON(ShardingCatalogClient::kMajorityWriteConcern.toBSON());
@@ -214,7 +215,7 @@ void mergeChunks(OperationContext* opCtx,
 
     // Refresh metadata to pick up new chunk definitions (regardless of the results returned from
     // running _configsvrCommitChunkMerge).
-    forceShardFilteringMetadataRefresh(opCtx, nss, true /* forceRefreshFromThisThread */);
+    onShardVersionMismatch(opCtx, nss, boost::none);
 
     // If _configsvrCommitChunkMerge returned an error, look at this shard's metadata to determine
     // if the merge actually did happen. This can happen if there's a network error getting the

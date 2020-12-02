@@ -32,6 +32,7 @@
 #include <limits>
 
 #include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/idl/unittest_gen.h"
 #include "mongo/rpc/op_msg.h"
@@ -548,6 +549,42 @@ TEST(IDLStructTests, TestNonStrictStruct) {
         auto testDoc =
             BSON("field4" << 1234 << "1" << 12 << "2" << 123 << "3" << 1234 << "field4" << 1234);
         ASSERT_THROWS(RequiredNonStrictField3::parse(ctxt, testDoc), AssertionException);
+    }
+}
+
+TEST(IDLStructTests, WriteConcernTest) {
+    IDLParserErrorContext ctxt("root");
+    // Numeric w value
+    {
+        auto writeConcernDoc = BSON("w" << 1 << "j" << true << "wtimeout" << 5000);
+        auto writeConcernStruct = WriteConcernIdl::parse(ctxt, writeConcernDoc);
+        BSONObjBuilder builder;
+        writeConcernStruct.serialize(&builder);
+        ASSERT_BSONOBJ_EQ(builder.obj(), writeConcernDoc);
+    }
+    // String w value
+    {
+        auto writeConcernDoc = BSON("w"
+                                    << "majority"
+                                    << "j" << true << "wtimeout" << 5000);
+        auto writeConcernStruct = WriteConcernIdl::parse(ctxt, writeConcernDoc);
+        BSONObjBuilder builder;
+        writeConcernStruct.serialize(&builder);
+        ASSERT_BSONOBJ_EQ(builder.obj(), writeConcernDoc);
+    }
+    // Ignore options wElectionId, wOpTime, getLastError
+    {
+        auto writeConcernDoc = BSON("w"
+                                    << "majority"
+                                    << "j" << true << "wtimeout" << 5000 << "wElectionId" << 12345
+                                    << "wOpTime" << 98765 << "getLastError" << true);
+        auto writeConcernDocWithoutIgnoredFields = BSON("w"
+                                                        << "majority"
+                                                        << "j" << true << "wtimeout" << 5000);
+        auto writeConcernStruct = WriteConcernIdl::parse(ctxt, writeConcernDoc);
+        BSONObjBuilder builder;
+        writeConcernStruct.serialize(&builder);
+        ASSERT_BSONOBJ_EQ(builder.obj(), writeConcernDocWithoutIgnoredFields);
     }
 }
 
@@ -2827,6 +2864,14 @@ TEST(IDLTypeCommand, TestStruct) {
     assert_same_types<decltype(testStruct.getCommandParameter()),
                       mongo::idl::import::One_string&>();
 
+    // Negative: Command with struct parameter should disallow 'undefined' input.
+    {
+        auto invalidDoc = BSON(CommandTypeStructCommand::kCommandName << BSONUndefined << "$db"
+                                                                      << "db");
+        ASSERT_THROWS(CommandTypeStructCommand::parse(ctxt, makeOMR(invalidDoc)),
+                      AssertionException);
+    }
+
     // Positive: Test we can roundtrip from the just parsed document
     {
         BSONObjBuilder builder;
@@ -2932,6 +2977,94 @@ TEST(IDLTypeCommand, TestUnderscoreCommand) {
         OpMsgRequest reply = one_new.serialize(BSONObj());
 
         ASSERT_BSONOBJ_EQ(testDoc, reply.body);
+    }
+}
+
+TEST(IDLTypeCommand, TestErrorReplyStruct) {
+    // Correctly parse all required fields.
+    {
+        IDLParserErrorContext ctxt("root");
+
+        auto errorDoc = BSON("ok" << 0.0 << "code" << 123456 << "codeName"
+                                  << "blah blah"
+                                  << "errmsg"
+                                  << "This is an error Message"
+                                  << "errorLabels"
+                                  << BSON_ARRAY("label1"
+                                                << "label2"));
+        auto errorReply = ErrorReply::parse(ctxt, errorDoc);
+        ASSERT_BSONOBJ_EQ(errorReply.toBSON(), errorDoc);
+    }
+    // Non-strictness: ensure we parse even if input has extra fields.
+    {
+        IDLParserErrorContext ctxt("root");
+
+        auto errorDoc = BSON("a"
+                             << "b"
+                             << "ok" << 0.0 << "code" << 123456 << "codeName"
+                             << "blah blah"
+                             << "errmsg"
+                             << "This is an error Message");
+        auto errorReply = ErrorReply::parse(ctxt, errorDoc);
+        ASSERT_BSONOBJ_EQ(errorReply.toBSON(),
+                          BSON("ok" << 0.0 << "code" << 123456 << "codeName"
+                                    << "blah blah"
+                                    << "errmsg"
+                                    << "This is an error Message"));
+    }
+    // Ensure that we fail to parse if any required fields are missing.
+    {
+        IDLParserErrorContext ctxt("root");
+
+        auto missingOk = BSON("code" << 123456 << "codeName"
+                                     << "blah blah"
+                                     << "errmsg"
+                                     << "This is an error Message");
+        auto missingCode = BSON("ok" << 0.0 << "codeName"
+                                     << "blah blah"
+                                     << "errmsg"
+                                     << "This is an error Message");
+        auto missingCodeName = BSON("ok" << 0.0 << "code" << 123456 << "errmsg"
+                                         << "This is an error Message");
+        auto missingErrmsg = BSON("ok" << 0.0 << "code" << 123456 << "codeName"
+                                       << "blah blah");
+        ASSERT_THROWS(ErrorReply::parse(ctxt, missingOk), AssertionException);
+        ASSERT_THROWS(ErrorReply::parse(ctxt, missingCode), AssertionException);
+        ASSERT_THROWS(ErrorReply::parse(ctxt, missingCodeName), AssertionException);
+        ASSERT_THROWS(ErrorReply::parse(ctxt, missingErrmsg), AssertionException);
+    }
+}
+
+TEST(IDLTypeCommand, TestCommandWithIDLAnyTypeField) {
+    IDLParserErrorContext ctxt("root");
+    std::vector<BSONObj> differentTypeObjs = {
+        BSON(CommandWithAnyTypeMember::kCommandName << 1 << "anyTypeField"
+                                                    << "string literal"
+                                                    << "$db"
+                                                    << "db"),
+        BSON(CommandWithAnyTypeMember::kCommandName << 1 << "anyTypeField" << 1234 << "$db"
+                                                    << "db"),
+        BSON(CommandWithAnyTypeMember::kCommandName << 1 << "anyTypeField" << 1234.5 << "$db"
+                                                    << "db"),
+        BSON(CommandWithAnyTypeMember::kCommandName << 1 << "anyTypeField" << OID::max() << "$db"
+                                                    << "db"),
+        BSON(CommandWithAnyTypeMember::kCommandName << 1 << "anyTypeField" << Date_t::now() << "$db"
+                                                    << "db"),
+        BSON(CommandWithAnyTypeMember::kCommandName << 1 << "anyTypeField"
+                                                    << BSON("a"
+                                                            << "b")
+                                                    << "$db"
+                                                    << "db"),
+        BSON(CommandWithAnyTypeMember::kCommandName << 1 << "anyTypeField"
+                                                    << BSON_ARRAY("a"
+                                                                  << "b")
+                                                    << "$db"
+                                                    << "db"),
+        BSON(CommandWithAnyTypeMember::kCommandName << 1 << "anyTypeField" << jstNULL << "$db"
+                                                    << "db")};
+    for (auto&& obj : differentTypeObjs) {
+        auto parsed = CommandWithAnyTypeMember::parse(ctxt, obj);
+        ASSERT_BSONELT_EQ(parsed.getAnyTypeField().getElement(), obj["anyTypeField"]);
     }
 }
 

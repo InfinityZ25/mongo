@@ -13,8 +13,6 @@
 // compatible with implicit sessions.
 TestData.disableImplicitSessions = true;
 
-load("jstests/multiVersion/libs/multi_rs.js");
-
 const keyFile = 'jstests/libs/key1';
 const adminUser = {
     db: "admin",
@@ -30,7 +28,7 @@ const timeoutValidLogicalTimeMs = 20 * 1000;
 
 function assertContainsValidLogicalTime(adminConn) {
     try {
-        const res = adminConn.runCommand({isMaster: 1});
+        const res = adminConn.runCommand({hello: 1});
         assert.hasFields(res, ["$clusterTime"]);
         assert.hasFields(res.$clusterTime, ["signature", "clusterTime"]);
         // clusterTime must be greater than the uninitialzed value.
@@ -94,7 +92,7 @@ st.rs0.startSet({restart: true});
 
 priRSConn = st.rs0.getPrimary().getDB("admin");
 priRSConn.auth(rUser.username, rUser.password);
-const resNoKeys = assert.commandWorked(priRSConn.runCommand({isMaster: 1}));
+const resNoKeys = assert.commandWorked(priRSConn.runCommand({hello: 1}));
 priRSConn.logout();
 
 assert.eq(resNoKeys.hasOwnProperty("$clusterTime"), false);

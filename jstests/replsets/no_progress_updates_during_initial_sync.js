@@ -5,13 +5,13 @@
  *      initial-syncing nodes should send no replSetUpdatePosition commands upstream at all
  *  - via heartbeats:
  *      these nodes should include null lastApplied and lastDurable optimes in heartbeat responses
- *
- * @tags: [requires_fcv_44]
  */
 (function() {
 "use strict";
 
 load("jstests/libs/write_concern_util.js");
+load("jstests/libs/fail_point_util.js");
+load('jstests/replsets/rslib.js');
 
 const testName = jsTestName();
 const rst = new ReplSetTest({name: testName, nodes: [{}, {rsConfig: {priority: 0}}]});
@@ -25,7 +25,7 @@ assert.commandWorked(primaryDb.test.insert({"starting": "doc"}, {writeConcern: {
 jsTestLog("Adding a new node to the replica set");
 
 const secondary = rst.add({
-    rsConfig: {priority: 0},
+    rsConfig: {priority: 0, votes: 0},
     setParameter: {
         'failpoint.forceSyncSourceCandidate':
             tojson({mode: 'alwaysOn', data: {"hostAndPort": primary.host}}),
@@ -37,6 +37,12 @@ const secondary = rst.add({
 });
 rst.reInitiate();
 rst.waitForState(secondary, ReplSetTest.State.STARTUP_2);
+
+// Add the new node with votes:0 and then give it votes:1 to avoid 'newlyAdded' and mimic a resync,
+// where a node is in initial sync with 1 vote.
+let nextConfig = rst.getReplSetConfigFromNode(0);
+nextConfig.members[2].votes = 1;
+reconfig(rst, nextConfig, false /* force */, true /* wait */);
 
 // Shut down the steady-state secondary so that it cannot participate in the majority.
 rst.stop(1);
@@ -86,11 +92,6 @@ const writeResW2 = primaryDb.runCommand({
 assert.commandWorkedIgnoringWriteConcernErrors(writeResW2);
 checkWriteConcernTimedOut(writeResW2);
 
-// The lastCommitted opTime should not advance on the secondary.
-const opTimesAfterW2 = assert.commandWorked(secondary.adminCommand({replSetGetStatus: 1})).optimes;
-assert.docEq(opTimesAfterW2.lastCommittedOpTime, nullOpTime, () => tojson(opTimesAfterW2));
-assert.eq(nullWallTime, opTimesAfterW2.lastCommittedWallTime, () => tojson(opTimesAfterW2));
-
 const writeResWMaj = primaryDb.runCommand({
     insert: "test",
     documents: [{"writeConcernMajority": "shouldfail"}],
@@ -99,14 +100,9 @@ const writeResWMaj = primaryDb.runCommand({
 assert.commandWorkedIgnoringWriteConcernErrors(writeResWMaj);
 checkWriteConcernTimedOut(writeResWMaj);
 
-// The lastCommitted opTime should not advance on the secondary.
-const statusAfterWMaj = assert.commandWorked(secondary.adminCommand({replSetGetStatus: 1}));
-const opTimesAfterWMaj = statusAfterWMaj.optimes;
-assert.docEq(opTimesAfterWMaj.lastCommittedOpTime, nullOpTime, () => tojson(opTimesAfterWMaj));
-assert.eq(nullWallTime, opTimesAfterWMaj.lastCommittedWallTime, () => tojson(opTimesAfterWMaj));
-
 // 3. Make sure that even though the lastApplied and lastDurable have advanced on the secondary...
-const secondaryOpTimes = opTimesAfterWMaj;
+const statusAfterWMaj = assert.commandWorked(secondary.adminCommand({replSetGetStatus: 1}));
+const secondaryOpTimes = statusAfterWMaj.optimes;
 assert.gte(
     bsonWoCompare(secondaryOpTimes.appliedOpTime, nullOpTime), 0, () => tojson(secondaryOpTimes));
 assert.gte(

@@ -34,7 +34,7 @@
 #include "mongo/idl/idl_parser.h"
 
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/command_generic_argument.h"
+#include "mongo/idl/command_generic_argument.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -183,6 +183,14 @@ void IDLParserErrorContext::throwMissingField(StringData fieldName) const {
 
 void IDLParserErrorContext::throwUnknownField(StringData fieldName) const {
     std::string path = getElementPath(fieldName);
+    if (isMongocryptdArgument(fieldName)) {
+        uasserted(
+            4662500,
+            str::stream()
+                << "BSON field '" << path
+                << "' is an unknown field. This command may be meant for a mongocryptd process.");
+    }
+
     uasserted(40415, str::stream() << "BSON field '" << path << "' is an unknown field.");
 }
 
@@ -214,6 +222,17 @@ void IDLParserErrorContext::throwBadEnumValue(StringData enumValue) const {
     uasserted(ErrorCodes::BadValue,
               str::stream() << "Enumeration value '" << enumValue << "' for field '" << path
                             << "' is not a valid value.");
+}
+
+void IDLParserErrorContext::throwAPIStrictErrorIfApplicable(BSONElement field) const {
+    throwAPIStrictErrorIfApplicable(field.fieldNameStringData());
+}
+
+void IDLParserErrorContext::throwAPIStrictErrorIfApplicable(StringData fieldName) const {
+    uassert(ErrorCodes::APIStrictError,
+            str::stream() << "BSON field '" << getElementPath(fieldName)
+                          << "' is not allowed with apiStrict:true.",
+            !_apiStrict);
 }
 
 NamespaceString IDLParserErrorContext::parseNSCollectionRequired(StringData dbName,

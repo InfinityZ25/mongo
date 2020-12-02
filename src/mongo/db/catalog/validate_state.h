@@ -61,8 +61,8 @@ public:
      */
     ValidateState(OperationContext* opCtx,
                   const NamespaceString& nss,
-                  bool background,
-                  ValidateOptions options,
+                  ValidateMode mode,
+                  RepairMode repairMode,
                   bool turnOnExtraLoggingForTest = false);
 
     const NamespaceString& nss() const {
@@ -70,15 +70,22 @@ public:
     }
 
     bool isBackground() const {
-        return _background;
+        return _mode == ValidateMode::kBackground;
     }
 
-    bool isFullCollectionValidation() const {
-        return (_options & ValidateOptions::kFullRecordStoreValidation);
+    bool shouldEnforceFastCount() const;
+
+    bool isFullValidation() const {
+        return _mode == ValidateMode::kForegroundFull ||
+            _mode == ValidateMode::kForegroundFullEnforceFastCount;
     }
 
     bool isFullIndexValidation() const {
-        return (_options & ValidateOptions::kFullIndexValidation);
+        return isFullValidation() || _mode == ValidateMode::kForegroundFullIndexOnly;
+    }
+
+    bool shouldRunRepair() const {
+        return _repairMode == RepairMode::kRepair;
     }
 
     const UUID uuid() const {
@@ -91,7 +98,7 @@ public:
         return _database;
     }
 
-    Collection* getCollection() const {
+    const CollectionPtr& getCollection() const {
         invariant(_collection);
         return _collection;
     }
@@ -155,7 +162,7 @@ private:
 
     /**
      * Re-locks the database and collection with the appropriate locks for background validation.
-     * This should only be called when '_background' is set to true.
+     * This should only be called when '_mode' is set to 'kBackground'.
      */
     void _relockDatabaseAndCollection(OperationContext* opCtx);
 
@@ -168,7 +175,7 @@ private:
      * validated, but a cross database collection rename will interrupt validation. If the locks
      * cannot be re-acquired, throws the error.
      *
-     * Throws if validation cannot continue.
+     * Throws an interruption exception if validation cannot continue.
      *
      * After locks are reacquired:
      *     - Check if the database exists.
@@ -179,23 +186,23 @@ private:
 
     /**
      * Saves and restores the open cursors to release snapshots and minimize cache pressure for
-     * foreground validation.
-     *
-     * This cannot be called for background validation or we risk losing our PIT view of the data.
+     * validation.  For background validation, also refreshes the snapshot by starting a new storage
+     * transaction.
      */
     void _yieldCursors(OperationContext* opCtx);
 
     NamespaceString _nss;
-    bool _background;
-    ValidateOptions _options;
+    ValidateMode _mode;
+    RepairMode _repairMode;
     OptionalCollectionUUID _uuid;
 
+    boost::optional<ShouldNotConflictWithSecondaryBatchApplicationBlock> _noPBWM;
     boost::optional<Lock::GlobalLock> _globalLock;
     boost::optional<AutoGetDb> _databaseLock;
     boost::optional<Lock::CollectionLock> _collectionLock;
 
     Database* _database;
-    Collection* _collection;
+    CollectionPtr _collection;
 
     // Stores the indexes that are going to be validated. When validate yields periodically we'll
     // use this list to determine if validation should abort when an existing index that was

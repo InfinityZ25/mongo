@@ -24,7 +24,7 @@ env.Library(
     target='write_conflict_exception',
     source=[
         'write_conflict_exception.cpp',
-        env.Idlc('write_conflict_exception.idl')[0],
+        'write_conflict_exception.idl',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -33,6 +33,16 @@ env.Library(
         '$BUILD_DIR/mongo/idl/server_parameter',
         '$BUILD_DIR/mongo/util/fail_point',
         '$BUILD_DIR/mongo/util/log_and_backoff',
+    ],
+)
+
+env.Library(
+    target='lock_manager_defs',
+    source=[
+        'lock_manager_defs.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
     ],
 )
 
@@ -52,6 +62,7 @@ env.Library(
         '$BUILD_DIR/mongo/util/concurrency/spin_lock',
         '$BUILD_DIR/mongo/util/concurrency/ticketholder',
         '$BUILD_DIR/third_party/shim_boost',
+        'lock_manager_defs',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/catalog/collection_catalog',
@@ -66,6 +77,9 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/base',
+    ],
+    LIBDEPS_TYPEINFO=[
+        '$BUILD_DIR/mongo/db/service_context',
     ],
 )
 
@@ -91,9 +105,9 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/auth/authmocks',
         '$BUILD_DIR/mongo/db/curop',
         '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
-        '$BUILD_DIR/mongo/util/progress_meter',
         '$BUILD_DIR/mongo/transport/transport_layer_common',
         '$BUILD_DIR/mongo/transport/transport_layer_mock',
+        '$BUILD_DIR/mongo/util/progress_meter',
         'lock_manager',
         'write_conflict_exception',
     ]

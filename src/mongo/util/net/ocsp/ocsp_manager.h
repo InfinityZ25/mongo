@@ -30,6 +30,7 @@
 
 
 #include "mongo/base/data_range.h"
+#include "mongo/db/service_context.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/future.h"
@@ -38,24 +39,30 @@
 
 namespace mongo {
 
-constexpr Seconds kOCSPRequestTimeoutSeconds(5);
+enum class OCSPPurpose { kClientVerify, kStaple };
+
 class OCSPManager {
 
 public:
     OCSPManager();
 
-    static OCSPManager* get() {
-        static OCSPManager manager = OCSPManager();
+    static void start(ServiceContext* service);
 
-        return &manager;
-    };
+    static void shutdown(ServiceContext* service);
 
-    Future<std::vector<uint8_t>> requestStatus(std::vector<uint8_t> data, StringData responderURI);
+    static OCSPManager* get(ServiceContext* service);
 
+    Future<std::vector<uint8_t>> requestStatus(std::vector<uint8_t> data,
+                                               StringData responderURI,
+                                               OCSPPurpose direction);
+
+private:
     void startThreadPool();
 
 private:
-    std::unique_ptr<HttpClient> _client;
+    std::unique_ptr<HttpClient> _tlsClientHttp;
+    std::unique_ptr<HttpClient> _tlsServerHttp;
+
     std::unique_ptr<ThreadPool> _pool;
 };
 

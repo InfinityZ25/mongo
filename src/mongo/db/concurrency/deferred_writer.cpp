@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kWrite
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kWrite
 
 #include "mongo/db/concurrency/deferred_writer.h"
 #include "mongo/db/catalog/create_collection.h"
@@ -48,7 +48,7 @@ auto kLogInterval = stdx::chrono::minutes(1);
 void DeferredWriter::_logFailure(const Status& status) {
     if (TimePoint::clock::now() - _lastLogged > kLogInterval) {
         LOGV2(20516,
-              "Unable to write to collection {nss}: {status}",
+              "Unable to write to collection {namespace}: {error}",
               "Unable to write to collection",
               "namespace"_attr = _nss.toString(),
               "error"_attr = status);
@@ -112,11 +112,11 @@ void DeferredWriter::_worker(InsertStatement stmt) {
 
     auto agc = std::move(result.getValue());
 
-    Collection& collection = *agc->getCollection();
+    const CollectionPtr& collection = agc->getCollection();
 
     Status status = writeConflictRetry(opCtx, "deferred insert", _nss.ns(), [&] {
         WriteUnitOfWork wuow(opCtx);
-        Status status = collection.insertDocument(opCtx, stmt, nullptr, false);
+        Status status = collection->insertDocument(opCtx, stmt, nullptr, false);
         if (!status.isOK()) {
             return status;
         }

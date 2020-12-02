@@ -8,7 +8,7 @@ env.Library(
     target="cluster_query",
     source=[
         "cluster_find.cpp",
-        env.Idlc('cluster_query_knobs.idl')[0],
+        'cluster_query_knobs.idl',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/commands',
@@ -33,10 +33,10 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/pipeline/pipeline',
-        '$BUILD_DIR/mongo/s/query/cluster_client_cursor',
         '$BUILD_DIR/mongo/db/pipeline/process_interface/mongos_process_interface',
         '$BUILD_DIR/mongo/db/pipeline/sharded_agg_helpers',
         '$BUILD_DIR/mongo/db/views/views',
+        '$BUILD_DIR/mongo/s/query/cluster_client_cursor',
         'cluster_query',
     ]
 )
@@ -47,6 +47,7 @@ env.Library(
         "cluster_client_cursor_impl.cpp",
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/db/shared_request_handling',
         "router_exec_stage",
     ],
 )
@@ -74,14 +75,14 @@ env.Library(
         "async_results_merger.cpp",
         "blocking_results_merger.cpp",
         "establish_cursors.cpp",
-        env.Idlc('async_results_merger_params.idl')[0],
+        'async_results_merger_params.idl',
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/db/query/command_request_response",
         "$BUILD_DIR/mongo/db/query/query_common",
         "$BUILD_DIR/mongo/executor/task_executor_interface",
-        "$BUILD_DIR/mongo/s/client/sharding_client",
         '$BUILD_DIR/mongo/s/catalog/sharding_catalog_client_impl',
+        "$BUILD_DIR/mongo/s/client/sharding_client",
         "$BUILD_DIR/mongo/s/sharding_router_api",
     ],
 )
@@ -93,6 +94,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/shared_request_handling',
     ],
 )
 
@@ -123,6 +125,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/kill_sessions',
         '$BUILD_DIR/mongo/db/logical_session_cache',
         '$BUILD_DIR/mongo/db/logical_session_id',
+        '$BUILD_DIR/mongo/db/shared_request_handling',
     ],
 )
 
@@ -143,7 +146,6 @@ env.CppUnitTest(
     source=[
         "async_results_merger_test.cpp",
         "blocking_results_merger_test.cpp",
-        "cluster_aggregate_test.cpp",
         "cluster_client_cursor_impl_test.cpp",
         "cluster_cursor_manager_test.cpp",
         "cluster_exchange_test.cpp",
@@ -160,10 +162,9 @@ env.CppUnitTest(
         "$BUILD_DIR/mongo/db/logical_session_id",
         "$BUILD_DIR/mongo/db/query/query_request",
         "$BUILD_DIR/mongo/db/query/query_test_service_context",
-        "$BUILD_DIR/mongo/db/service_context_test_fixture",
         "$BUILD_DIR/mongo/executor/thread_pool_task_executor_test_fixture",
-        "$BUILD_DIR/mongo/s/commands/cluster_command_test_fixture",
         "$BUILD_DIR/mongo/s/sharding_router_test_fixture",
+        "$BUILD_DIR/mongo/s/vector_clock_mongos",
         "$BUILD_DIR/mongo/util/clock_source_mock",
         "async_results_merger",
         "cluster_aggregate",

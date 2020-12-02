@@ -40,7 +40,7 @@ assert.eq(primaryTestDB.capped.find().itcount(),
 
 // Truncate a capped collection on a secondary.
 assert.commandFailedWithCode(secondaryTestDB.runCommand({emptycapped: 'capped'}),
-                             ErrorCodes.NotMaster);
+                             ErrorCodes.NotWritablePrimary);
 
 // Truncate the oplog.
 assert.commandFailedWithCode(primaryLocalDB.runCommand({emptycapped: "oplog.rs"}),
@@ -73,7 +73,7 @@ assert.commandWorked(primaryAdminDB.runCommand({
 assert.commandWorked(primaryAdminDB.runCommand(
     {createUser: "root2", pwd: "pwd", roles: [{role: "root", db: "admin"}]}));
 
-// TODO: Test system.backup_users & system.new_users.
+// TODO: Test system.backup_users
 
 // Truncate the admin system.roles collection.
 assert.commandFailedWithCode(primaryAdminDB.runCommand({emptycapped: "system.roles"}),

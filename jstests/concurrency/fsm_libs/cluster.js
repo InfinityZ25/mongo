@@ -390,7 +390,7 @@ var Cluster = function(options) {
         assert(this.isSharded(), 'cluster is not sharded');
 
         // If we are continuously stepping down shards, the config server may have stale view of the
-        // cluster, so retry on retryable errors, e.g. NotMaster.
+        // cluster, so retry on retryable errors, e.g. NotWritablePrimary.
         if (this.shouldPerformContinuousStepdowns()) {
             assert.soon(() => {
                 try {
@@ -404,7 +404,7 @@ var Cluster = function(options) {
                     // done.
                     //
                     // TODO SERVER-30949: Remove this try catch block once listCollections and
-                    // listIndexes automatically retry on NotMaster errors.
+                    // listIndexes automatically retry on NotWritablePrimary errors.
                     if (e.code === 18630 ||  // listCollections failure
                         e.code === 18631) {  // listIndexes failure
                         print("Caught retryable error from shardCollection, retrying: " +
@@ -511,18 +511,25 @@ var Cluster = function(options) {
             res.databases.forEach(dbInfo => {
                 // Don't perform listCollections on the admin or config database through a mongos
                 // connection when stepping down the config server primary, because both are stored
-                // on the config server, and listCollections may return a not master error if the
+                // on the config server, and listCollections may return a NotPrimaryError if the
                 // mongos is stale.
                 //
                 // TODO SERVER-30949: listCollections through mongos should automatically retry on
-                // NotMaster errors. Once that is true, remove this check.
+                // NotWritablePrimary errors. Once that is true, remove this check.
                 if (isSteppingDownConfigServers && isMongos &&
                     (dbInfo.name === "admin" || dbInfo.name === "config")) {
                     return;
                 }
 
+                const validateOptions = {full: true, enforceFastCount: true};
+                // TODO (SERVER-24266): Once fast counts are tolerant to unclean shutdowns, remove
+                // the check for TestData.allowUncleanShutdowns.
+                if (TestData.skipEnforceFastCountOnValidate || TestData.allowUncleanShutdowns) {
+                    validateOptions.enforceFastCount = false;
+                }
+
                 assert.commandWorked(
-                    validateCollections(db.getSiblingDB(dbInfo.name), {full: true}),
+                    validateCollections(db.getSiblingDB(dbInfo.name), validateOptions),
                     phase + ' collection validation failed');
             });
         };
@@ -547,9 +554,7 @@ var Cluster = function(options) {
         replSets.forEach(rst => {
             var startTime = Date.now();
             var res;
-
-            // Use '_master' instead of getPrimary() to avoid the detection of a new primary.
-            var primary = rst._master;
+            var primary = rst.getPrimary();
 
             if (shouldCheckDBHashes) {
                 jsTest.log('Starting consistency checks for replica set with ' + primary.host +

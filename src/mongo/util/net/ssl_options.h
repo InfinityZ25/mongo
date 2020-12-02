@@ -37,6 +37,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/client/connection_string.h"
 #include "mongo/config.h"
 #include "mongo/crypto/sha256_block.h"
 #include "mongo/db/auth/role_name.h"
@@ -53,6 +54,8 @@ class OptionSection;
 class Environment;
 }  // namespace optionenvironment
 
+constexpr auto kSSLCipherConfigDefault = "HIGH:!EXPORT:!aNULL@STRENGTH"_sd;
+
 struct SSLParams {
     using TLSCATrusts = std::map<SHA256Block, std::set<RoleName>>;
 
@@ -63,11 +66,12 @@ struct SSLParams {
     std::string sslPEMKeyFile;      // --tlsCertificateKeyFile
     std::string sslPEMKeyPassword;  // --tlsCertificateKeyFilePassword
     std::string sslClusterFile;     // --tlsInternalKeyFile
-    std::string sslClusterPassword;  // --tlsInternalKeyPassword
-    std::string sslCAFile;           // --tlsCAFile
-    std::string sslClusterCAFile;    // --tlsClusterCAFile
-    std::string sslCRLFile;          // --tlsCRLFile
-    std::string sslCipherConfig;     // --tlsCipherConfig
+    std::string sslClusterPassword;    // --tlsInternalKeyPassword
+    std::string sslCAFile;             // --tlsCAFile
+    std::string sslClusterCAFile;      // --tlsClusterCAFile
+    std::string sslCRLFile;            // --tlsCRLFile
+    std::string sslCipherConfig;       // --tlsCipherConfig
+    std::string sslCipherSuiteConfig;  // --tlsCipherSuiteConfig
 
     boost::optional<TLSCATrusts> tlsCATrusts;  // --setParameter tlsCATrusts
 
@@ -96,7 +100,7 @@ struct SSLParams {
         false;  // --setParameter suppressNoTLSPeerCertificateWarning
     bool tlsWithholdClientCertificate = false;  // --setParameter tlsWithholdClientCertificate
 
-    SSLParams() {
+    SSLParams() : sslCipherConfig(kSSLCipherConfigDefault) {
         sslMode.store(SSLMode_disabled);
     }
 
@@ -129,6 +133,14 @@ struct SSLParams {
 };
 
 extern SSLParams sslGlobalParams;
+
+// Additional SSL Params that could be used to augment a particular connection
+// or have limited lifetime. In all cases, the fields stored here are not appropriate
+// to be part of sslGlobalParams.
+struct TransientSSLParams {
+    ConnectionString targetedClusterConnectionString;
+    std::string sslClusterPEMPayload;
+};
 
 /**
  * Older versions of mongod/mongos accepted --sslDisabledProtocols values

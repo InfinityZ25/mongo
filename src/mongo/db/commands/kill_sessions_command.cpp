@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/base/init.h"
@@ -65,9 +63,9 @@ KillAllSessionsByPatternSet patternsForLoggedInUser(OperationContext* opCtx) {
             User* user = authzSession->lookupUser(*iter);
             invariant(user);
 
-            auto pattern = makeKillAllSessionsByPattern(opCtx);
-            pattern.setUid(user->getDigest());
-            patterns.emplace(std::move(pattern));
+            auto item = makeKillAllSessionsByPattern(opCtx);
+            item.pattern.setUid(user->getDigest());
+            patterns.emplace(std::move(item));
         }
     } else {
         patterns.emplace(makeKillAllSessionsByPattern(opCtx));

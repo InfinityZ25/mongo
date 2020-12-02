@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -52,10 +52,7 @@ const auto kUnshardedCollection = std::make_shared<UnshardedCollection>();
 
 class CollectionShardingStateStandalone final : public CollectionShardingState {
 public:
-    ScopedCollectionDescription getCollectionDescription() override {
-        return {kUnshardedCollection};
-    }
-    ScopedCollectionDescription getCollectionDescription_DEPRECATED() override {
+    ScopedCollectionDescription getCollectionDescription(OperationContext* opCtx) override {
         return {kUnshardedCollection};
     }
     ScopedCollectionFilter getOwnershipFilter(OperationContext*,

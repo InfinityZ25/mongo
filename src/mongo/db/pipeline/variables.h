@@ -33,7 +33,7 @@
 
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/pipeline/runtime_constants_gen.h"
+#include "mongo/db/pipeline/legacy_runtime_constants_gen.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/string_map.h"
 
@@ -53,7 +53,7 @@ public:
     /**
      * Generate runtime constants using the current local and cluster times.
      */
-    static RuntimeConstants generateRuntimeConstants(OperationContext* opCtx);
+    static LegacyRuntimeConstants generateRuntimeConstants(OperationContext* opCtx);
 
     /**
      * Generates Variables::Id and keeps track of the number of Ids handed out. Each successive Id
@@ -73,8 +73,6 @@ public:
 
     Variables() = default;
 
-    static void validateNameForUserWrite(StringData varName);
-    static void validateNameForUserRead(StringData varName);
     static bool isUserDefinedVariable(Variables::Id id) {
         return id >= 0;
     }
@@ -128,10 +126,8 @@ public:
      * Returns whether a constant value for 'id' has been defined using setConstantValue().
      */
     bool hasConstantValue(Variables::Id id) const {
-        if (auto it = _values.find(id); it != _values.end() && it->second.isConstant) {
-            return true;
-        }
-        return false;
+        auto it = _definitions.find(id);
+        return (it != _definitions.end() && it->second.isConstant);
     }
 
     /**
@@ -145,16 +141,9 @@ public:
     }
 
     /**
-     * Return a reference to an object which represents the variables which are considered "runtime
-     * constants." It is a programming error to call this function without having called
-     * setRuntimeConstants().
-     */
-    const RuntimeConstants& getRuntimeConstants() const;
-
-    /**
      * Set the runtime constants. It is a programming error to call this more than once.
      */
-    void setRuntimeConstants(const RuntimeConstants& constants);
+    void setLegacyRuntimeConstants(const LegacyRuntimeConstants& constants);
 
     /**
      * Set the runtime constants using the current local and cluster times.
@@ -162,23 +151,16 @@ public:
     void setDefaultRuntimeConstants(OperationContext* opCtx);
 
     /**
-     * Return an object which represents the variables which are considered let parameters.
-     */
-    BSONObj serializeLetParameters(const VariablesParseState& vps) const;
-
-    /**
      * Seed let parameters with the given BSONObj.
      */
-    void seedVariablesWithLetParameters(boost::intrusive_ptr<ExpressionContext> expCtx,
+    void seedVariablesWithLetParameters(ExpressionContext* const expCtx,
                                         const BSONObj letParameters);
 
     bool hasValue(Variables::Id id) const {
-        if (id < 0)  // system variables.
-            return true;
-        if (auto it = _letParametersMap.find(id); it != _letParametersMap.end())
-            return true;
-        return false;
+        return _definitions.find(id) != _definitions.end();
     };
+
+    void appendSystemVariables(BSONObjBuilder& bob) const;
 
     /**
      * Copies this Variables and 'vps' to the Variables and VariablesParseState objects in 'expCtx'.
@@ -190,6 +172,8 @@ public:
      * runtime.
      */
     void copyToExpCtx(const VariablesParseState& vps, ExpressionContext* expCtx) const;
+
+    LegacyRuntimeConstants transitionalExtractRuntimeConstants() const;
 
 private:
     struct ValueAndState {
@@ -203,11 +187,6 @@ private:
 
     void setValue(Id id, const Value& value, bool isConstant);
 
-    static void validateName(StringData varName,
-                             std::function<bool(char)> prefixPred,
-                             std::function<bool(char)> suffixPred,
-                             int prefixLen);
-
     static auto getBuiltinVariableName(Variables::Id variable) {
         for (auto& [name, id] : kBuiltinVarNameToId) {
             if (variable == id) {
@@ -218,12 +197,7 @@ private:
     }
 
     IdGenerator _idGenerator;
-    stdx::unordered_map<Id, ValueAndState> _values;
-    stdx::unordered_map<Id, Value> _runtimeConstantsMap;
-    stdx::unordered_map<Id, Value> _letParametersMap;
-
-    // Populated after construction. Should not be set more than once.
-    boost::optional<RuntimeConstants> _runtimeConstants;
+    stdx::unordered_map<Id, ValueAndState> _definitions;
 };
 
 /**
@@ -267,7 +241,17 @@ public:
      */
     std::set<Variables::Id> getDefinedVariableIDs() const;
 
+    /**
+     * Serializes a map from name to values of defined variables.
+     */
     BSONObj serialize(const Variables& vars) const;
+
+    /**
+     * Splits defined variables into runtime constants and "the rest" as a transitional tool while
+     * we phase out using LegacyRuntimeConstants.
+     */
+    std::pair<LegacyRuntimeConstants, BSONObj> transitionalCompatibilitySerialize(
+        const Variables& vars) const;
 
     /**
      * Return a copy of this VariablesParseState. Will replace the copy's '_idGenerator' pointer

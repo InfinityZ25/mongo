@@ -31,6 +31,7 @@
 
 
 #include "mongo/base/status.h"
+#include "mongo/db/cst/c_node.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
@@ -191,12 +192,6 @@ public:
     std::string toStringShort() const;
 
     /**
-     * Traverses expression tree post-order.
-     * Sorts children at each non-leaf node by (MatchType, path(), children, number of children)
-     */
-    static void sortTree(MatchExpression* tree);
-
-    /**
      * Returns a count of 'type' nodes in expression tree.
      */
     static size_t countNodes(const MatchExpression* root, MatchExpression::MatchType type);
@@ -214,8 +209,11 @@ public:
         return _canHaveNoopMatchNodes;
     }
 
-    const boost::intrusive_ptr<ExpressionContext>& getExpCtx() const {
+    auto& getExpCtx() const {
         return _expCtx;
+    }
+    auto getExpCtxRaw() const {
+        return _expCtx.get();
     }
 
 private:
@@ -239,7 +237,6 @@ private:
 
     std::unique_ptr<QueryRequest> _qr;
 
-    // _root points into _qr->getFilter()
     std::unique_ptr<MatchExpression> _root;
 
     boost::optional<projection_ast::Projection> _proj;

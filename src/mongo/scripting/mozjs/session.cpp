@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -152,10 +152,10 @@ void SessionInfo::finalize(js::FreeOp* fop, JSObject* obj) {
             auto status = exceptionToStatus();
 
             try {
-                LOGV2(22791,
-                      "Failed to end session {lsid} due to {status}",
-                      "lsid"_attr = lsid,
-                      "status"_attr = status);
+                LOGV2_INFO(22791,
+                           "Failed to end logical session",
+                           "lsid"_attr = lsid,
+                           "error"_attr = status);
             } catch (...) {
                 // This is here in case logging fails.
             }

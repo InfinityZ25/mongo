@@ -32,10 +32,9 @@
 #include <vector>
 
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/request_types/shard_collection_gen.h"
 #include "mongo/s/shard_id.h"
@@ -46,6 +45,10 @@ namespace mongo {
 
 struct SplitPolicyParams {
     NamespaceString nss;
+    // TODO SERVER-53105 update this comment explaining that just (nss || uuid) field will be
+    // persisted If boost::none, the resulting config.chunks document(s) are not going to include
+    // the collection UUID field
+    boost::optional<CollectionUUID> collectionUUID;
     ShardId primaryShardId;
 };
 
@@ -58,7 +61,7 @@ public:
     static std::unique_ptr<InitialSplitPolicy> calculateOptimizationStrategy(
         OperationContext* opCtx,
         const ShardKeyPattern& shardKeyPattern,
-        const ShardsvrShardCollection& request,
+        const ShardsvrShardCollectionRequest& request,
         const std::vector<TagsType>& tags,
         size_t numShards,
         bool collectionIsEmpty);
@@ -78,6 +81,7 @@ public:
 
     struct ShardCollectionConfig {
         std::vector<ChunkType> chunks;
+        Timestamp creationTime;
 
         const auto& collVersion() const {
             return chunks.back().getVersion();
@@ -102,25 +106,12 @@ public:
      * assignments as configSvrShardCollection.
      */
     static ShardCollectionConfig generateShardCollectionInitialChunks(
-        const NamespaceString& nss,
+        SplitPolicyParams params,
         const ShardKeyPattern& shardKeyPattern,
-        const ShardId& databasePrimaryShardId,
         const Timestamp& validAfter,
         const std::vector<BSONObj>& splitPoints,
         const std::vector<ShardId>& allShardIds,
         const int numContiguousChunksPerShard = 1);
-
-    /**
-     * Throws an exception if the collection is already sharded with different options.
-     *
-     * If the collection is already sharded with the same options, returns the existing
-     * collection's full spec, else returns boost::none.
-     */
-    static boost::optional<CollectionType> checkIfCollectionAlreadyShardedWithSameOptions(
-        OperationContext* opCtx,
-        const NamespaceString& nss,
-        const ShardsvrShardCollection& request,
-        repl::ReadConcernLevel readConcernLevel);
 
     /**
      * Generates a list of initial chunks to be created during a shardCollection operation.
@@ -286,4 +277,31 @@ private:
     StringMap<size_t> _numTagsPerShard;
 };
 
+/**
+ * Split point building strategy to be used for resharding when zones are not defined.
+ */
+class ReshardingSplitPolicy : public InitialSplitPolicy {
+public:
+    ReshardingSplitPolicy(OperationContext* opCtx,
+                          const NamespaceString& nss,
+                          const ShardKeyPattern& shardKey,
+                          int numInitialChunks,
+                          const std::vector<ShardId>& recipientShardIds,
+                          const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                          int samplingRatio = 10);
+    ShardCollectionConfig createFirstChunks(OperationContext* opCtx,
+                                            const ShardKeyPattern& shardKeyPattern,
+                                            SplitPolicyParams params);
+    /**
+     * Creates the aggregation pipeline BSON to get documents for sampling from shards.
+     */
+    static std::vector<BSONObj> createRawPipeline(const ShardKeyPattern& shardKey,
+                                                  int samplingRatio,
+                                                  int numSplitPoints);
+
+private:
+    std::vector<BSONObj> _splitPoints;
+    std::vector<ShardId> _recipientShardIds;
+    int _numContiguousChunksPerShard;
+};
 }  // namespace mongo

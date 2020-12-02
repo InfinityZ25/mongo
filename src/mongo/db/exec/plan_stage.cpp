@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -46,13 +46,13 @@ void PlanStage::saveState() {
     doSaveState();
 }
 
-void PlanStage::restoreState() {
+void PlanStage::restoreState(const RestoreContext& context) {
     ++_commonStats.unyields;
     for (auto&& child : _children) {
-        child->restoreState();
+        child->restoreState(context);
     }
 
-    doRestoreState();
+    doRestoreState(context);
 }
 
 void PlanStage::detachFromOperationContext() {

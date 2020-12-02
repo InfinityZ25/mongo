@@ -119,18 +119,17 @@ public:
      * the failure. These are some of the known failures:
      *  - NamespaceNotFound - database does not exist
      */
-    virtual StatusWith<repl::OpTimeWith<DatabaseType>> getDatabase(
-        OperationContext* opCtx,
-        const std::string& dbName,
-        repl::ReadConcernLevel readConcernLevel) = 0;
+    virtual DatabaseType getDatabase(OperationContext* opCtx,
+                                     StringData db,
+                                     repl::ReadConcernLevel readConcernLevel) = 0;
 
     /**
      * Retrieves all databases in a cluster.
      *
      * Returns a !OK status if an error occurs.
      */
-    virtual StatusWith<repl::OpTimeWith<std::vector<DatabaseType>>> getAllDBs(
-        OperationContext* opCtx, repl::ReadConcernLevel readConcern) = 0;
+    virtual std::vector<DatabaseType> getAllDBs(OperationContext* opCtx,
+                                                repl::ReadConcernLevel readConcern) = 0;
 
     /**
      * Retrieves the metadata for a given collection, if it exists.
@@ -142,26 +141,18 @@ public:
      * the failure. These are some of the known failures:
      *  - NamespaceNotFound - collection does not exist
      */
-    virtual StatusWith<repl::OpTimeWith<CollectionType>> getCollection(
+    virtual CollectionType getCollection(
         OperationContext* opCtx,
         const NamespaceString& nss,
         repl::ReadConcernLevel readConcernLevel = repl::ReadConcernLevel::kMajorityReadConcern) = 0;
 
     /**
-     * Retrieves all collections undera specified database (or in the system).
-     *
-     * @param dbName an optional database name. Must be nullptr or non-empty. If nullptr is
-     *      specified, all collections on the system are returned.
-     * @param optime an out parameter that will contain the opTime of the config server.
-     *      Can be null. Note that collections can be fetched in multiple batches and each batch
-     *      can have a unique opTime. This opTime will be the one from the last batch.
-     *
-     * Returns the set of collections, or a !OK status if an error occurs.
+     * Retrieves all collections under a specified database (or in the system). If the dbName
+     * parameter is empty, returns all collections.
      */
-    virtual StatusWith<std::vector<CollectionType>> getCollections(
+    virtual std::vector<CollectionType> getCollections(
         OperationContext* opCtx,
-        const std::string* dbName,
-        repl::OpTime* optime,
+        StringData db,
         repl::ReadConcernLevel readConcernLevel = repl::ReadConcernLevel::kMajorityReadConcern) = 0;
 
     /**
@@ -228,11 +219,11 @@ public:
      * @param result: contains data returned from config servers
      * Returns true on success.
      */
-    virtual bool runUserManagementWriteCommand(OperationContext* opCtx,
-                                               const std::string& commandName,
-                                               const std::string& dbname,
-                                               const BSONObj& cmdObj,
-                                               BSONObjBuilder* result) = 0;
+    virtual Status runUserManagementWriteCommand(OperationContext* opCtx,
+                                                 StringData commandName,
+                                                 StringData dbname,
+                                                 const BSONObj& cmdObj,
+                                                 BSONObjBuilder* result) = 0;
 
     /**
      * Runs a user management related read-only command on a config server.
@@ -338,7 +329,7 @@ public:
      * Updates a single document in the specified namespace on the config server. Must only be used
      * for updates to the 'config' database.
      *
-     * This method retries the operation on NotMaster or network errors, so it should only be used
+     * This method retries the operation on NotPrimary or network errors, so it should only be used
      * with modifications which are idempotent.
      *
      * Returns non-OK status if the command failed to run for some reason. If the command was

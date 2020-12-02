@@ -64,7 +64,7 @@ using ServerSelectorPtr = std::unique_ptr<ServerSelector>;
 
 class SdamServerSelector : public ServerSelector {
 public:
-    explicit SdamServerSelector(const ServerSelectionConfiguration& config);
+    explicit SdamServerSelector(const SdamConfiguration& config);
 
     boost::optional<std::vector<ServerDescriptionPtr>> selectServers(
         const TopologyDescriptionPtr topologyDescription,
@@ -111,10 +111,12 @@ private:
                 ? *primaryDescription->getLastWriteDate()
                 : Date_t::min();
 
-            auto result = (serverDescription->getLastUpdateTime() - lastWriteDate) -
-                (primaryDescription->getLastUpdateTime() - primaryLastWriteDate) +
-                _config.getHeartBeatFrequencyMs();
-            return duration_cast<Milliseconds>(result);
+            auto result = durationCount<Milliseconds>(
+                              (serverDescription->getLastUpdateTime() - lastWriteDate)) -
+                durationCount<Milliseconds>(
+                              (primaryDescription->getLastUpdateTime() - primaryLastWriteDate)) +
+                durationCount<Milliseconds>(_config.getHeartBeatFrequency());
+            return Milliseconds{result};
         } else if (topologyDescription->getType() == TopologyType::kReplicaSetNoPrimary) {
             //  SMax.lastWriteDate - S.lastWriteDate + heartbeatFrequencyMS
             Date_t maxLastWriteDate = Date_t::min();
@@ -132,13 +134,19 @@ private:
                 }
             }
 
-            auto result = (maxLastWriteDate - lastWriteDate) + _config.getHeartBeatFrequencyMs();
-            return duration_cast<Milliseconds>(result);
+            auto result = durationCount<Milliseconds>(maxLastWriteDate - lastWriteDate) +
+                durationCount<Milliseconds>(_config.getHeartBeatFrequency());
+            return Milliseconds{result};
         } else {
             // Not a replica set
             return Milliseconds(0);
         }
     }
+
+    void _verifyMaxstalenessLowerBound(TopologyDescriptionPtr topologyDescription,
+                                       Seconds maxStalenessSeconds);
+    void _verifyMaxstalenessWireVersions(TopologyDescriptionPtr topologyDescription,
+                                         Seconds maxStalenessSeconds);
 
     bool recencyFilter(const ReadPreferenceSetting& readPref, const ServerDescriptionPtr& s);
 
@@ -170,21 +178,25 @@ private:
         };
     };
 
-    ServerSelectionConfiguration _config;
+    const SelectionFilter shardedFilter = [this](const ReadPreferenceSetting& readPref) {
+        return [&](const ServerDescriptionPtr& s) { return s->getType() == ServerType::kMongos; };
+    };
+
+    SdamConfiguration _config;
     mutable PseudoRandom _random;
 };
 
 // This is used to filter out servers based on their current latency measurements.
 struct LatencyWindow {
-    const IsMasterRTT lower;
-    IsMasterRTT upper;
+    const HelloRTT lower;
+    HelloRTT upper;
 
-    explicit LatencyWindow(const IsMasterRTT lowerBound, const IsMasterRTT windowWidth)
+    explicit LatencyWindow(const HelloRTT lowerBound, const HelloRTT windowWidth)
         : lower(lowerBound) {
-        upper = (lowerBound == IsMasterRTT::max()) ? lowerBound : lowerBound + windowWidth;
+        upper = (lowerBound == HelloRTT::max()) ? lowerBound : lowerBound + windowWidth;
     }
 
-    bool isWithinWindow(IsMasterRTT latency);
+    bool isWithinWindow(HelloRTT latency);
 
     // remove servers not in the latency window in-place.
     void filterServers(std::vector<ServerDescriptionPtr>* servers);

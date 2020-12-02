@@ -66,6 +66,7 @@ let st = new ShardingTest({
     },
 });
 
+enableCoordinateCommitReturnImmediatelyAfterPersistingDecision(st);
 assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
 assert.commandWorked(st.s.adminCommand({movePrimary: dbName, to: st.shard1.shardName}));
 
@@ -183,10 +184,12 @@ const transactionTypes = {
     writeReadSingleShardExpectSingleShardCommit: txnNumber => {
         return [writeShard0(txnNumber), readShard0(txnNumber)];
     },
-    readOneShardWriteOtherShardExpectSingleWriteShardCommit: txnNumber => {
+    // TODO (SERVER-48340): Re-enable the single-write-shard transaction commit optimization.
+    readOneShardWriteOtherShardExpectTwoPhaseCommit: txnNumber => {
         return [readShard0(txnNumber), writeShard1(txnNumber)];
     },
-    writeOneShardReadOtherShardExpectSingleWriteShardCommit: txnNumber => {
+    // TODO (SERVER-48340): Re-enable the single-write-shard transaction commit optimization.
+    writeOneShardReadOtherShardExpectTwoPhaseCommit: txnNumber => {
         return [writeShard0(txnNumber), readShard1(txnNumber)];
     },
     readOneShardWriteTwoOtherShardsExpectTwoPhaseCommit: txnNumber => {
@@ -300,15 +303,11 @@ const failureModes = {
 
 for (const failureModeName in failureModes) {
     for (const type in transactionTypes) {
-        // TODO (SERVER-37364): Unblacklist these test cases once the coordinator returns the
-        // decision as soon as the decision is made. At the moment, the coordinator makes an
-        // abort decision after timing out waiting for votes, but coordinateCommitTransaction
-        // hangs because it waits for the decision to be majority-ack'd by all participants,
-        // which can't happen while a participant can't majority commit writes.
+        // If the participants cannot majority commit writes, the coordinator will timeout
+        // waiting for votes, and consequently send out abortTransaction to the participants
+        // who will then respond with NoSuchTransaction error.
         if (failureModeName.includes("participantCannotMajorityCommitWrites") &&
             type.includes("ExpectTwoPhaseCommit")) {
-            jsTest.log(
-                `${failureModeName} with ${type} is skipped until SERVER-37364 is implemented`);
             continue;
         }
 

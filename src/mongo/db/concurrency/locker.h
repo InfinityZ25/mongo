@@ -71,7 +71,7 @@ public:
      * Require global lock attempts to obtain tickets from 'reading' (for MODE_S and MODE_IS),
      * and from 'writing' (for MODE_IX), which must have static lifetimes. There is no throttling
      * for MODE_X, as there can only ever be a single locker using this mode. The throttling is
-     * intended to defend against arge drops in throughput under high load due to too much
+     * intended to defend against large drops in throughput under high load due to too much
      * concurrency.
      */
     static void setGlobalThrottling(class TicketHolder* reading, class TicketHolder* writing);
@@ -162,7 +162,6 @@ public:
     virtual void lockGlobal(OperationContext* opCtx,
                             LockMode mode,
                             Date_t deadline = Date_t::max()) = 0;
-    virtual void lockGlobal(LockMode mode, Date_t deadline = Date_t::max()) = 0;
 
     /**
      * Decrements the reference count on the global lock.  If the reference count on the

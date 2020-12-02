@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/db/query/planner_ixselect.h"
 
@@ -42,6 +42,7 @@
 #include "mongo/db/matcher/expression_geo.h"
 #include "mongo/db/matcher/expression_internal_expr_eq.h"
 #include "mongo/db/matcher/expression_text.h"
+#include "mongo/db/query/canonical_query_encoder.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/index_tag.h"
 #include "mongo/db/query/indexability.h"
@@ -55,11 +56,13 @@ namespace {
 
 namespace wcp = ::mongo::wildcard_planning;
 
-// Can't index negations of {$eq: <Array>} or {$in: [<Array>, ...]}. Note that we could
-// use the index in principle, though we would need to generate special bounds.
-bool isEqualsArrayOrNotInArray(const MatchExpression* me) {
+// Can't index negations of {$eq: <Array>}, {$lt: <Array>}, {$gt: <Array>}, {$lte: <Array>}, {$gte:
+// <Array>}, or {$in: [<Array>, ...]}. Note that we could use the index in principle, though we
+// would need to generate special bounds.
+bool isComparisonWithArrayPred(const MatchExpression* me) {
     const auto type = me->matchType();
-    if (type == MatchExpression::EQ) {
+    if (type == MatchExpression::EQ || type == MatchExpression::LT || type == MatchExpression::GT ||
+        type == MatchExpression::LTE || type == MatchExpression::GTE) {
         return static_cast<const ComparisonMatchExpression*>(me)->getData().type() ==
             BSONType::Array;
     } else if (type == MatchExpression::MATCH_IN) {
@@ -68,7 +71,6 @@ bool isEqualsArrayOrNotInArray(const MatchExpression* me) {
             return elt.type() == BSONType::Array;
         });
     }
-
     return false;
 }
 
@@ -185,14 +187,11 @@ static double fieldWithDefault(const BSONObj& infoObj, const string& name, doubl
  * 2d indices don't handle wrapping so we can't use them for queries that wrap.
  */
 static bool twoDWontWrap(const Circle& circle, const IndexEntry& index) {
-    GeoHashConverter::Parameters hashParams;
-    Status paramStatus = GeoHashConverter::parseParameters(index.infoObj, &hashParams);
-    verify(paramStatus.isOK());  // we validated the params on index creation
-
-    GeoHashConverter conv(hashParams);
+    auto conv = GeoHashConverter::createFromDoc(index.infoObj);
+    uassertStatusOK(conv.getStatus());  // We validated the parameters when creating the index.
 
     // FYI: old code used flat not spherical error.
-    double yscandist = rad2deg(circle.radius) + conv.getErrorSphere();
+    double yscandist = rad2deg(circle.radius) + conv.getValue()->getErrorSphere();
     double xscandist = computeXScanDistance(circle.center.y, yscandist);
     bool ret = circle.center.x + xscandist < 180 && circle.center.x - xscandist > -180 &&
         circle.center.y + yscandist < 90 && circle.center.y - yscandist > -90;
@@ -289,8 +288,9 @@ std::vector<IndexEntry> QueryPlannerIXSelect::findIndexesByHint(
             if (entry.identifier.catalogName == hintName) {
                 LOGV2_DEBUG(20952,
                             5,
-                            "Hint by name specified, restricting indices to {entry_keyPattern}",
-                            "entry_keyPattern"_attr = entry.keyPattern.toString());
+                            "Hint by name specified, restricting indices",
+                            "name"_attr = entry.identifier.catalogName,
+                            "keyPattern"_attr = entry.keyPattern);
                 out.push_back(entry);
             }
         }
@@ -299,8 +299,9 @@ std::vector<IndexEntry> QueryPlannerIXSelect::findIndexesByHint(
             if (SimpleBSONObjComparator::kInstance.evaluate(entry.keyPattern == hintedIndex)) {
                 LOGV2_DEBUG(20953,
                             5,
-                            "Hint specified, restricting indices to {hintedIndex}",
-                            "hintedIndex"_attr = hintedIndex.toString());
+                            "Hint specified, restricting indices",
+                            "name"_attr = entry.identifier.catalogName,
+                            "keyPattern"_attr = entry.keyPattern);
                 out.push_back(entry);
             }
         }
@@ -417,26 +418,11 @@ bool QueryPlannerIXSelect::_compatible(const BSONElement& keyPatternElt,
                 return false;
             }
 
+            // The type being INDEX_WILDCARD implies that the index is sparse.
+            invariant(index.sparse || index.type != INDEX_WILDCARD);
+
             const auto* child = node->getChild(0);
             const MatchExpression::MatchType childtype = child->matchType();
-            const bool isNotEqualsNull =
-                (childtype == MatchExpression::EQ &&
-                 static_cast<const ComparisonMatchExpression*>(child)->getData().type() ==
-                     BSONType::jstNULL);
-
-            // The type being INDEX_WILDCARD implies that the index is sparse.
-            invariant(!(index.type == INDEX_WILDCARD && !index.sparse));
-
-            // Prevent negated predicates from using sparse indices. Doing so would cause us to
-            // miss documents which do not contain the indexed fields. The only case where we may
-            // use a sparse index for a negation is when the query is {$ne: null}. This is due to
-            // the behavior of {$eq: null} matching documents where the field does not exist OR the
-            // field is equal to literal null. The negation of {$eq: null} therefore matches
-            // documents where the field does exist AND the field is not equal to literal
-            // null. Since the field must exist, it is safe to use a sparse index.
-            if (index.sparse && !isNotEqualsNull) {
-                return false;
-            }
 
             // Can't index negations of MOD, REGEX, TYPE_OPERATOR, or ELEM_MATCH_VALUE.
             if (MatchExpression::REGEX == childtype || MatchExpression::MOD == childtype ||
@@ -445,12 +431,25 @@ bool QueryPlannerIXSelect::_compatible(const BSONElement& keyPatternElt,
                 return false;
             }
 
-            if (isEqualsArrayOrNotInArray(child)) {
+            // Comparisons with arrays have strange enough semantics that inverting the bounds
+            // within a $not has many complex special cases. We avoid indexing these queries, even
+            // though it is sometimes possible to build useful bounds.
+            if (isComparisonWithArrayPred(child)) {
+                return false;
+            }
+
+            // $gt and $lt to MinKey/MaxKey must build inexact bounds if the index is multikey and
+            // therefore cannot be inverted safely in a $not.
+            if (index.multikey && (child->isGTMinKey() || child->isLTMaxKey())) {
                 return false;
             }
 
             // Most of the time we can't use a multikey index for a $ne: null query, however there
             // are a few exceptions around $elemMatch.
+            const bool isNotEqualsNull =
+                (childtype == MatchExpression::EQ &&
+                 static_cast<const ComparisonMatchExpression*>(child)->getData().type() ==
+                     BSONType::jstNULL);
             const bool canUseIndexForNeNull =
                 notEqualsNullCanUseIndex(index, keyPatternElt, keyPatternIdx, elemMatchContext);
             if (isNotEqualsNull && !canUseIndexForNeNull) {
@@ -470,6 +469,11 @@ bool QueryPlannerIXSelect::_compatible(const BSONElement& keyPatternElt,
                     return false;
                 }
             }
+        }
+
+        if (index.pathHasMultikeyComponent(keyPatternElt.fieldNameStringData()) && !index.sparse &&
+            isQueryNegatingGTEorLTENull(node)) {
+            return false;
         }
 
         // If this is an $elemMatch value, make sure _all_ of the children can use the index.
@@ -531,6 +535,10 @@ bool QueryPlannerIXSelect::_compatible(const BSONElement& keyPatternElt,
         // above.
         MONGO_UNREACHABLE;
     } else if (IndexNames::HASHED == indexedFieldType) {
+        if (index.sparse && !nodeIsSupportedBySparseIndex(node, isChildOfElemMatchValue)) {
+            return false;
+        }
+
         return nodeIsSupportedByHashedIndex(node);
     } else if (IndexNames::GEO_2DSPHERE == indexedFieldType) {
         if (exprtype == MatchExpression::GEO) {
@@ -585,9 +593,9 @@ bool QueryPlannerIXSelect::_compatible(const BSONElement& keyPatternElt,
         return false;
     } else {
         LOGV2_WARNING(20954,
-                      "Unknown indexing for node {node_debugString} and field {keyPatternElt}",
-                      "node_debugString"_attr = node->debugString(),
-                      "keyPatternElt"_attr = keyPatternElt.toString());
+                      "Unknown indexing for given node and field",
+                      "node"_attr = node->debugString(),
+                      "field"_attr = keyPatternElt.toString());
         verify(0);
     }
 }
@@ -600,11 +608,6 @@ bool QueryPlannerIXSelect::nodeIsSupportedBySparseIndex(const MatchExpression* q
     // cannot answer), so this function only needs to check if the query performs an equality to
     // null.
 
-    // Equality to null inside an $elemMatch implies a match on literal 'null'.
-    if (isInElemMatch) {
-        return true;
-    }
-
     // Otherwise, we can't use a sparse index for $eq (or $lte, or $gte) with a null element.
     //
     // We can use a sparse index for $_internalExprEq with a null element. Expression language
@@ -613,10 +616,30 @@ bool QueryPlannerIXSelect::nodeIsSupportedBySparseIndex(const MatchExpression* q
     const auto typ = queryExpr->matchType();
     if (typ == MatchExpression::EQ) {
         const auto* queryExprEquality = static_cast<const EqualityMatchExpression*>(queryExpr);
-        return !queryExprEquality->getData().isNull();
+        // Equality to null inside an $elemMatch implies a match on literal 'null'.
+        return isInElemMatch || !queryExprEquality->getData().isNull();
     } else if (queryExpr->matchType() == MatchExpression::MATCH_IN) {
         const auto* queryExprIn = static_cast<const InMatchExpression*>(queryExpr);
-        return !queryExprIn->hasNull();
+        // Equality to null inside an $elemMatch implies a match on literal 'null'.
+        return isInElemMatch || !queryExprIn->hasNull();
+    } else if (queryExpr->matchType() == MatchExpression::NOT) {
+        const auto* child = queryExpr->getChild(0);
+        const MatchExpression::MatchType childtype = child->matchType();
+        const bool isNotEqualsNull =
+            (childtype == MatchExpression::EQ &&
+             static_cast<const ComparisonMatchExpression*>(child)->getData().type() ==
+                 BSONType::jstNULL);
+
+        // Prevent negated predicates from using sparse indices. Doing so would cause us to
+        // miss documents which do not contain the indexed fields. The only case where we may
+        // use a sparse index for a negation is when the query is {$ne: null}. This is due to
+        // the behavior of {$eq: null} matching documents where the field does not exist OR the
+        // field is equal to literal null. The negation of {$eq: null} therefore matches
+        // documents where the field does exist AND the field is not equal to literal
+        // null. Since the field must exist, it is safe to use a sparse index.
+        if (!isNotEqualsNull) {
+            return false;
+        }
     }
 
     return true;
@@ -624,7 +647,7 @@ bool QueryPlannerIXSelect::nodeIsSupportedBySparseIndex(const MatchExpression* q
 
 bool QueryPlannerIXSelect::logicalNodeMayBeSupportedByAnIndex(const MatchExpression* queryExpr) {
     return !(queryExpr->matchType() == MatchExpression::NOT &&
-             isEqualsArrayOrNotInArray(queryExpr->getChild(0)));
+             isComparisonWithArrayPred(queryExpr->getChild(0)));
 }
 
 bool QueryPlannerIXSelect::nodeIsSupportedByWildcardIndex(const MatchExpression* queryExpr) {

@@ -25,7 +25,6 @@ selector:
   - jstests/core/diagdata.js # Command not supported in mongos
   - jstests/core/dropdb_race.js  # syncdelay.
   - jstests/core/fsync.js  # uses fsync.
-  - jstests/core/geo_haystack*.js  # geoSearch.
   - jstests/core/geo_s2cursorlimitskip.js  # profiling.
   - jstests/core/geo_update_btree2.js  # notablescan.
   - jstests/core/index_id_options.js  # "local" database.
@@ -370,6 +369,8 @@ selector:
   # system.profile collection doesn't exist on mongos. Also, transactions are not allowed to operate
   # on capped collections.
   - requires_profiling
+  # Snapshot reads in transactions are banned on capped collections.
+  - requires_capped
   # Retrying a query can change whether a plan cache entry is active.
   - inspects_whether_plan_cache_entry_is_active
 
@@ -461,6 +462,7 @@ executor:
     num_rs_nodes_per_shard: 3
     configsvr_options:
       mongod_options:
+        wiredTigerEngineConfigString: "debug_mode=(table_logging=true)"
         set_parameters:
           enableTestCommands: 1
     shard_options:

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -50,6 +50,10 @@ static const Status kDefaultReadConcernNotPermitted{ErrorCodes::InvalidOptions,
 class ClusterAbortTransactionCmd : public BasicCommand {
 public:
     ClusterAbortTransactionCmd() : BasicCommand("abortTransaction") {}
+
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;

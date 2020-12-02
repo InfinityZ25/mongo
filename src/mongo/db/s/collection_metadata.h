@@ -60,7 +60,7 @@ public:
      * "thisShardId" is the shard identity of this shard for purposes of answering questions like
      * "does this key belong to this shard"?
      */
-    CollectionMetadata(std::shared_ptr<ChunkManager> cm, const ShardId& thisShardId);
+    CollectionMetadata(ChunkManager cm, const ShardId& thisShardId);
 
     /**
      * Returns whether this metadata object represents a sharded or unsharded collection.
@@ -68,6 +68,22 @@ public:
     bool isSharded() const {
         return bool(_cm);
     }
+
+    bool allowMigrations() const;
+
+    /**
+     * Returns the resharding key if the coordinator state is such that the recipient is tailing
+     * the donor's oplog.
+     */
+    boost::optional<ShardKeyPattern> getReshardingKeyIfShouldForwardOps() const;
+
+    /**
+     * Writes should run in distributed transactions when
+     *      1. The coordinator is between the mirroring and committed states, OR
+     *      2. The coordinator is in the renaming state, but the epoch is still the original epoch.
+     */
+    bool writesShouldRunInDistributedTransaction(const OID& originalEpoch,
+                                                 const OID& reshardingEpoch) const;
 
     /**
      * Returns the current shard version for the collection or UNSHARDED if it is not sharded.
@@ -158,9 +174,9 @@ public:
     // Methods used for orphan filtering and general introspection of the chunks owned by the shard
     //
 
-    ChunkManager* getChunkManager() const {
+    const ChunkManager* getChunkManager() const {
         invariant(isSharded());
-        return _cm.get();
+        return _cm.get_ptr();
     }
 
     /**
@@ -224,12 +240,17 @@ public:
      */
     void toBSONChunks(BSONArrayBuilder* builder) const;
 
+    const boost::optional<TypeCollectionReshardingFields>& getReshardingFields() const {
+        invariant(isSharded());
+        return _cm->getReshardingFields();
+    }
+
 private:
-    // The full routing table for the collection or nullptr if the collection is not sharded
-    std::shared_ptr<ChunkManager> _cm;
+    // The full routing table for the collection or boost::none if the collection is not sharded
+    boost::optional<ChunkManager> _cm;
 
     // The identity of this shard, for the purpose of answering "key belongs to me" queries. If the
-    // collection is not sharded (_cm is nullptr), then this value will be empty.
+    // collection is not sharded (_cm is boost::none), then this value will be empty.
     ShardId _thisShardId;
 };
 

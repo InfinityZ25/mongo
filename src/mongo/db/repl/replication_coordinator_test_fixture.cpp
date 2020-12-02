@@ -36,8 +36,7 @@
 #include <functional>
 #include <memory>
 
-#include "mongo/db/logical_clock.h"
-#include "mongo/db/repl/is_master_response.h"
+#include "mongo/db/repl/hello_response.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_consistency_markers_mock.h"
@@ -68,8 +67,7 @@ executor::TaskExecutor* ReplCoordTest::getReplExec() {
 }
 
 ReplSetConfig ReplCoordTest::assertMakeRSConfig(const BSONObj& configBson) {
-    ReplSetConfig config;
-    ASSERT_OK(config.initialize(configBson));
+    auto config = ReplSetConfig::parse(configBson);
     ASSERT_OK(config.validate());
     return config;
 }
@@ -130,9 +128,6 @@ void ReplCoordTest::init() {
     // PRNG seed for tests.
     const int64_t seed = 0;
 
-    auto logicalClock = std::make_unique<LogicalClock>(service);
-    LogicalClock::set(service, std::move(logicalClock));
-
     TopologyCoordinator::Options settings;
     auto topo = std::make_unique<TopologyCoordinator>(settings);
     _topo = topo.get();
@@ -154,9 +149,8 @@ void ReplCoordTest::init() {
                                                          replicationProcess,
                                                          _storageInterface,
                                                          seed);
-    service->setFastClockSource(std::make_unique<executor::NetworkInterfaceMockClockSource>(_net));
-    service->setPreciseClockSource(
-        std::make_unique<executor::NetworkInterfaceMockClockSource>(_net));
+    service->setFastClockSource(std::make_unique<ClockSourceMock>());
+    service->setPreciseClockSource(std::make_unique<ClockSourceMock>());
 }
 
 void ReplCoordTest::init(const ReplSettings& settings) {
@@ -174,6 +168,9 @@ void ReplCoordTest::start() {
     // construct ServiceEntryPoint and this causes a segmentation fault when
     // reconstructPreparedTransactions uses DBDirectClient to call into ServiceEntryPoint.
     FailPointEnableBlock skipReconstructPreparedTransactions("skipReconstructPreparedTransactions");
+    // Skip recovering tenant migration access blockers for the same reason as the above.
+    FailPointEnableBlock skipRecoverTenantMigrationAccessBlockers(
+        "skipRecoverTenantMigrationAccessBlockers");
     invariant(!_callShutdown);
     // if we haven't initialized yet, do that first.
     if (!_repl) {
@@ -181,7 +178,7 @@ void ReplCoordTest::start() {
     }
 
     const auto opCtx = makeOperationContext();
-    _repl->startup(opCtx.get());
+    _repl->startup(opCtx.get(), LastStorageEngineShutdownState::kClean);
     _repl->waitForStartUpComplete_forTest();
     // _rsConfig should be written down at this point, so populate _memberData accordingly.
     _topo->populateAllMembersConfigVersionAndTerm_forTest();
@@ -360,6 +357,9 @@ void ReplCoordTest::simulateSuccessfulV1ElectionWithoutExitingDrainMode(Date_t e
         ReplSetHeartbeatArgsV1 hbArgs;
         Status status = hbArgs.initialize(request.cmdObj);
         if (status.isOK()) {
+            if (replCoord->getMemberState().primary()) {
+                ASSERT_EQ(hbArgs.getPrimaryId(), replCoord->getMyId());
+            }
             ReplSetHeartbeatResponse hbResp;
             hbResp.setSetName(rsConfig.getReplSetName());
             hbResp.setState(MemberState::RS_SECONDARY);
@@ -391,9 +391,9 @@ void ReplCoordTest::simulateSuccessfulV1ElectionWithoutExitingDrainMode(Date_t e
     ASSERT(replCoord->getApplierState() == ReplicationCoordinator::ApplierState::Draining);
     ASSERT(replCoord->getMemberState().primary()) << replCoord->getMemberState().toString();
 
-    auto imResponse = replCoord->awaitIsMasterResponse(opCtx, {}, boost::none, boost::none);
-    ASSERT_FALSE(imResponse->isMaster()) << imResponse->toBSON().toString();
-    ASSERT_TRUE(imResponse->isSecondary()) << imResponse->toBSON().toString();
+    auto helloResponse = replCoord->awaitHelloResponse(opCtx, {}, boost::none, boost::none);
+    ASSERT_FALSE(helloResponse->isWritablePrimary()) << helloResponse->toBSON().toString();
+    ASSERT_TRUE(helloResponse->isSecondary()) << helloResponse->toBSON().toString();
 }
 
 void ReplCoordTest::simulateSuccessfulV1ElectionAt(Date_t electionTime) {
@@ -404,9 +404,9 @@ void ReplCoordTest::simulateSuccessfulV1ElectionAt(Date_t electionTime) {
     signalDrainComplete(opCtx.get());
 
     ASSERT(replCoord->getApplierState() == ReplicationCoordinator::ApplierState::Stopped);
-    auto imResponse = replCoord->awaitIsMasterResponse(opCtx.get(), {}, boost::none, boost::none);
-    ASSERT_TRUE(imResponse->isMaster()) << imResponse->toBSON().toString();
-    ASSERT_FALSE(imResponse->isSecondary()) << imResponse->toBSON().toString();
+    auto helloResponse = replCoord->awaitHelloResponse(opCtx.get(), {}, boost::none, boost::none);
+    ASSERT_TRUE(helloResponse->isWritablePrimary()) << helloResponse->toBSON().toString();
+    ASSERT_FALSE(helloResponse->isSecondary()) << helloResponse->toBSON().toString();
 
     ASSERT(replCoord->getMemberState().primary()) << replCoord->getMemberState().toString();
 }

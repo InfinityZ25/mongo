@@ -36,10 +36,10 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/migration_chunk_cloner_source_legacy.h"
+#include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/s/catalog/sharding_catalog_client_mock.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/shard_server_test_fixture.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
 
@@ -154,18 +154,24 @@ protected:
                 nullptr,
                 false,
                 epoch,
+                boost::none,
+                true,
                 {ChunkType{kNss,
                            ChunkRange{BSON(kShardKey << MINKEY), BSON(kShardKey << MAXKEY)},
                            ChunkVersion(1, 0, epoch),
                            ShardId("dummyShardId")}});
 
-            std::shared_ptr<ChunkManager> cm = std::make_shared<ChunkManager>(rt, boost::none);
-
             AutoGetDb autoDb(operationContext(), kNss.db(), MODE_IX);
             Lock::CollectionLock collLock(operationContext(), kNss, MODE_IX);
             CollectionShardingRuntime::get(operationContext(), kNss)
-                ->setFilteringMetadata(operationContext(),
-                                       CollectionMetadata(cm, ShardId("dummyShardId")));
+                ->setFilteringMetadata(
+                    operationContext(),
+                    CollectionMetadata(
+                        ChunkManager(ShardId("dummyShardId"),
+                                     DatabaseVersion(UUID::gen()),
+                                     makeStandaloneRoutingTableHistory(std::move(rt)),
+                                     boost::none),
+                        ShardId("dummyShardId")));
         }();
 
         _client->createIndex(kNss.ns(), kShardKeyPattern);
@@ -252,7 +258,7 @@ TEST_F(MigrationChunkClonerSourceLegacyTest, CorrectDocumentsFetched) {
             onCommand([&](const RemoteCommandRequest& request) { return BSON("ok" << true); });
         });
 
-        ASSERT_OK(cloner.startClone(operationContext(), UUID::gen(), _lsid, _txnNumber, false));
+        ASSERT_OK(cloner.startClone(operationContext(), UUID::gen(), _lsid, _txnNumber));
         futureStartClone.default_timed_get();
     }
 
@@ -350,7 +356,7 @@ TEST_F(MigrationChunkClonerSourceLegacyTest, CollectionNotFound) {
         kDonorConnStr,
         kRecipientConnStr.getServers()[0]);
 
-    ASSERT_NOT_OK(cloner.startClone(operationContext(), UUID::gen(), _lsid, _txnNumber, false));
+    ASSERT_NOT_OK(cloner.startClone(operationContext(), UUID::gen(), _lsid, _txnNumber));
     cloner.cancelClone(operationContext());
 }
 
@@ -363,7 +369,7 @@ TEST_F(MigrationChunkClonerSourceLegacyTest, ShardKeyIndexNotFound) {
         kDonorConnStr,
         kRecipientConnStr.getServers()[0]);
 
-    ASSERT_NOT_OK(cloner.startClone(operationContext(), UUID::gen(), _lsid, _txnNumber, false));
+    ASSERT_NOT_OK(cloner.startClone(operationContext(), UUID::gen(), _lsid, _txnNumber));
     cloner.cancelClone(operationContext());
 }
 
@@ -390,7 +396,7 @@ TEST_F(MigrationChunkClonerSourceLegacyTest, FailedToEngageRecipientShard) {
         });
 
         auto startCloneStatus =
-            cloner.startClone(operationContext(), UUID::gen(), _lsid, _txnNumber, false);
+            cloner.startClone(operationContext(), UUID::gen(), _lsid, _txnNumber);
         ASSERT_EQ(ErrorCodes::NetworkTimeout, startCloneStatus.code());
         futureStartClone.default_timed_get();
     }

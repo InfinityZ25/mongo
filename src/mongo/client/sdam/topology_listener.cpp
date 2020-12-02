@@ -26,18 +26,43 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 #include "mongo/client/sdam/topology_listener.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo::sdam {
 
 void TopologyEventsPublisher::registerListener(TopologyListenerPtr listener) {
+    auto locked_listener = listener.lock();
+    if (!locked_listener) {
+        LOGV2_WARNING(5148001, "Trying to register an empty listener with TopologyEventsPublisher");
+        return;
+    }
     stdx::lock_guard lock(_mutex);
-    _listeners.push_back(listener);
+    if (std::find_if(_listeners.begin(),
+                     _listeners.end(),
+                     [&locked_listener](const TopologyListenerPtr& ptr) {
+                         return ptr.lock() == locked_listener;
+                     }) == std::end(_listeners)) {
+        _listeners.push_back(listener);
+    }
 }
 
 void TopologyEventsPublisher::removeListener(TopologyListenerPtr listener) {
+    auto locked_listener = listener.lock();
+    if (!locked_listener) {
+        LOGV2_WARNING(5148002,
+                      "Trying to unregister an empty listener from TopologyEventsPublisher");
+        return;
+    }
     stdx::lock_guard lock(_mutex);
-    _listeners.erase(std::remove(_listeners.begin(), _listeners.end(), listener), _listeners.end());
+    _listeners.erase(std::remove_if(_listeners.begin(),
+                                    _listeners.end(),
+                                    [&locked_listener](const TopologyListenerPtr& ptr) {
+                                        return ptr.lock() == locked_listener;
+                                    }),
+                     _listeners.end());
 }
 
 void TopologyEventsPublisher::close() {
@@ -47,14 +72,11 @@ void TopologyEventsPublisher::close() {
 }
 
 void TopologyEventsPublisher::onTopologyDescriptionChangedEvent(
-    UUID topologyId,
-    TopologyDescriptionPtr previousDescription,
-    TopologyDescriptionPtr newDescription) {
+    TopologyDescriptionPtr previousDescription, TopologyDescriptionPtr newDescription) {
     {
         stdx::lock_guard lock(_eventQueueMutex);
         EventPtr event = std::make_unique<Event>();
         event->type = EventType::TOPOLOGY_DESCRIPTION_CHANGED;
-        event->topologyId = std::move(topologyId);
         event->previousDescription = previousDescription;
         event->newDescription = newDescription;
         _eventQueue.push_back(std::move(event));
@@ -62,14 +84,14 @@ void TopologyEventsPublisher::onTopologyDescriptionChangedEvent(
     _scheduleNextDelivery();
 }
 
-void TopologyEventsPublisher::onServerHandshakeCompleteEvent(IsMasterRTT durationMs,
-                                                             const sdam::ServerAddress& address,
+void TopologyEventsPublisher::onServerHandshakeCompleteEvent(HelloRTT duration,
+                                                             const HostAndPort& address,
                                                              const BSONObj reply) {
     {
         stdx::lock_guard<Mutex> lock(_eventQueueMutex);
         EventPtr event = std::make_unique<Event>();
         event->type = EventType::HANDSHAKE_COMPLETE;
-        event->duration = duration_cast<IsMasterRTT>(durationMs);
+        event->duration = duration;
         event->hostAndPort = address;
         event->reply = reply;
         _eventQueue.push_back(std::move(event));
@@ -77,7 +99,7 @@ void TopologyEventsPublisher::onServerHandshakeCompleteEvent(IsMasterRTT duratio
     _scheduleNextDelivery();
 }
 
-void TopologyEventsPublisher::onServerHandshakeFailedEvent(const sdam::ServerAddress& address,
+void TopologyEventsPublisher::onServerHandshakeFailedEvent(const HostAndPort& address,
                                                            const Status& status,
                                                            const BSONObj reply) {
     {
@@ -92,7 +114,7 @@ void TopologyEventsPublisher::onServerHandshakeFailedEvent(const sdam::ServerAdd
     _scheduleNextDelivery();
 }
 
-void TopologyEventsPublisher::onServerHeartbeatSucceededEvent(const ServerAddress& hostAndPort,
+void TopologyEventsPublisher::onServerHeartbeatSucceededEvent(const HostAndPort& hostAndPort,
                                                               const BSONObj reply) {
     {
         stdx::lock_guard lock(_eventQueueMutex);
@@ -106,7 +128,7 @@ void TopologyEventsPublisher::onServerHeartbeatSucceededEvent(const ServerAddres
 }
 
 void TopologyEventsPublisher::onServerHeartbeatFailureEvent(Status errorStatus,
-                                                            const ServerAddress& hostAndPort,
+                                                            const HostAndPort& hostAndPort,
                                                             const BSONObj reply) {
     {
         stdx::lock_guard lock(_eventQueueMutex);
@@ -126,7 +148,7 @@ void TopologyEventsPublisher::_scheduleNextDelivery() {
         [self = shared_from_this()](const Status& status) { self->_nextDelivery(); });
 }
 
-void TopologyEventsPublisher::onServerPingFailedEvent(const ServerAddress& hostAndPort,
+void TopologyEventsPublisher::onServerPingFailedEvent(const HostAndPort& hostAndPort,
                                                       const Status& status) {
     {
         stdx::lock_guard lock(_eventQueueMutex);
@@ -139,13 +161,13 @@ void TopologyEventsPublisher::onServerPingFailedEvent(const ServerAddress& hostA
     _scheduleNextDelivery();
 }
 
-void TopologyEventsPublisher::onServerPingSucceededEvent(IsMasterRTT durationMS,
-                                                         const ServerAddress& hostAndPort) {
+void TopologyEventsPublisher::onServerPingSucceededEvent(HelloRTT duration,
+                                                         const HostAndPort& hostAndPort) {
     {
         stdx::lock_guard lock(_eventQueueMutex);
         EventPtr event = std::make_unique<Event>();
         event->type = EventType::PING_SUCCESS;
-        event->duration = duration_cast<IsMasterRTT>(durationMS);
+        event->duration = duration;
         event->hostAndPort = hostAndPort;
         _eventQueue.push_back(std::move(event));
     }
@@ -167,22 +189,38 @@ void TopologyEventsPublisher::_nextDelivery() {
 
     // release the lock before sending to avoid deadlock in the case there
     // are events generated by sending the current one.
-    std::vector<TopologyListenerPtr> listeners;
+    std::vector<std::shared_ptr<TopologyListener>> listeners;
     {
         stdx::lock_guard lock(_mutex);
         if (_isClosed) {
             return;
         }
-        listeners = _listeners;
+        listeners.reserve(_listeners.size());
+        // Helps to purge empty elements when a weak_ptr points to an element removed elsewhere.
+        // We take advantage of the fact that we are scanning the container anyway.
+        _listeners.erase(std::remove_if(_listeners.begin(),
+                                        _listeners.end(),
+                                        [this, &listeners](const TopologyListenerPtr& ptr) {
+                                            auto p = ptr.lock();
+                                            if (p) {
+                                                // Makes a copy of non-empty elements in
+                                                // 'listeners'.
+                                                listeners.push_back(p);
+                                                return false;
+                                            }
+                                            return true;
+                                        }),
+                         _listeners.end());
     }
 
     // send to the listeners outside of the lock.
     for (auto listener : listeners) {
-        _sendEvent(listener, *nextEvent);
+        // The copy logic above guaranteed that only non-empty elements are in the vector.
+        _sendEvent(listener.get(), *nextEvent);
     }
 }
 
-void TopologyEventsPublisher::_sendEvent(TopologyListenerPtr listener, const Event& event) {
+void TopologyEventsPublisher::_sendEvent(TopologyListener* listener, const Event& event) {
     switch (event.type) {
         case EventType::HEARTBEAT_SUCCESS:
             listener->onServerHeartbeatSucceededEvent(event.hostAndPort, event.reply);
@@ -191,19 +229,15 @@ void TopologyEventsPublisher::_sendEvent(TopologyListenerPtr listener, const Eve
             listener->onServerHeartbeatFailureEvent(event.status, event.hostAndPort, event.reply);
             break;
         case EventType::TOPOLOGY_DESCRIPTION_CHANGED:
-            // TODO SERVER-46497: fix uuid or just remove
-            listener->onTopologyDescriptionChangedEvent(
-                UUID::gen(), event.previousDescription, event.newDescription);
+            listener->onTopologyDescriptionChangedEvent(event.previousDescription,
+                                                        event.newDescription);
             break;
         case EventType::HANDSHAKE_COMPLETE:
             listener->onServerHandshakeCompleteEvent(
-                sdam::IsMasterRTT(duration_cast<Milliseconds>(event.duration)),
-                event.hostAndPort,
-                event.reply);
+                event.duration, event.hostAndPort, event.reply);
             break;
         case EventType::PING_SUCCESS:
-            listener->onServerPingSucceededEvent(duration_cast<IsMasterRTT>(event.duration),
-                                                 event.hostAndPort);
+            listener->onServerPingSucceededEvent(event.duration, event.hostAndPort);
             break;
         case EventType::PING_FAILURE:
             listener->onServerPingFailedEvent(event.hostAndPort, event.status);

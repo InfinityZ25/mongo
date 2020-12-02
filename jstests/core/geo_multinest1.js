@@ -1,6 +1,9 @@
 // Cannot implicitly shard accessed collections because of extra shard key index in sharded
 // collection.
-// @tags: [assumes_no_implicit_index_creation]
+// @tags: [
+//   assumes_no_implicit_index_creation,
+//   sbe_incompatible,
+// ]
 
 // Test distance queries with interleaved distances
 
@@ -13,7 +16,7 @@ var res =
     t.insert({zip: "10003", data: [{loc: [30, 30], type: "home"}, {loc: [49, 49], type: "work"}]});
 assert.commandWorked(res);
 
-assert.commandWorked(t.ensureIndex({"data.loc": "2d", zip: 1}));
+assert.commandWorked(t.createIndex({"data.loc": "2d", zip: 1}));
 assert.eq(2, t.getIndexKeys().length);
 
 res =

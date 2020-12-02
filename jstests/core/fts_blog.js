@@ -7,7 +7,10 @@ t.save({_id: 3, title: "knives are Fun", text: "this is a new blog i am writing.
 
 // default weight is 1
 // specify weights if you want a field to be more meaningull
-t.ensureIndex({"title": "text", text: "text"}, {weights: {title: 10}});
+// @tags: [
+//   sbe_incompatible,
+// ]
+t.createIndex({"title": "text", text: "text"}, {weights: {title: 10}});
 
 res = t.find({"$text": {"$search": "blog"}}, {score: {"$meta": "textScore"}}).sort({
     score: {"$meta": "textScore"}

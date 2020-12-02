@@ -1,5 +1,8 @@
 // Check that OCSP verification works
-// @tags: [requires_http_client]
+// @tags: [
+//   requires_http_client,
+//   live_record_incompatible,
+// ]
 
 load("jstests/ocsp/lib/mock_ocsp.js");
 
@@ -57,7 +60,17 @@ if (determineSSLProvider() === "apple") {
     return;
 }
 
+clearOCSPCache();
+
+// Give time for the OCSP cache to clean up.
+sleep(1000);
+
+// Test that soft fail works.
 ocsp_options.sslPEMKeyFile = OCSP_SERVER_CERT;
+
+assert.doesNotThrow(() => {
+    conn = MongoRunner.runMongod(ocsp_options);
+});
 
 clearOCSPCache();
 

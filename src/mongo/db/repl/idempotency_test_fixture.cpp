@@ -55,6 +55,7 @@
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_applier.h"
 #include "mongo/db/repl/oplog_applier_impl.h"
+#include "mongo/db/repl/oplog_entry_test_helpers.h"
 #include "mongo/db/repl/oplog_interface_local.h"
 #include "mongo/db/repl/replication_consistency_markers_mock.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
@@ -65,40 +66,6 @@
 namespace mongo {
 namespace repl {
 
-namespace {
-
-/**
- * Creates an OplogEntry with given parameters and preset defaults for this test suite.
- */
-repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
-                                repl::OpTypeEnum opType,
-                                NamespaceString nss,
-                                BSONObj object,
-                                boost::optional<BSONObj> object2 = boost::none,
-                                OperationSessionInfo sessionInfo = {},
-                                Date_t wallClockTime = Date_t(),
-                                boost::optional<StmtId> stmtId = boost::none,
-                                boost::optional<UUID> uuid = boost::none,
-                                boost::optional<OpTime> prevOpTime = boost::none) {
-    return repl::OplogEntry(opTime,                           // optime
-                            boost::none,                      // hash
-                            opType,                           // opType
-                            nss,                              // namespace
-                            uuid,                             // uuid
-                            boost::none,                      // fromMigrate
-                            repl::OplogEntry::kOplogVersion,  // version
-                            object,                           // o
-                            object2,                          // o2
-                            sessionInfo,                      // sessionInfo
-                            boost::none,                      // upsert
-                            wallClockTime,                    // wall clock time
-                            stmtId,                           // statement id
-                            prevOpTime,    // optime of previous write within same transaction
-                            boost::none,   // pre-image optime
-                            boost::none);  // post-image optime
-}
-
-}  // namespace
 
 /**
  * Compares BSON objects (BSONObj) in two sets of BSON objects (BSONObjSet) to see if the two
@@ -203,168 +170,6 @@ StringBuilder& operator<<(StringBuilder& sb, const CollectionState& state) {
 
 const auto kCollectionDoesNotExist = CollectionState();
 
-/**
- * Creates an oplog entry for 'command' with the given 'optime', 'namespace' and optional 'uuid'.
- */
-OplogEntry makeCommandOplogEntry(OpTime opTime,
-                                 const NamespaceString& nss,
-                                 const BSONObj& command,
-                                 boost::optional<UUID> uuid) {
-    return makeOplogEntry(opTime,
-                          OpTypeEnum::kCommand,
-                          nss.getCommandNS(),
-                          command,
-                          boost::none /* o2 */,
-                          {} /* sessionInfo */,
-                          Date_t() /* wallClockTime*/,
-                          boost::none /* stmtId */,
-                          uuid);
-}
-
-/**
- * Creates an oplog entry for 'command' with the given 'optime', 'namespace' and session information
- */
-OplogEntry makeCommandOplogEntryWithSessionInfoAndStmtId(OpTime opTime,
-                                                         const NamespaceString& nss,
-                                                         const BSONObj& command,
-                                                         LogicalSessionId lsid,
-                                                         TxnNumber txnNum,
-                                                         StmtId stmtId,
-                                                         boost::optional<OpTime> prevOpTime) {
-    OperationSessionInfo info;
-    info.setSessionId(lsid);
-    info.setTxnNumber(txnNum);
-    return makeOplogEntry(opTime,
-                          OpTypeEnum::kCommand,
-                          nss.getCommandNS(),
-                          command,
-                          boost::none /* o2 */,
-                          info /* sessionInfo */,
-                          Date_t::min() /* wallClockTime -- required but not checked */,
-                          stmtId,
-                          boost::none /* uuid */,
-                          prevOpTime);
-}
-
-/**
- * Creates a create collection oplog entry with given optime.
- */
-OplogEntry makeCreateCollectionOplogEntry(OpTime opTime,
-                                          const NamespaceString& nss,
-                                          const BSONObj& options) {
-    BSONObjBuilder bob;
-    bob.append("create", nss.coll());
-    boost::optional<UUID> optionalUUID;
-    if (options.hasField("uuid")) {
-        StatusWith<UUID> uuid = UUID::parse(options.getField("uuid"));
-        optionalUUID = uuid.getValue();
-    }
-    bob.appendElements(options);
-    return makeCommandOplogEntry(opTime, nss, bob.obj(), optionalUUID);
-}
-
-/**
- * Creates an insert oplog entry with given optime and namespace.
- */
-OplogEntry makeInsertDocumentOplogEntry(OpTime opTime,
-                                        const NamespaceString& nss,
-                                        const BSONObj& documentToInsert) {
-    return makeOplogEntry(opTime,               // optime
-                          OpTypeEnum::kInsert,  // op type
-                          nss,                  // namespace
-                          documentToInsert,     // o
-                          boost::none,          // o2
-                          {},                   // session info
-                          Date_t::now());       // wall clock time
-}
-
-/**
- * Creates a delete oplog entry with given optime and namespace.
- */
-OplogEntry makeDeleteDocumentOplogEntry(OpTime opTime,
-                                        const NamespaceString& nss,
-                                        const BSONObj& documentToDelete) {
-    return makeOplogEntry(opTime,               // optime
-                          OpTypeEnum::kDelete,  // op type
-                          nss,                  // namespace
-                          documentToDelete,     // o
-                          boost::none,          // o2
-                          {},                   // session info
-                          Date_t::now());       // wall clock time
-}
-
-/**
- * Creates an update oplog entry with given optime and namespace.
- */
-OplogEntry makeUpdateDocumentOplogEntry(OpTime opTime,
-                                        const NamespaceString& nss,
-                                        const BSONObj& documentToUpdate,
-                                        const BSONObj& updatedDocument) {
-    return makeOplogEntry(opTime,               // optime
-                          OpTypeEnum::kUpdate,  // op type
-                          nss,                  // namespace
-                          updatedDocument,      // o
-                          documentToUpdate,     // o2
-                          {},                   // session info
-                          Date_t::now());       // wall clock time
-}
-
-/**
- * Creates an index creation entry with given optime and namespace.
- */
-OplogEntry makeCreateIndexOplogEntry(OpTime opTime,
-                                     const NamespaceString& nss,
-                                     const std::string& indexName,
-                                     const BSONObj& keyPattern,
-                                     const UUID& uuid) {
-    BSONObjBuilder indexInfoBob;
-    indexInfoBob.append("createIndexes", nss.coll());
-    indexInfoBob.append("v", 2);
-    indexInfoBob.append("key", keyPattern);
-    indexInfoBob.append("name", indexName);
-    return makeCommandOplogEntry(opTime, nss, indexInfoBob.obj(), uuid);
-}
-
-/**
- * Creates an insert oplog entry with given optime, namespace and session info.
- */
-OplogEntry makeInsertDocumentOplogEntryWithSessionInfo(OpTime opTime,
-                                                       const NamespaceString& nss,
-                                                       const BSONObj& documentToInsert,
-                                                       OperationSessionInfo info) {
-    return makeOplogEntry(opTime,               // optime
-                          OpTypeEnum::kInsert,  // op type
-                          nss,                  // namespace
-                          documentToInsert,     // o
-                          boost::none,          // o2
-                          info,                 // session info
-                          Date_t::now());       // wall clock time
-}
-
-OplogEntry makeInsertDocumentOplogEntryWithSessionInfoAndStmtId(
-    OpTime opTime,
-    const NamespaceString& nss,
-    boost::optional<UUID> uuid,
-    const BSONObj& documentToInsert,
-    LogicalSessionId lsid,
-    TxnNumber txnNum,
-    StmtId stmtId,
-    boost::optional<OpTime> prevOpTime) {
-    OperationSessionInfo info;
-    info.setSessionId(lsid);
-    info.setTxnNumber(txnNum);
-    return makeOplogEntry(opTime,               // optime
-                          OpTypeEnum::kInsert,  // op type
-                          nss,                  // namespace
-                          documentToInsert,     // o
-                          boost::none,          // o2
-                          info,                 // session info
-                          Date_t::now(),        // wall clock time
-                          stmtId,
-                          uuid,
-                          prevOpTime);  // previous optime in same session
-}
-
 
 Status IdempotencyTest::resetState() {
     return Status::OK();
@@ -406,7 +211,7 @@ void IdempotencyTest::testOpsAreIdempotent(std::vector<OplogEntry> ops, Sequence
 
         auto state2 = validateAllCollections();
         if (state1 != state2) {
-            FAIL(getStatesString(state1, state2, fullSequence));
+            FAIL(getStatesString(state1, state2, ops, fullSequence));
         }
     }
 }
@@ -519,16 +324,16 @@ OplogEntry IdempotencyTest::partialTxn(LogicalSessionId lsid,
                           prevOpTime);
 }
 
-std::string IdempotencyTest::computeDataHash(Collection* collection) {
+std::string IdempotencyTest::computeDataHash(const CollectionPtr& collection) {
     auto desc = collection->getIndexCatalog()->findIdIndex(_opCtx.get());
     ASSERT_TRUE(desc);
     auto exec = InternalPlanner::indexScan(_opCtx.get(),
-                                           collection,
+                                           &collection,
                                            desc,
                                            BSONObj(),
                                            BSONObj(),
                                            BoundInclusion::kIncludeStartKeyOnly,
-                                           PlanExecutor::NO_YIELD,
+                                           PlanYieldPolicy::YieldPolicy::NO_YIELD,
                                            InternalPlanner::FORWARD,
                                            InternalPlanner::IXSCAN_FETCH);
     ASSERT(nullptr != exec.get());
@@ -549,15 +354,15 @@ std::string IdempotencyTest::computeDataHash(Collection* collection) {
 
 std::vector<CollectionState> IdempotencyTest::validateAllCollections() {
     std::vector<CollectionState> collStates;
-    auto& catalog = CollectionCatalog::get(_opCtx.get());
-    auto dbs = catalog.getAllDbNames();
+    auto catalog = CollectionCatalog::get(_opCtx.get());
+    auto dbs = catalog->getAllDbNames();
     for (auto& db : dbs) {
         // Skip local database.
         if (db != "local") {
             std::vector<NamespaceString> collectionNames;
             {
                 Lock::DBLock lk(_opCtx.get(), db, MODE_S);
-                collectionNames = catalog.getAllCollectionNamesFromDb(_opCtx.get(), db);
+                collectionNames = catalog->getAllCollectionNamesFromDb(_opCtx.get(), db);
             }
             for (const auto& nss : collectionNames) {
                 collStates.push_back(validate(nss));
@@ -570,7 +375,7 @@ std::vector<CollectionState> IdempotencyTest::validateAllCollections() {
 CollectionState IdempotencyTest::validate(const NamespaceString& nss) {
     auto collUUID = [&]() -> OptionalCollectionUUID {
         AutoGetCollectionForReadCommand autoColl(_opCtx.get(), nss);
-        if (auto collection = autoColl.getCollection()) {
+        if (const auto& collection = autoColl.getCollection()) {
             return collection->uuid();
         }
         return boost::none;
@@ -583,8 +388,7 @@ CollectionState IdempotencyTest::validate(const NamespaceString& nss) {
     }
 
     {
-        AutoGetCollectionForReadCommand autoColl(_opCtx.get(), nss);
-        auto collection = autoColl.getCollection();
+        AutoGetCollectionForReadCommand collection(_opCtx.get(), nss);
 
         if (!collection) {
             // Return a mostly default initialized CollectionState struct with exists set to false
@@ -600,17 +404,16 @@ CollectionState IdempotencyTest::validate(const NamespaceString& nss) {
         ASSERT_OK(
             CollectionValidation::validate(_opCtx.get(),
                                            nss,
-                                           CollectionValidation::ValidateOptions::kFullValidation,
-                                           false,
+                                           CollectionValidation::ValidateMode::kForegroundFull,
+                                           CollectionValidation::RepairMode::kNone,
                                            &validateResults,
                                            &bob));
         ASSERT_TRUE(validateResults.valid);
     }
 
-    AutoGetCollectionForReadCommand autoColl(_opCtx.get(), nss);
-    auto collection = autoColl.getCollection();
+    AutoGetCollectionForReadCommand collection(_opCtx.get(), nss);
 
-    std::string dataHash = computeDataHash(collection);
+    std::string dataHash = computeDataHash(collection.getCollection());
 
     auto durableCatalog = DurableCatalog::get(_opCtx.get());
     auto collectionOptions =
@@ -631,7 +434,8 @@ CollectionState IdempotencyTest::validate(const NamespaceString& nss) {
 
 std::string IdempotencyTest::getStatesString(const std::vector<CollectionState>& state1,
                                              const std::vector<CollectionState>& state2,
-                                             const std::vector<OplogEntry>& ops) {
+                                             const std::vector<OplogEntry>& state1Ops,
+                                             const std::vector<OplogEntry>& state2Ops) {
     StringBuilder sb;
     sb << "The states:\n";
     for (const auto& s : state1) {
@@ -643,7 +447,7 @@ std::string IdempotencyTest::getStatesString(const std::vector<CollectionState>&
     }
     sb << "found after applying the operations a second time, therefore breaking idempotency.\n";
     sb << "Applied ops:\n";
-    for (const auto& op : ops) {
+    for (const auto& op : state2Ops) {
         sb << op.toString() << "\n";
     }
     return sb.str();

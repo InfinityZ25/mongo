@@ -53,7 +53,8 @@ const StringDataSet Document::allMetadataFieldNames{Document::metaFieldTextScore
                                                     Document::metaFieldGeoNearPoint,
                                                     Document::metaFieldSearchScore,
                                                     Document::metaFieldSearchHighlights,
-                                                    Document::metaFieldIndexKey};
+                                                    Document::metaFieldIndexKey,
+                                                    Document::metaFieldSearchScoreDetails};
 
 DocumentStorageIterator::DocumentStorageIterator(DocumentStorage* storage, BSONObjIterator bsonIt)
     : _bsonIt(std::move(bsonIt)),
@@ -398,6 +399,8 @@ void DocumentStorage::loadLazyMetadata() const {
                 _metadataFields.setGeoNearPoint(val);
             } else if (fieldName == Document::metaFieldIndexKey) {
                 _metadataFields.setIndexKey(elem.Obj());
+            } else if (fieldName == Document::metaFieldSearchScoreDetails) {
+                _metadataFields.setSearchScoreDetails(elem.Obj());
             }
         }
     }
@@ -419,6 +422,13 @@ Document::Document(std::initializer_list<std::pair<StringData, ImplicitValue>> i
         mutableDoc.addField(pair.first, pair.second);
     }
 
+    *this = mutableDoc.freeze();
+}
+
+Document::Document(std::vector<std::pair<StringData, Value>> fields) {
+    MutableDocument mutableDoc(fields.size());
+    for (auto&& pair : fields)
+        mutableDoc.addField(pair.first, pair.second);
     *this = mutableDoc.freeze();
 }
 
@@ -469,6 +479,7 @@ constexpr StringData Document::metaFieldGeoNearDistance;
 constexpr StringData Document::metaFieldGeoNearPoint;
 constexpr StringData Document::metaFieldSearchScore;
 constexpr StringData Document::metaFieldSearchHighlights;
+constexpr StringData Document::metaFieldSearchScoreDetails;
 
 BSONObj Document::toBsonWithMetaData() const {
     BSONObjBuilder bb;
@@ -495,6 +506,8 @@ BSONObj Document::toBsonWithMetaData() const {
         metadata().getSearchHighlights().addToBsonObj(&bb, metaFieldSearchHighlights);
     if (metadata().hasIndexKey())
         bb.append(metaFieldIndexKey, metadata().getIndexKey());
+    if (metadata().hasSearchScoreDetails())
+        bb.append(metaFieldSearchScoreDetails, metadata().getSearchScoreDetails());
     return bb.obj();
 }
 

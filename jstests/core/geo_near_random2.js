@@ -1,4 +1,7 @@
 // this tests 1% of all points
+// @tags: [
+//   sbe_incompatible,
+// ]
 load("jstests/libs/geo_near_random.js");
 
 var test = new GeoNearRandomTest("geo_near_random2");
@@ -35,7 +38,7 @@ test.testPt(test.mkPt(0.8), opts);
 
 // Test $nearSphere with 2dsphere index
 assert.commandWorked(db.geo_near_random2.dropIndex({loc: '2d'}));
-assert.commandWorked(db.geo_near_random2.ensureIndex({loc: '2dsphere'}));
+assert.commandWorked(db.geo_near_random2.createIndex({loc: '2dsphere'}));
 test.testPt([0, 0], opts);
 test.testPt(test.mkPt(0.8), opts);
 test.testPt(test.mkPt(0.8), opts);

@@ -1,4 +1,6 @@
-// @tags: [requires_getmore, requires_fcv_44]
+// @tags: [
+//   requires_getmore,
+// ]
 
 // Tests where the QueryOptimizerCursor enters takeover mode during a query rather than a get more.
 
@@ -8,7 +10,7 @@ t.drop();
 numDocs = 200;
 
 function clearQueryPlanCache() {
-    t.ensureIndex({c: 1});
+    t.createIndex({c: 1});
     t.dropIndex({c: 1});
 }
 
@@ -89,7 +91,7 @@ function queryWithPlanTypes(withDups) {
     } else {
         t.save({_id: 0, a: 0, b: 0});
     }
-    t.ensureIndex({a: 1, _id: 1});  // Include _id for a covered index projection.
+    t.createIndex({a: 1, _id: 1});  // Include _id for a covered index projection.
 
     // All plans in order.
     checkCursorWithBatchSize({a: {$gte: 0}}, null, 150, 150);

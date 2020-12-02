@@ -1,4 +1,7 @@
-// @tags: [requires_getmore, requires_collstats]
+// @tags: [
+//   requires_collstats,
+//   requires_getmore,
+// ]
 
 // Test $or query with several clauses on separate indexes.
 
@@ -9,7 +12,7 @@ orClauses = [];
 for (idxKey = 'a'; idxKey <= 'aaaaaaaaaa'; idxKey += 'a') {
     idx = {};
     idx[idxKey] = 1;
-    t.ensureIndex(idx);
+    t.createIndex(idx);
     for (i = 0; i < 200; ++i) {
         t.insert(idx);
     }

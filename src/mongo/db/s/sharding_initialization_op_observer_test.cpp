@@ -40,12 +40,12 @@
 #include "mongo/db/s/shard_server_catalog_cache_loader.h"
 #include "mongo/db/s/shard_server_op_observer.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
+#include "mongo/db/s/sharding_mongod_test_fixture.h"
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/db/server_options.h"
 #include "mongo/s/catalog/dist_lock_manager_mock.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/config_server_catalog_cache_loader.h"
-#include "mongo/s/sharding_mongod_test_fixture.h"
 
 namespace mongo {
 namespace {
@@ -90,7 +90,7 @@ private:
 TEST_F(ShardingInitializationOpObserverTest, GlobalInitGetsCalledAfterWriteCommits) {
     ShardIdentityType shardIdentity;
     shardIdentity.setConfigsvrConnectionString(
-        ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
+        ConnectionString(ConnectionString::ConnectionType::kReplicaSet, "a:1,b:2", "config"));
     shardIdentity.setShardName(kShardName);
     shardIdentity.setClusterId(OID::gen());
 
@@ -102,7 +102,7 @@ TEST_F(ShardingInitializationOpObserverTest, GlobalInitGetsCalledAfterWriteCommi
 TEST_F(ShardingInitializationOpObserverTest, GlobalInitDoesntGetCalledIfWriteAborts) {
     ShardIdentityType shardIdentity;
     shardIdentity.setConfigsvrConnectionString(
-        ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
+        ConnectionString(ConnectionString::ConnectionType::kReplicaSet, "a:1,b:2", "config"));
     shardIdentity.setShardName(kShardName);
     shardIdentity.setClusterId(OID::gen());
 
@@ -128,7 +128,7 @@ TEST_F(ShardingInitializationOpObserverTest, GlobalInitDoesntGetCalledIfWriteAbo
 TEST_F(ShardingInitializationOpObserverTest, GlobalInitDoesntGetsCalledIfNSIsNotForShardIdentity) {
     ShardIdentityType shardIdentity;
     shardIdentity.setConfigsvrConnectionString(
-        ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
+        ConnectionString(ConnectionString::ConnectionType::kReplicaSet, "a:1,b:2", "config"));
     shardIdentity.setShardName(kShardName);
     shardIdentity.setClusterId(OID::gen());
 

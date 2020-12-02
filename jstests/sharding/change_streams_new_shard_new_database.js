@@ -5,7 +5,11 @@
  * Tagging as 'requires_find_command' to ensure that this test is not run in the legacy protocol
  * passthroughs. Legacy getMore fails in cases where it is run on a database or collection which
  * does not yet exist.
- * @tags: [uses_change_streams, requires_sharding, requires_find_command, requires_fcv_44]
+ * @tags: [
+ *   requires_find_command,
+ *   requires_sharding,
+ *   uses_change_streams,
+ * ]
  */
 (function() {
 
@@ -41,8 +45,16 @@ function assertAllEventsObserved(changeStream, expectedDocs) {
     for (let expectedDoc of expectedDocs) {
         assert.soon(() => changeStream.hasNext());
         const nextEvent = changeStream.next();
-        assert.docEq(nextEvent.fullDocument, expectedDoc);
+        assert.docEq(nextEvent.fullDocument, expectedDoc, tojson(nextEvent));
     }
+}
+
+// Helper function to confirm that a change stream sees a collection drop event.
+function assertCollectionDropEventObserved(changeStream, dbName, collectionName) {
+    assert.soon(() => changeStream.hasNext());
+    const nextEvent = changeStream.next();
+    assert.eq(nextEvent.operationType, "drop", tojson(nextEvent));
+    assert.docEq(nextEvent.ns, {db: dbName, coll: collectionName}, tojson(nextEvent));
 }
 
 // Open a whole-db change stream on the as yet non-existent database.
@@ -70,7 +82,22 @@ for (let csCursor of [wholeDBCS, singleCollCS]) {
 // Now add a new shard into the cluster...
 const newShard1 = addShardToCluster("newShard1");
 
-// ... create a new database and collection, and verify that they were placed on the new shard....
+// .. make sure the primary shard of 'newShardDB' database is the new shard ..
+assert.commandWorked(
+    newShardDB.runCommand({create: "unusedCollection"}));  // To trigger creation of a database.
+const isNewShardDBOnNewShard =
+    configDB.databases.findOne({_id: newShardDB.getName(), primary: "newShard1"}) != null;
+if (!isNewShardDBOnNewShard) {
+    st.ensurePrimaryShard(newShardDB.getName(), "newShard1");
+
+    // Consume collection drop events from the existing change streams caused by movePrimary command
+    // issued by a call to 'ensurePrimaryShard()' above.
+    for (let csCursor of [wholeDBCS, wholeClusterCS]) {
+        assertCollectionDropEventObserved(csCursor, newShardDB.getName(), "unusedCollection");
+    }
+}
+
+//... create a new collection, and verify that it was placed on the new shard....
 assert.commandWorked(newShardDB.runCommand({create: newShardColl.getName()}));
 assert(configDB.databases.findOne({_id: newShardDB.getName(), primary: "newShard1"}));
 

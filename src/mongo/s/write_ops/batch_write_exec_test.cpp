@@ -33,8 +33,8 @@
 #include "mongo/client/remote_command_targeter_factory_mock.h"
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_session_id.h"
+#include "mongo/db/vector_clock.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/session_catalog_router.h"
@@ -138,10 +138,10 @@ BSONObj expectInsertsReturnStaleDbVersionErrorsBase(const NamespaceString& nss,
         errorBuilder.append("index", i);
         errorBuilder.append("code", int(ErrorCodes::StaleDbVersion));
 
-        auto dbVersion = databaseVersion::makeNew();
+        auto dbVersion = DatabaseVersion(UUID::gen());
         errorBuilder.append("db", nss.db());
         errorBuilder.append("vReceived", dbVersion.toBSON());
-        errorBuilder.append("vWanted", databaseVersion::makeIncremented(dbVersion).toBSON());
+        errorBuilder.append("vWanted", dbVersion.makeUpdated().toBSON());
 
         errorBuilder.append("errmsg", "mock stale db version");
 
@@ -169,7 +169,6 @@ public:
         // Set up the RemoteCommandTargeter for the config shard
         configTargeter()->setFindHostReturnValue(kTestConfigShardHost);
 
-        // Add a RemoteCommandTargeter for the data shard2
         targeterFactory()->addTargeterToReturn(ConnectionString(kTestShardHost1), [] {
             std::unique_ptr<RemoteCommandTargeterMock> targeter(
                 std::make_unique<RemoteCommandTargeterMock>());
@@ -317,6 +316,174 @@ TEST_F(BatchWriteExecTest, SingleOpUnordered) {
     future.default_timed_get();
 }
 
+TEST_F(BatchWriteExecTest, SingleUpdateTargetsShardWithLet) {
+    // Try to update the single doc where a let param is used in the shard key.
+    const auto let = BSON("y" << 100);
+    const auto rtc = LegacyRuntimeConstants{Date_t::now(), Timestamp(1, 1)};
+    const auto q = BSON("x"
+                        << "$$y");
+    BatchedCommandRequest updateRequest([&] {
+        write_ops::Update updateOp(nss);
+        updateOp.setWriteCommandBase([] {
+            write_ops::WriteCommandBase writeCommandBase;
+            writeCommandBase.setOrdered(false);
+            return writeCommandBase;
+        }());
+        updateOp.setLet(let);
+        updateOp.setLegacyRuntimeConstants(rtc);
+        updateOp.setUpdates(std::vector{write_ops::UpdateOpEntry(
+            q,
+            write_ops::UpdateModification::parseFromClassicUpdate(BSON("Key"
+                                                                       << "100")))});
+        return updateOp;
+    }());
+    updateRequest.setWriteConcern(BSONObj());
+
+    const static auto epoch = OID::gen();
+
+    class MultiShardTargeter : public MockNSTargeter {
+    public:
+        using MockNSTargeter::MockNSTargeter;
+
+        std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
+                                                const BatchItemRef& itemRef) const override {
+            return std::vector<ShardEndpoint>{
+                ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
+        }
+    };
+
+    MultiShardTargeter multiShardNSTargeter(
+        nss,
+        {MockRange(ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
+                   BSON("x" << MINKEY),
+                   BSON("x" << 0)),
+         MockRange(ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch)),
+                   BSON("x" << 0),
+                   BSON("x" << MAXKEY))});
+
+    auto future = launchAsync([&] {
+        BatchedCommandResponse response;
+        BatchWriteExecStats stats;
+        BatchWriteExec::executeBatch(
+            operationContext(), multiShardNSTargeter, updateRequest, &response, &stats);
+
+        return response;
+    });
+
+    // The update will hit the first shard.
+    onCommandForPoolExecutor(
+        [&](const RemoteCommandRequest& request) {
+            ASSERT_EQ(kTestShardHost2, request.target);
+
+            BatchedCommandResponse response;
+            response.setStatus(Status::OK());
+            response.setNModified(1);
+
+            // Check that let params and runtimeConstants are propigated to shards.
+            const auto opMsgRequest(OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj));
+            const auto actualBatchedUpdate(BatchedCommandRequest::parseUpdate(opMsgRequest));
+            ASSERT_BSONOBJ_EQ(let, actualBatchedUpdate.getLet().value_or(BSONObj()));
+            ASSERT_EQUALS(actualBatchedUpdate.getLegacyRuntimeConstants()->getLocalNow(),
+                          rtc.getLocalNow());
+            ASSERT_EQUALS(actualBatchedUpdate.getLegacyRuntimeConstants()->getClusterTime(),
+                          rtc.getClusterTime());
+
+            // Check that let params are only forwarded and not evaluated.
+            auto expectedQ = BSON("x"
+                                  << "$$y");
+            for (auto&& u : actualBatchedUpdate.getUpdateRequest().getUpdates())
+                ASSERT_BSONOBJ_EQ(expectedQ, u.getQ());
+
+            return response.toBSON();
+        });
+
+    auto response = future.default_timed_get();
+    ASSERT_OK(response.getTopLevelStatus());
+    ASSERT_EQ(1, response.getNModified());
+}
+
+TEST_F(BatchWriteExecTest, SingleDeleteTargetsShardWithLet) {
+    // Try to update the single doc where a let param is used in the shard key.
+    const auto let = BSON("y" << 100);
+    const auto rtc = LegacyRuntimeConstants{Date_t::now(), Timestamp(1, 1)};
+    const auto q = BSON("x"
+                        << "$$y");
+    BatchedCommandRequest deleteRequest([&] {
+        write_ops::Delete deleteOp(nss);
+        deleteOp.setWriteCommandBase([] {
+            write_ops::WriteCommandBase writeCommandBase;
+            writeCommandBase.setOrdered(false);
+            return writeCommandBase;
+        }());
+        deleteOp.setLet(let);
+        deleteOp.setLegacyRuntimeConstants(rtc);
+        deleteOp.setDeletes(std::vector{write_ops::DeleteOpEntry(q, false)});
+        return deleteOp;
+    }());
+    deleteRequest.setWriteConcern(BSONObj());
+
+    const static auto epoch = OID::gen();
+
+    class MultiShardTargeter : public MockNSTargeter {
+    public:
+        using MockNSTargeter::MockNSTargeter;
+
+    protected:
+        std::vector<ShardEndpoint> targetDelete(OperationContext* opCtx,
+                                                const BatchItemRef& itemRef) const override {
+            return std::vector<ShardEndpoint>{
+                ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
+        }
+    };
+
+    MultiShardTargeter multiShardNSTargeter(
+        nss,
+        {MockRange(ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
+                   BSON("x" << MINKEY),
+                   BSON("x" << 0)),
+         MockRange(ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch)),
+                   BSON("x" << 0),
+                   BSON("x" << MAXKEY))});
+
+    auto future = launchAsync([&] {
+        BatchedCommandResponse response;
+        BatchWriteExecStats stats;
+        BatchWriteExec::executeBatch(
+            operationContext(), multiShardNSTargeter, deleteRequest, &response, &stats);
+
+        return response;
+    });
+
+    // The update will hit the first shard.
+    onCommandForPoolExecutor(
+        [&](const RemoteCommandRequest& request) {
+            ASSERT_EQ(kTestShardHost2, request.target);
+
+            BatchedCommandResponse response;
+            response.setStatus(Status::OK());
+
+            // Check that let params are propigated to shards.
+            const auto opMsgRequest(OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj));
+            const auto actualBatchedUpdate(BatchedCommandRequest::parseDelete(opMsgRequest));
+            ASSERT_BSONOBJ_EQ(let, actualBatchedUpdate.getLet().value_or(BSONObj()));
+            ASSERT_EQUALS(actualBatchedUpdate.getLegacyRuntimeConstants()->getLocalNow(),
+                          rtc.getLocalNow());
+            ASSERT_EQUALS(actualBatchedUpdate.getLegacyRuntimeConstants()->getClusterTime(),
+                          rtc.getClusterTime());
+
+            // Check that let params are only forwarded and not evaluated.
+            auto expectedQ = BSON("x"
+                                  << "$$y");
+            for (auto&& u : actualBatchedUpdate.getDeleteRequest().getDeletes())
+                ASSERT_BSONOBJ_EQ(expectedQ, u.getQ());
+
+            return response.toBSON();
+        });
+
+    auto response = future.default_timed_get();
+    ASSERT_OK(response.getTopLevelStatus());
+}
+
 TEST_F(BatchWriteExecTest, MultiOpLargeOrdered) {
     const int kNumDocsToInsert = 100'000;
     const std::string kDocValue(200, 'x');
@@ -438,8 +605,9 @@ TEST_F(BatchWriteExecTest, StaleShardVersionReturnedFromBatchWithSingleMultiWrit
             writeCommandBase.setOrdered(false);
             return writeCommandBase;
         }());
-        updateOp.setUpdates(
-            std::vector{write_ops::UpdateOpEntry(BSON("_id" << 100), {BSON("Key" << 100)})});
+        updateOp.setUpdates(std::vector{write_ops::UpdateOpEntry(
+            BSON("_id" << 100),
+            write_ops::UpdateModification::parseFromClassicUpdate(BSON("Key" << 100)))});
         return updateOp;
     }());
     request.setWriteConcern(BSONObj());
@@ -450,8 +618,8 @@ TEST_F(BatchWriteExecTest, StaleShardVersionReturnedFromBatchWithSingleMultiWrit
     public:
         using MockNSTargeter::MockNSTargeter;
 
-        std::vector<ShardEndpoint> targetUpdate(
-            OperationContext* opCtx, const write_ops::UpdateOpEntry& updateDoc) const override {
+        std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
+                                                const BatchItemRef& itemRef) const override {
             return std::vector<ShardEndpoint>{
                 ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
                 ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
@@ -536,9 +704,13 @@ TEST_F(BatchWriteExecTest,
             writeCommandBase.setOrdered(false);
             return writeCommandBase;
         }());
-        updateOp.setUpdates(
-            std::vector{write_ops::UpdateOpEntry(BSON("id" << 150), {BSON("x" << 1)}),
-                        write_ops::UpdateOpEntry(BSON("id" << 200), {BSON("y" << 2)})});
+        updateOp.setUpdates(std::vector{
+            write_ops::UpdateOpEntry(
+                BSON("id" << 150),
+                write_ops::UpdateModification::parseFromClassicUpdate(BSON("x" << 1))),
+            write_ops::UpdateOpEntry(
+                BSON("id" << 200),
+                write_ops::UpdateModification::parseFromClassicUpdate(BSON("y" << 2)))});
         return updateOp;
     }());
     request.setWriteConcern(BSONObj());
@@ -551,8 +723,8 @@ TEST_F(BatchWriteExecTest,
     public:
         using MockNSTargeter::MockNSTargeter;
 
-        std::vector<ShardEndpoint> targetUpdate(
-            OperationContext* opCtx, const write_ops::UpdateOpEntry& updateDoc) const override {
+        std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
+                                                const BatchItemRef& itemRef) const override {
             return std::vector<ShardEndpoint>{
                 ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
                 ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
@@ -652,9 +824,13 @@ TEST_F(BatchWriteExecTest, RetryableErrorReturnedFromMultiWriteWithShard1Firs) {
             writeCommandBase.setOrdered(false);
             return writeCommandBase;
         }());
-        updateOp.setUpdates(
-            std::vector{write_ops::UpdateOpEntry(BSON("id" << 150), {BSON("x" << 1)}),
-                        write_ops::UpdateOpEntry(BSON("id" << 200), {BSON("y" << 2)})});
+        updateOp.setUpdates(std::vector{
+            write_ops::UpdateOpEntry(
+                BSON("id" << 150),
+                write_ops::UpdateModification::parseFromClassicUpdate(BSON("x" << 1))),
+            write_ops::UpdateOpEntry(
+                BSON("id" << 200),
+                write_ops::UpdateModification::parseFromClassicUpdate(BSON("y" << 2)))});
         return updateOp;
     }());
     request.setWriteConcern(BSONObj());
@@ -667,8 +843,8 @@ TEST_F(BatchWriteExecTest, RetryableErrorReturnedFromMultiWriteWithShard1Firs) {
     public:
         using MockNSTargeter::MockNSTargeter;
 
-        std::vector<ShardEndpoint> targetUpdate(
-            OperationContext* opCtx, const write_ops::UpdateOpEntry& updateDoc) const override {
+        std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
+                                                const BatchItemRef& itemRef) const override {
             return std::vector<ShardEndpoint>{
                 ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
                 ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
@@ -779,9 +955,13 @@ TEST_F(BatchWriteExecTest, RetryableErrorReturnedFromMultiWriteWithShard1FirstOK
             writeCommandBase.setOrdered(false);
             return writeCommandBase;
         }());
-        updateOp.setUpdates(
-            std::vector{write_ops::UpdateOpEntry(BSON("id" << 150), {BSON("x" << 1)}),
-                        write_ops::UpdateOpEntry(BSON("id" << 200), {BSON("y" << 2)})});
+        updateOp.setUpdates(std::vector{
+            write_ops::UpdateOpEntry(
+                BSON("id" << 150),
+                write_ops::UpdateModification::parseFromClassicUpdate(BSON("x" << 1))),
+            write_ops::UpdateOpEntry(
+                BSON("id" << 200),
+                write_ops::UpdateModification::parseFromClassicUpdate(BSON("y" << 2)))});
         return updateOp;
     }());
     request.setWriteConcern(BSONObj());
@@ -794,8 +974,8 @@ TEST_F(BatchWriteExecTest, RetryableErrorReturnedFromMultiWriteWithShard1FirstOK
     public:
         using MockNSTargeter::MockNSTargeter;
 
-        std::vector<ShardEndpoint> targetUpdate(
-            OperationContext* opCtx, const write_ops::UpdateOpEntry& updateDoc) const override {
+        std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
+                                                const BatchItemRef& itemRef) const override {
             return std::vector<ShardEndpoint>{
                 ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
                 ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
@@ -906,8 +1086,9 @@ TEST_F(BatchWriteExecTest, RetryableErrorReturnedFromWriteWithShard1SSVShard2OK)
             writeCommandBase.setOrdered(false);
             return writeCommandBase;
         }());
-        updateOp.setUpdates(
-            std::vector{write_ops::UpdateOpEntry(BSON("_id" << 150), {BSON("x" << 1)})});
+        updateOp.setUpdates(std::vector{write_ops::UpdateOpEntry(
+            BSON("_id" << 150),
+            write_ops::UpdateModification::parseFromClassicUpdate(BSON("x" << 1)))});
         return updateOp;
     }());
     request.setWriteConcern(BSONObj());
@@ -919,8 +1100,8 @@ TEST_F(BatchWriteExecTest, RetryableErrorReturnedFromWriteWithShard1SSVShard2OK)
     public:
         using MockNSTargeter::MockNSTargeter;
 
-        std::vector<ShardEndpoint> targetUpdate(
-            OperationContext* opCtx, const write_ops::UpdateOpEntry& updateDoc) const override {
+        std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
+                                                const BatchItemRef& itemRef) const override {
             if (targetAll) {
                 return std::vector<ShardEndpoint>{
                     ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
@@ -1273,7 +1454,7 @@ TEST_F(BatchWriteExecTest, RetryableErrorNoTxnNumber) {
     request.setWriteConcern(BSONObj());
 
     BatchedCommandResponse retryableErrResponse;
-    retryableErrResponse.setStatus({ErrorCodes::NotMaster, "mock retryable error"});
+    retryableErrResponse.setStatus({ErrorCodes::NotWritablePrimary, "mock retryable error"});
 
     auto future = launchAsync([&] {
         BatchedCommandResponse response;
@@ -1315,7 +1496,7 @@ TEST_F(BatchWriteExecTest, RetryableErrorTxnNumber) {
     operationContext()->setTxnNumber(5);
 
     BatchedCommandResponse retryableErrResponse;
-    retryableErrResponse.setStatus({ErrorCodes::NotMaster, "mock retryable error"});
+    retryableErrResponse.setStatus({ErrorCodes::NotWritablePrimary, "mock retryable error"});
 
     auto future = launchAsync([&] {
         BatchedCommandResponse response;
@@ -1417,6 +1598,426 @@ TEST_F(BatchWriteExecTest, StaleEpochIsNotRetryable) {
     future.default_timed_get();
 }
 
+/**
+ * Mimics a two shard backend with a targeting error on the first shard.
+ */
+class BatchWriteExecTargeterErrorTest : public ShardingTestFixture {
+public:
+    BatchWriteExecTargeterErrorTest() = default;
+    ~BatchWriteExecTargeterErrorTest() = default;
+
+    void setUp() override {
+        ShardingTestFixture::setUp();
+        setRemote(HostAndPort("ClientHost", 12345));
+
+        // Set up the RemoteCommandTargeter for the config shard
+        configTargeter()->setFindHostReturnValue(kTestConfigShardHost);
+
+        targeterFactory()->addTargeterToReturn(ConnectionString(kTestShardHost1), [] {
+            std::unique_ptr<RemoteCommandTargeterMock> targeter(
+                std::make_unique<RemoteCommandTargeterMock>());
+            targeter->setConnectionStringReturnValue(ConnectionString(kTestShardHost1));
+            targeter->setFindHostReturnValue(
+                {ErrorCodes::ShardNotFound,
+                 str::stream() << "Shard " << kShardName1 << " not found"});
+            return targeter;
+        }());
+
+        targeterFactory()->addTargeterToReturn(ConnectionString(kTestShardHost2), [] {
+            std::unique_ptr<RemoteCommandTargeterMock> targeter(
+                std::make_unique<RemoteCommandTargeterMock>());
+            targeter->setConnectionStringReturnValue(ConnectionString(kTestShardHost2));
+            targeter->setFindHostReturnValue(kTestShardHost2);
+            return targeter;
+        }());
+
+        // Set up the shard registry to contain the fake shards
+        setupShards({[] {
+                         ShardType shardType;
+                         shardType.setName(kShardName1);
+                         shardType.setHost(kTestShardHost1.toString());
+                         return shardType;
+                     }(),
+                     [] {
+                         ShardType shardType;
+                         shardType.setName(kShardName2);
+                         shardType.setHost(kTestShardHost2.toString());
+                         return shardType;
+                     }()});
+    }
+
+    const NamespaceString nss{"foo.bar"};
+};
+
+TEST_F(BatchWriteExecTargeterErrorTest, TargetedFailedAndErrorResponse) {
+    BatchedCommandRequest request([&] {
+        write_ops::Update updateOp(nss);
+        updateOp.setWriteCommandBase([] {
+            write_ops::WriteCommandBase writeCommandBase;
+            writeCommandBase.setOrdered(false);
+            return writeCommandBase;
+        }());
+        updateOp.setUpdates(std::vector{write_ops::UpdateOpEntry(
+            BSON("_id" << 100),
+            write_ops::UpdateModification::parseFromClassicUpdate(BSON("Key" << 100)))});
+        return updateOp;
+    }());
+    request.setWriteConcern(BSONObj());
+
+    const static auto epoch = OID::gen();
+
+    class MultiShardTargeter : public MockNSTargeter {
+    public:
+        using MockNSTargeter::MockNSTargeter;
+
+        std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
+                                                const BatchItemRef& itemRef) const override {
+            return std::vector<ShardEndpoint>{
+                ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
+                ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
+        }
+    };
+
+    MultiShardTargeter multiShardNSTargeter(
+        nss,
+        {MockRange(ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
+                   BSON("x" << MINKEY),
+                   BSON("x" << 0)),
+         MockRange(ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch)),
+                   BSON("x" << 0),
+                   BSON("x" << MAXKEY))});
+
+    auto future = launchAsync([&] {
+        BatchedCommandResponse response;
+        BatchWriteExecStats stats;
+        BatchWriteExec::executeBatch(
+            operationContext(), multiShardNSTargeter, request, &response, &stats);
+        ASSERT(response.isErrDetailsSet());
+        auto code = response.getErrDetailsAt(0)->toStatus().code();
+        ASSERT_EQUALS(code, ErrorCodes::MultipleErrorsOccurred);
+    });
+
+    onCommandForPoolExecutor([&](const RemoteCommandRequest& request) {
+        ASSERT_EQ(kTestShardHost2, request.target);
+
+        BatchedCommandResponse response;
+        response.setStatus(Status::OK());
+        response.addToErrDetails([&] {
+            WriteErrorDetail* errDetail = new WriteErrorDetail();
+            errDetail->setIndex(0);
+            errDetail->setStatus({ErrorCodes::UnknownError, "mock non-retryable error"});
+            return errDetail;
+        }());
+
+        return response.toBSON();
+    });
+
+    future.default_timed_get();
+}
+
+class BatchWriteExecTransactionTargeterErrorTest : public BatchWriteExecTest {
+public:
+    const TxnNumber kTxnNumber = 5;
+    const LogicalTime kInMemoryLogicalTime = LogicalTime(Timestamp(3, 1));
+
+    void setUp() override {
+        BatchWriteExecTest::setUp();
+
+        setRemote(HostAndPort("ClientHost", 12345));
+
+        // Set up the RemoteCommandTargeter for the config shard
+        configTargeter()->setFindHostReturnValue(kTestConfigShardHost);
+
+        targeterFactory()->addTargeterToReturn(ConnectionString(kTestShardHost1), [] {
+            std::unique_ptr<RemoteCommandTargeterMock> targeter(
+                std::make_unique<RemoteCommandTargeterMock>());
+            targeter->setFindHostReturnValue(
+                {ErrorCodes::ShardNotFound,
+                 str::stream() << "Shard " << kShardName1 << " not found"});
+            return targeter;
+        }());
+
+        targeterFactory()->addTargeterToReturn(ConnectionString(kTestShardHost2), [] {
+            std::unique_ptr<RemoteCommandTargeterMock> targeter(
+                std::make_unique<RemoteCommandTargeterMock>());
+            targeter->setConnectionStringReturnValue(ConnectionString(kTestShardHost2));
+            targeter->setFindHostReturnValue(kTestShardHost2);
+            return targeter;
+        }());
+
+        // Set up the shard registry to contain the fake shards
+        setupShards({[] {
+                         ShardType shardType;
+                         shardType.setName(kShardName1);
+                         shardType.setHost(kTestShardHost1.toString());
+                         return shardType;
+                     }(),
+                     [] {
+                         ShardType shardType;
+                         shardType.setName(kShardName2);
+                         shardType.setHost(kTestShardHost2.toString());
+                         return shardType;
+                     }()});
+
+        operationContext()->setLogicalSessionId(makeLogicalSessionIdForTest());
+        operationContext()->setTxnNumber(kTxnNumber);
+        repl::ReadConcernArgs::get(operationContext()) =
+            repl::ReadConcernArgs(repl::ReadConcernLevel::kSnapshotReadConcern);
+
+        VectorClock::get(getServiceContext())->advanceClusterTime_forTest(kInMemoryLogicalTime);
+
+        _scopedSession.emplace(operationContext());
+
+        auto txnRouter = TransactionRouter::get(operationContext());
+        txnRouter.beginOrContinueTxn(
+            operationContext(), kTxnNumber, TransactionRouter::TransactionActions::kStart);
+        txnRouter.setDefaultAtClusterTime(operationContext());
+    }
+
+    void tearDown() override {
+        _scopedSession.reset();
+        repl::ReadConcernArgs::get(operationContext()) = repl::ReadConcernArgs();
+
+        BatchWriteExecTest::tearDown();
+    }
+
+    const NamespaceString nss{"foo.bar"};
+
+private:
+    boost::optional<RouterOperationContextSession> _scopedSession;
+};
+
+TEST_F(BatchWriteExecTransactionTargeterErrorTest, TargetedFailedAndErrorResponseInTransaction) {
+    BatchedCommandRequest request([&] {
+        write_ops::Update updateOp(nss);
+        updateOp.setWriteCommandBase([] {
+            write_ops::WriteCommandBase writeCommandBase;
+            writeCommandBase.setOrdered(false);
+            return writeCommandBase;
+        }());
+        updateOp.setUpdates(std::vector{write_ops::UpdateOpEntry(
+            BSON("_id" << 100),
+            write_ops::UpdateModification::parseFromClassicUpdate(BSON("Key" << 100)))});
+        return updateOp;
+    }());
+    request.setWriteConcern(BSONObj());
+
+    const static auto epoch = OID::gen();
+
+    class MultiShardTargeter : public MockNSTargeter {
+    public:
+        using MockNSTargeter::MockNSTargeter;
+
+        std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
+                                                const BatchItemRef& itemRef) const override {
+            return std::vector<ShardEndpoint>{
+                ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
+                ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
+        }
+    };
+
+    MultiShardTargeter multiShardNSTargeter(
+        nss,
+        {MockRange(ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
+                   BSON("x" << MINKEY),
+                   BSON("x" << 0)),
+         MockRange(ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch)),
+                   BSON("x" << 0),
+                   BSON("x" << MAXKEY))});
+
+    auto future = launchAsync([&] {
+        BatchedCommandResponse response;
+        BatchWriteExecStats stats;
+        BatchWriteExec::executeBatch(
+            operationContext(), multiShardNSTargeter, request, &response, &stats);
+        ASSERT(response.isErrDetailsSet());
+        auto code = response.getErrDetailsAt(0)->toStatus().code();
+        ASSERT_EQUALS(code, ErrorCodes::ShardNotFound);
+    });
+
+    onCommandForPoolExecutor([&](const RemoteCommandRequest& request) {
+        ASSERT_EQ(kTestShardHost2, request.target);
+        BSONObjBuilder bob;
+
+        bob.append("ok", 0);
+        bob.append("code", ErrorCodes::UnknownError);
+        bob.append("codeName", ErrorCodes::errorString(ErrorCodes::UnknownError));
+
+        // Because this is the transaction-specific fixture, return transaction metadata in
+        // the response.
+        TxnResponseMetadata txnResponseMetadata(false /* readOnly */);
+        txnResponseMetadata.serialize(&bob);
+
+        return bob.obj();
+    });
+
+    future.default_timed_get();
+
+    // It is expected that the transaction will leave the request of Shard2 without processing, so,
+    // the baton is manually run because there is no other blocking call on the operation context,
+    // making the cleanup as scheduled by the destructor of MultiStatementTransactionRequestsSender.
+    operationContext()->getBaton()->run(getServiceContext()->getPreciseClockSource());
+}
+
+class BatchWriteExecTransactionMultiShardTest : public BatchWriteExecTest {
+public:
+    const TxnNumber kTxnNumber = 5;
+    const LogicalTime kInMemoryLogicalTime = LogicalTime(Timestamp(3, 1));
+
+    void setUp() override {
+        BatchWriteExecTest::setUp();
+
+        setRemote(HostAndPort("ClientHost", 12345));
+
+        // Set up the RemoteCommandTargeter for the config shard
+        configTargeter()->setFindHostReturnValue(kTestConfigShardHost);
+
+        targeterFactory()->addTargeterToReturn(ConnectionString(kTestShardHost1), [] {
+            std::unique_ptr<RemoteCommandTargeterMock> targeter(
+                std::make_unique<RemoteCommandTargeterMock>());
+            targeter->setConnectionStringReturnValue(ConnectionString(kTestShardHost1));
+            targeter->setFindHostReturnValue(kTestShardHost1);
+            return targeter;
+        }());
+
+        targeterFactory()->addTargeterToReturn(ConnectionString(kTestShardHost2), [] {
+            std::unique_ptr<RemoteCommandTargeterMock> targeter(
+                std::make_unique<RemoteCommandTargeterMock>());
+            targeter->setConnectionStringReturnValue(ConnectionString(kTestShardHost2));
+            targeter->setFindHostReturnValue(kTestShardHost2);
+            return targeter;
+        }());
+
+        // Set up the shard registry to contain the fake shards
+        setupShards({[] {
+                         ShardType shardType;
+                         shardType.setName(kShardName1);
+                         shardType.setHost(kTestShardHost1.toString());
+                         return shardType;
+                     }(),
+                     [] {
+                         ShardType shardType;
+                         shardType.setName(kShardName2);
+                         shardType.setHost(kTestShardHost2.toString());
+                         return shardType;
+                     }()});
+
+        operationContext()->setLogicalSessionId(makeLogicalSessionIdForTest());
+        operationContext()->setTxnNumber(kTxnNumber);
+        repl::ReadConcernArgs::get(operationContext()) =
+            repl::ReadConcernArgs(repl::ReadConcernLevel::kSnapshotReadConcern);
+
+        VectorClock::get(getServiceContext())->advanceClusterTime_forTest(kInMemoryLogicalTime);
+
+        _scopedSession.emplace(operationContext());
+
+        auto txnRouter = TransactionRouter::get(operationContext());
+        txnRouter.beginOrContinueTxn(
+            operationContext(), kTxnNumber, TransactionRouter::TransactionActions::kStart);
+        txnRouter.setDefaultAtClusterTime(operationContext());
+    }
+
+    void tearDown() override {
+        _scopedSession.reset();
+        repl::ReadConcernArgs::get(operationContext()) = repl::ReadConcernArgs();
+
+        BatchWriteExecTest::tearDown();
+    }
+
+private:
+    boost::optional<RouterOperationContextSession> _scopedSession;
+};
+
+TEST_F(BatchWriteExecTransactionMultiShardTest, TargetedSucceededAndErrorResponseInTransaction) {
+    BatchedCommandRequest request([&] {
+        write_ops::Update updateOp(nss);
+        updateOp.setWriteCommandBase([] {
+            write_ops::WriteCommandBase writeCommandBase;
+            writeCommandBase.setOrdered(false);
+            return writeCommandBase;
+        }());
+        updateOp.setUpdates(std::vector{write_ops::UpdateOpEntry(
+            BSON("_id" << 100),
+            write_ops::UpdateModification::parseFromClassicUpdate(BSON("Key" << 100)))});
+        return updateOp;
+    }());
+    request.setWriteConcern(BSONObj());
+
+    const static auto epoch = OID::gen();
+
+    class MultiShardTargeter : public MockNSTargeter {
+    public:
+        using MockNSTargeter::MockNSTargeter;
+
+        std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
+                                                const BatchItemRef& itemRef) const override {
+            return std::vector<ShardEndpoint>{
+                ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
+                ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
+        }
+    };
+
+    MultiShardTargeter multiShardNSTargeter(
+        nss,
+        {MockRange(ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
+                   BSON("x" << MINKEY),
+                   BSON("x" << 0)),
+         MockRange(ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch)),
+                   BSON("x" << 0),
+                   BSON("x" << MAXKEY))});
+
+    auto future = launchAsync([&] {
+        BatchedCommandResponse response;
+        BatchWriteExecStats stats;
+        BatchWriteExec::executeBatch(
+            operationContext(), multiShardNSTargeter, request, &response, &stats);
+        ASSERT(response.isErrDetailsSet());
+        auto code = response.getErrDetailsAt(0)->toStatus().code();
+        ASSERT_EQUALS(code, ErrorCodes::UnknownError);
+    });
+
+    onCommandForPoolExecutor([&](const RemoteCommandRequest& request) {
+        ASSERT_EQ(kTestShardHost1, request.target);
+        BSONObjBuilder bob;
+
+        bob.append("ok", 0);
+        bob.append("code", ErrorCodes::UnknownError);
+        bob.append("codeName", ErrorCodes::errorString(ErrorCodes::UnknownError));
+
+        // Because this is the transaction-specific fixture, return transaction metadata in
+        // the response.
+        TxnResponseMetadata txnResponseMetadata(false /* readOnly */);
+        txnResponseMetadata.serialize(&bob);
+
+        return bob.obj();
+    });
+    onCommandForPoolExecutor([&](const RemoteCommandRequest& request) {
+        ASSERT_EQ(kTestShardHost2, request.target);
+        BSONObjBuilder bob;
+
+        bob.append("ok", 0);
+        bob.append("code", ErrorCodes::UnknownError);
+        bob.append("codeName", ErrorCodes::errorString(ErrorCodes::UnknownError));
+
+        // Because this is the transaction-specific fixture, return transaction metadata in
+        // the response.
+        TxnResponseMetadata txnResponseMetadata(false /* readOnly */);
+        txnResponseMetadata.serialize(&bob);
+
+        return bob.obj();
+    });
+
+    future.default_timed_get();
+
+    // It is expected that the transaction will leave the request of Shard2 without processing, so,
+    // the baton is manually run because there is no other blocking call on the operation context,
+    // making the cleanup as scheduled by the destructor of MultiStatementTransactionRequestsSender.
+    operationContext()->getBaton()->run(getServiceContext()->getPreciseClockSource());
+}
+
+/**
+ * General transaction tests.
+ */
 class BatchWriteExecTransactionTest : public BatchWriteExecTest {
 public:
     const TxnNumber kTxnNumber = 5;
@@ -1430,9 +2031,7 @@ public:
         repl::ReadConcernArgs::get(operationContext()) =
             repl::ReadConcernArgs(repl::ReadConcernLevel::kSnapshotReadConcern);
 
-        auto logicalClock = std::make_unique<LogicalClock>(getServiceContext());
-        logicalClock->setClusterTimeFromTrustedSource(kInMemoryLogicalTime);
-        LogicalClock::set(getServiceContext(), std::move(logicalClock));
+        VectorClock::get(getServiceContext())->advanceClusterTime_forTest(kInMemoryLogicalTime);
 
         _scopedSession.emplace(operationContext());
 

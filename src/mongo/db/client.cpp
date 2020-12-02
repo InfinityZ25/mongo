@@ -42,6 +42,7 @@
 #include "mongo/base/status.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/operation_cpu_timer.h"
 #include "mongo/db/service_context.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/concurrency/thread_name.h"
@@ -82,13 +83,6 @@ void Client::initThread(StringData desc,
     currentClient = service->makeClient(fullDesc, std::move(session));
 }
 
-void Client::initKillableThread(StringData desc, ServiceContext* service) {
-    initThread(desc, service, nullptr);
-
-    stdx::lock_guard lk(*currentClient);
-    currentClient->setSystemOperationKillable(lk);
-}
-
 namespace {
 int64_t generateSeed(const std::string& desc) {
     size_t seed = 0;
@@ -121,17 +115,6 @@ ServiceContext::UniqueOperationContext Client::makeOperationContext() {
     return getServiceContext()->makeOperationContext(this);
 }
 
-void Client::setOperationContext(OperationContext* opCtx) {
-    // We can only set the OperationContext once before resetting it.
-    invariant(opCtx != nullptr && _opCtx == nullptr);
-    _opCtx = opCtx;
-}
-
-void Client::resetOperationContext() {
-    invariant(_opCtx != nullptr);
-    _opCtx = nullptr;
-}
-
 std::string Client::clientAddress(bool includePort) const {
     if (!hasRemote()) {
         return "";
@@ -162,13 +145,19 @@ bool haveClient() {
 }
 
 ServiceContext::UniqueClient Client::releaseCurrent() {
-    invariant(haveClient());
+    invariant(haveClient(), "No client to release");
+    if (auto opCtx = currentClient->_opCtx)
+        if (auto timer = OperationCPUTimer::get(opCtx))
+            timer->onThreadDetach();
     return std::move(currentClient);
 }
 
 void Client::setCurrent(ServiceContext::UniqueClient client) {
     invariantNoCurrentClient();
     currentClient = std::move(client);
+    if (auto opCtx = currentClient->_opCtx)
+        if (auto timer = OperationCPUTimer::get(opCtx))
+            timer->onThreadAttach();
 }
 
 /**

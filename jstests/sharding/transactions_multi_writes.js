@@ -1,10 +1,13 @@
-// Verifies multi-writes in transactions are sent with shard versions to only the targeted shards.
-//
-// @tags: [
-//   requires_sharding,
-//   uses_multi_shard_transaction,
-//   uses_transactions,
-// ]
+/**
+ * Verifies multi-writes in transactions are sent with shard versions to only the targeted shards.
+ *
+ * @tags: [
+ *  requires_find_command,
+ *  requires_sharding,
+ *  uses_multi_shard_transaction,
+ *  uses_transactions,
+ * ]
+ */
 (function() {
 "use strict";
 
@@ -16,6 +19,7 @@ const ns = dbName + "." + collName;
 
 const st = new ShardingTest({shards: 3, config: 1, mongos: 2});
 
+enableCoordinateCommitReturnImmediatelyAfterPersistingDecision(st);
 enableStaleVersionAndSnapshotRetriesWithinTransactions(st);
 
 // Set up a sharded collection with 3 chunks, [min, 0), [0, 10), [10, max), one on each shard,
@@ -77,7 +81,7 @@ function runTest(st, session, writeCmd, staleRouter) {
     assert.commandWorked(session.commitTransaction_forTesting());
     if (isUpdate) {
         assert.sameMembers(
-            st.getDB(dbName)[collName].find().toArray(),
+            sessionDB[collName].find().toArray(),
             [
                 {_id: 1, counter: 1, skey: -5},
                 {_id: 2, counter: 1, skey: 5},
@@ -86,7 +90,7 @@ function runTest(st, session, writeCmd, staleRouter) {
             "document mismatch for update, stale: " + staleRouter + ", cmd: " + tojson(writeCmd));
     } else {  // isDelete
         assert.sameMembers(
-            st.getDB(dbName)[collName].find().toArray(),
+            sessionDB[collName].find().toArray(),
             [{_id: 3, counter: 0, skey: 15}],
             "document mismatch for delete, stale: " + staleRouter + ", cmd: " + tojson(writeCmd));
     }

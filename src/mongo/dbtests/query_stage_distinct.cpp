@@ -126,7 +126,7 @@ public:
         addIndex(BSON("a" << 1));
 
         AutoGetCollectionForReadCommand ctx(&_opCtx, nss);
-        Collection* coll = ctx.getCollection();
+        const CollectionPtr& coll = ctx.getCollection();
 
         // Set up the distinct stage.
         std::vector<const IndexDescriptor*> indexes;
@@ -144,7 +144,7 @@ public:
         params.bounds.fields.push_back(oil);
 
         WorkingSet ws;
-        DistinctScan distinct(_expCtx.get(), std::move(params), &ws);
+        DistinctScan distinct(_expCtx.get(), coll, std::move(params), &ws);
 
         WorkingSetID wsid;
         // Get our first result.
@@ -192,7 +192,7 @@ public:
         addIndex(BSON("a" << 1));
 
         AutoGetCollectionForReadCommand ctx(&_opCtx, nss);
-        Collection* coll = ctx.getCollection();
+        const CollectionPtr& coll = ctx.getCollection();
 
         // Set up the distinct stage.
         std::vector<const IndexDescriptor*> indexes;
@@ -212,7 +212,7 @@ public:
         params.bounds.fields.push_back(oil);
 
         WorkingSet ws;
-        DistinctScan distinct(_expCtx.get(), std::move(params), &ws);
+        DistinctScan distinct(_expCtx.get(), coll, std::move(params), &ws);
 
         // We should see each number in the range [1, 6] exactly once.
         std::set<int> seen;
@@ -259,7 +259,7 @@ public:
         addIndex(BSON("a" << 1 << "b" << 1));
 
         AutoGetCollectionForReadCommand ctx(&_opCtx, nss);
-        Collection* coll = ctx.getCollection();
+        const CollectionPtr& coll = ctx.getCollection();
 
         std::vector<const IndexDescriptor*> indices;
         coll->getIndexCatalog()->findIndexesByKeyPattern(
@@ -281,7 +281,7 @@ public:
         params.bounds.fields.push_back(bOil);
 
         WorkingSet ws;
-        DistinctScan distinct(_expCtx.get(), std::move(params), &ws);
+        DistinctScan distinct(_expCtx.get(), coll, std::move(params), &ws);
 
         WorkingSetID wsid;
         PlanStage::StageState state;
@@ -289,7 +289,6 @@ public:
         std::vector<int> seen;
 
         while (PlanStage::IS_EOF != (state = distinct.work(&wsid))) {
-            ASSERT_NE(PlanStage::FAILURE, state);
             if (PlanStage::ADVANCED == state) {
                 seen.push_back(getIntFieldDotted(ws, wsid, "b"));
             }

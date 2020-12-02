@@ -31,17 +31,20 @@
 
 #include "mongo/client/read_preference.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/s/config_server_test_fixture.h"
 
 namespace mongo {
 namespace {
 
-const NamespaceString kNamespace("TestDB.TestColl");
+using unittest::assertGet;
 
 using MergeChunkTest = ConfigServerTestFixture;
+
+const NamespaceString kNamespace("TestDB.TestColl");
+const KeyPattern kKeyPattern(BSON("x" << 1));
 
 TEST_F(MergeChunkTest, MergeExistingChunksCorrectlyShouldSucceed) {
     ChunkType chunk;
@@ -68,17 +71,28 @@ TEST_F(MergeChunkTest, MergeExistingChunksCorrectlyShouldSucceed) {
 
     std::vector<BSONObj> chunkBoundaries{chunkMin, chunkBound, chunkMax};
 
-    setupChunks({chunk, chunk2});
+    setupCollection(kNamespace, kKeyPattern, {chunk, chunk2});
 
     Timestamp validAfter{100, 0};
 
-    ASSERT_OK(ShardingCatalogManager::get(operationContext())
-                  ->commitChunkMerge(operationContext(),
-                                     kNamespace,
-                                     origVersion.epoch(),
-                                     chunkBoundaries,
-                                     "shard0000",
-                                     validAfter));
+    auto versions = assertGet(ShardingCatalogManager::get(operationContext())
+                                  ->commitChunkMerge(operationContext(),
+                                                     kNamespace,
+                                                     origVersion.epoch(),
+                                                     chunkBoundaries,
+                                                     "shard0000",
+                                                     validAfter));
+
+    auto collVersion = assertGet(ChunkVersion::parseWithField(versions, "collectionVersion"));
+    auto shardVersion = assertGet(ChunkVersion::parseWithField(versions, "shardVersion"));
+
+    ASSERT_GT(shardVersion, origVersion);
+    ASSERT_EQ(collVersion, shardVersion);
+
+    // Check for increment on mergedChunk's minor version
+    auto expectedShardVersion = ChunkVersion(
+        origVersion.majorVersion(), origVersion.minorVersion() + 1, origVersion.epoch());
+    ASSERT_EQ(expectedShardVersion, shardVersion);
 
     auto findResponse = uassertStatusOK(
         getConfigShard()->exhaustiveFindOnConfig(operationContext(),
@@ -99,11 +113,8 @@ TEST_F(MergeChunkTest, MergeExistingChunksCorrectlyShouldSucceed) {
     ASSERT_BSONOBJ_EQ(chunkMin, mergedChunk.getMin());
     ASSERT_BSONOBJ_EQ(chunkMax, mergedChunk.getMax());
 
-    {
-        // Check for increment on mergedChunk's minor version
-        ASSERT_EQ(origVersion.majorVersion(), mergedChunk.getVersion().majorVersion());
-        ASSERT_EQ(origVersion.minorVersion() + 1, mergedChunk.getVersion().minorVersion());
-    }
+    // Check that the shard version returned by the merge matches the CSRS one
+    ASSERT_EQ(shardVersion, mergedChunk.getVersion());
 
     // Make sure history is there
     ASSERT_EQ(1UL, mergedChunk.getHistory().size());
@@ -142,7 +153,7 @@ TEST_F(MergeChunkTest, MergeSeveralChunksCorrectlyShouldSucceed) {
     // Record chunk boundaries for passing into commitChunkMerge
     std::vector<BSONObj> chunkBoundaries{chunkMin, chunkBound, chunkBound2, chunkMax};
 
-    setupChunks({chunk, chunk2, chunk3});
+    setupCollection(kNamespace, kKeyPattern, {chunk, chunk2, chunk3});
 
     Timestamp validAfter{100, 0};
 
@@ -220,7 +231,7 @@ TEST_F(MergeChunkTest, NewMergeShouldClaimHighestVersion) {
     otherChunk.setMin(BSON("a" << 10));
     otherChunk.setMax(BSON("a" << 20));
 
-    setupChunks({chunk, chunk2, otherChunk});
+    setupCollection(kNamespace, kKeyPattern, {chunk, chunk2, otherChunk});
 
     Timestamp validAfter{100, 0};
 
@@ -294,7 +305,7 @@ TEST_F(MergeChunkTest, MergeLeavesOtherChunksAlone) {
     otherChunk.setMin(BSON("a" << 10));
     otherChunk.setMax(BSON("a" << 20));
 
-    setupChunks({chunk, chunk2, otherChunk});
+    setupCollection(kNamespace, kKeyPattern, {chunk, chunk2, otherChunk});
 
     Timestamp validAfter{1};
 
@@ -360,7 +371,7 @@ TEST_F(MergeChunkTest, NonExistingNamespace) {
     // Record chunk boundaries for passing into commitChunkMerge
     std::vector<BSONObj> chunkBoundaries{chunkMin, chunkBound, chunkMax};
 
-    setupChunks({chunk, chunk2});
+    setupCollection(kNamespace, kKeyPattern, {chunk, chunk2});
 
     Timestamp validAfter{1};
 
@@ -371,7 +382,7 @@ TEST_F(MergeChunkTest, NonExistingNamespace) {
                                               chunkBoundaries,
                                               "shard0000",
                                               validAfter);
-    ASSERT_EQ(ErrorCodes::IllegalOperation, mergeStatus);
+    ASSERT_NOT_OK(mergeStatus);
 }
 
 TEST_F(MergeChunkTest, NonMatchingEpochsOfChunkAndRequestErrors) {
@@ -397,7 +408,7 @@ TEST_F(MergeChunkTest, NonMatchingEpochsOfChunkAndRequestErrors) {
     // Record chunk baoundaries for passing into commitChunkMerge
     std::vector<BSONObj> chunkBoundaries{chunkMin, chunkBound, chunkMax};
 
-    setupChunks({chunk, chunk2});
+    setupCollection(kNamespace, kKeyPattern, {chunk, chunk2});
 
     Timestamp validAfter{1};
 
@@ -442,7 +453,7 @@ TEST_F(MergeChunkTest, MergeAlreadyHappenedSucceeds) {
     mergedChunk.setVersion(mergedVersion);
     mergedChunk.setMax(chunkMax);
 
-    setupChunks({mergedChunk});
+    setupCollection(kNamespace, kKeyPattern, {mergedChunk});
 
     Timestamp validAfter{1};
 
@@ -507,7 +518,7 @@ TEST_F(MergeChunkTest, ChunkBoundariesOutOfOrderFails) {
         chunk.setVersion(version);
         originalChunks.push_back(chunk);
 
-        setupChunks(originalChunks);
+        setupCollection(kNamespace, kKeyPattern, originalChunks);
     }
 
     Timestamp validAfter{1};
@@ -548,7 +559,7 @@ TEST_F(MergeChunkTest, MergingChunksWithDollarPrefixShouldSucceed) {
     chunk3.setMin(chunkBound2);
     chunk3.setMax(chunkMax);
 
-    setupChunks({chunk1, chunk2, chunk3});
+    setupCollection(kNamespace, kKeyPattern, {chunk1, chunk2, chunk3});
 
     // Record chunk boundaries for passing into commitChunkMerge
     std::vector<BSONObj> chunkBoundaries{chunkMin, chunkBound1, chunkBound2, chunkMax};

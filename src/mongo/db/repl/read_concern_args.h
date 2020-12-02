@@ -80,7 +80,7 @@ public:
 
     ReadConcernArgs(boost::optional<OpTime> opTime, boost::optional<ReadConcernLevel> level);
 
-    ReadConcernArgs(boost::optional<LogicalTime> clusterTime,
+    ReadConcernArgs(boost::optional<LogicalTime> afterClusterTime,
                     boost::optional<ReadConcernLevel> level);
     /**
      * Format:
@@ -167,7 +167,21 @@ public:
     boost::optional<LogicalTime> getArgsAfterClusterTime() const;
 
     boost::optional<LogicalTime> getArgsAtClusterTime() const;
+
+    /**
+     * Returns a BSON object of the form:
+     *
+     * { readConcern: { level: "...",
+     *                  afterClusterTime: Timestamp(...) } }
+     */
     BSONObj toBSON() const;
+
+    /**
+     * Returns a BSON object of the form:
+     *
+     * { level: "...",
+     *   afterClusterTime: Timestamp(...) }
+     */
     BSONObj toBSONInner() const;
     std::string toString() const;
 
@@ -176,6 +190,27 @@ public:
     }
     const ReadWriteConcernProvenance& getProvenance() const {
         return _provenance;
+    }
+
+    /**
+     * Set atClusterTime, clear afterClusterTime. The BSON representation becomes
+     * {level: "snapshot", atClusterTime: <ts>}.
+     */
+    void setArgsAtClusterTimeForSnapshot(Timestamp ts) {
+        invariant(_level && _level == ReadConcernLevel::kSnapshotReadConcern);
+        // Only overwrite a server-selected atClusterTime, not user-supplied.
+        invariant(_atClusterTime.is_initialized() == _atClusterTimeSelected);
+        _afterClusterTime = boost::none;
+        _atClusterTime = LogicalTime(ts);
+        _atClusterTimeSelected = true;
+    }
+
+    /**
+     * Return whether an atClusterTime has been selected by the server for a snapshot read. This
+     * function returns false if the atClusterTime was specified by the client.
+     */
+    bool wasAtClusterTimeSelected() const {
+        return _atClusterTimeSelected;
     }
 
 private:
@@ -212,6 +247,8 @@ private:
     bool _specified;
 
     ReadWriteConcernProvenance _provenance;
+
+    bool _atClusterTimeSelected = false;
 };
 
 }  // namespace repl

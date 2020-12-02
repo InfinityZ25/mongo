@@ -32,11 +32,11 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/bson/json.h"
-#include "mongo/db/logical_clock.h"
+#include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/config/initial_split_policy.h"
+#include "mongo/db/vector_clock.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog/type_tags.h"
-#include "mongo/s/config_server_test_fixture.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -279,7 +279,7 @@ TEST_F(GenerateInitialHashedSplitChunksTest, NoSplitPoints) {
     const std::vector<BSONObj> splitPoints;
     const std::vector<ShardId> shardIds = makeShardIds(2);
     const auto shardCollectionConfig = InitialSplitPolicy::generateShardCollectionInitialChunks(
-        nss(), shardKeyPattern(), shardIds[0], timeStamp(), splitPoints, shardIds);
+        {nss(), boost::none, shardIds[0]}, shardKeyPattern(), timeStamp(), splitPoints, shardIds);
 
     // there should only be one chunk
     const auto expectedChunks =
@@ -291,8 +291,12 @@ TEST_F(GenerateInitialHashedSplitChunksTest, NoSplitPoints) {
 
 TEST_F(GenerateInitialHashedSplitChunksTest, SplitPointsMoreThanAvailableShards) {
     const std::vector<ShardId> shardIds = makeShardIds(2);
-    const auto shardCollectionConfig = InitialSplitPolicy::generateShardCollectionInitialChunks(
-        nss(), shardKeyPattern(), shardIds[0], timeStamp(), hashedSplitPoints(), shardIds);
+    const auto shardCollectionConfig =
+        InitialSplitPolicy::generateShardCollectionInitialChunks({nss(), boost::none, shardIds[0]},
+                                                                 shardKeyPattern(),
+                                                                 timeStamp(),
+                                                                 hashedSplitPoints(),
+                                                                 shardIds);
 
     // // chunks should be distributed in a round-robin manner
     const std::vector<ChunkType> expectedChunks = makeChunks(
@@ -303,8 +307,13 @@ TEST_F(GenerateInitialHashedSplitChunksTest, SplitPointsMoreThanAvailableShards)
 TEST_F(GenerateInitialHashedSplitChunksTest,
        SplitPointsNumContiguousChunksPerShardsGreaterThanOne) {
     const std::vector<ShardId> shardIds = makeShardIds(2);
-    const auto shardCollectionConfig = InitialSplitPolicy::generateShardCollectionInitialChunks(
-        nss(), shardKeyPattern(), shardIds[0], timeStamp(), hashedSplitPoints(), shardIds, 2);
+    const auto shardCollectionConfig =
+        InitialSplitPolicy::generateShardCollectionInitialChunks({nss(), boost::none, shardIds[0]},
+                                                                 shardKeyPattern(),
+                                                                 timeStamp(),
+                                                                 hashedSplitPoints(),
+                                                                 shardIds,
+                                                                 2);
 
     // chunks should be distributed in a round-robin manner two chunks at a time
     const std::vector<ChunkType> expectedChunks = makeChunks(
@@ -328,13 +337,12 @@ public:
         setupShards(shards);
         shardRegistry()->reload(opCtx);
         SingleChunkPerTagSplitPolicy splitPolicy(opCtx, tags);
-        const auto shardCollectionConfig =
-            splitPolicy.createFirstChunks(opCtx, shardKeyPattern, {});
+        const auto shardCollectionConfig = splitPolicy.createFirstChunks(
+            opCtx, shardKeyPattern, {nss(), boost::none, expectedShardIds.front()});
 
-        const std::vector<ChunkType> expectedChunks =
-            makeChunks(expectedChunkRanges,
-                       expectedShardIds,
-                       LogicalClock::get(opCtx)->getClusterTime().asTimestamp());
+        const auto currentTime = VectorClock::get(opCtx)->getTime();
+        const std::vector<ChunkType> expectedChunks = makeChunks(
+            expectedChunkRanges, expectedShardIds, currentTime.clusterTime().asTimestamp());
         assertChunkVectorsAreEqual(expectedChunks, shardCollectionConfig.chunks);
     }
 
@@ -559,7 +567,9 @@ TEST_F(SingleChunkPerTagSplitPolicyTest, ZoneNotAssociatedWithAnyShardShouldFail
 
     SingleChunkPerTagSplitPolicy splitPolicy(operationContext(), tags);
 
-    ASSERT_THROWS_CODE(splitPolicy.createFirstChunks(operationContext(), shardKeyPattern(), {}),
+    ASSERT_THROWS_CODE(splitPolicy.createFirstChunks(operationContext(),
+                                                     shardKeyPattern(),
+                                                     {nss(), boost::none, ShardId("shardId")}),
                        AssertionException,
                        50973);
 }
@@ -579,13 +589,12 @@ public:
                                          bool isCollEmpty = true) {
         PresplitHashedZonesSplitPolicy splitPolicy(
             operationContext(), shardKeyPattern, tags, numInitialChunk, isCollEmpty);
-        const auto shardCollectionConfig =
-            splitPolicy.createFirstChunks(operationContext(), shardKeyPattern, {});
+        const auto shardCollectionConfig = splitPolicy.createFirstChunks(
+            operationContext(), shardKeyPattern, {nss(), boost::none, expectedShardIds.front()});
 
-        const std::vector<ChunkType> expectedChunks =
-            makeChunks(expectedChunkRanges,
-                       expectedShardIds,
-                       LogicalClock::get(operationContext())->getClusterTime().asTimestamp());
+        const auto currentTime = VectorClock::get(operationContext())->getTime();
+        const std::vector<ChunkType> expectedChunks = makeChunks(
+            expectedChunkRanges, expectedShardIds, currentTime.clusterTime().asTimestamp());
         assertChunkVectorsAreEqual(expectedChunks, shardCollectionConfig.chunks);
     }
 };

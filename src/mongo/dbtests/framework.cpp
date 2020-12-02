@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -105,8 +105,12 @@ int runDbTests(int argc, char** argv) {
     auto runner = makePeriodicRunner(globalServiceContext);
     globalServiceContext->setPeriodicRunner(std::move(runner));
 
-    initializeStorageEngine(globalServiceContext, StorageEngineInitFlags::kNone);
-    StorageControl::startStorageControls(globalServiceContext);
+    {
+        auto opCtx = globalServiceContext->makeOperationContext(&cc());
+        initializeStorageEngine(opCtx.get(), StorageEngineInitFlags::kNone);
+    }
+
+    StorageControl::startStorageControls(globalServiceContext, true /*forTestOnly*/);
     DatabaseHolder::set(globalServiceContext, std::make_unique<DatabaseHolderImpl>());
     IndexAccessMethodFactory::set(globalServiceContext,
                                   std::make_unique<IndexAccessMethodFactoryImpl>());

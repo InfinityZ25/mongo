@@ -72,11 +72,12 @@ public:
                             false,        // bypassDocumentValidation,
                             false,        // isMapReduce
                             nss,
-                            RuntimeConstants(Date_t::now(), Timestamp(1, 0)),
+                            LegacyRuntimeConstants(Date_t::now(), Timestamp(1, 0)),
                             {},  // collator
                             std::make_shared<StubMongoProcessInterface>(),
                             {},    // resolvedNamespaces
                             {},    // collUUID
+                            {},    // let
                             false  // mayDbProfile
           ) {
         // If there is an existing global ServiceContext, adopt it. Otherwise, create a new context.
@@ -122,11 +123,12 @@ public:
                             false,        // bypassDocumentValidation,
                             false,        // isMapReduce
                             nss,
-                            RuntimeConstants(Date_t::now(), Timestamp(1, 0)),
+                            LegacyRuntimeConstants(Date_t::now(), Timestamp(1, 0)),
                             {},  // collator
                             std::make_shared<StubMongoProcessInterface>(),
                             {},    // resolvedNamespaces
                             {},    // collUUID
+                            {},    // let
                             false  // mayDbProfile
                             ),
           _serviceContext(opCtx->getServiceContext()) {
@@ -141,6 +143,36 @@ public:
     ExpressionContextForTest(OperationContext* opCtx, const AggregationRequest& request)
         : ExpressionContext(
               opCtx, request, nullptr, std::make_shared<StubMongoProcessInterface>(), {}, {}),
+          _serviceContext(opCtx->getServiceContext()) {
+        // Resolve the TimeZoneDatabase to be used by this ExpressionContextForTest.
+        _setTimeZoneDatabase();
+    }
+
+    /**
+     * Constructor which sets the given OperationContext on the ExpressionContextForTest. This will
+     * also resolve the ExpressionContextForTest's ServiceContext from the OperationContext and
+     * accepts letParameters.
+     */
+    ExpressionContextForTest(OperationContext* opCtx,
+                             const NamespaceString& nss,
+                             std::unique_ptr<CollatorInterface> collator,
+                             const boost::optional<BSONObj>& letParameters = boost::none)
+        : ExpressionContext(opCtx,
+                            boost::none,  // explain
+                            false,        // fromMongos,
+                            false,        // needsMerge,
+                            false,        // allowDiskUse,
+                            false,        // bypassDocumentValidation,
+                            false,        // isMapReduce
+                            nss,
+                            LegacyRuntimeConstants(Date_t::now(), Timestamp(1, 0)),
+                            std::move(collator),
+                            std::make_shared<StubMongoProcessInterface>(),
+                            {},  // resolvedNamespaces
+                            {},  // collUUID
+                            letParameters,
+                            false  // mayDbProfile
+                            ),
           _serviceContext(opCtx->getServiceContext()) {
         // Resolve the TimeZoneDatabase to be used by this ExpressionContextForTest.
         _setTimeZoneDatabase();

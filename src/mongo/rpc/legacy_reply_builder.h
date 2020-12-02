@@ -40,7 +40,7 @@
 namespace mongo {
 namespace rpc {
 
-class LegacyReplyBuilder : public ReplyBuilderInterface {
+class LegacyReplyBuilder final : public ReplyBuilderInterface {
 public:
     static const char kCursorTag[];
     static const char kFirstBatchTag[];
@@ -68,8 +68,6 @@ private:
     std::size_t _bodyOffset = 0;
     Message _message;
     bool _haveCommandReply = false;
-    // For stale config errors we need to set the correct ResultFlag.
-    bool _staleConfigError = false;
 };
 
 }  // namespace rpc

@@ -1,4 +1,6 @@
-// @tags: [assumes_balancer_off, requires_fcv_44]
+// @tags: [
+//   assumes_balancer_off,
+// ]
 load("jstests/libs/fixture_helpers.js");
 
 t = db.index_diag;
@@ -46,7 +48,7 @@ if (FixtureHelpers.numberOfShardsForCollection(t) === 1) {
     assert.commandWorked(t.createIndex({_id: 1, x: 1}));
     assert.eq(all, t.find().hint({_id: 1, x: 1}).returnKey().toArray());
 }
-assert.commandWorked(t.ensureIndex({_id: 1, x: 1}));
+assert.commandWorked(t.createIndex({_id: 1, x: 1}));
 assert.eq(r(all), t.find().hint({_id: 1, x: 1}).sort({x: 1}).returnKey().toArray());
 
 assert.eq([{}, {}, {}], t.find().hint({$natural: 1}).returnKey().toArray());

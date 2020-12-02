@@ -50,6 +50,28 @@ namespace mongo {
  * Iteration over the cache will visit elements in order of last use, from most
  * recently used to least recently used.
  */
+
+template <typename Hasher, typename Comparator>
+struct KeyConstraints {
+    template <typename T, typename = decltype(std::declval<Hasher>().operator()(std::declval<T>()))>
+    static constexpr std::true_type IsHashable(T&&);
+    static constexpr std::false_type IsHashable(...);
+
+    template <typename T,
+              typename TT,
+              typename = decltype(std::declval<Comparator>().operator()(std::declval<T>(),
+                                                                        std::declval<TT>()))>
+    static constexpr std::true_type IsComparable(T&&, TT&&);
+    static constexpr std::false_type IsComparable(...);
+};
+
+template <typename Hasher, typename Comparator, typename T, typename TT>
+inline constexpr bool IsComparableWith =
+    decltype(KeyConstraints<Hasher, Comparator>::IsHashable(std::declval<TT>()))::value&& decltype(
+        KeyConstraints<Hasher, Comparator>::IsComparable(std::declval<T>(),
+                                                         std::declval<TT>()))::value;
+
+
 template <typename K,
           typename V,
           typename Hash = typename stdx::unordered_map<K, V>::hasher,
@@ -58,11 +80,14 @@ class LRUCache {
     LRUCache(const LRUCache&) = delete;
     LRUCache& operator=(const LRUCache&) = delete;
 
-public:
-    explicit LRUCache(std::size_t maxSize) : _maxSize(maxSize) {}
-
     LRUCache(LRUCache&&) = delete;
     LRUCache& operator=(LRUCache&&) = delete;
+
+public:
+    template <typename T>
+    static constexpr bool IsComparable = IsComparableWith<Hash, KeyEqual, K, T>;
+
+    explicit LRUCache(std::size_t maxSize) : _maxSize(maxSize) {}
 
     using ListEntry = std::pair<K, V>;
     using List = std::list<ListEntry>;
@@ -88,35 +113,37 @@ public:
      */
     boost::optional<std::pair<K, V>> add(const K& key, V entry) {
         // If the key already exists, delete it first.
-        auto i = this->_map.find(key);
-        if (i != this->_map.end()) {
-            this->_list.erase(i->second);
+        auto i = _map.find(key);
+        if (i != _map.end()) {
+            _list.erase(i->second);
         }
 
-        this->_list.push_front(std::make_pair(key, std::move(entry)));
-        this->_map[key] = this->_list.begin();
+        _list.push_front(std::make_pair(key, std::move(entry)));
+        _map[key] = _list.begin();
 
         // If the store has grown beyond its allowed size,
         // evict the least recently used entry.
-        if (this->size() > this->_maxSize) {
-            auto pair = std::move(this->_list.back());
+        if (size() > _maxSize) {
+            auto pair = std::move(_list.back());
 
-            this->_map.erase(pair.first);
-            this->_list.pop_back();
+            _map.erase(pair.first);
+            _list.pop_back();
 
-            invariant(this->size() <= this->_maxSize);
+            invariant(size() <= _maxSize);
             return std::move(pair);
         }
 
-        invariant(this->size() <= this->_maxSize);
+        invariant(size() <= _maxSize);
         return boost::none;
     }
 
     /**
      * Finds an element in the cache by key.
      */
-    iterator find(const K& key) {
-        return this->promote(key);
+    TEMPLATE(typename KeyType)
+    REQUIRES(IsComparable<KeyType>)
+    iterator find(const KeyType& key) {
+        return promote(key);
     }
 
     /**
@@ -128,21 +155,25 @@ public:
      * the find(...) method above will prevent the LRUCache from functioning
      * properly.
      */
-    const_iterator cfind(const K& key) const {
-        auto it = this->_map.find(key);
+    TEMPLATE(typename KeyType)
+    REQUIRES(IsComparable<KeyType>)
+    const_iterator cfind(const KeyType& key) const {
+        auto it = _map.find(key);
         // TODO(SERVER-28890): Remove the function-style cast when MSVC's
         // `std::list< ... >::iterator` implementation doesn't conflict with their `/Zc:ternary`
         // flag support .
-        return (it == this->_map.end()) ? this->end() : const_iterator(it->second);
+        return (it == _map.end()) ? end() : const_iterator(it->second);
     }
 
     /**
      * Promotes the element matching the given key, if one exists in the cache,
      * to the least recently used element.
      */
-    iterator promote(const K& key) {
-        auto it = this->_map.find(key);
-        return (it == this->_map.end()) ? this->end() : this->promote(it->second);
+    TEMPLATE(typename KeyType)
+    REQUIRES(IsComparable<KeyType>)
+    iterator promote(const KeyType& key) {
+        auto it = _map.find(key);
+        return (it == _map.end()) ? end() : promote(it->second);
     }
 
     /**
@@ -150,12 +181,12 @@ public:
      * recently used element in the cache.
      */
     iterator promote(const iterator& iter) {
-        if (iter == this->_list.end()) {
+        if (iter == _list.end()) {
             return iter;
         }
 
-        this->_list.splice(this->_list.begin(), this->_list, iter);
-        return this->_list.begin();
+        _list.splice(_list.begin(), _list, iter);
+        return _list.begin();
     }
 
     /**
@@ -163,26 +194,28 @@ public:
      * least recently used element in the cache.
      */
     const_iterator promote(const const_iterator& iter) {
-        if (iter == this->_list.cend()) {
+        if (iter == _list.cend()) {
             return iter;
         }
 
-        this->_list.splice(this->_list.begin(), this->_list, iter);
-        return this->_list.begin();
+        _list.splice(_list.begin(), _list, iter);
+        return _list.begin();
     }
 
     /**
      * Removes the element in the cache stored for this key, if one
      * exists. Returns the count of elements erased.
      */
-    typename Map::size_type erase(const K& key) {
-        auto it = this->_map.find(key);
-        if (it == this->_map.end()) {
+    TEMPLATE(typename KeyType)
+    REQUIRES(IsComparable<KeyType>)
+    typename Map::size_type erase(const KeyType& key) {
+        auto it = _map.find(key);
+        if (it == _map.end()) {
             return 0;
         }
 
-        this->_list.erase(it->second);
-        this->_map.erase(it);
+        _list.erase(it->second);
+        _map.erase(it);
         return 1;
     }
 
@@ -192,82 +225,86 @@ public:
      * element, or the end iterator, if no such element exists.
      */
     iterator erase(iterator it) {
-        invariant(it != this->_list.end());
-        invariant(this->_map.erase(it->first) == 1);
-        return this->_list.erase(it);
+        invariant(it != _list.end());
+        invariant(_map.erase(it->first) == 1);
+        return _list.erase(it);
     }
 
     /**
      * Removes all items from the cache.
      */
     void clear() {
-        this->_map.clear();
-        this->_list.clear();
+        _map.clear();
+        _list.clear();
     }
 
     /**
      * If the given key has a matching element stored in the cache, returns true.
      * Otherwise, returns false.
      */
-    bool hasKey(const K& key) const {
-        return _map.find(key) != this->_map.end();
+    TEMPLATE(typename KeyType)
+    REQUIRES(IsComparable<KeyType>)
+    bool hasKey(const KeyType& key) const {
+        return _map.find(key) != _map.end();
     }
 
     /**
      * Returns the number of elements currently in the cache.
      */
     std::size_t size() const {
-        return this->_list.size();
+        return _list.size();
     }
 
     bool empty() const {
-        return this->_list.empty();
+        return _list.empty();
     }
 
     /**
      * Returns an iterator pointing to the most recently used element in the cache.
      */
     iterator begin() {
-        return this->_list.begin();
+        return _list.begin();
     }
 
     /**
      * Returns an iterator pointing past the least recently used element in the cache.
      */
     iterator end() {
-        return this->_list.end();
+        return _list.end();
     }
 
     /**
      * Returns a const_iterator pointing to the most recently used element in the cache.
      */
     const_iterator begin() const {
-        return this->_list.begin();
+        return _list.begin();
     }
 
     /**
      * Returns a const_iterafor pointing past the least recently used element in the cache.
      */
     const_iterator end() const {
-        return this->_list.end();
+        return _list.end();
     }
 
     /**
      * Returns a const_iterator pointing to the most recently used element in the cache.
      */
     const_iterator cbegin() const {
-        return this->_list.cbegin();
+        return _list.cbegin();
     }
 
     /**
      * Returns a const_iterator pointing past the least recently used element in the cache.
      */
     const_iterator cend() const {
-        return this->_list.cend();
+        return _list.cend();
     }
 
-    typename Map::size_type count(const K& key) const {
-        return this->_map.count(key);
+    TEMPLATE(typename KeyType)
+    REQUIRES(IsComparable<KeyType>)
+    typename Map::size_type count(const KeyType& key) const {
+        return _map.count(key);
     }
 
 private:

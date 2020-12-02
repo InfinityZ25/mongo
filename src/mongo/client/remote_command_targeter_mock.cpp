@@ -31,9 +31,6 @@
 
 #include "mongo/client/remote_command_targeter_mock.h"
 
-#include "mongo/base/status_with.h"
-#include "mongo/client/read_preference.h"
-
 namespace mongo {
 
 RemoteCommandTargeterMock::RemoteCommandTargeterMock()
@@ -77,12 +74,18 @@ SemiFuture<std::vector<HostAndPort>> RemoteCommandTargeterMock::findHostsWithMax
     return _findHostReturnValue;
 }
 
-void RemoteCommandTargeterMock::markHostNotMaster(const HostAndPort& host, const Status& status) {
+void RemoteCommandTargeterMock::markHostNotPrimary(const HostAndPort& host, const Status& status) {
     stdx::lock_guard<Latch> lg(_mutex);
     _hostsMarkedDown.insert(host);
 }
 
 void RemoteCommandTargeterMock::markHostUnreachable(const HostAndPort& host, const Status& status) {
+    stdx::lock_guard<Latch> lg(_mutex);
+    _hostsMarkedDown.insert(host);
+}
+
+void RemoteCommandTargeterMock::markHostShuttingDown(const HostAndPort& host,
+                                                     const Status& status) {
     stdx::lock_guard<Latch> lg(_mutex);
     _hostsMarkedDown.insert(host);
 }

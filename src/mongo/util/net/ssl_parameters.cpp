@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -245,7 +245,7 @@ Status TLSCATrustsSetParameter::setFromString(const std::string& json) try {
 }  // namespace mongo
 
 mongo::Status mongo::validateOpensslCipherConfig(const std::string&) {
-    if (!sslGlobalParams.sslCipherConfig.empty()) {
+    if (sslGlobalParams.sslCipherConfig != kSSLCipherConfigDefault) {
         return {ErrorCodes::BadValue,
                 "opensslCipherConfig setParameter is incompatible with net.tls.tlsCipherConfig"};
     }

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -42,6 +42,13 @@
 #include "mongo/logv2/log.h"
 
 namespace mongo {
+
+namespace {
+MONGO_INITIALIZER(initApplicationInfo)(InitializerContext* context) {
+    ProcessInfo().appInfo().init(context->args());
+    return Status::OK();
+}
+}  // namespace
 
 class PidFileWiper {
 public:

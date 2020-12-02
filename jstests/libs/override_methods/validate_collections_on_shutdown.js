@@ -29,8 +29,8 @@ MongoRunner.validateCollectionsCallback = function(port) {
         return;
     }
 
-    // Set slaveOk=true so that we can run commands against any secondaries.
-    conn.setSlaveOk();
+    // Set secondaryOk=true so that we can run commands against any secondaries.
+    conn.setSecondaryOk();
 
     let dbNames;
     let result =
@@ -67,9 +67,10 @@ MongoRunner.validateCollectionsCallback = function(port) {
                                       conn.adminCommand(
                                           {replSetStepDown: kFreezeTimeSecs, force: true}),
                                       [
-                                          ErrorCodes.NotMaster,
+                                          ErrorCodes.NotWritablePrimary,
                                           ErrorCodes.NotYetInitialized,
-                                          ErrorCodes.Unauthorized
+                                          ErrorCodes.Unauthorized,
+                                          ErrorCodes.ConflictingOperationInProgress
                                       ]);
                                   const res = conn.adminCommand({replSetFreeze: kFreezeTimeSecs});
                                   assert.commandWorkedOrFailedWithCode(res, [
@@ -124,7 +125,14 @@ MongoRunner.validateCollectionsCallback = function(port) {
     for (let i = 0; i < dbNames.length; ++i) {
         const dbName = dbNames[i];
         cmds.then("validating " + dbName, function(conn) {
-            const validate_res = validateCollections(conn.getDB(dbName), {full: true});
+            const validateOptions = {full: true, enforceFastCount: true};
+            // TODO (SERVER-24266): Once fast counts are tolerant to unclean shutdowns, remove the
+            // check for TestData.allowUncleanShutdowns.
+            if (TestData.skipEnforceFastCountOnValidate || TestData.allowUncleanShutdowns) {
+                validateOptions.enforceFastCount = false;
+            }
+
+            const validate_res = validateCollections(conn.getDB(dbName), validateOptions);
             if (!validate_res.ok) {
                 return {
                     shouldStop: true,

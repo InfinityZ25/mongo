@@ -32,6 +32,7 @@
 #include <boost/optional.hpp>
 
 #include "mongo/client/read_preference.h"
+#include "mongo/db/api_parameters.h"
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/logical_session_id.h"
@@ -176,9 +177,19 @@ public:
     virtual boost::optional<TxnNumber> getTxnNumber() const = 0;
 
     /**
+     * Returns the APIParameters for this cursor.
+     */
+    virtual APIParameters getAPIParameters() const = 0;
+
+    /**
      * Returns the readPreference for this cursor.
      */
     virtual boost::optional<ReadPreferenceSetting> getReadPreference() const = 0;
+
+    /**
+     * Returns the readConcern for this cursor.
+     */
+    virtual boost::optional<ReadConcernArgs> getReadConcern() const = 0;
 
     /**
      * Returns the creation date of the cursor.

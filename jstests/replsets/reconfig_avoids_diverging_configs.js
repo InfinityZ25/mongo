@@ -12,8 +12,6 @@
  * 5. Issue a reconfig to node1 that removes node2. We now have diverging configs
  *   from two different primaries.
  * 6. Reconnect node0 to the rest of the set and verify that its reconfig fails.
- *
- * @tags: [requires_fcv_44]
  */
 (function() {
 "use strict";
@@ -21,6 +19,7 @@ load("jstests/libs/parallel_shell_helpers.js");
 load('jstests/libs/test_background_ops.js');
 load("jstests/replsets/rslib.js");
 load('jstests/aggregation/extras/utils.js');
+load("jstests/libs/fail_point_util.js");
 
 let rst = new ReplSetTest({nodes: 4, useBridge: true});
 rst.startSet();
@@ -42,7 +41,7 @@ C1.members = C1.members.slice(0, 3);  // Remove the last node.
 // Increase the C1 version by a high number to ensure the following config
 // C2 will win the propagation by having a higher term.
 C1.version = C1.version + 1000;
-waitForConfigReplication(node0);
+rst.waitForConfigReplication(node0);
 rst.awaitReplication();
 
 jsTestLog("Disconnecting the primary from other nodes");
@@ -59,9 +58,9 @@ const parallelShell = startParallelShell(
     }, C1), node0.port);
 
 assert.commandWorked(node1.adminCommand({replSetStepUp: 1}));
-rst.awaitNodesAgreeOnPrimary(rst.kDefaultTimeoutMS, [node1, node2, node3], 1);
+rst.awaitNodesAgreeOnPrimary(rst.kDefaultTimeoutMS, [node1, node2, node3], node1);
 jsTestLog("Current replica set topology: [node0 (Primary)] [node1 (Primary), node2, node3]");
-assert.soon(() => node1.getDB('admin').runCommand({ismaster: 1}).ismaster);
+assert.soon(() => node1.getDB('admin').runCommand({hello: 1}).isWritablePrimary);
 assert.soon(() => isConfigCommitted(node1));
 
 // Reconfig to remove a secondary. We need to specify the node to get the original
@@ -79,7 +78,7 @@ node0.reconnect([node1, node2, node3]);
 // step down from being primary. The reconfig command issued to this node, C1, will fail.
 rst.waitForState(node0, ReplSetTest.State.SECONDARY);
 rst.awaitNodesAgreeOnPrimary(rst.kDefaultTimeoutMS, [node0, node1, node3]);
-waitForConfigReplication(node1);
+rst.waitForConfigReplication(node1);
 assert.eq(C2, rst.getReplSetConfigFromNode());
 
 // The new config is now {node0, node1, node2, node3}.

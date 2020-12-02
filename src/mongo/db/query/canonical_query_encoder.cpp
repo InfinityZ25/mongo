@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -42,6 +42,27 @@
 #include "mongo/logv2/log.h"
 
 namespace mongo {
+
+bool isQueryNegatingGTEorLTENull(const mongo::MatchExpression* tree) {
+    // If the query predicate is null, do not reuse the plan since empty arrays ([]) are
+    // encoded as 'null' in the index. Thus we cannot safely invert the index bounds since 'null'
+    // has special comparison semantics.
+    if (tree->matchType() != MatchExpression::NOT) {
+        return false;
+    }
+
+    const MatchExpression* child = tree->getChild(0);
+    switch (child->matchType()) {
+        case MatchExpression::GTE:
+        case MatchExpression::LTE:
+            return static_cast<const ComparisonMatchExpression*>(child)->getData().type() ==
+                BSONType::jstNULL;
+
+        default:
+            return false;
+    }
+}
+
 namespace {
 
 // Delimiters for cache key encoding.
@@ -269,12 +290,9 @@ void encodeGeoMatchExpression(const GeoMatchExpression* tree, StringBuilder* key
         *keyBuilder << "ss";
     } else {
         LOGV2_ERROR(23849,
-                    "unknown CRS type {int_geoQuery_getGeometry_getNativeCRS} in geometry of type "
-                    "{geoQuery_getGeometry_getDebugType}",
-                    "int_geoQuery_getGeometry_getNativeCRS"_attr =
-                        (int)geoQuery.getGeometry().getNativeCRS(),
-                    "geoQuery_getGeometry_getDebugType"_attr =
-                        geoQuery.getGeometry().getDebugType());
+                    "Unknown CRS type in geometry",
+                    "crsType"_attr = (int)geoQuery.getGeometry().getNativeCRS(),
+                    "geometryType"_attr = geoQuery.getGeometry().getDebugType());
         MONGO_UNREACHABLE;
     }
 }
@@ -303,10 +321,9 @@ void encodeGeoNearMatchExpression(const GeoNearMatchExpression* tree, StringBuil
             *keyBuilder << "ss";
             break;
         case UNSET:
-            LOGV2_ERROR(
-                23850,
-                "unknown CRS type {int_nearQuery_centroid_crs} in point geometry for near query",
-                "int_nearQuery_centroid_crs"_attr = (int)nearQuery.centroid->crs);
+            LOGV2_ERROR(23850,
+                        "Unknown CRS type in point geometry for near query",
+                        "crsType"_attr = (int)nearQuery.centroid->crs);
             MONGO_UNREACHABLE;
             break;
     }
@@ -416,6 +433,21 @@ void encodeKeyForMatch(const MatchExpression* tree, StringBuilder* keyBuilder) {
             encodeUserString("_re"_sd, keyBuilder);
             encodeRegexFlagsForMatch(inMatch->getRegexes(), keyBuilder);
         }
+    }
+
+    // If the query predicate is minKey or maxKey it can't use the same plan as other GT/LT
+    // queries. If the index is multikey and the query involves one of these values, it needs
+    // to use INEXACT_FETCH and the bounds can't be inverted. Therefore these need their own
+    // shape.
+    if (tree->isGTMinKey())
+        *keyBuilder << "min";
+    else if (tree->isLTMaxKey())
+        *keyBuilder << "max";
+
+    // If the query predicate involves comparison to null, do not reuse the plan since empty arrays
+    // ([]) are encoded as null in the index. Thus we cannot safely invert the index bounds.
+    if (isQueryNegatingGTEorLTENull(tree)) {
+        *keyBuilder << "not_gte_lte_null";
     }
 
     // Traverse child nodes.

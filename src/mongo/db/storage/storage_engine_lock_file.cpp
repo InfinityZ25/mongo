@@ -27,13 +27,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/storage/storage_engine_lock_file.h"
 
 #include "mongo/platform/process_id.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
@@ -53,6 +54,13 @@ Status StorageEngineLockFile::writePid() {
     std::string pidStr = ss.str();
 
     return writeString(pidStr);
+}
+
+std::string StorageEngineLockFile::_getNonExistentPathMessage() const {
+    return str::stream() << "Data directory " << _dbpath
+                         << " not found. Create the missing directory or specify another path "
+                            "using (1) the --dbpath command line option, or (2) by adding the "
+                            "'storage.dbPath' option in the configuration file.";
 }
 
 }  // namespace mongo

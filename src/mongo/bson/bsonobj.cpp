@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/db/jsobj.h"
@@ -91,9 +90,8 @@ int compareObjects(const BSONObj& firstObj,
 void BSONObj::_assertInvalid(int maxSize) const {
     StringBuilder ss;
     int os = objsize();
-    ss << "BSONObj size: " << os << " (0x" << integerToHex(os) << ") is invalid. "
-       << "Size must be between 0 and " << BSONObjMaxInternalSize << "("
-       << (maxSize / (1024 * 1024)) << "MB)";
+    ss << "BSONObj size: " << os << " (0x" << unsignedHex(os) << ") is invalid. "
+       << "Size must be between 0 and " << maxSize << "(" << (maxSize / (1024 * 1024)) << "MB)";
     try {
         BSONElement e = firstElement();
         ss << " First element: " << e.toString();
@@ -193,20 +191,19 @@ BSONObj BSONObj::_jsonStringGenerator(const Generator& g,
     if (!e.eoo()) {
         bool writeSeparator = false;
         while (1) {
-            truncation =
-                e.jsonStringGenerator(g, writeSeparator, !isArray, pretty, buffer, writeLimit);
+            truncation = e.jsonStringGenerator(
+                g, writeSeparator, !isArray, pretty ? (pretty + 1) : 0, buffer, writeLimit);
             e = i.next();
             if (!truncation.isEmpty() || e.eoo()) {
                 g.writePadding(buffer);
                 break;
             }
             writeSeparator = true;
-            if (pretty) {
-                fmt::format_to(buffer, "{: <{}}", '\n', pretty * 2);
-            }
         }
     }
 
+    if (pretty)
+        fmt::format_to(buffer, "\n{:<{}}", "", (pretty - 1) * 4);
     buffer.push_back(isArray ? ']' : '}');
     return truncation;
 }
@@ -266,8 +263,8 @@ BSONObj BSONObj::jsonStringBuffer(JsonStringFormat format,
     }
 }
 
-bool BSONObj::valid(BSONVersion version) const {
-    return validateBSON(objdata(), objsize(), version).isOK();
+bool BSONObj::valid() const {
+    return validateBSON(objdata(), objsize()).isOK();
 }
 
 int BSONObj::woCompare(const BSONObj& r,
@@ -403,42 +400,6 @@ BSONElement BSONObj::getFieldUsingIndexNames(StringData fieldName, const BSONObj
         --j;
     }
     return BSONElement();
-}
-
-/* note: addFields always adds _id even if not specified
-   returns n added not counting _id unless requested.
-*/
-int BSONObj::addFields(BSONObj& from, std::set<std::string>& fields) {
-    verify(isEmpty() && !isOwned()); /* partial implementation for now... */
-
-    BSONObjBuilder b;
-
-    int N = fields.size();
-    int n = 0;
-    BSONObjIterator i(from);
-    bool gotId = false;
-    while (i.moreWithEOO()) {
-        BSONElement e = i.next();
-        const char* fname = e.fieldName();
-        if (fields.count(fname)) {
-            b.append(e);
-            ++n;
-            gotId = gotId || strcmp(fname, "_id") == 0;
-            if (n == N && gotId)
-                break;
-        } else if (strcmp(fname, "_id") == 0) {
-            b.append(e);
-            gotId = true;
-            if (n == N && gotId)
-                break;
-        }
-    }
-
-    if (n) {
-        *this = b.obj();
-    }
-
-    return n;
 }
 
 bool BSONObj::couldBeArray() const {
@@ -657,6 +618,29 @@ BSONObj BSONObj::addField(const BSONElement& field) const {
     return b.obj();
 }
 
+BSONObj BSONObj::addFields(const BSONObj& from,
+                           const boost::optional<std::set<std::string>>& fields) const {
+    BSONObjBuilder bob;
+    for (auto&& originalField : *this) {
+        auto commonField = from[originalField.fieldNameStringData()];
+        // If there is a common field, add the value from 'from' object.
+        if (commonField && (!fields || fields->count(originalField.fieldName()))) {
+            bob.append(commonField);
+        } else {
+            bob.append(originalField);
+        }
+    }
+
+    for (auto&& fromField : from) {
+        // Ignore the common fields as they are already added earlier.
+        if (!hasField(fromField.fieldNameStringData()) &&
+            (!fields || fields->count(fromField.fieldName()))) {
+            bob.append(fromField);
+        }
+    }
+    return bob.obj();
+}
+
 BSONObj BSONObj::removeField(StringData name) const {
     BSONObjBuilder b;
     BSONObjIterator i(*this);
@@ -667,6 +651,17 @@ BSONObj BSONObj::removeField(StringData name) const {
             b.append(e);
     }
     return b.obj();
+}
+
+BSONObj BSONObj::removeFields(const std::set<std::string>& fields) const {
+    BSONObjBuilder bob;
+    for (auto&& field : *this) {
+        if (fields.count(field.fieldName())) {
+            continue;
+        }
+        bob.append(field);
+    }
+    return bob.obj();
 }
 
 std::string BSONObj::hexDump() const {
@@ -823,5 +818,18 @@ BSONObjIteratorSorted::BSONObjIteratorSorted(const BSONObj& object)
 
 BSONArrayIteratorSorted::BSONArrayIteratorSorted(const BSONArray& array)
     : BSONIteratorSorted(array, ElementFieldCmp(true)) {}
+
+/**
+ * Types used to represent BSONObj and BSONArray memory in the Visual Studio debugger
+ */
+#if defined(_MSC_VER) && defined(_DEBUG)
+struct BSONObjData {
+    int32_t size;
+} bsonObjDataInstance;
+
+struct BSONArrayData {
+    int32_t size;
+} bsonObjArrayInstance;
+#endif  // defined(_MSC_VER) && defined(_DEBUG)
 
 }  // namespace mongo

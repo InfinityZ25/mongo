@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -134,58 +134,50 @@ void DocumentSourceCursor::loadBatch() {
 
     PlanExecutor::ExecState state;
     Document resultObj;
-    {
-        AutoGetCollectionForRead autoColl(pExpCtx->opCtx, _exec->nss());
+
+    boost::optional<AutoGetCollectionForReadMaybeLockFree> autoColl;
+    if (_exec->lockPolicy() == PlanExecutor::LockPolicy::kLockExternally) {
+        autoColl.emplace(pExpCtx->opCtx, _exec->nss());
         uassertStatusOK(repl::ReplicationCoordinator::get(pExpCtx->opCtx)
                             ->checkCanServeReadsFor(pExpCtx->opCtx, _exec->nss(), true));
+    }
 
-        _exec->restoreState();
+    _exec->restoreState(autoColl ? &autoColl->getCollection() : nullptr);
 
-        {
-            ON_BLOCK_EXIT([this] { recordPlanSummaryStats(); });
+    try {
+        ON_BLOCK_EXIT([this] { recordPlanSummaryStats(); });
 
-            while ((state = _exec->getNext(&resultObj, nullptr)) == PlanExecutor::ADVANCED) {
-                _currentBatch.enqueue(transformDoc(std::move(resultObj)));
+        while ((state = _exec->getNextDocument(&resultObj, nullptr)) == PlanExecutor::ADVANCED) {
+            _currentBatch.enqueue(transformDoc(std::move(resultObj)));
 
-                // As long as we're waiting for inserts, we shouldn't do any batching at this level
-                // we need the whole pipeline to see each document to see if we should stop waiting.
-                if (awaitDataState(pExpCtx->opCtx).shouldWaitForInserts ||
-                    static_cast<long long>(_currentBatch.memUsageBytes()) >
-                        internalDocumentSourceCursorBatchSizeBytes.load()) {
-                    // End this batch and prepare PlanExecutor for yielding.
-                    _exec->saveState();
-                    return;
-                }
-            }
-            // Special case for tailable cursor -- EOF doesn't preclude more results, so keep
-            // the PlanExecutor alive.
-            if (state == PlanExecutor::IS_EOF && pExpCtx->isTailableAwaitData()) {
+            // As long as we're waiting for inserts, we shouldn't do any batching at this level we
+            // need the whole pipeline to see each document to see if we should stop waiting.
+            if (awaitDataState(pExpCtx->opCtx).shouldWaitForInserts ||
+                static_cast<long long>(_currentBatch.memUsageBytes()) >
+                    internalDocumentSourceCursorBatchSizeBytes.load()) {
+                // End this batch and prepare PlanExecutor for yielding.
                 _exec->saveState();
                 return;
             }
         }
 
-        // If we got here, there won't be any more documents, so destroy our PlanExecutor. Note we
-        // must hold a collection lock to destroy '_exec', but we can only assume that our locks are
-        // still held if '_exec' did not end in an error. If '_exec' encountered an error during a
-        // yield, the locks might be yielded.
-        if (state != PlanExecutor::FAILURE) {
-            cleanupExecutor();
+        invariant(state == PlanExecutor::IS_EOF);
+
+        // Special case for tailable cursor -- EOF doesn't preclude more results, so keep
+        // the PlanExecutor alive.
+        if (pExpCtx->isTailableAwaitData()) {
+            _exec->saveState();
+            return;
         }
+    } catch (...) {
+        // Record error details before re-throwing the exception.
+        _execStatus = exceptionToStatus().withContext("Error in $cursor stage");
+        throw;
     }
 
-    switch (state) {
-        case PlanExecutor::ADVANCED:
-        case PlanExecutor::IS_EOF:
-            return;  // We've reached our limit or exhausted the cursor.
-        case PlanExecutor::FAILURE: {
-            _execStatus = WorkingSetCommon::getMemberObjectStatus(resultObj).withContext(
-                "Error in $cursor stage");
-            uassertStatusOK(_execStatus);
-        }
-        default:
-            MONGO_UNREACHABLE;
-    }
+    // If we got here, there won't be any more documents, so destroy our PlanExecutor. Note we must
+    // hold a collection lock to destroy '_exec'.
+    cleanupExecutor();
 }
 
 void DocumentSourceCursor::_updateOplogTimestamp() {
@@ -203,7 +195,7 @@ void DocumentSourceCursor::_updateOplogTimestamp() {
 
 void DocumentSourceCursor::recordPlanSummaryStats() {
     invariant(_exec);
-    Explain::getSummaryStats(*_exec, &_planSummaryStats);
+    _exec->getPlanExplainer().getSummaryStats(&_planSummaryStats);
 }
 
 Value DocumentSourceCursor::serialize(boost::optional<ExplainOptions::Verbosity> verbosity) const {
@@ -227,14 +219,15 @@ Value DocumentSourceCursor::serialize(boost::optional<ExplainOptions::Verbosity>
         AutoGetDb dbLock(opCtx, _exec->nss().db(), lockMode);
         Lock::CollectionLock collLock(opCtx, _exec->nss(), lockMode);
         auto collection = dbLock.getDb()
-            ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, _exec->nss())
+            ? CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, _exec->nss())
             : nullptr;
 
         Explain::explainStages(_exec.get(),
                                collection,
                                verbosity.get(),
                                _execStatus,
-                               _winningPlanTrialStats.get(),
+                               _winningPlanTrialStats,
+                               BSONObj(),
                                BSONObj(),
                                &explainStatsBuilder);
     }
@@ -252,7 +245,8 @@ Value DocumentSourceCursor::serialize(boost::optional<ExplainOptions::Verbosity>
 }
 
 void DocumentSourceCursor::detachFromOperationContext() {
-    if (_exec && !_exec->isDetached()) {
+    // Only detach the underlying executor if it hasn't been detached already.
+    if (_exec && _exec->getOpCtx()) {
         _exec->detachFromOperationContext();
     }
 }
@@ -292,7 +286,7 @@ DocumentSourceCursor::~DocumentSourceCursor() {
 }
 
 DocumentSourceCursor::DocumentSourceCursor(
-    Collection* collection,
+    const CollectionPtr& collection,
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
     const intrusive_ptr<ExpressionContext>& pCtx,
     CursorType cursorType,
@@ -307,22 +301,25 @@ DocumentSourceCursor::DocumentSourceCursor(
     // Later code in the DocumentSourceCursor lifecycle expects that '_exec' is in a saved state.
     _exec->saveState();
 
-    _planSummary = Explain::getPlanSummary(_exec.get());
+    auto&& explainer = _exec->getPlanExplainer();
+    _planSummary = explainer.getPlanSummary();
     recordPlanSummaryStats();
 
     if (pExpCtx->explain) {
         // It's safe to access the executor even if we don't have the collection lock since we're
         // just going to call getStats() on it.
-        _winningPlanTrialStats = Explain::getWinningPlanTrialStats(_exec.get());
+        _winningPlanTrialStats =
+            explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
     }
 
     if (collection) {
-        CollectionQueryInfo::get(collection).notifyOfQuery(pExpCtx->opCtx, _planSummaryStats);
+        CollectionQueryInfo::get(collection)
+            .notifyOfQuery(pExpCtx->opCtx, collection, _planSummaryStats);
     }
 }
 
 intrusive_ptr<DocumentSourceCursor> DocumentSourceCursor::create(
-    Collection* collection,
+    const CollectionPtr& collection,
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
     const intrusive_ptr<ExpressionContext>& pExpCtx,
     CursorType cursorType,

@@ -10,6 +10,7 @@ load('jstests/libs/chunk_manipulation_util.js');
 load("jstests/libs/fail_point_util.js");
 load("jstests/sharding/libs/sharded_index_util.js");
 load("jstests/sharding/libs/shard_versioning_util.js");
+load("jstests/libs/parallelTester.js");  // For Thread.
 
 // Test deliberately inserts orphans outside of migration.
 TestData.skipCheckOrphans = true;
@@ -43,7 +44,6 @@ function assertCommandChecksShardVersions(st, dbName, collName, testCase) {
     // version.
     ShardVersioningUtil.assertCollectionVersionOlderThan(st.shard0, ns, latestCollectionVersion);
     ShardVersioningUtil.assertCollectionVersionOlderThan(st.shard2, ns, latestCollectionVersion);
-    ShardVersioningUtil.assertCollectionVersionOlderThan(st.shard3, ns, latestCollectionVersion);
 
     if (testCase.setUpFuncForCheckShardVersionTest) {
         testCase.setUpFuncForCheckShardVersionTest();
@@ -58,9 +58,6 @@ function assertCommandChecksShardVersions(st, dbName, collName, testCase) {
     // Assert that the targeted shards have the latest collection version after the command is run.
     ShardVersioningUtil.assertCollectionVersionEquals(st.shard1, ns, latestCollectionVersion);
     ShardVersioningUtil.assertCollectionVersionEquals(st.shard2, ns, latestCollectionVersion);
-
-    // Assert that the unaffected shard still has the stale collection version.
-    ShardVersioningUtil.assertCollectionVersionOlderThan(st.shard3, ns, latestCollectionVersion);
 }
 
 /*
@@ -90,24 +87,25 @@ function assertCommandBlocksIfCriticalSectionInProgress(
 
     // Run the command with maxTimeMS.
     const cmdWithMaxTimeMS = Object.assign({}, testCase.command, {maxTimeMS: 500});
-    let cmdThread = new Thread((host, dbName, cmdWithMaxTimeMS) => {
-        const conn = new Mongo(host);
-        conn.getDB(dbName).runCommand(cmdWithMaxTimeMS);
-    }, st.s.host, dbName, cmdWithMaxTimeMS);
-    cmdThread.start();
+    assert.commandFailed(st.s.getDB(dbName).runCommand(cmdWithMaxTimeMS));
 
     // Assert that the command eventually times out.
-    checkLog.contains(st.shard0,
-                      new RegExp("Failed to refresh metadata for collection.*MaxTimeMSExpired"));
-    cmdThread.join();
+    checkLog.checkContainsOnceJsonStringMatch(st.shard0, 22062, "error", "MaxTimeMSExpired");
 
     // Turn off the fail point and wait for moveChunk to complete.
     unpauseMoveChunkAtStep(fromShard, moveChunkStepNames.chunkDataCommitted);
     joinMoveChunk();
 }
 
-const numShards = 4;
-const st = new ShardingTest({shards: numShards});
+// Disable checking for index consistency to ensure that the config server doesn't trigger a
+// StaleShardVersion exception on shards and cause them to refresh their sharding metadata.
+const nodeOptions = {
+    setParameter: {enableShardedIndexConsistencyCheck: false}
+};
+
+const numShards = 3;
+const st = new ShardingTest({shards: numShards, other: {configOptions: nodeOptions}});
+
 const allShards = [];
 for (let i = 0; i < numShards; i++) {
     allShards.push(st["shard" + i]);

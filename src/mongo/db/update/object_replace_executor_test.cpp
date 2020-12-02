@@ -34,7 +34,6 @@
 #include "mongo/bson/mutable/algorithm.h"
 #include "mongo/bson/mutable/mutable_bson_test_utils.h"
 #include "mongo/db/json.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/update/update_node_test_fixture.h"
 #include "mongo/unittest/unittest.h"
 
@@ -55,7 +54,7 @@ TEST_F(ObjectReplaceExecutorTest, Noop) {
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 1, b: 2}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+    ASSERT_BSONOBJ_BINARY_EQ(fromjson("{}"), result.oplogEntry);
 }
 
 TEST_F(ObjectReplaceExecutorTest, ShouldNotCreateIdIfNoIdExistsAndNoneIsSpecified) {
@@ -68,7 +67,7 @@ TEST_F(ObjectReplaceExecutorTest, ShouldNotCreateIdIfNoIdExistsAndNoneIsSpecifie
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 1, b: 2}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{a: 1, b: 2}"), getLogDoc());
+    ASSERT_BSONOBJ_BINARY_EQ(fromjson("{a: 1, b: 2}"), result.oplogEntry);
 }
 
 TEST_F(ObjectReplaceExecutorTest, ShouldPreserveIdOfExistingDocumentIfIdNotSpecified) {
@@ -81,7 +80,7 @@ TEST_F(ObjectReplaceExecutorTest, ShouldPreserveIdOfExistingDocumentIfIdNotSpeci
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{_id: 0, a: 1, b: 2}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{_id: 0, a: 1, b: 2}"), getLogDoc());
+    ASSERT_BSONOBJ_BINARY_EQ(fromjson("{_id: 0, a: 1, b: 2}"), result.oplogEntry);
 }
 
 TEST_F(ObjectReplaceExecutorTest, ShouldSucceedWhenImmutableIdIsNotModified) {
@@ -95,7 +94,7 @@ TEST_F(ObjectReplaceExecutorTest, ShouldSucceedWhenImmutableIdIsNotModified) {
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{_id: 0, a: 1, b: 2}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{_id: 0, a: 1, b: 2}"), getLogDoc());
+    ASSERT_BSONOBJ_BINARY_EQ(fromjson("{_id: 0, a: 1, b: 2}"), result.oplogEntry);
 }
 
 TEST_F(ObjectReplaceExecutorTest, IdTimestampNotModified) {
@@ -108,7 +107,7 @@ TEST_F(ObjectReplaceExecutorTest, IdTimestampNotModified) {
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{_id: Timestamp(0,0)}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{_id: Timestamp(0,0)}"), getLogDoc());
+    ASSERT_BSONOBJ_BINARY_EQ(fromjson("{_id: Timestamp(0,0)}"), result.oplogEntry);
 }
 
 TEST_F(ObjectReplaceExecutorTest, NonIdTimestampsModified) {
@@ -135,7 +134,7 @@ TEST_F(ObjectReplaceExecutorTest, NonIdTimestampsModified) {
     ASSERT_NOT_EQUALS(0U, elemB.getValueTimestamp().getInc());
 
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(doc, getLogDoc());
+    ASSERT_BSONOBJ_BINARY_EQ(doc.getObject(), result.oplogEntry);
 }
 
 TEST_F(ObjectReplaceExecutorTest, ComplexDoc) {
@@ -148,7 +147,7 @@ TEST_F(ObjectReplaceExecutorTest, ComplexDoc) {
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 1, b: [0, 1, 2], c: {d: 1}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{a: 1, b: [0, 1, 2], c: {d: 1}}"), getLogDoc());
+    ASSERT_BSONOBJ_BINARY_EQ(fromjson("{a: 1, b: [0, 1, 2], c: {d: 1}}"), result.oplogEntry);
 }
 
 TEST_F(ObjectReplaceExecutorTest, CannotRemoveImmutablePath) {
@@ -175,7 +174,7 @@ TEST_F(ObjectReplaceExecutorTest, IdFieldIsNotRemoved) {
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{_id: 0, a: 1}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{_id: 0, a: 1}"), getLogDoc());
+    ASSERT_BSONOBJ_BINARY_EQ(fromjson("{_id: 0, a: 1}"), result.oplogEntry);
 }
 
 TEST_F(ObjectReplaceExecutorTest, CannotReplaceImmutablePathWithArrayField) {
@@ -241,7 +240,7 @@ TEST_F(ObjectReplaceExecutorTest, CanAddImmutableField) {
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {b: 1}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{a: {b: 1}}"), getLogDoc());
+    ASSERT_BSONOBJ_BINARY_EQ(fromjson("{a: {b: 1}}"), result.oplogEntry);
 }
 
 TEST_F(ObjectReplaceExecutorTest, CanAddImmutableId) {
@@ -255,7 +254,7 @@ TEST_F(ObjectReplaceExecutorTest, CanAddImmutableId) {
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{_id: 0}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{_id: 0}"), getLogDoc());
+    ASSERT_BSONOBJ_BINARY_EQ(fromjson("{_id: 0}"), result.oplogEntry);
 }
 
 TEST_F(ObjectReplaceExecutorTest, CannotCreateDollarPrefixedNameWhenValidateForStorageIsTrue) {
@@ -281,7 +280,7 @@ TEST_F(ObjectReplaceExecutorTest, CanCreateDollarPrefixedNameWhenValidateForStor
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {b: 1, $bad: 1}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{a: {b: 1, $bad: 1}}"), getLogDoc());
+    ASSERT_BSONOBJ_BINARY_EQ(fromjson("{a: {b: 1, $bad: 1}}"), result.oplogEntry);
 }
 
 TEST_F(ObjectReplaceExecutorTest, NoLogBuilder) {

@@ -36,6 +36,7 @@
 
 #include "mongo/client/mongo_uri.h"
 #include "mongo/client/replica_set_change_notifier.h"
+#include "mongo/util/cancelation.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
@@ -78,20 +79,20 @@ public:
      * Known errors are:
      *  FailedToSatisfyReadPreference, if node cannot be found, which matches the read preference.
      */
-    virtual SemiFuture<HostAndPort> getHostOrRefresh(
-        const ReadPreferenceSetting& readPref, Milliseconds maxWait = kDefaultFindHostTimeout) = 0;
+    virtual SemiFuture<HostAndPort> getHostOrRefresh(const ReadPreferenceSetting& readPref,
+                                                     const CancelationToken& cancelToken) = 0;
 
     virtual SemiFuture<std::vector<HostAndPort>> getHostsOrRefresh(
-        const ReadPreferenceSetting& readPref, Milliseconds maxWait = kDefaultFindHostTimeout) = 0;
+        const ReadPreferenceSetting& readPref, const CancelationToken& cancelToken) = 0;
 
     /**
-     * Returns the host the RSM thinks is the current master or uasserts.
+     * Returns the host the RSM thinks is the current primary or uasserts.
      *
      * This is a thin wrapper around getHostOrRefresh and will also refresh the view if a primary
      * does not exist. The main difference is that this will uassert rather than returning an empty
      * HostAndPort.
      */
-    virtual HostAndPort getMasterOrUassert() = 0;
+    virtual HostAndPort getPrimaryOrUassert() = 0;
 
     /**
      * Notifies this Monitor that a host has failed because of the specified error 'status' and

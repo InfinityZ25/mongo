@@ -34,6 +34,7 @@
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/platform/visibility.h"
 #include "mongo/util/safe_num.h"
 
 namespace mongo {
@@ -111,7 +112,7 @@ class Document;
  *    be removed.
  */
 
-class Element {
+class MONGO_API(mutable_bson) Element {
 public:
     typedef uint32_t RepIdx;
 
@@ -384,11 +385,21 @@ public:
     // Serialization API.
     //
 
-    /** Write this Element to the provided object builder. */
+    /**
+     * Writes this Element to the provided object builder. Note that if this element is not a root,
+     * then it gets wrapped inside an object.
+     */
     void writeTo(BSONObjBuilder* builder) const;
 
-    /** Write this Element to the provided array builder. This Element must be of type
-     *  mongo::Array.
+    /**
+     * Writes all the children of the current Element to the provided object builder. This Element
+     * must be of type mongo::Object.
+     */
+    void writeChildrenTo(BSONObjBuilder* builder) const;
+
+    /**
+     * Write this Element to the provided array builder. This Element must be of type
+     * mongo::Array.
      */
     void writeArrayTo(BSONArrayBuilder* builder) const;
 
@@ -617,11 +628,11 @@ private:
 
     inline Element(Document* doc, RepIdx repIdx);
 
-    Status addChild(Element e, bool front);
+    MONGO_PRIVATE Status addChild(Element e, bool front);
 
-    StringData getValueStringOrSymbol() const;
+    MONGO_PRIVATE StringData getValueStringOrSymbol() const;
 
-    Status setValue(Element::RepIdx newValueIdx);
+    MONGO_PRIVATE Status setValue(Element::RepIdx newValueIdx);
 
     Document* _doc;
     RepIdx _repIdx;

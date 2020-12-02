@@ -35,11 +35,12 @@
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/operation_context.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/duration.h"
+#include "mongo/util/interruptible.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 
@@ -202,10 +203,14 @@ public:
      */
     static StatusWith<ModeOptions> parseBSON(const BSONObj& obj);
 
-    FailPoint();
+    explicit FailPoint(std::string name);
 
     FailPoint(const FailPoint&) = delete;
     FailPoint& operator=(const FailPoint&) = delete;
+
+    const std::string& getName() const {
+        return _name;
+    }
 
     /**
      * Returns true if fail point is active.
@@ -272,11 +277,11 @@ public:
     EntryCountT waitForTimesEntered(EntryCountT targetTimesEntered) const noexcept;
 
     /**
-     * Like `waitForTimesEntered`, but interruptible via the `opCtx->sleepFor` mechanism.  See
-     * `mongo::Interruptible::sleepFor` (Interruptible is a base class of
-     * OperationContext).
+     * Like `waitForTimesEntered`, but interruptible via the `interruptible->sleepFor` mechanism.
+     * See `mongo::Interruptible::sleepFor`.
      */
-    EntryCountT waitForTimesEntered(OperationContext* opCtx, EntryCountT targetTimesEntered) const;
+    EntryCountT waitForTimesEntered(Interruptible* interruptible,
+                                    EntryCountT targetTimesEntered) const;
 
     /**
      * @returns a BSON object showing the current mode and data stored.
@@ -326,26 +331,22 @@ public:
     }
 
     /**
-     * Take 100msec pauses for as long as the FailPoint is active.
+     * Take 'kWaitGranularity' pauses for as long as the FailPoint is active.
      * This calls `shouldFail()` with kFirstTimeEntered once and with kEnteredAlready thereafter, so
      * affects FailPoint counters once.
      */
     void pauseWhileSet() {
-        for (auto entryMode = kFirstTimeEntered; MONGO_unlikely(shouldFail(entryMode));
-             entryMode = kEnteredAlready) {
-            sleepmillis(100);
-        }
+        pauseWhileSet(Interruptible::notInterruptible());
     }
 
     /**
-     * Like `pauseWhileSet`, but interruptible via the `opCtx->sleepFor` mechanism.  See
-     * `mongo::Interruptible::sleepFor` (Interruptible is a base class of
-     * OperationContext).
+     * Like `pauseWhileSet`, but interruptible via the `interruptible->sleepFor` mechanism.  See
+     * `mongo::Interruptible::sleepFor`.
      */
-    void pauseWhileSet(OperationContext* opCtx) {
+    void pauseWhileSet(Interruptible* interruptible) {
         for (auto entryMode = kFirstTimeEntered; MONGO_unlikely(shouldFail(entryMode));
              entryMode = kEnteredAlready) {
-            opCtx->sleepFor(Milliseconds(100));
+            interruptible->sleepFor(Milliseconds(100));
         }
     }
 
@@ -427,6 +428,8 @@ private:
     AtomicWord<int> _timesOrPeriod{0};
     BSONObj _data;
 
+    const std::string _name;
+
     // protects _mode, _timesOrPeriod, _data
     mutable Mutex _modMutex = MONGO_MAKE_LATCH("FailPoint::_modMutex");
 };
@@ -443,12 +446,12 @@ public:
      *     51006 - if the given name already exists in this registry.
      *     CannotMutateObject - if this registry is already frozen.
      */
-    Status add(const std::string& name, FailPoint* failPoint);
+    Status add(FailPoint* failPoint);
 
     /**
      * @return a registered FailPoint, or nullptr if it was not registered.
      */
-    FailPoint* find(const std::string& name) const;
+    FailPoint* find(StringData name) const;
 
     /**
      * Freezes this registry from being modified.
@@ -462,9 +465,16 @@ public:
      */
     void registerAllFailPointsAsServerParameters();
 
+    /**
+     * Sets all registered FailPoints to Mode::off. Used primarily during unit test cleanup to
+     * reset the state of all FailPoints set by the unit test. Does not prevent FailPoints from
+     * being enabled again after.
+     */
+    void disableAllFailpoints();
+
 private:
     bool _frozen;
-    stdx::unordered_map<std::string, FailPoint*> _fpMap;
+    StringMap<FailPoint*> _fpMap;
 };
 
 /**
@@ -472,9 +482,14 @@ private:
  */
 class FailPointEnableBlock {
 public:
-    explicit FailPointEnableBlock(std::string failPointName);
-    FailPointEnableBlock(std::string failPointName, BSONObj data);
+    explicit FailPointEnableBlock(StringData failPointName);
+    FailPointEnableBlock(StringData failPointName, BSONObj data);
+    explicit FailPointEnableBlock(FailPoint* failPoint);
+    FailPointEnableBlock(FailPoint* failPoint, BSONObj data);
     ~FailPointEnableBlock();
+
+    FailPointEnableBlock(const FailPointEnableBlock&) = delete;
+    FailPointEnableBlock& operator=(const FailPointEnableBlock&) = delete;
 
     // Const access to the underlying FailPoint
     const FailPoint* failPoint() const {
@@ -492,8 +507,7 @@ public:
     }
 
 private:
-    std::string _failPointName;
-    FailPoint* _failPoint;
+    FailPoint* const _failPoint;
     FailPoint::EntryCountT _initialTimesEntered;
 };
 
@@ -511,7 +525,7 @@ FailPoint::EntryCountT setGlobalFailPoint(const std::string& failPointName, cons
  */
 class FailPointRegisterer {
 public:
-    FailPointRegisterer(const std::string& name, FailPoint* fp);
+    explicit FailPointRegisterer(FailPoint* fp);
 };
 
 FailPointRegistry& globalFailPointRegistry();
@@ -522,8 +536,8 @@ FailPointRegistry& globalFailPointRegistry();
  * Never use in header files, only .cpp files.
  */
 #define MONGO_FAIL_POINT_DEFINE(fp) \
-    ::mongo::FailPoint fp;          \
-    ::mongo::FailPointRegisterer fp##failPointRegisterer(#fp, &fp);
+    ::mongo::FailPoint fp(#fp);     \
+    ::mongo::FailPointRegisterer fp##failPointRegisterer(&fp);
 
 
 }  // namespace mongo

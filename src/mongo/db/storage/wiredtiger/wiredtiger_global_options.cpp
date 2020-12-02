@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -43,11 +43,6 @@ WiredTigerGlobalOptions wiredTigerGlobalOptions;
 
 Status WiredTigerGlobalOptions::store(const moe::Environment& params) {
     // WiredTiger storage engine options
-    if (params.count("storage.syncPeriodSecs")) {
-        wiredTigerGlobalOptions.checkpointDelaySecs =
-            static_cast<size_t>(params["storage.syncPeriodSecs"].as<double>());
-    }
-
     if (!wiredTigerGlobalOptions.engineConfig.empty()) {
         LOGV2(22293,
               "Engine custom option: {wiredTigerGlobalOptions_engineConfig}",
@@ -82,15 +77,6 @@ Status WiredTigerGlobalOptions::validateWiredTigerCompressor(const std::string& 
         !kZlib.equalCaseInsensitive(value) && !kZstd.equalCaseInsensitive(value)) {
         return {ErrorCodes::BadValue,
                 "Compression option must be one of: 'none', 'snappy', 'zlib', or 'zstd'"};
-    }
-
-    return Status::OK();
-}
-
-Status WiredTigerGlobalOptions::validateMaxCacheOverflowFileSizeGB(double value) {
-    if (value != 0.0 && value < 0.1) {
-        return {ErrorCodes::BadValue,
-                "MaxCacheOverflowFileSizeGB must be either 0 (unbounded) or greater than 0.1."};
     }
 
     return Status::OK();

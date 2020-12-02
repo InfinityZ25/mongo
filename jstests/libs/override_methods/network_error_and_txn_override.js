@@ -92,12 +92,9 @@ const kNonRetryableCommands = new Set([
     "captrunc",
     "clone",
     "cloneCollectionAsCapped",
-    "collMod",
     "convertToCapped",
     "create",
     "createIndexes",
-    "createRole",
-    "createUser",
     "deleteIndexes",
     "drop",
     "dropAllRolesFromDatabase",
@@ -108,13 +105,8 @@ const kNonRetryableCommands = new Set([
     "dropUser",
     "emptycapped",
     "godinsert",
-    "grantPrivilegesToRole",
-    "grantRolesToRole",
-    "grantRolesToUser",
+    "internalRenameIfOptionsAndIndexesMatch",
     "renameCollection",
-    "revokePrivilegesFromRole",
-    "revokeRolesFromRole",
-    "revokeRolesFromUser",
     "updateRole",
     "updateUser",
 ]);
@@ -125,6 +117,8 @@ const kNonRetryableCommands = new Set([
 const kAcceptableNonRetryableCommands = new Set([
     "create",
     "createIndexes",
+    "createRole",
+    "createUser",
     "deleteIndexes",
     "drop",
     "dropDatabase",  // Already ignores NamespaceNotFound errors, so not handled below.
@@ -145,9 +139,14 @@ function isRetryableReadCmdName(cmdName) {
 // given command type.
 function isAcceptableRetryFailedResponse(cmdName, res) {
     assert(!res.ok, res);
+    // These codes are uniquely returned from user_management_commands.cpp
+    const kErrorCodeRoleAlreadyExists = 51002;
+    const kErrorCodeUserAlreadyExists = 51003;
     return ((cmdName === "create" && res.code === ErrorCodes.NamespaceExists) ||
             (cmdName === "createIndexes" && res.code === ErrorCodes.IndexAlreadyExists) ||
             (cmdName === "drop" && res.code === ErrorCodes.NamespaceNotFound) ||
+            ((cmdName == "createUser") && (res.code === kErrorCodeUserAlreadyExists)) ||
+            ((cmdName == "createRole") && (res.code === kErrorCodeRoleAlreadyExists)) ||
             ((cmdName === "dropIndexes" || cmdName === "deleteIndexes") &&
              res.code === ErrorCodes.IndexNotFound));
 }
@@ -236,14 +235,16 @@ function isRetryableShardCollectionResponse(res) {
 // Returns true if the given response could have come from moveChunk being interrupted by a
 // failover.
 function isRetryableMoveChunkResponse(res) {
-    return res.code === ErrorCodes.OperationFailed &&
-        (RetryableWritesUtil.errmsgContainsRetryableCodeName(res.errmsg) ||
-         // The transaction number is bumped by the migration coordinator when its commit or abort
-         // decision is being made durable.
-         res.errmsg.includes("TransactionTooOld") ||
-         // The range deletion task may have been interrupted. This error can occur even when
-         // _waitForDelete=false.
-         res.errmsg.includes("operation was interrupted"));
+    return (res.code === ErrorCodes.OperationFailed &&
+            (RetryableWritesUtil.errmsgContainsRetryableCodeName(res.errmsg) ||
+             // The transaction number is bumped by the migration coordinator when its commit or
+             // abort decision is being made durable.
+             res.errmsg.includes("TransactionTooOld") ||
+             // The range deletion task may have been interrupted. This error can occur even when
+             // _waitForDelete=false.
+             res.errmsg.includes("operation was interrupted"))) ||
+        // This error may occur when the node is shutting down.
+        res.code === ErrorCodes.CallbackCanceled;
 }
 
 function hasError(res) {
@@ -612,6 +613,16 @@ function isCommandNonTxnGetMore(cmdName, cmdObj) {
     return cmdName === "getMore" && nonTxnAggCursorSet[cmdObj.getMore];
 }
 
+function isNamespaceSystemDotProfile(cmdObj) {
+    // No operations on system.profile are permitted inside transactions (see SERVER-46900).
+    for (let val of Object.values(cmdObj)) {
+        if (typeof val === 'string' && val.endsWith('system.profile')) {
+            return true;
+        }
+    }
+    return false;
+}
+
 function setupTransactionCommand(conn, dbName, cmdName, cmdObj, lsid) {
     // We want to overwrite whatever read and write concern is already set.
     delete cmdObj.readConcern;
@@ -621,8 +632,10 @@ function setupTransactionCommand(conn, dbName, cmdName, cmdObj, lsid) {
     // use transactions.
     const driverSession = conn.getDB(dbName).getSession();
     const commandSupportsTransaction = TransactionsUtil.commandSupportsTxn(dbName, cmdName, cmdObj);
-    if (commandSupportsTransaction && driverSession.getSessionId() !== null &&
-        !isCommandNonTxnGetMore(cmdName, cmdObj)) {
+    const isSystemDotProfile = isNamespaceSystemDotProfile(cmdObj);
+
+    if (commandSupportsTransaction && !isSystemDotProfile &&
+        driverSession.getSessionId() !== null && !isCommandNonTxnGetMore(cmdName, cmdObj)) {
         if (isNested()) {
             // Nested commands should never start a new transaction.
         } else if (ops.length === 0) {
@@ -641,7 +654,10 @@ function setupTransactionCommand(conn, dbName, cmdName, cmdObj, lsid) {
         continueTransaction(conn, dbName, cmdName, cmdObj);
 
     } else {
-        if (ops.length > 0 && !isNested()) {
+        if (ops.length > 0 && !isNested() && !isSystemDotProfile) {
+            // Operations on system.profile must be allowed to execute in parallel with open
+            // transactions, so operations on system.profile should not commit the current open
+            // transaction.
             logMsgFull('setupTransactionCommand',
                        `Committing transaction ${txnOptions.txnNumber} on session` +
                            ` ${tojsononeline(lsid)} to run a command that does not support` +
@@ -820,8 +836,8 @@ function shouldRetryWithNetworkErrorOverride(
     if (!res.ok) {
         if (RetryableWritesUtil.isRetryableCode(res.code)) {
             // Don't decrement retries, because the command returned before the connection was
-            // closed, so a subsequent attempt will receive a network error (or NotMaster error)
-            // and need to retry.
+            // closed, so a subsequent attempt will receive a network error (or NotWritablePrimary
+            // error) and need to retry.
             logError("Retrying failed response with retryable code");
             return kContinue;
         }
@@ -1107,9 +1123,6 @@ function runCommandOverride(conn, dbName, cmdName, cmdObj, clientFunction, makeF
 }
 
 if (configuredForNetworkRetry()) {
-    OverrideHelpers.prependOverrideInParallelShell(
-        "jstests/libs/override_methods/network_error_and_txn_override.js");
-
     const connectOriginal = connect;
 
     connect = function(url, user, pass) {
@@ -1138,13 +1151,18 @@ if (configuredForNetworkRetry()) {
         throw new Error(
             "logout() isn't resilient to network errors. Please add requires_non_retryable_commands to your test");
     };
+
+    startParallelShell = function() {
+        throw new Error("Cowardly refusing to run test with network retries enabled when it uses " +
+                        "startParallelShell()");
+    };
 }
 
 if (configuredForTxnOverride()) {
     startParallelShell = function() {
         throw new Error(
-            "Cowardly refusing to run test with transaction override enabled when it uses" +
-            "startParalleShell()");
+            "Cowardly refusing to run test with transaction override enabled when it uses " +
+            "startParallelShell()");
     };
 }
 

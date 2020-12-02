@@ -1,10 +1,12 @@
 /**
- * @tags: [assumes_superuser_permissions, requires_fcv_44]
+ * @tags: [
+ *   assumes_superuser_permissions,
+ * ]
  */
 (function() {
 'use strict';
 
-var isMongos = ("isdbgrid" == db.runCommand("ismaster").msg);
+var isMongos = ("isdbgrid" == db.runCommand("hello").msg);
 
 var extractResult = function(obj) {
     if (!isMongos)
@@ -39,7 +41,7 @@ var checkImplicitCreate = function(createIndexResult) {
     assert.eq(true, createIndexResult.createdCollectionAutomatically);
 };
 
-var dbTest = db.getSisterDB('create_indexes_db');
+var dbTest = db.getSiblingDB('create_indexes_db');
 dbTest.dropDatabase();
 
 // Database does not exist

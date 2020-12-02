@@ -104,9 +104,12 @@ BtreeKeyGenerator::BtreeKeyGenerator(std::vector<const char*> fieldNames,
       _collator(collator) {
 
     for (const char* fieldName : fieldNames) {
-        size_t pathLength = FieldRef{fieldName}.numParts();
+        FieldRef fieldRef{fieldName};
+        auto pathLength = fieldRef.numParts();
         invariant(pathLength > 0);
         _pathLengths.push_back(pathLength);
+        _pathsContainPositionalComponent =
+            _pathsContainPositionalComponent || fieldRef.hasNumericPathComponents();
     }
 }
 
@@ -236,7 +239,7 @@ void BtreeKeyGenerator::getKeys(SharedBufferFragmentBuilder& pooledBufferBuilder
         if (multikeyPaths) {
             multikeyPaths->resize(1);
         }
-    } else if (skipMultikey) {
+    } else if (skipMultikey && !_pathsContainPositionalComponent) {
         // This index doesn't contain array values. We therefore always set 'multikeyPaths' as
         // [[ ], [], ...].
         if (multikeyPaths) {
@@ -505,7 +508,7 @@ void BtreeKeyGenerator::_getKeysWithArray(std::vector<const char*>* fieldNames,
         // Generate a key for each element of the indexed array.
         std::vector<const char*> fieldNamesTemp;
         std::vector<BSONElement> fixedTemp;
-        for (const auto arrObjElem : arrObj) {
+        for (const auto& arrObjElem : arrObj) {
             _getKeysArrEltFixed(*fieldNames,
                                 *fixed,
                                 &fieldNamesTemp,

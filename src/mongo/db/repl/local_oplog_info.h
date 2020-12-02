@@ -56,18 +56,8 @@ public:
     LocalOplogInfo& operator=(const LocalOplogInfo&) = delete;
     LocalOplogInfo() = default;
 
-    /**
-     * Returns namespace of the local oplog collection.
-     */
-    const NamespaceString& getOplogCollectionName() const;
-
-    /**
-     * Detects the current replication mode and sets the "_oplogName" accordingly.
-     */
-    void setOplogCollectionName(ServiceContext* service);
-
-    Collection* getCollection() const;
-    void setCollection(Collection* oplog);
+    const CollectionPtr& getCollection() const;
+    void setCollection(const CollectionPtr& oplog);
     void resetCollection();
 
     /**
@@ -88,7 +78,7 @@ private:
     // The "oplog" pointer is always valid (or null) because an operation must take the global
     // exclusive lock to set the pointer to null when the Collection instance is destroyed. See
     // "oplogCheckCloseDatabase".
-    Collection* _oplog = nullptr;
+    CollectionPtr _oplog;
 
     // Synchronizes the section where a new Timestamp is generated and when it is registered in the
     // storage engine.

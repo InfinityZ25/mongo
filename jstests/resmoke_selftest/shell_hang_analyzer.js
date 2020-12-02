@@ -17,26 +17,37 @@ const anyLineMatches = function(lines, rex) {
  */
 
 const child = MongoRunner.runMongod();
-try {
-    clearRawMongoProgramOutput();
+clearRawMongoProgramOutput();
 
-    // drive-by test for enable(). Separate test for disable() below.
-    MongoRunner.runHangAnalyzer.disable();
-    MongoRunner.runHangAnalyzer.enable();
+// drive-by test for enable(). Separate test for disable() below.
+MongoRunner.runHangAnalyzer.disable();
+MongoRunner.runHangAnalyzer.enable();
 
-    MongoRunner.runHangAnalyzer([child.pid]);
+MongoRunner.runHangAnalyzer([child.pid]);
+
+if (TestData && TestData.inEvergreen) {
+    assert.soon(() => {
+        // Ensure the hang-analyzer has killed the process.
+        return !checkProgram(child.pid).alive;
+    });
 
     const lines = rawMongoProgramOutput().split('\n');
-
-    if (TestData.isAsanBuild) {
-        // Nothing should be executed, so there's no output.
-        assert.eq(lines, ['']);
+    if (_isAddressSanitizerActive()) {
+        assert.soon(() => {
+            // On ASAN builds, we never dump the core during hang analyzer runs,
+            // nor should the output be empty (empty means it didn't run).
+            // If you're trying to debug why this test is failing, confirm that the
+            // hang_analyzer_dump_core expansion has not been set to true.
+            return !anyLineMatches(lines, /Dumping core/) && lines.length != 0;
+        });
     } else {
         assert.soon(() => {
+            // Outside of ASAN builds, we expect the core to be dumped.
             return anyLineMatches(lines, /Dumping core/);
         });
     }
-} finally {
+} else {
+    // When running locally the hang-analyzer is not run.
     MongoRunner.stopMongod(child);
 }
 })();

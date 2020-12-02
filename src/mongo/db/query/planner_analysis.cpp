@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/db/query/planner_analysis.h"
 
@@ -73,6 +73,43 @@ void getLeafNodes(QuerySolutionNode* root, vector<QuerySolutionNode*>* leafNodes
 }
 
 /**
+ * Determines if the query solution node 'node' is a FETCH node with an IXSCAN child node.
+ */
+bool isFetchNodeWithIndexScanChild(const QuerySolutionNode* node) {
+    return (STAGE_FETCH == node->getType() && node->children.size() == 1 &&
+            STAGE_IXSCAN == node->children[0]->getType());
+}
+
+/**
+ * Walks the tree 'root' and outputs all nodes that can be considered for explosion for sort.
+ * Outputs FETCH nodes with an IXSCAN node as a child as well as singular IXSCAN leaves without a
+ * FETCH as a parent into 'explodableNodes'.
+ */
+void getExplodableNodes(QuerySolutionNode* root, vector<QuerySolutionNode*>* explodableNodes) {
+    if (STAGE_IXSCAN == root->getType() || isFetchNodeWithIndexScanChild(root)) {
+        explodableNodes->push_back(root);
+    } else {
+        for (auto&& childNode : root->children) {
+            getExplodableNodes(childNode, explodableNodes);
+        }
+    }
+}
+
+/**
+ * Returns the IXSCAN node from the tree 'node' that can be either a IXSCAN node or a FETCH node
+ * with an IXSCAN node as a child.
+ */
+const IndexScanNode* getIndexScanNode(const QuerySolutionNode* node) {
+    if (STAGE_IXSCAN == node->getType()) {
+        return static_cast<const IndexScanNode*>(node);
+    } else if (isFetchNodeWithIndexScanChild(node)) {
+        return static_cast<const IndexScanNode*>(node->children[0]);
+    }
+    MONGO_UNREACHABLE;
+    return nullptr;
+}
+
+/**
  * Returns true if every interval in 'oil' is a point, false otherwise.
  */
 bool isUnionOfPoints(const OrderedIntervalList& oil) {
@@ -115,16 +152,16 @@ bool structureOKForExplode(QuerySolutionNode* solnRoot, QuerySolutionNode** toRe
         return true;
     }
 
-    if (STAGE_FETCH == solnRoot->getType()) {
-        if (STAGE_IXSCAN == solnRoot->children[0]->getType()) {
-            *toReplace = solnRoot->children[0];
-            return true;
-        }
+    if (isFetchNodeWithIndexScanChild(solnRoot)) {
+        *toReplace = solnRoot->children[0];
+        return true;
     }
 
+    // If we have a STAGE_OR, we can explode only when all children are either IXSCANs or FETCHes
+    // that have an IXSCAN as a child.
     if (STAGE_OR == solnRoot->getType()) {
-        for (size_t i = 0; i < solnRoot->children.size(); ++i) {
-            if (STAGE_IXSCAN != solnRoot->children[i]->getType()) {
+        for (auto&& child : solnRoot->children) {
+            if (STAGE_IXSCAN != child->getType() && !isFetchNodeWithIndexScanChild(child)) {
                 return false;
             }
         }
@@ -184,9 +221,9 @@ void makeCartesianProduct(const IndexBounds& bounds,
 }
 
 /**
- * Take the provided index scan node 'isn'. Returns a list of index scans which are
- * logically equivalent to 'isn' if joined by a MergeSort through the out-parameter
- * 'explosionResult'. These index scan instances are owned by the caller.
+ * Takes the provided 'node', either an IndexScanNode or FetchNode with a direct child that is an
+ * IndexScanNode. Returns a list of nodes which are logically equivalent to 'node' if joined by a
+ * MergeSort through the out-parameter 'explosionResult'. These nodes are owned by the caller.
  *
  * fieldsToExplode is a count of how many fields in the scan's bounds are the union of point
  * intervals.  This is computed beforehand and provided as a small optimization.
@@ -194,18 +231,21 @@ void makeCartesianProduct(const IndexBounds& bounds,
  * Example:
  *
  * For the query find({a: {$in: [1,2]}}).sort({b: 1}) using the index {a:1, b:1}:
- * 'isn' will be scan with bounds a:[[1,1],[2,2]] & b: [MinKey, MaxKey]
+ * 'node' will be a scan with multi-interval bounds a: [[1, 1], [2, 2]], b: [MinKey, MaxKey]
  * 'sort' will be {b: 1}
  * 'fieldsToExplode' will be 1 (as only one field isUnionOfPoints).
  *
  * On return, 'explosionResult' will contain the following two scans:
- * a:[[1,1]], b:[MinKey, MaxKey]
- * a:[[2,2]], b:[MinKey, MaxKey]
+ * a: [[1, 1]], b: [MinKey, MaxKey]
+ * a: [[2, 2]], b: [MinKey, MaxKey]
  */
-void explodeScan(const IndexScanNode* isn,
+void explodeNode(const QuerySolutionNode* node,
                  const BSONObj& sort,
                  size_t fieldsToExplode,
                  vector<QuerySolutionNode*>* explosionResult) {
+    // Get the 'isn' from either the FetchNode or IndexScanNode.
+    const IndexScanNode* isn = getIndexScanNode(node);
+
     // Turn the compact bounds in 'isn' into a bunch of points...
     vector<PointPrefix> prefixForScans;
     makeCartesianProduct(isn->bounds, fieldsToExplode, &prefixForScans);
@@ -234,7 +274,23 @@ void explodeScan(const IndexScanNode* isn,
         for (size_t j = fieldsToExplode; j < isn->bounds.fields.size(); ++j) {
             child->bounds.fields[j] = isn->bounds.fields[j];
         }
-        explosionResult->push_back(child);
+
+        // If the explosion is on a FetchNode, make a copy and add the 'isn' as a child.
+        if (STAGE_FETCH == node->getType()) {
+            auto origFetchNode = static_cast<const FetchNode*>(node);
+            auto newFetchNode = std::make_unique<FetchNode>();
+
+            // Copy the FETCH's filter, if it exists.
+            if (origFetchNode->filter.get()) {
+                newFetchNode->filter = origFetchNode->filter->shallowClone();
+            }
+
+            // Add the 'child' IXSCAN under the FETCH stage, and the FETCH stage to the result set.
+            newFetchNode->children.push_back(child);
+            explosionResult->push_back(newFetchNode.release());
+        } else {
+            explosionResult->push_back(child);
+        }
     }
 }
 
@@ -251,20 +307,6 @@ void replaceNodeInTree(QuerySolutionNode** root,
             replaceNodeInTree(&(*root)->children[i], oldNode, newNode);
         }
     }
-}
-
-bool hasNode(QuerySolutionNode* root, StageType type) {
-    if (type == root->getType()) {
-        return true;
-    }
-
-    for (size_t i = 0; i < root->children.size(); ++i) {
-        if (hasNode(root->children[i], type)) {
-            return true;
-        }
-    }
-
-    return false;
 }
 
 void geoSkipValidationOn(const std::set<StringData>& twoDSphereFields,
@@ -344,10 +386,7 @@ std::unique_ptr<QuerySolutionNode> addSortKeyGeneratorStageIfNeeded(
 std::unique_ptr<ProjectionNode> analyzeProjection(const CanonicalQuery& query,
                                                   std::unique_ptr<QuerySolutionNode> solnRoot,
                                                   const bool hasSortStage) {
-    LOGV2_DEBUG(20949,
-                5,
-                "PROJECTION: Current plan is:\n{solnRoot}",
-                "solnRoot"_attr = redact(solnRoot->toString()));
+    LOGV2_DEBUG(20949, 5, "PROJECTION: Current plan", "plan"_attr = redact(solnRoot->toString()));
 
     // If the projection requires the entire document we add a fetch stage if not present. Otherwise
     // we add a fetch stage if we are not covered.
@@ -417,11 +456,21 @@ std::unique_ptr<QuerySolutionNode> tryPushdownProjectBeneathSort(
         return root;
     }
 
-    if (!isSortStageType(projectNode->children[0]->getType())) {
+    // There could be a situation when there is a SKIP stage between PROJECT and SORT:
+    //   PROJECT => SKIP => SORT
+    // In this case we still want to push PROJECT beneath SORT.
+    bool hasSkipBetween = false;
+    auto sortNodeCandidate = projectNode->children[0];
+    if (sortNodeCandidate->getType() == STAGE_SKIP) {
+        hasSkipBetween = true;
+        sortNodeCandidate = sortNodeCandidate->children[0];
+    }
+
+    if (!isSortStageType(sortNodeCandidate->getType())) {
         return root;
     }
 
-    auto sortNode = static_cast<SortNode*>(root->children[0]);
+    auto sortNode = static_cast<SortNode*>(sortNodeCandidate);
 
     // Don't perform this optimization if the sort is a top-k sort. We would be wasting work
     // computing projections for documents that are discarded since they are not in the top-k set.
@@ -439,32 +488,52 @@ std::unique_ptr<QuerySolutionNode> tryPushdownProjectBeneathSort(
 
     // Perform the swap. We are starting with the following structure:
     //   PROJECT => SORT => CHILD
+    // Or if there is a SKIP stage between PROJECT and SORT:
+    //   PROJECT => SKIP => SORT => CHILD
     //
     // This needs to be transformed to the following:
     //   SORT => PROJECT => CHILD
+    // Or to the following in case of SKIP:
+    //   SKIP => SORT => PROJECT => CHILD
     //
-    // First, detach the bottom of the tree.
+    // First, detach the bottom of the tree. This part is CHILD in the comment above.
     std::unique_ptr<QuerySolutionNode> restOfTree{sortNode->children[0]};
     invariant(sortNode->children.size() == 1u);
     sortNode->children.clear();
 
-    // Next, detach the sort from the projection and assume ownership of it.
-    std::unique_ptr<QuerySolutionNode> ownedSortNode{sortNode};
+    // Next, detach the input from the projection and assume ownership of it.
+    // The projection input is either this structure:
+    //   SORT
+    // Or this if we have SKIP:
+    //   SKIP => SORT
+    std::unique_ptr<QuerySolutionNode> ownedProjectionInput{projectNode->children[0]};
     sortNode = nullptr;
     invariant(projectNode->children.size() == 1u);
     projectNode->children.clear();
 
     // Attach the lower part of the tree as the child of the projection.
+    // We want to get the following structure:
+    //   PROJECT => CHILD
     std::unique_ptr<QuerySolutionNode> ownedProjectionNode = std::move(root);
     ownedProjectionNode->children.push_back(restOfTree.release());
 
     // Attach the projection as the child of the sort stage.
-    ownedSortNode->children.push_back(ownedProjectionNode.release());
+    if (hasSkipBetween) {
+        // In this case 'ownedProjectionInput' points to the structure:
+        //   SKIP => SORT
+        // And to attach PROJECT => CHILD to it, we need to access children of SORT stage.
+        ownedProjectionInput->children[0]->children.push_back(ownedProjectionNode.release());
+    } else {
+        // In this case 'ownedProjectionInput' points to the structure:
+        //   SORT
+        // And we can just add PROJECT => CHILD to its children.
+        ownedProjectionInput->children.push_back(ownedProjectionNode.release());
+    }
 
     // Re-compute properties so that they reflect the new structure of the tree.
-    ownedSortNode->computeProperties();
+    ownedProjectionInput->computeProperties();
 
-    return ownedSortNode;
+    return ownedProjectionInput;
 }
 
 bool canUseSimpleSort(const QuerySolutionNode& solnRoot,
@@ -543,31 +612,31 @@ BSONObj QueryPlannerAnalysis::getSortPattern(const BSONObj& indexKeyPattern) {
 bool QueryPlannerAnalysis::explodeForSort(const CanonicalQuery& query,
                                           const QueryPlannerParams& params,
                                           QuerySolutionNode** solnRoot) {
-    vector<QuerySolutionNode*> leafNodes;
+    vector<QuerySolutionNode*> explodableNodes;
 
     QuerySolutionNode* toReplace;
     if (!structureOKForExplode(*solnRoot, &toReplace)) {
         return false;
     }
 
-    getLeafNodes(*solnRoot, &leafNodes);
+    // Find explodable nodes in the subtree rooted at 'toReplace'.
+    getExplodableNodes(toReplace, &explodableNodes);
 
     const BSONObj& desiredSort = query.getQueryRequest().getSort();
 
     // How many scan leaves will result from our expansion?
     size_t totalNumScans = 0;
 
-    // The value of entry i is how many scans we want to blow up for leafNodes[i].
-    // We calculate this in the loop below and might as well reuse it if we blow up
-    // that scan.
+    // The value of entry i is how many scans we want to blow up for explodableNodes[i]. We
+    // calculate this in the loop below and might as well reuse it if we blow up that scan.
     vector<size_t> fieldsToExplode;
 
     // The sort order we're looking for has to possibly be provided by each of the index scans
     // upon explosion.
-    for (size_t i = 0; i < leafNodes.size(); ++i) {
+    for (auto&& explodableNode : explodableNodes) {
         // We can do this because structureOKForExplode is only true if the leaves are index
         // scans.
-        IndexScanNode* isn = static_cast<IndexScanNode*>(leafNodes[i]);
+        IndexScanNode* isn = const_cast<IndexScanNode*>(getIndexScanNode(explodableNode));
         const IndexBounds& bounds = isn->bounds;
 
         // Not a point interval prefix, can't try to rewrite.
@@ -638,6 +707,20 @@ bool QueryPlannerAnalysis::explodeForSort(const CanonicalQuery& query,
             }
         }
 
+        // An index whose collation does not match the query's cannot provide a sort if sort-by
+        // fields can contain collatable values.
+        if (!CollatorInterface::collatorsMatch(isn->index.collator, query.getCollator())) {
+            auto fieldsWithStringBounds =
+                IndexScanNode::getFieldsWithStringBounds(bounds, isn->index.keyPattern);
+            for (auto&& element : desiredSort) {
+                if (fieldsWithStringBounds.count(element.fieldNameStringData()) > 0) {
+                    // The field can contain collatable values and therefore we cannot use the index
+                    // to provide the sort.
+                    return false;
+                }
+            }
+        }
+
         // Do some bookkeeping to see how many ixscans we'll create total.
         totalNumScans += numScans;
 
@@ -647,11 +730,12 @@ bool QueryPlannerAnalysis::explodeForSort(const CanonicalQuery& query,
 
     // Too many ixscans spoil the performance.
     if (totalNumScans > (size_t)internalQueryMaxScansToExplode.load()) {
-        LOGV2_DEBUG(20950,
-                    5,
-                    "Could expand ixscans to pull out sort order but resulting scan "
-                    "count({totalNumScans}) is too high.",
-                    "totalNumScans"_attr = totalNumScans);
+        (*solnRoot)->hitScanLimit = true;
+        LOGV2_DEBUG(
+            20950,
+            5,
+            "Could expand ixscans to pull out sort order but resulting scan count is too high",
+            "numScans"_attr = totalNumScans);
         return false;
     }
 
@@ -659,9 +743,8 @@ bool QueryPlannerAnalysis::explodeForSort(const CanonicalQuery& query,
     // get our sort order via ixscan blow-up.
     MergeSortNode* merge = new MergeSortNode();
     merge->sort = desiredSort;
-    for (size_t i = 0; i < leafNodes.size(); ++i) {
-        IndexScanNode* isn = static_cast<IndexScanNode*>(leafNodes[i]);
-        explodeScan(isn, desiredSort, fieldsToExplode[i], &merge->children);
+    for (size_t i = 0; i < explodableNodes.size(); ++i) {
+        explodeNode(explodableNodes[i], desiredSort, fieldsToExplode[i], &merge->children);
     }
 
     merge->computeProperties();
@@ -698,22 +781,20 @@ QuerySolutionNode* QueryPlannerAnalysis::analyzeSort(const CanonicalQuery& query
     }
 
     // See if solnRoot gives us the sort.  If so, we're done.
-    BSONObjSet sorts = solnRoot->getSort();
-
-    // If the sort we want is in the set of sort orders provided already, bail out.
-    if (sorts.end() != sorts.find(sortObj)) {
+    auto providedSorts = solnRoot->providedSorts();
+    if (providedSorts.contains(sortObj)) {
         return solnRoot;
     }
 
     // Sort is not provided.  See if we provide the reverse of our sort pattern.
     // If so, we can reverse the scan direction(s).
     BSONObj reverseSort = QueryPlannerCommon::reverseSortObj(sortObj);
-    if (sorts.end() != sorts.find(reverseSort)) {
+    if (providedSorts.contains(reverseSort)) {
         QueryPlannerCommon::reverseScans(solnRoot);
         LOGV2_DEBUG(20951,
                     5,
-                    "Reversing ixscan to provide sort. Result: {solnRoot}",
-                    "solnRoot"_attr = redact(solnRoot->toString()));
+                    "Reversing ixscan to provide sort",
+                    "newPlan"_attr = redact(solnRoot->toString()));
         return solnRoot;
     }
 
@@ -890,7 +971,7 @@ std::unique_ptr<QuerySolution> QueryPlannerAnalysis::analyzeDataAccess(
 
     // A solution can be blocking if it has a blocking sort stage or
     // a hashed AND stage.
-    bool hasAndHashStage = hasNode(solnRoot.get(), STAGE_AND_HASH);
+    bool hasAndHashStage = solnRoot->hasNode(STAGE_AND_HASH);
     soln->hasBlockingStage = hasSortStage || hasAndHashStage;
 
     const QueryRequest& qr = query.getQueryRequest();
@@ -949,7 +1030,7 @@ std::unique_ptr<QuerySolution> QueryPlannerAnalysis::analyzeDataAccess(
 
     solnRoot = tryPushdownProjectBeneathSort(std::move(solnRoot));
 
-    soln->root = std::move(solnRoot);
+    soln->setRoot(std::move(solnRoot));
     return soln;
 }
 

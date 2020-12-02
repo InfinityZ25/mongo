@@ -50,10 +50,14 @@ class CursorResponseBuilder {
 public:
     /**
      * Structure used to configure the CursorResponseBuilder.
+     *
+     * If we selected atClusterTime or received it from the client, transmit it back to the client
+     * in the cursor reply document by setting it here.
      */
     struct Options {
         bool isInitialResponse = false;
         bool useDocumentSequences = false;
+        boost::optional<LogicalTime> atClusterTime = boost::none;
     };
 
     /**
@@ -191,6 +195,7 @@ public:
     CursorResponse(NamespaceString nss,
                    CursorId cursorId,
                    std::vector<BSONObj> batch,
+                   boost::optional<Timestamp> atClusterTime = boost::none,
                    boost::optional<long long> numReturnedSoFar = boost::none,
                    boost::optional<BSONObj> postBatchResumeToken = boost::none,
                    boost::optional<BSONObj> writeConcernError = boost::none,
@@ -231,6 +236,10 @@ public:
         return _writeConcernError;
     }
 
+    boost::optional<Timestamp> getAtClusterTime() const {
+        return _atClusterTime;
+    }
+
     bool getPartialResultsReturned() const {
         return _partialResultsReturned;
     }
@@ -248,6 +257,7 @@ private:
     NamespaceString _nss;
     CursorId _cursorId;
     std::vector<BSONObj> _batch;
+    boost::optional<Timestamp> _atClusterTime;
     boost::optional<long long> _numReturnedSoFar;
     boost::optional<BSONObj> _postBatchResumeToken;
     boost::optional<BSONObj> _writeConcernError;

@@ -43,10 +43,12 @@
 
 namespace mongo {
 class Collection;
+class CollectionPtr;
 class DocumentSourceCursor;
 class DocumentSourceMatch;
 class DocumentSourceSort;
 class ExpressionContext;
+class SkipThenLimit;
 class OperationContext;
 class Pipeline;
 struct PlanSummaryStats;
@@ -67,7 +69,7 @@ public:
      * the new stage to the pipeline.
      */
     using AttachExecutorCallback = std::function<void(
-        Collection*, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>, Pipeline*)>;
+        const CollectionPtr&, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>, Pipeline*)>;
 
     /**
      * This method looks for early pipeline stages that can be folded into the underlying
@@ -88,7 +90,7 @@ public:
      * 'nullptr'.
      */
     static std::pair<AttachExecutorCallback, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
-    buildInnerQueryExecutor(Collection* collection,
+    buildInnerQueryExecutor(const CollectionPtr& collection,
                             const NamespaceString& nss,
                             const AggregationRequest* aggRequest,
                             Pipeline* pipeline);
@@ -101,7 +103,7 @@ public:
      * 'nullptr'.
      */
     static void attachInnerQueryExecutorToPipeline(
-        Collection* collection,
+        const CollectionPtr& collection,
         AttachExecutorCallback attachExecutorCallback,
         std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
         Pipeline* pipeline);
@@ -112,15 +114,10 @@ public:
      * used when the executor attachment phase doesn't need to be deferred and the $cursor stage
      * can be created right after buiding the executor.
      */
-    static void buildAndAttachInnerQueryExecutorToPipeline(Collection* collection,
+    static void buildAndAttachInnerQueryExecutorToPipeline(const CollectionPtr& collection,
                                                            const NamespaceString& nss,
                                                            const AggregationRequest* aggRequest,
                                                            Pipeline* pipeline);
-
-
-    static std::string getPlanSummaryStr(const Pipeline* pipeline);
-
-    static void getPlanSummaryStats(const Pipeline* pipeline, PlanSummaryStats* statsOut);
 
     static Timestamp getLatestOplogTimestamp(const Pipeline* pipeline);
 
@@ -130,7 +127,7 @@ public:
      */
     static std::unique_ptr<CollatorInterface> resolveCollator(OperationContext* opCtx,
                                                               BSONObj userCollation,
-                                                              const Collection* collection) {
+                                                              const CollectionPtr& collection) {
         if (!userCollation.isEmpty()) {
             return uassertStatusOK(CollatorFactoryInterface::get(opCtx->getServiceContext())
                                        ->makeFromBSON(userCollation));
@@ -149,7 +146,7 @@ private:
      * the 'pipeline'.
      */
     static std::pair<AttachExecutorCallback, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
-    buildInnerQueryExecutorGeneric(Collection* collection,
+    buildInnerQueryExecutorGeneric(const CollectionPtr& collection,
                                    const NamespaceString& nss,
                                    const AggregationRequest* aggRequest,
                                    Pipeline* pipeline);
@@ -160,7 +157,7 @@ private:
      * not exist, as the $geoNearCursor requires a 2d or 2dsphere index.
      */
     static std::pair<AttachExecutorCallback, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
-    buildInnerQueryExecutorGeoNear(Collection* collection,
+    buildInnerQueryExecutorGeoNear(const CollectionPtr& collection,
                                    const NamespaceString& nss,
                                    const AggregationRequest* aggRequest,
                                    Pipeline* pipeline);
@@ -179,14 +176,14 @@ private:
      */
     static StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> prepareExecutor(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
-        Collection* collection,
+        const CollectionPtr& collection,
         const NamespaceString& nss,
         Pipeline* pipeline,
         const boost::intrusive_ptr<DocumentSourceSort>& sortStage,
         std::unique_ptr<GroupFromFirstDocumentTransformation> rewrittenGroupStage,
         QueryMetadataBitSet metadataAvailable,
         const BSONObj& queryObj,
-        boost::optional<long long> limit,
+        SkipThenLimit skipThenLimit,
         const AggregationRequest* aggRequest,
         const MatchExpressionParser::AllowedFeatureSet& matcherFeatures,
         bool* hasNoRequirements);

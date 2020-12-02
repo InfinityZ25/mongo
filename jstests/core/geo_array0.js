@@ -1,6 +1,9 @@
 // Cannot implicitly shard accessed collections because of extra shard key index in sharded
 // collection.
-// @tags: [assumes_no_implicit_index_creation]
+// @tags: [
+//   assumes_no_implicit_index_creation,
+//   sbe_incompatible,
+// ]
 
 // Make sure the very basics of geo arrays are sane by creating a few multi location docs
 t = db.geoarray;
@@ -13,7 +16,7 @@ function test(index) {
     assert.commandWorked(res);
 
     if (index) {
-        assert.commandWorked(t.ensureIndex({loc: "2d", zip: 1}));
+        assert.commandWorked(t.createIndex({loc: "2d", zip: 1}));
         assert.eq(2, t.getIndexKeys().length);
     }
 

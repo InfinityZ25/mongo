@@ -33,18 +33,17 @@
 
 #include "mongo/client/read_preference.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time_validator.h"
-#include "mongo/rpc/metadata/client_metadata_ismaster.h"
+#include "mongo/db/vector_clock.h"
+#include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/rpc/metadata/config_server_metadata.h"
 #include "mongo/rpc/metadata/impersonated_user_metadata.h"
-#include "mongo/rpc/metadata/logical_time_metadata.h"
 #include "mongo/rpc/metadata/sharding_metadata.h"
 #include "mongo/rpc/metadata/tracking_metadata.h"
 #include "mongo/util/string_map.h"
+#include "mongo/util/testing_proctor.h"
 
 namespace mongo {
 namespace rpc {
@@ -53,12 +52,14 @@ BSONObj makeEmptyMetadata() {
     return BSONObj();
 }
 
-void readRequestMetadata(OperationContext* opCtx, const BSONObj& metadataObj, bool requiresAuth) {
+void readRequestMetadata(OperationContext* opCtx,
+                         const BSONObj& metadataObj,
+                         bool cmdRequiresAuth) {
     BSONElement readPreferenceElem;
     BSONElement configSvrElem;
     BSONElement trackingElem;
     BSONElement clientElem;
-    BSONElement logicalTimeElem;
+    BSONElement helloClientElem;
     BSONElement impersonationElem;
     BSONElement clientOperationKeyElem;
 
@@ -72,8 +73,6 @@ void readRequestMetadata(OperationContext* opCtx, const BSONObj& metadataObj, bo
             clientElem = metadataElem;
         } else if (fieldName == TrackingMetadata::fieldName()) {
             trackingElem = metadataElem;
-        } else if (fieldName == LogicalTimeMetadata::fieldName()) {
-            logicalTimeElem = metadataElem;
         } else if (fieldName == kImpersonationMetadataSectionName) {
             impersonationElem = metadataElem;
         } else if (fieldName == "clientOperationKey"_sd) {
@@ -84,7 +83,7 @@ void readRequestMetadata(OperationContext* opCtx, const BSONObj& metadataObj, bo
     AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
 
     if (clientOperationKeyElem &&
-        (getTestCommandsEnabled() ||
+        (TestingProctor::instance().isEnabled() ||
          authSession->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
                                                        ActionType::internal))) {
         auto opKey = uassertStatusOK(UUID::parse(clientOperationKeyElem));
@@ -98,7 +97,13 @@ void readRequestMetadata(OperationContext* opCtx, const BSONObj& metadataObj, bo
 
     readImpersonatedUserMetadata(impersonationElem, opCtx);
 
-    uassertStatusOK(ClientMetadataIsMasterState::readFromMetadata(opCtx, clientElem));
+    // We check for "$client" but not "client" here, because currentOp can filter on "client" as
+    // a top-level field.
+    if (clientElem) {
+        // The '$client' field is populated by mongos when it sends requests to shards on behalf of
+        // its own requests. This may or may not be relevant for SERVER-50804.
+        ClientMetadata::setFromMetadataForOperation(opCtx, clientElem);
+    }
 
     ConfigServerMetadata::get(opCtx) =
         uassertStatusOK(ConfigServerMetadata::readFromMetadata(configSvrElem));
@@ -106,41 +111,7 @@ void readRequestMetadata(OperationContext* opCtx, const BSONObj& metadataObj, bo
     TrackingMetadata::get(opCtx) =
         uassertStatusOK(TrackingMetadata::readFromMetadata(trackingElem));
 
-    auto logicalClock = LogicalClock::get(opCtx);
-    if (logicalClock && logicalClock->isEnabled()) {
-        auto logicalTimeMetadata =
-            uassertStatusOK(rpc::LogicalTimeMetadata::readFromMetadata(logicalTimeElem));
-
-        auto& signedTime = logicalTimeMetadata.getSignedTime();
-
-        if (!requiresAuth &&
-            AuthorizationManager::get(opCtx->getServiceContext())->isAuthEnabled() &&
-            (!signedTime.getProof() || *signedTime.getProof() == TimeProofService::TimeProof())) {
-
-            // The client is not authenticated and is not using localhost auth bypass.
-            if (authSession && !authSession->isAuthenticated() &&
-                !authSession->isUsingLocalhostBypass()) {
-                return;
-            }
-        }
-
-        // LogicalTimeMetadata is default constructed if no cluster time metadata was sent, so a
-        // default constructed SignedLogicalTime should be ignored.
-        if (signedTime.getTime() != LogicalTime::kUninitialized) {
-            auto logicalTimeValidator = LogicalTimeValidator::get(opCtx);
-            if (!LogicalTimeValidator::isAuthorizedToAdvanceClock(opCtx)) {
-                if (!logicalTimeValidator) {
-                    uasserted(ErrorCodes::CannotVerifyAndSignLogicalTime,
-                              "Cannot accept logicalTime: " + signedTime.getTime().toString() +
-                                  ". May not be a part of a sharded cluster");
-                } else {
-                    uassertStatusOK(logicalTimeValidator->validate(opCtx, signedTime));
-                }
-            }
-
-            uassertStatusOK(logicalClock->advanceClusterTime(signedTime.getTime()));
-        }
-    }
+    VectorClock::get(opCtx)->gossipIn(opCtx, metadataObj, !cmdRequiresAuth);
 }
 
 namespace {
@@ -193,7 +164,7 @@ OpMsgRequest upconvertRequest(StringData db, BSONObj cmdObj, int queryFlags) {
 
     if (!readPrefContainer.isEmpty()) {
         cmdObj = BSONObjBuilder(std::move(cmdObj)).appendElements(readPrefContainer).obj();
-    } else if (!cmdObj.hasField("$readPreference") && (queryFlags & QueryOption_SlaveOk)) {
+    } else if (!cmdObj.hasField("$readPreference") && (queryFlags & QueryOption_SecondaryOk)) {
         BSONObjBuilder bodyBuilder(std::move(cmdObj));
         ReadPreferenceSetting(ReadPreference::SecondaryPreferred).toContainingBSON(&bodyBuilder);
         cmdObj = bodyBuilder.obj();

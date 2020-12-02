@@ -31,10 +31,9 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/persistent_task_queue.h"
-#include "mongo/s/shard_server_test_fixture.h"
+#include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/unittest/barrier.h"
-#include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace {
@@ -71,7 +70,7 @@ void killOps(ServiceContext* serviceCtx) {
 
     for (Client* client = cursor.next(); client != nullptr; client = cursor.next()) {
         stdx::lock_guard<Client> lk(*client);
-        if (client->isFromSystemConnection() && !client->shouldKillSystemOperation(lk))
+        if (client->isFromSystemConnection() && !client->canKillSystemOperationInStepdown(lk))
             continue;
 
         OperationContext* toKill = client->getOperationContext();
@@ -290,7 +289,7 @@ TEST_F(PersistentTaskQueueTest, TestKilledOperationContextWhileWaitingOnCV) {
         ThreadClient tc("RangeDeletionService", getGlobalServiceContext());
         {
             stdx::lock_guard<Client> lk(*tc.get());
-            tc->setSystemOperationKillable(lk);
+            tc->setSystemOperationKillableByStepdown(lk);
         }
 
         auto opCtx = tc->makeOperationContext();

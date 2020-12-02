@@ -94,8 +94,8 @@ assert.commandFailed(
     'configured a storage engine with invalid options');
 
 // Tests that a non-active storage engine can be configured so long as it is registered.
-var alternateStorageEngine =
-    db.serverBuildInfo().storageEngines.find(engine => engine !== storageEngineName);
+var alternateStorageEngine = db.serverBuildInfo().storageEngines.find(
+    engine => engine !== storageEngineName && engine !== "biggie");
 if (alternateStorageEngine) {
     var indexOptions = {storageEngine: {[alternateStorageEngine]: {}}};
     assert.commandWorked(db.createCollection('idxOptions', {indexOptionDefaults: indexOptions}),
@@ -115,5 +115,4 @@ assert.docEq({storageEngine: validStorageEngineOptions},
 
 dd("e");
 
-assert.eq("foo", db.getSisterDB("foo").getName());
 assert.eq("foo", db.getSiblingDB("foo").getName());

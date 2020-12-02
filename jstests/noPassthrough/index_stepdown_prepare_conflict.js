@@ -19,6 +19,7 @@
 load('jstests/noPassthrough/libs/index_build.js');
 load("jstests/replsets/rslib.js");
 load("jstests/core/txns/libs/prepare_helpers.js");
+load("jstests/libs/fail_point_util.js");
 
 (function() {
 
@@ -90,12 +91,7 @@ jsTestLog("Aborting transaction and waiting for index build to finish");
 assert.commandWorked(session.abortTransaction_forTesting());
 IndexBuildTest.waitForIndexBuildToStop(primaryDB, primaryColl.getFullName(), "x_1");
 
-// A single-phase index build will get aborted from the state transition.
-if (IndexBuildTest.supportsTwoPhaseIndexBuild(primary)) {
-    IndexBuildTest.assertIndexes(primaryColl, 2, ["_id_", "x_1"], []);
-} else {
-    IndexBuildTest.assertIndexes(primaryColl, 1, ["_id_"], []);
-}
+IndexBuildTest.assertIndexes(primaryColl, 2, ["_id_", "x_1"], []);
 
 rst.stopSet();
 })();

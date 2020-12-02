@@ -45,6 +45,7 @@
 #include "mongo/client/dbclient_rs.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/client/replica_set_monitor_protocol_test_util.h"
+#include "mongo/client/scanning_replica_set_monitor.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/dbtests/mock/mock_conn_registry.h"
 #include "mongo/dbtests/mock/mock_replica_set.h"
@@ -63,7 +64,7 @@ using std::unique_ptr;
 using std::vector;
 
 MONGO_INITIALIZER(DisableReplicaSetMonitorRefreshRetries)(InitializerContext*) {
-    ReplicaSetMonitor::disableRefreshRetries_forTest();
+    ScanningReplicaSetMonitor::disableRefreshRetries_forTest();
     return Status::OK();
 }
 
@@ -558,7 +559,7 @@ protected:
         DBClientRSTest::setUp();
 
         // Tests for pinning behavior require this.
-        ReplicaSetMonitor::useDeterministicHostSelection = true;
+        ScanningReplicaSetMonitor::useDeterministicHostSelection = true;
 
         // This shuts down the background RSMWatcher thread and prevents it from running. These
         // tests depend on controlling when the RSMs are updated.
@@ -653,15 +654,14 @@ protected:
             }
 
             membersBuilder.done();
-            mongo::repl::ReplSetConfig newConfig;
-            fassert(28569, newConfig.initialize(newConfigBuilder.done()));
+            auto newConfig = mongo::repl::ReplSetConfig::parse(newConfigBuilder.done());
             fassert(28568, newConfig.validate());
             _replSet->setConfig(newConfig);
         }
     }
 
     void tearDown() {
-        ReplicaSetMonitor::useDeterministicHostSelection = false;
+        ScanningReplicaSetMonitor::useDeterministicHostSelection = false;
 
         ConnectionString::setConnectionHook(_originalConnectionHook);
         ReplicaSetMonitor::cleanup();
@@ -809,20 +809,20 @@ TEST_F(TaggedFiveMemberRS, ConnShouldNotPinIfDiffTag) {
     }
 }
 
-// Note: slaveConn is dangerous and should be deprecated! Also see SERVER-7801.
-TEST_F(TaggedFiveMemberRS, SlaveConnReturnsSecConn) {
+// Note: secondaryConn is dangerous and should be deprecated! Also see SERVER-7801.
+TEST_F(TaggedFiveMemberRS, SecondaryConnReturnsSecConn) {
     MockReplicaSet* replSet = getReplSet();
     vector<HostAndPort> seedList;
     seedList.push_back(HostAndPort(replSet->getPrimary()));
 
     DBClientReplicaSet replConn(replSet->getSetName(), seedList, StringData());
 
-    // Need up-to-date view since slaveConn() uses SecondaryPreferred, and this test assumes it
+    // Need up-to-date view since secondaryConn() uses SecondaryPreferred, and this test assumes it
     // knows about at least one secondary.
     ReplicaSetMonitor::get(replSet->getSetName())->runScanForMockReplicaSet();
 
     string dest;
-    mongo::DBClientConnection& secConn = replConn.slaveConn();
+    mongo::DBClientConnection& secConn = replConn.secondaryConn();
 
     // Note: IdentityNS contains the name of the server.
     unique_ptr<DBClientCursor> cursor = secConn.query(NamespaceString(IdentityNS), Query());

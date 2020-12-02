@@ -42,9 +42,7 @@ namespace mongo::sdam {
 class ServerSelectorTestFixture : public SdamTestFixture {
 public:
     static inline const auto clockSource = SystemClockSource::get();
-    static inline const auto sdamConfiguration = SdamConfiguration({{"s0"}});
-    static inline const auto selectionConfig =
-        ServerSelectionConfiguration(Milliseconds(10), Milliseconds(10));
+    static inline const auto sdamConfiguration = SdamConfiguration({{HostAndPort("s0")}});
 
     static constexpr auto SET_NAME = "set";
     static constexpr int NUM_ITERATIONS = 1000;
@@ -93,8 +91,8 @@ public:
         static inline const auto secondarySet = TagSet(BSON_ARRAY(secondary));
     };
 
-    static ServerDescriptionPtr make_with_latency(IsMasterRTT latency,
-                                                  ServerAddress address,
+    static ServerDescriptionPtr make_with_latency(HelloRTT latency,
+                                                  HostAndPort address,
                                                   ServerType serverType = ServerType::kRSPrimary,
                                                   std::map<std::string, std::string> tags = {}) {
         auto builder = ServerDescriptionBuilder()
@@ -117,28 +115,28 @@ public:
     static auto makeServerDescriptionList() {
         return std::vector<ServerDescriptionPtr>{
             make_with_latency(Milliseconds(1),
-                              "s1",
+                              HostAndPort("s1"),
                               ServerType::kRSSecondary,
                               {{"dc", "east"}, {"usage", "production"}}),
             make_with_latency(Milliseconds(1),
-                              "s1-test",
+                              HostAndPort("s1-test"),
                               ServerType::kRSSecondary,
                               {{"dc", "east"}, {"usage", "test"}}),
             make_with_latency(Milliseconds(1),
-                              "s2",
+                              HostAndPort("s2"),
                               ServerType::kRSSecondary,
                               {{"dc", "west"}, {"usage", "production"}}),
             make_with_latency(Milliseconds(1),
-                              "s2-test",
+                              HostAndPort("s2-test"),
                               ServerType::kRSSecondary,
                               {{"dc", "west"}, {"usage", "test"}}),
             make_with_latency(Milliseconds(1),
-                              "s3",
+                              HostAndPort("s3"),
                               ServerType::kRSSecondary,
                               {{"dc", "north"}, {"usage", "production"}})};
     };
 
-    SdamServerSelector selector = SdamServerSelector(selectionConfig);
+    SdamServerSelector selector = SdamServerSelector(sdamConfiguration);
 };
 
 TEST_F(ServerSelectorTestFixture, ShouldFilterCorrectlyByLatencyWindow) {
@@ -149,18 +147,18 @@ TEST_F(ServerSelectorTestFixture, ShouldFilterCorrectlyByLatencyWindow) {
     auto window = LatencyWindow(lowerBound, windowWidth);
 
     std::vector<ServerDescriptionPtr> servers = {
-        make_with_latency(window.lower - delta, "less"),
-        make_with_latency(window.lower, "boundary-lower"),
-        make_with_latency(window.lower + delta, "within"),
-        make_with_latency(window.upper, "boundary-upper"),
-        make_with_latency(window.upper + delta, "greater")};
+        make_with_latency(window.lower - delta, HostAndPort("less")),
+        make_with_latency(window.lower, HostAndPort("boundary-lower")),
+        make_with_latency(window.lower + delta, HostAndPort("within")),
+        make_with_latency(window.upper, HostAndPort("boundary-upper")),
+        make_with_latency(window.upper + delta, HostAndPort("greater"))};
 
     window.filterServers(&servers);
 
     ASSERT_EQ(3, servers.size());
-    ASSERT_EQ("boundary-lower", servers[0]->getAddress());
-    ASSERT_EQ("within", servers[1]->getAddress());
-    ASSERT_EQ("boundary-upper", servers[2]->getAddress());
+    ASSERT_EQ(HostAndPort("boundary-lower"), servers[0]->getAddress());
+    ASSERT_EQ(HostAndPort("within"), servers[1]->getAddress());
+    ASSERT_EQ(HostAndPort("boundary-upper"), servers[2]->getAddress());
 }
 
 TEST_F(ServerSelectorTestFixture, ShouldThrowOnWireError) {
@@ -182,7 +180,33 @@ TEST_F(ServerSelectorTestFixture, ShouldThrowOnWireError) {
 TEST_F(ServerSelectorTestFixture, ShouldReturnNoneIfTopologyUnknown) {
     auto topologyDescription = std::make_shared<TopologyDescription>(sdamConfiguration);
     ASSERT_EQ(TopologyType::kUnknown, topologyDescription->getType());
-    ASSERT_EQ(boost::none, selector.selectServers(topologyDescription, ReadPreferenceSetting()));
+    ASSERT_EQ(adaptForAssert(boost::none),
+              adaptForAssert(selector.selectServers(topologyDescription, ReadPreferenceSetting())));
+}
+
+TEST_F(ServerSelectorTestFixture, ShouldBeAbleToSelectWithMaxStalenessFromClonedTopology) {
+    TopologyStateMachine stateMachine(sdamConfiguration);
+    auto topologyDescription = std::make_shared<TopologyDescription>(sdamConfiguration);
+    auto primary = ServerDescriptionBuilder()
+                       .withAddress(HostAndPort("s0"))
+                       .withType(ServerType::kRSPrimary)
+                       .withLastUpdateTime(Date_t::now())
+                       .withLastWriteDate(Date_t::now())
+                       .withRtt(Milliseconds{1})
+                       .withSetName("set")
+                       .withHost(HostAndPort("s0"))
+                       .withMinWireVersion(WireVersion::SUPPORTS_OP_MSG)
+                       .withMaxWireVersion(WireVersion::LATEST_WIRE_VERSION)
+                       .instance();
+    stateMachine.onServerDescription(*topologyDescription, primary);
+    topologyDescription = TopologyDescription::clone(topologyDescription);
+
+    const auto ninetySeconds = Seconds(90);
+    const auto readPref =
+        ReadPreferenceSetting(ReadPreference::Nearest, TagSets::emptySet, ninetySeconds);
+    auto result = selector.selectServers(topologyDescription, readPref);
+    ASSERT(result);
+    ASSERT_EQ(primary->getAddress(), (*result)[0]->getAddress());
 }
 
 TEST_F(ServerSelectorTestFixture, ShouldSelectRandomlyWhenMultipleOptionsAreAvailable) {
@@ -191,37 +215,42 @@ TEST_F(ServerSelectorTestFixture, ShouldSelectRandomlyWhenMultipleOptionsAreAvai
 
     const auto s0Latency = Milliseconds(1);
     auto primary = ServerDescriptionBuilder()
-                       .withAddress("s0")
+                       .withAddress(HostAndPort("s0"))
                        .withType(ServerType::kRSPrimary)
                        .withLastUpdateTime(Date_t::now())
                        .withLastWriteDate(Date_t::now())
                        .withRtt(s0Latency)
                        .withSetName("set")
-                       .withHost("s0")
-                       .withHost("s1")
-                       .withHost("s2")
-                       .withHost("s3")
+                       .withHost(HostAndPort("s0"))
+                       .withHost(HostAndPort("s1"))
+                       .withHost(HostAndPort("s2"))
+                       .withHost(HostAndPort("s3"))
                        .withMinWireVersion(WireVersion::SUPPORTS_OP_MSG)
                        .withMaxWireVersion(WireVersion::LATEST_WIRE_VERSION)
                        .instance();
     stateMachine.onServerDescription(*topologyDescription, primary);
 
-    const auto s1Latency = Milliseconds((s0Latency + selectionConfig.getLocalThresholdMs()) / 2);
-    auto secondaryInLatencyWindow = make_with_latency(s1Latency, "s1", ServerType::kRSSecondary);
+    const auto s1Latency = Milliseconds((s0Latency + sdamConfiguration.getLocalThreshold()) / 2);
+    auto secondaryInLatencyWindow =
+        make_with_latency(s1Latency, HostAndPort("s1"), ServerType::kRSSecondary);
     stateMachine.onServerDescription(*topologyDescription, secondaryInLatencyWindow);
 
     // s2 is on the boundary of the latency window
-    const auto s2Latency = s0Latency + selectionConfig.getLocalThresholdMs();
+    const auto s2Latency = s0Latency + sdamConfiguration.getLocalThreshold();
     auto secondaryOnBoundaryOfLatencyWindow =
-        make_with_latency(s2Latency, "s2", ServerType::kRSSecondary);
+        make_with_latency(s2Latency, HostAndPort("s2"), ServerType::kRSSecondary);
     stateMachine.onServerDescription(*topologyDescription, secondaryOnBoundaryOfLatencyWindow);
 
     // s3 should not be selected
     const auto s3Latency = s2Latency + Milliseconds(10);
-    auto secondaryTooFar = make_with_latency(s3Latency, "s3", ServerType::kRSSecondary);
+    auto secondaryTooFar =
+        make_with_latency(s3Latency, HostAndPort("s3"), ServerType::kRSSecondary);
     stateMachine.onServerDescription(*topologyDescription, secondaryTooFar);
 
-    std::map<ServerAddress, int> frequencyInfo{{"s0", 0}, {"s1", 0}, {"s2", 0}, {"s3", 0}};
+    std::map<HostAndPort, int> frequencyInfo{{HostAndPort("s0"), 0},
+                                             {HostAndPort("s1"), 0},
+                                             {HostAndPort("s2"), 0},
+                                             {HostAndPort("s3"), 0}};
     for (int i = 0; i < NUM_ITERATIONS; i++) {
         auto server = selector.selectServer(topologyDescription,
                                             ReadPreferenceSetting(ReadPreference::Nearest));
@@ -230,10 +259,10 @@ TEST_F(ServerSelectorTestFixture, ShouldSelectRandomlyWhenMultipleOptionsAreAvai
         }
     }
 
-    ASSERT(frequencyInfo["s0"]);
-    ASSERT(frequencyInfo["s1"]);
-    ASSERT(frequencyInfo["s2"]);
-    ASSERT_FALSE(frequencyInfo["s3"]);
+    ASSERT(frequencyInfo[HostAndPort("s0")]);
+    ASSERT(frequencyInfo[HostAndPort("s1")]);
+    ASSERT(frequencyInfo[HostAndPort("s2")]);
+    ASSERT_FALSE(frequencyInfo[HostAndPort("s3")]);
 }
 
 TEST_F(ServerSelectorTestFixture, ShouldFilterByLastWriteTime) {
@@ -247,13 +276,13 @@ TEST_F(ServerSelectorTestFixture, ShouldFilterByLastWriteTime) {
 
     const auto d0 = now - Milliseconds(1000);
     const auto s0 = ServerDescriptionBuilder()
-                        .withAddress("s0")
+                        .withAddress(HostAndPort("s0"))
                         .withType(ServerType::kRSPrimary)
-                        .withRtt(selectionConfig.getLocalThresholdMs())
+                        .withRtt(sdamConfiguration.getLocalThreshold())
                         .withSetName("set")
-                        .withHost("s0")
-                        .withHost("s1")
-                        .withHost("s2")
+                        .withHost(HostAndPort("s0"))
+                        .withHost(HostAndPort("s1"))
+                        .withHost(HostAndPort("s2"))
                         .withMinWireVersion(WireVersion::SUPPORTS_OP_MSG)
                         .withMaxWireVersion(WireVersion::LATEST_WIRE_VERSION)
                         .withLastUpdateTime(now)
@@ -263,9 +292,9 @@ TEST_F(ServerSelectorTestFixture, ShouldFilterByLastWriteTime) {
 
     const auto d1 = now - Milliseconds(1000 * 5);
     const auto s1 = ServerDescriptionBuilder()
-                        .withAddress("s1")
+                        .withAddress(HostAndPort("s1"))
                         .withType(ServerType::kRSSecondary)
-                        .withRtt(selectionConfig.getLocalThresholdMs())
+                        .withRtt(sdamConfiguration.getLocalThreshold())
                         .withSetName("set")
                         .withMinWireVersion(WireVersion::SUPPORTS_OP_MSG)
                         .withMaxWireVersion(WireVersion::LATEST_WIRE_VERSION)
@@ -277,9 +306,9 @@ TEST_F(ServerSelectorTestFixture, ShouldFilterByLastWriteTime) {
     // d2 is stale, so s2 should not be selected.
     const auto d2 = now - ninetySeconds - ninetySeconds;
     const auto s2 = ServerDescriptionBuilder()
-                        .withAddress("s2")
+                        .withAddress(HostAndPort("s2"))
                         .withType(ServerType::kRSSecondary)
-                        .withRtt(selectionConfig.getLocalThresholdMs())
+                        .withRtt(sdamConfiguration.getLocalThreshold())
                         .withSetName("set")
                         .withMinWireVersion(WireVersion::SUPPORTS_OP_MSG)
                         .withMaxWireVersion(WireVersion::LATEST_WIRE_VERSION)
@@ -291,7 +320,8 @@ TEST_F(ServerSelectorTestFixture, ShouldFilterByLastWriteTime) {
     const auto readPref =
         ReadPreferenceSetting(ReadPreference::Nearest, TagSets::emptySet, ninetySeconds);
 
-    std::map<ServerAddress, int> frequencyInfo{{"s0", 0}, {"s1", 0}, {"s2", 0}};
+    std::map<HostAndPort, int> frequencyInfo{
+        {HostAndPort("s0"), 0}, {HostAndPort("s1"), 0}, {HostAndPort("s2"), 0}};
     for (int i = 0; i < NUM_ITERATIONS; i++) {
         auto server = selector.selectServer(topologyDescription, readPref);
 
@@ -300,9 +330,9 @@ TEST_F(ServerSelectorTestFixture, ShouldFilterByLastWriteTime) {
         }
     }
 
-    ASSERT(frequencyInfo["s0"]);
-    ASSERT(frequencyInfo["s1"]);
-    ASSERT_FALSE(frequencyInfo["s2"]);
+    ASSERT(frequencyInfo[HostAndPort("s0")]);
+    ASSERT(frequencyInfo[HostAndPort("s1")]);
+    ASSERT_FALSE(frequencyInfo[HostAndPort("s2")]);
 }
 
 TEST_F(ServerSelectorTestFixture, ShouldSelectPreferredIfAvailable) {
@@ -314,12 +344,12 @@ TEST_F(ServerSelectorTestFixture, ShouldSelectPreferredIfAvailable) {
 
     const auto d0 = now - Milliseconds(1000);
     const auto s0 = ServerDescriptionBuilder()
-                        .withAddress("s0")
+                        .withAddress(HostAndPort("s0"))
                         .withType(ServerType::kRSPrimary)
-                        .withRtt(selectionConfig.getLocalThresholdMs())
+                        .withRtt(sdamConfiguration.getLocalThreshold())
                         .withSetName("set")
-                        .withHost("s0")
-                        .withHost("s1")
+                        .withHost(HostAndPort("s0"))
+                        .withHost(HostAndPort("s1"))
                         .withMinWireVersion(WireVersion::SUPPORTS_OP_MSG)
                         .withMaxWireVersion(WireVersion::LATEST_WIRE_VERSION)
                         .withLastWriteDate(d0)
@@ -328,12 +358,12 @@ TEST_F(ServerSelectorTestFixture, ShouldSelectPreferredIfAvailable) {
     stateMachine.onServerDescription(*topologyDescription, s0);
 
     const auto s1 = ServerDescriptionBuilder()
-                        .withAddress("s1")
+                        .withAddress(HostAndPort("s1"))
                         .withType(ServerType::kRSSecondary)
-                        .withRtt(selectionConfig.getLocalThresholdMs())
+                        .withRtt(sdamConfiguration.getLocalThreshold())
                         .withSetName("set")
-                        .withHost("s0")
-                        .withHost("s1")
+                        .withHost(HostAndPort("s0"))
+                        .withHost(HostAndPort("s1"))
                         .withMinWireVersion(WireVersion::SUPPORTS_OP_MSG)
                         .withMaxWireVersion(WireVersion::LATEST_WIRE_VERSION)
                         .withLastWriteDate(d0)
@@ -345,18 +375,18 @@ TEST_F(ServerSelectorTestFixture, ShouldSelectPreferredIfAvailable) {
         ReadPreferenceSetting(ReadPreference::PrimaryPreferred, TagSets::secondarySet);
     auto result1 = selector.selectServer(topologyDescription, primaryPreferredTagSecondary);
     ASSERT(result1 != boost::none);
-    ASSERT_EQ("s0", (*result1)->getAddress());
+    ASSERT_EQ(HostAndPort("s0"), (*result1)->getAddress());
 
     const auto secondaryPreferredWithTag =
         ReadPreferenceSetting(ReadPreference::SecondaryPreferred, TagSets::secondarySet);
     auto result2 = selector.selectServer(topologyDescription, secondaryPreferredWithTag);
     ASSERT(result2 != boost::none);
-    ASSERT_EQ("s1", (*result2)->getAddress());
+    ASSERT_EQ(HostAndPort("s1"), (*result2)->getAddress());
 
     const auto secondaryPreferredNoTag = ReadPreferenceSetting(ReadPreference::SecondaryPreferred);
     auto result3 = selector.selectServer(topologyDescription, secondaryPreferredNoTag);
     ASSERT(result3 != boost::none);
-    ASSERT_EQ("s1", (*result2)->getAddress());
+    ASSERT_EQ(HostAndPort("s1"), (*result2)->getAddress());
 }
 
 TEST_F(ServerSelectorTestFixture, ShouldSelectTaggedSecondaryIfPreferredPrimaryNotAvailable) {
@@ -368,13 +398,13 @@ TEST_F(ServerSelectorTestFixture, ShouldSelectTaggedSecondaryIfPreferredPrimaryN
     const auto d0 = now - Milliseconds(1000);
 
     const auto s0 = ServerDescriptionBuilder()
-                        .withAddress("s0")
+                        .withAddress(HostAndPort("s0"))
                         .withType(ServerType::kRSPrimary)
-                        .withRtt(selectionConfig.getLocalThresholdMs())
+                        .withRtt(sdamConfiguration.getLocalThreshold())
                         .withSetName("set")
-                        .withHost("s0")
-                        .withHost("s1")
-                        .withHost("s2")
+                        .withHost(HostAndPort("s0"))
+                        .withHost(HostAndPort("s1"))
+                        .withHost(HostAndPort("s2"))
                         .withMinWireVersion(WireVersion::SUPPORTS_OP_MSG)
                         .withMaxWireVersion(WireVersion::LATEST_WIRE_VERSION)
                         .withLastWriteDate(d0)
@@ -384,20 +414,20 @@ TEST_F(ServerSelectorTestFixture, ShouldSelectTaggedSecondaryIfPreferredPrimaryN
 
     // old primary unavailable
     const auto s0_failed = ServerDescriptionBuilder()
-                               .withAddress("s0")
+                               .withAddress(HostAndPort("s0"))
                                .withType(ServerType::kUnknown)
                                .withSetName("set")
                                .instance();
     stateMachine.onServerDescription(*topologyDescription, s0_failed);
 
     const auto s1 = ServerDescriptionBuilder()
-                        .withAddress("s1")
+                        .withAddress(HostAndPort("s1"))
                         .withType(ServerType::kRSSecondary)
-                        .withRtt(selectionConfig.getLocalThresholdMs())
+                        .withRtt(sdamConfiguration.getLocalThreshold())
                         .withSetName("set")
-                        .withHost("s0")
-                        .withHost("s1")
-                        .withHost("s2")
+                        .withHost(HostAndPort("s0"))
+                        .withHost(HostAndPort("s1"))
+                        .withHost(HostAndPort("s2"))
                         .withMinWireVersion(WireVersion::SUPPORTS_OP_MSG)
                         .withMaxWireVersion(WireVersion::LATEST_WIRE_VERSION)
                         .withLastWriteDate(d0)
@@ -406,13 +436,13 @@ TEST_F(ServerSelectorTestFixture, ShouldSelectTaggedSecondaryIfPreferredPrimaryN
     stateMachine.onServerDescription(*topologyDescription, s1);
 
     const auto s2 = ServerDescriptionBuilder()
-                        .withAddress("s2")
+                        .withAddress(HostAndPort("s2"))
                         .withType(ServerType::kRSSecondary)
-                        .withRtt(selectionConfig.getLocalThresholdMs())
+                        .withRtt(sdamConfiguration.getLocalThreshold())
                         .withSetName("set")
-                        .withHost("s0")
-                        .withHost("s1")
-                        .withHost("s2")
+                        .withHost(HostAndPort("s0"))
+                        .withHost(HostAndPort("s1"))
+                        .withHost(HostAndPort("s2"))
                         .withMinWireVersion(WireVersion::SUPPORTS_OP_MSG)
                         .withMaxWireVersion(WireVersion::LATEST_WIRE_VERSION)
                         .withLastWriteDate(d0)
@@ -423,7 +453,7 @@ TEST_F(ServerSelectorTestFixture, ShouldSelectTaggedSecondaryIfPreferredPrimaryN
         ReadPreferenceSetting(ReadPreference::PrimaryPreferred, TagSets::secondarySet);
     auto result1 = selector.selectServer(topologyDescription, primaryPreferredTagSecondary);
     ASSERT(result1 != boost::none);
-    ASSERT_EQ("s1", (*result1)->getAddress());
+    ASSERT_EQ(HostAndPort("s1"), (*result1)->getAddress());
 }
 
 TEST_F(ServerSelectorTestFixture, ShouldFilterByTags) {

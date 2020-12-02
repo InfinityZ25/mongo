@@ -31,54 +31,69 @@
 
 #include "mongo/db/exec/requires_collection_stage.h"
 
-#include "mongo/db/catalog/collection_catalog.h"
-
 namespace mongo {
 
-template <typename CollectionT>
-void RequiresCollectionStageBase<CollectionT>::doSaveState() {
+void RequiresCollectionStage::doSaveState() {
     doSaveStateRequiresCollection();
-
-    // A stage may not access storage while in a saved state.
-    _collection = nullptr;
 }
 
-template <typename CollectionT>
-void RequiresCollectionStageBase<CollectionT>::doRestoreState() {
-    invariant(!_collection);
+void RequiresCollectionStage::doRestoreState(const RestoreContext& context) {
+    auto collectionDropped = [this]() {
+        uasserted(ErrorCodes::QueryPlanKilled,
+                  str::stream() << "collection dropped. UUID " << _collectionUUID);
+    };
 
-    // We should be holding a lock associated with the name of the collection prior to yielding,
-    // even if the collection was renamed during yield.
-    dassert(opCtx()->lockState()->isCollectionLockedForMode(_nss, MODE_IS));
+    auto collectionRenamed = [this](const NamespaceString& newNss) {
+        uasserted(ErrorCodes::QueryPlanKilled,
+                  str::stream() << "collection renamed from '" << _nss << "' to '" << newNss
+                                << "'. UUID " << _collectionUUID);
+    };
 
-    const CollectionCatalog& catalog = CollectionCatalog::get(opCtx());
-    auto newNss = catalog.lookupNSSByUUID(opCtx(), _collectionUUID);
+    if (context.type() == RestoreContext::RestoreType::kExternal) {
+        // RequiresCollectionStage requires a collection to be provided in restore. However, it may
+        // be null in case the collection got dropped or renamed.
+        auto collPtr = context.collection();
+        invariant(collPtr);
+        _collection = collPtr;
+
+        // If we restore externally and get a null Collection we need to figure out if this was a
+        // drop or rename. The external lookup could have been done for UUID or namespace.
+        const auto& coll = *collPtr;
+
+        // If collection exists uuid does not match assume lookup was over namespace and treat this
+        // as a drop.
+        if (coll && coll->uuid() != _collectionUUID) {
+            collectionDropped();
+        }
+
+        // If we didn't get a valid collection but can still find the UUID in the catalog then we
+        // treat this as a rename.
+        if (!coll) {
+            auto catalog = CollectionCatalog::get(opCtx());
+            auto newNss = catalog->lookupNSSByUUID(opCtx(), _collectionUUID);
+            if (newNss && *newNss != _nss) {
+                collectionRenamed(*newNss);
+            }
+        }
+    }
+
+    const auto& coll = *_collection;
+
+    if (!coll) {
+        collectionDropped();
+    }
+
+    // TODO SERVER-31695: Allow queries to survive collection rename, rather than throwing here
+    // when a rename has happened during yield.
+    if (const auto& newNss = coll->ns(); newNss != _nss) {
+        collectionRenamed(newNss);
+    }
+
     uassert(ErrorCodes::QueryPlanKilled,
-            str::stream() << "collection dropped. UUID " << _collectionUUID,
-            newNss);
-
-    // TODO SERVER-31695: Allow queries to survive collection rename, rather than throwing here when
-    // a rename has happened during yield.
-    uassert(ErrorCodes::QueryPlanKilled,
-            str::stream() << "collection renamed from '" << _nss << "' to '" << *newNss
-                          << "'. UUID " << _collectionUUID,
-            *newNss == _nss);
-
-    // At this point we know that the collection name has not changed, and therefore we have
-    // restored locks on the correct name. It is now safe to restore the Collection pointer. The
-    // collection must exist, since we already successfully looked up the namespace string by UUID
-    // under the correct lock manager locks.
-    _collection = catalog.lookupCollectionByUUID(opCtx(), _collectionUUID);
-    invariant(_collection);
-
-    uassert(ErrorCodes::QueryPlanKilled,
-            str::stream() << "Database epoch changed due to a database-level event.",
-            getDatabaseEpoch(_collection) == _databaseEpoch);
+            str::stream() << "The catalog was closed and reopened",
+            getCatalogEpoch() == _catalogEpoch);
 
     doRestoreStateRequiresCollection();
 }
-
-template class RequiresCollectionStageBase<const Collection*>;
-template class RequiresCollectionStageBase<Collection*>;
 
 }  // namespace mongo

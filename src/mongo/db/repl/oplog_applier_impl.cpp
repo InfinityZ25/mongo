@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/db/repl/oplog_applier_impl.h"
@@ -43,17 +42,16 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/repl/apply_ops.h"
-#include "mongo/db/repl/insert_group.h"
+#include "mongo/db/repl/oplog_applier_utils.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/transaction_oplog_application.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/stats/timer_stats.h"
-#include "mongo/db/storage/control/storage_control.h"
+#include "mongo/db/storage/control/journal_flusher.h"
 #include "mongo/logv2/log.h"
 #include "mongo/platform/basic.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/log_with_sampling.h"
-#include "third_party/murmurhash3/MurmurHash3.h"
 
 namespace mongo {
 namespace repl {
@@ -74,28 +72,6 @@ ServerStatusMetricField<Counter64> displayOplogApplicationBatchSize("repl.apply.
 // Number and time of each ApplyOps worker pool round
 TimerStats applyBatchStats;
 ServerStatusMetricField<TimerStats> displayOpBatchesApplied("repl.apply.batches", &applyBatchStats);
-
-NamespaceString parseUUIDOrNs(OperationContext* opCtx, const OplogEntry& oplogEntry) {
-    auto optionalUuid = oplogEntry.getUuid();
-    if (!optionalUuid) {
-        return oplogEntry.getNss();
-    }
-
-    const auto& uuid = optionalUuid.get();
-    auto& catalog = CollectionCatalog::get(opCtx);
-    auto nss = catalog.lookupNSSByUUID(opCtx, uuid);
-    uassert(ErrorCodes::NamespaceNotFound,
-            str::stream() << "No namespace with UUID " << uuid.toString(),
-            nss);
-    return *nss;
-}
-
-NamespaceStringOrUUID getNsOrUUID(const NamespaceString& nss, const OplogEntry& op) {
-    if (auto ui = op.getUuid()) {
-        return {nss.db().toString(), ui.get()};
-    }
-    return nss;
-}
 
 /**
  * Used for logging a report of ops that take longer than "slowMS" to apply. This is called
@@ -134,131 +110,6 @@ Status finishAndLogApply(OperationContext* opCtx,
     return finalStatus;
 }
 
-LockMode fixLockModeForSystemDotViewsChanges(const NamespaceString& nss, LockMode mode) {
-    return nss.isSystemDotViews() ? MODE_X : mode;
-}
-
-/**
- * Caches per-collection properties which are relevant for oplog application, so that they don't
- * have to be retrieved repeatedly for each op.
- */
-class CachedCollectionProperties {
-public:
-    struct CollectionProperties {
-        bool isCapped = false;
-        const CollatorInterface* collator = nullptr;
-    };
-
-    CollectionProperties getCollectionProperties(OperationContext* opCtx,
-                                                 const StringMapHashedKey& ns) {
-        auto it = _cache.find(ns);
-        if (it != _cache.end()) {
-            return it->second;
-        }
-
-        auto collProperties = getCollectionPropertiesImpl(opCtx, NamespaceString(ns.key()));
-        _cache[ns] = collProperties;
-        return collProperties;
-    }
-
-private:
-    CollectionProperties getCollectionPropertiesImpl(OperationContext* opCtx,
-                                                     const NamespaceString& nss) {
-        CollectionProperties collProperties;
-
-        auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
-
-        if (!collection) {
-            return collProperties;
-        }
-
-        collProperties.isCapped = collection->isCapped();
-        collProperties.collator = collection->getDefaultCollator();
-        return collProperties;
-    }
-
-    StringMap<CollectionProperties> _cache;
-};
-
-/**
- * Updates a CRUD op's hash and isForCappedCollection field if necessary.
- */
-void processCrudOp(OperationContext* opCtx,
-                   OplogEntry* op,
-                   uint32_t* hash,
-                   StringMapHashedKey* hashedNs,
-                   CachedCollectionProperties* collPropertiesCache) {
-    const bool supportsDocLocking =
-        opCtx->getServiceContext()->getStorageEngine()->supportsDocLocking();
-    auto collProperties = collPropertiesCache->getCollectionProperties(opCtx, *hashedNs);
-
-    // For doc locking engines, include the _id of the document in the hash so we get
-    // parallelism even if all writes are to a single collection.
-    //
-    // For capped collections, this is illegal, since capped collections must preserve
-    // insertion order.
-    if (supportsDocLocking && !collProperties.isCapped) {
-        BSONElement id = op->getIdElement();
-        BSONElementComparator elementHasher(BSONElementComparator::FieldNamesMode::kIgnore,
-                                            collProperties.collator);
-        const size_t idHash = elementHasher.hash(id);
-        MurmurHash3_x86_32(&idHash, sizeof(idHash), *hash, hash);
-    }
-
-    if (op->getOpType() == OpTypeEnum::kInsert && collProperties.isCapped) {
-        // Mark capped collection ops before storing them to ensure we do not attempt to
-        // bulk insert them.
-        op->isForCappedCollection = true;
-    }
-}
-
-/**
- * Adds a single oplog entry to the appropriate writer vector.
- */
-void addToWriterVector(OplogEntry* op,
-                       std::vector<std::vector<const OplogEntry*>>* writerVectors,
-                       uint32_t hash) {
-    const uint32_t numWriters = writerVectors->size();
-    auto& writer = (*writerVectors)[hash % numWriters];
-    if (writer.empty()) {
-        writer.reserve(8);  // Skip a few growth rounds
-    }
-    writer.push_back(op);
-}
-
-/**
- * Adds a set of derivedOps to writerVectors.
- * If `serial` is true, assign all derived operations to the writer vector corresponding to the hash
- * of the first operation in `derivedOps`.
- */
-void addDerivedOps(OperationContext* opCtx,
-                   std::vector<OplogEntry>* derivedOps,
-                   std::vector<std::vector<const OplogEntry*>>* writerVectors,
-                   CachedCollectionProperties* collPropertiesCache,
-                   bool serial) {
-
-    boost::optional<uint32_t>
-        serialWriterId;  // Used to determine which writer vector to assign serial ops.
-
-    for (auto&& op : *derivedOps) {
-        auto hashedNs = StringMapHasher().hashed_key(op.getNss().ns());
-        uint32_t hash = static_cast<uint32_t>(hashedNs.hash());
-        if (!serialWriterId && serial) {
-            serialWriterId.emplace(hash);
-        }
-        if (op.isCrudOpType()) {
-            processCrudOp(opCtx, &op, &hash, &hashedNs, collPropertiesCache);
-        }
-        if (serial) {
-            // Serial derived ops go to the writer vector corresponding to the first op of
-            // derivedOps.
-            addToWriterVector(&op, writerVectors, serialWriterId.get());
-        } else {
-            addToWriterVector(&op, writerVectors, hash);
-        }
-    }
-}
-
 void _addOplogChainOpsToWriterVectors(OperationContext* opCtx,
                                       std::vector<OplogEntry*>* partialTxnList,
                                       std::vector<std::vector<OplogEntry>>* derivedOps,
@@ -273,14 +124,8 @@ void _addOplogChainOpsToWriterVectors(OperationContext* opCtx,
     partialTxnList->clear();
 
     // Transaction entries cannot have different session updates.
-    addDerivedOps(opCtx, &derivedOps->back(), writerVectors, collPropertiesCache, shouldSerialize);
-}
-
-void stableSortByNamespace(std::vector<const OplogEntry*>* oplogEntryPointers) {
-    auto nssComparator = [](const OplogEntry* l, const OplogEntry* r) {
-        return l->getNss() < r->getNss();
-    };
-    std::stable_sort(oplogEntryPointers->begin(), oplogEntryPointers->end(), nssComparator);
+    OplogApplierUtils::addDerivedOps(
+        opCtx, &derivedOps->back(), writerVectors, collPropertiesCache, shouldSerialize);
 }
 
 }  // namespace
@@ -293,17 +138,15 @@ public:
     ApplyBatchFinalizer(ReplicationCoordinator* replCoord) : _replCoord(replCoord) {}
     virtual ~ApplyBatchFinalizer(){};
 
-    virtual void record(const OpTimeAndWallTime& newOpTimeAndWallTime,
-                        ReplicationCoordinator::DataConsistency consistency) {
-        _recordApplied(newOpTimeAndWallTime, consistency);
+    virtual void record(const OpTimeAndWallTime& newOpTimeAndWallTime) {
+        _recordApplied(newOpTimeAndWallTime);
     };
 
 protected:
-    void _recordApplied(const OpTimeAndWallTime& newOpTimeAndWallTime,
-                        ReplicationCoordinator::DataConsistency consistency) {
+    void _recordApplied(const OpTimeAndWallTime& newOpTimeAndWallTime) {
         // We have to use setMyLastAppliedOpTimeAndWallTimeForward since this thread races with
         // ReplicationExternalStateImpl::onTransitionToPrimary.
-        _replCoord->setMyLastAppliedOpTimeAndWallTimeForward(newOpTimeAndWallTime, consistency);
+        _replCoord->setMyLastAppliedOpTimeAndWallTimeForward(newOpTimeAndWallTime);
     }
 
     void _recordDurable(const OpTimeAndWallTime& newOpTimeAndWallTime) {
@@ -324,8 +167,7 @@ public:
           _waiterThread{&ApplyBatchFinalizerForJournal::_run, this} {};
     ~ApplyBatchFinalizerForJournal();
 
-    void record(const OpTimeAndWallTime& newOpTimeAndWallTime,
-                ReplicationCoordinator::DataConsistency consistency) override;
+    void record(const OpTimeAndWallTime& newOpTimeAndWallTime) override;
 
 private:
     /**
@@ -356,9 +198,8 @@ ApplyBatchFinalizerForJournal::~ApplyBatchFinalizerForJournal() {
     _waiterThread.join();
 }
 
-void ApplyBatchFinalizerForJournal::record(const OpTimeAndWallTime& newOpTimeAndWallTime,
-                                           ReplicationCoordinator::DataConsistency consistency) {
-    _recordApplied(newOpTimeAndWallTime, consistency);
+void ApplyBatchFinalizerForJournal::record(const OpTimeAndWallTime& newOpTimeAndWallTime) {
+    _recordApplied(newOpTimeAndWallTime);
 
     stdx::unique_lock<Latch> lock(_mutex);
     _latestOpTimeAndWallTime = newOpTimeAndWallTime;
@@ -386,7 +227,7 @@ void ApplyBatchFinalizerForJournal::_run() {
         }
 
         auto opCtx = cc().makeOperationContext();
-        opCtx->recoveryUnit()->waitUntilDurable(opCtx.get());
+        JournalFlusher::get(opCtx.get())->waitForJournalFlush();
         _recordDurable(latestOpTimeAndWallTime);
     }
 }
@@ -521,16 +362,8 @@ void OplogApplierImpl::_run(OplogBuffer* oplogBuffer) {
         _storageInterface->oplogDiskLocRegister(
             &opCtx, lastOpTimeInBatch.getTimestamp(), orderedCommit);
 
-        // 4. Finalize this batch. We are at a consistent optime if our current optime is >= the
-        // current 'minValid' optime. Note that recording the lastOpTime in the finalizer includes
-        // advancing the global timestamp to at least its timestamp.
-        const auto minValid = _consistencyMarkers->getMinValid(&opCtx);
-        auto consistency = (lastOpTimeInBatch >= minValid)
-            ? ReplicationCoordinator::DataConsistency::Consistent
-            : ReplicationCoordinator::DataConsistency::Inconsistent;
-
-        // The finalizer advances the global timestamp to lastOpTimeInBatch.
-        finalizer->record({lastOpTimeInBatch, lastWallTimeInBatch}, consistency);
+        // 4. Finalize this batch. The finalizer advances the global timestamp to lastOpTimeInBatch.
+        finalizer->record({lastOpTimeInBatch, lastWallTimeInBatch});
     }
 }
 
@@ -581,13 +414,9 @@ void scheduleWritesToOplog(OperationContext* opCtx,
     const bool enoughToMultiThread =
         ops.size() >= kMinOplogEntriesPerThread * writerPool->getStats().numThreads;
 
-    // Only doc-locking engines support parallel writes to the oplog because they are required to
-    // ensure that oplog entries are ordered correctly, even if inserted out-of-order. Additionally,
-    // there would be no way to take advantage of multiple threads if a storage engine doesn't
-    // support document locking.
-    if (!enoughToMultiThread ||
-        !opCtx->getServiceContext()->getStorageEngine()->supportsDocLocking()) {
-
+    // Storage engines support parallel writes to the oplog because they are required to ensure that
+    // oplog entries are ordered correctly, even if inserted out-of-order.
+    if (!enoughToMultiThread) {
         writerPool->schedule(makeOplogWriterForRange(0, ops.size()));
         return;
     }
@@ -732,7 +561,7 @@ StatusWith<OpTime> OplogApplierImpl::_applyOplogBatch(OperationContext* opCtx,
     // new writes with timestamps associated with those oplog entries will show up in the future. We
     // want to flush the journal as soon as possible in order to free ops waiting with 'j' write
     // concern.
-    StorageControl::triggerJournalFlush(opCtx->getServiceContext());
+    JournalFlusher::get(opCtx)->triggerJournalFlush();
 
     // Use this fail point to hold the PBWM lock and prevent the batch from completing.
     if (MONGO_unlikely(pauseBatchApplicationBeforeCompletion.shouldFail())) {
@@ -760,8 +589,12 @@ StatusWith<OpTime> OplogApplierImpl::_applyOplogBatch(OperationContext* opCtx,
             // the first timestamp in the batch since we do not have enough information to find out
             // the timestamp of the first write that set the given multikey path.
             fassert(50686,
-                    _storageInterface->setIndexIsMultikey(
-                        opCtx, info.nss, info.indexName, info.multikeyPaths, firstTimeInBatch));
+                    _storageInterface->setIndexIsMultikey(opCtx,
+                                                          info.nss,
+                                                          info.indexName,
+                                                          info.multikeyMetadataKeys,
+                                                          info.multikeyPaths,
+                                                          firstTimeInBatch));
         }
     }
 
@@ -798,22 +631,16 @@ void OplogApplierImpl::_deriveOpsAndFillWriterVectors(
             continue;
         }
 
-        auto hashedNs = StringMapHasher().hashed_key(op.getNss().ns());
-        // Reduce the hash from 64bit down to 32bit, just to allow combinations with murmur3 later
-        // on. Bit depth not important, we end up just doing integer modulo with this in the end.
-        // The hash function should provide entropy in the lower bits as it's used in hash tables.
-        uint32_t hash = static_cast<uint32_t>(hashedNs.hash());
-
         // We need to track all types of ops, including type 'n' (these are generated from chunk
         // migrations).
         if (sessionUpdateTracker) {
             if (auto newOplogWrites = sessionUpdateTracker->updateSession(op)) {
                 derivedOps->emplace_back(std::move(*newOplogWrites));
-                addDerivedOps(opCtx,
-                              &derivedOps->back(),
-                              writerVectors,
-                              &collPropertiesCache,
-                              false /*serial*/);
+                OplogApplierUtils::addDerivedOps(opCtx,
+                                                 &derivedOps->back(),
+                                                 writerVectors,
+                                                 &collPropertiesCache,
+                                                 false /*serial*/);
             }
         }
 
@@ -838,8 +665,6 @@ void OplogApplierImpl::_deriveOpsAndFillWriterVectors(
             partialTxnList.clear();
         }
 
-        if (op.isCrudOpType())
-            processCrudOp(opCtx, &op, &hash, &hashedNs, &collPropertiesCache);
         // Extract applyOps operations and fill writers with extracted operations using this
         // function.
         if (op.isTerminalApplyOps()) {
@@ -860,11 +685,11 @@ void OplogApplierImpl::_deriveOpsAndFillWriterVectors(
                 derivedOps->emplace_back(ApplyOps::extractOperations(op));
 
                 // Nested entries cannot have different session updates.
-                addDerivedOps(opCtx,
-                              &derivedOps->back(),
-                              writerVectors,
-                              &collPropertiesCache,
-                              false /*serial*/);
+                OplogApplierUtils::addDerivedOps(opCtx,
+                                                 &derivedOps->back(),
+                                                 writerVectors,
+                                                 &collPropertiesCache,
+                                                 false /*serial*/);
             }
             continue;
         }
@@ -880,7 +705,7 @@ void OplogApplierImpl::_deriveOpsAndFillWriterVectors(
             continue;
         }
 
-        addToWriterVector(&op, writerVectors, hash);
+        OplogApplierUtils::addToWriterVector(opCtx, &op, writerVectors, &collPropertiesCache);
     }
 }
 
@@ -907,13 +732,8 @@ Status applyOplogEntryOrGroupedInserts(OperationContext* opCtx,
     // Guarantees that applyOplogEntryOrGroupedInserts' context matches that of its calling
     // function, applyOplogBatchPerWorker.
     invariant(!opCtx->writesAreReplicated());
-    invariant(documentValidationDisabled(opCtx));
 
-    auto op = entryOrGroupedInserts.getOp();
     // Count each log op application as a separate operation, for reporting purposes
-    CurOp individualOp(opCtx);
-
-    const NamespaceString nss(op.getNss());
 
     auto incrementOpsAppliedStats = [] { opsAppliedStats.increment(1); };
 
@@ -928,10 +748,16 @@ Status applyOplogEntryOrGroupedInserts(OperationContext* opCtx,
         hangAfterRecordingOpApplicationStartTime.pauseWhileSet();
     }
 
-    auto opType = op.getOpType();
+    auto status = OplogApplierUtils::applyOplogEntryOrGroupedInsertsCommon(opCtx,
+                                                                           entryOrGroupedInserts,
+                                                                           oplogApplicationMode,
+                                                                           incrementOpsAppliedStats,
+                                                                           &replOpCounters);
 
-    if (opType == OpTypeEnum::kNoop) {
-        incrementOpsAppliedStats();
+    auto op = entryOrGroupedInserts.getOp();
+    if (op.getOpType() == OpTypeEnum::kNoop) {
+        // No-ops should never fail application, since there's nothing to do.
+        invariant(status.isOK());
 
         auto opObj = op.getObject();
         if (opObj.hasField(ReplicationCoordinator::newPrimaryMsgField) &&
@@ -942,87 +768,24 @@ Status applyOplogEntryOrGroupedInserts(OperationContext* opCtx,
                                                                       applyStartTime);
         }
 
-        return Status::OK();
-    } else if (OplogEntry::isCrudOpType(opType)) {
-        auto status =
-            writeConflictRetry(opCtx, "applyOplogEntryOrGroupedInserts_CRUD", nss.ns(), [&] {
-                // Need to throw instead of returning a status for it to be properly ignored.
-                try {
-                    AutoGetCollection autoColl(opCtx,
-                                               getNsOrUUID(nss, op),
-                                               fixLockModeForSystemDotViewsChanges(nss, MODE_IX));
-                    auto db = autoColl.getDb();
-                    uassert(ErrorCodes::NamespaceNotFound,
-                            str::stream() << "missing database (" << nss.db() << ")",
-                            db);
-                    OldClientContext ctx(opCtx, autoColl.getNss().ns(), db);
-
-                    // We convert updates to upserts in secondary mode when the
-                    // oplogApplicationEnforcesSteadyStateConstraints parameter is false, to avoid
-                    // failing on the constraint that updates in steady state mode always update
-                    // an existing document.
-                    //
-                    // In initial sync and recovery modes we always ignore errors about missing
-                    // documents on update, so there is no reason to convert the updates to upsert.
-
-                    bool shouldAlwaysUpsert = !oplogApplicationEnforcesSteadyStateConstraints &&
-                        oplogApplicationMode == OplogApplication::Mode::kSecondary;
-                    Status status = applyOperation_inlock(opCtx,
-                                                          db,
-                                                          entryOrGroupedInserts,
-                                                          shouldAlwaysUpsert,
-                                                          oplogApplicationMode,
-                                                          incrementOpsAppliedStats);
-                    if (!status.isOK() && status.code() == ErrorCodes::WriteConflict) {
-                        throw WriteConflictException();
-                    }
-                    return status;
-                } catch (ExceptionFor<ErrorCodes::NamespaceNotFound>& ex) {
-                    // This can happen in initial sync or recovery modes (when a delete of the
-                    // namespace appears later in the oplog), but we will ignore it in the caller.
-                    //
-                    // When we're not enforcing steady-state constraints, the error is ignored
-                    // only for deletes, on the grounds that deleting from a non-existent collection
-                    // is a no-op.
-                    if (opType == OpTypeEnum::kDelete &&
-                        !oplogApplicationEnforcesSteadyStateConstraints &&
-                        oplogApplicationMode == OplogApplication::Mode::kSecondary) {
-                        replOpCounters.gotDeleteFromMissingNamespace();
-                        return Status::OK();
-                    }
-
-                    ex.addContext(str::stream() << "Failed to apply operation: "
-                                                << redact(entryOrGroupedInserts.toBSON()));
-                    throw;
-                }
-            });
-        return finishAndLogApply(opCtx, clockSource, status, applyStartTime, entryOrGroupedInserts);
-    } else if (opType == OpTypeEnum::kCommand) {
-        auto status =
-            writeConflictRetry(opCtx, "applyOplogEntryOrGroupedInserts_command", nss.ns(), [&] {
-                // A special case apply for commands to avoid implicit database creation.
-                Status status = applyCommand_inlock(opCtx, op, oplogApplicationMode);
-                incrementOpsAppliedStats();
-                return status;
-            });
+        return status;
+    } else {
         return finishAndLogApply(opCtx, clockSource, status, applyStartTime, entryOrGroupedInserts);
     }
-
-    MONGO_UNREACHABLE;
 }
 
 Status OplogApplierImpl::applyOplogBatchPerWorker(OperationContext* opCtx,
                                                   std::vector<const OplogEntry*>* ops,
                                                   WorkerMultikeyPathInfo* workerMultikeyPathInfo) {
     UnreplicatedWritesBlock uwb(opCtx);
-    DisableDocumentValidation validationDisabler(opCtx);
     // Since we swap the locker in stash / unstash transaction resources,
     // ShouldNotConflictWithSecondaryBatchApplicationBlock will touch the locker that has been
     // destroyed by unstash in its destructor. Thus we set the flag explicitly.
     opCtx->lockState()->setShouldConflictWithSecondaryBatchApplication(false);
 
-    // Explicitly start future read transactions without a timestamp.
-    opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
+    // Ensure future transactions read without a timestamp.
+    invariant(RecoveryUnit::ReadSource::kNoTimestamp ==
+              opCtx->recoveryUnit()->getTimestampReadSource());
 
     // When querying indexes, we return the record matching the key if it exists, or an adjacent
     // document. This means that it is possible for us to hit a prepare conflict if we query for an
@@ -1032,64 +795,17 @@ Status OplogApplierImpl::applyOplogBatchPerWorker(OperationContext* opCtx,
     opCtx->recoveryUnit()->setPrepareConflictBehavior(
         PrepareConflictBehavior::kIgnoreConflictsAllowWrites);
 
-    stableSortByNamespace(ops);
-
-    const auto oplogApplicationMode = getOptions().mode;
-
-    InsertGroup insertGroup(ops, opCtx, oplogApplicationMode);
-
     {  // Ensure that the MultikeyPathTracker stops tracking paths.
         ON_BLOCK_EXIT([opCtx] { MultikeyPathTracker::get(opCtx).stopTrackingMultikeyPathInfo(); });
         MultikeyPathTracker::get(opCtx).startTrackingMultikeyPathInfo();
-
-        for (auto it = ops->cbegin(); it != ops->cend(); ++it) {
-            const OplogEntry& entry = **it;
-
-            // If we are successful in grouping and applying inserts, advance the current iterator
-            // past the end of the inserted group of entries.
-            auto groupResult = insertGroup.groupAndApplyInserts(it);
-            if (groupResult.isOK()) {
-                it = groupResult.getValue();
-                continue;
-            }
-
-            // If we didn't create a group, try to apply the op individually.
-            try {
-                const Status status =
-                    applyOplogEntryOrGroupedInserts(opCtx, &entry, oplogApplicationMode);
-
-                if (!status.isOK()) {
-                    // Tried to apply an update operation but the document is missing, there must be
-                    // a delete operation for the document later in the oplog.
-                    if (status == ErrorCodes::UpdateOperationFailed &&
-                        (oplogApplicationMode == OplogApplication::Mode::kInitialSync ||
-                         oplogApplicationMode == OplogApplication::Mode::kRecovering)) {
-                        continue;
-                    }
-
-                    LOGV2_FATAL_CONTINUE(21237,
-                                         "Error applying operation ({oplogEntry}): {error}",
-                                         "Error applying operation",
-                                         "oplogEntry"_attr = redact(entry.toBSON()),
-                                         "error"_attr = causedBy(redact(status)));
-                    return status;
-                }
-            } catch (const DBException& e) {
-                // SERVER-24927 If we have a NamespaceNotFound exception, then this document will be
-                // dropped before initial sync or recovery ends anyways and we should ignore it.
-                if (e.code() == ErrorCodes::NamespaceNotFound && entry.isCrudOpType() &&
-                    getOptions().allowNamespaceNotFoundErrorsOnCrudOps) {
-                    continue;
-                }
-
-                LOGV2_FATAL_CONTINUE(21238,
-                                     "writer worker caught exception: {error} on: {oplogEntry}",
-                                     "Writer worker caught exception",
-                                     "error"_attr = redact(e),
-                                     "oplogEntry"_attr = redact(entry.toBSON()));
-                return e.toStatus();
-            }
-        }
+        auto status = OplogApplierUtils::applyOplogBatchCommon(
+            opCtx,
+            ops,
+            getOptions().mode,
+            getOptions().allowNamespaceNotFoundErrorsOnCrudOps,
+            &applyOplogEntryOrGroupedInserts);
+        if (!status.isOK())
+            return status;
     }
 
     invariant(!MultikeyPathTracker::get(opCtx).isTrackingMultikeyPathInfo());

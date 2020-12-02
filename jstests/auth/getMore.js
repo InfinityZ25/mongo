@@ -3,14 +3,14 @@
 (function() {
 "use strict";
 
-// TODO SERVER-35447: Multiple users cannot be authenticated on one connection within a session.
+// Multiple users cannot be authenticated on one connection within a session.
 TestData.disableImplicitSessions = true;
 
 function runTest(conn) {
     let adminDB = conn.getDB("admin");
-    let isMaster = adminDB.runCommand("ismaster");
-    assert.commandWorked(isMaster);
-    const isMongos = (isMaster.msg === "isdbgrid");
+    let hello = adminDB.runCommand("hello");
+    assert.commandWorked(hello);
+    const isMongos = (hello.msg === "isdbgrid");
 
     // Create the admin user.
     assert.commandWorked(adminDB.runCommand({createUser: "admin", pwd: "admin", roles: ["root"]}));

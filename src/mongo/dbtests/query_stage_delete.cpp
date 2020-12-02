@@ -81,7 +81,7 @@ public:
         _client.remove(nss.ns(), obj);
     }
 
-    void getRecordIds(Collection* collection,
+    void getRecordIds(const CollectionPtr& collection,
                       CollectionScanParams::Direction direction,
                       vector<RecordId>* out) {
         WorkingSet ws;
@@ -133,7 +133,7 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
 
-        Collection* coll = ctx.getCollection();
+        const CollectionPtr& coll = ctx.getCollection();
         ASSERT(coll);
 
         // Get the RecordIds that would be returned by an in-order scan.
@@ -172,7 +172,7 @@ public:
         BSONObj targetDoc = coll->docFor(&_opCtx, recordIds[targetDocIndex]).value();
         ASSERT(!targetDoc.isEmpty());
         remove(targetDoc);
-        static_cast<PlanStage*>(&deleteStage)->restoreState();
+        static_cast<PlanStage*>(&deleteStage)->restoreState(&coll);
 
         // Remove the rest.
         while (!deleteStage.isEOF()) {
@@ -194,7 +194,7 @@ public:
     void run() {
         // Various variables we'll need.
         dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
-        Collection* coll = ctx.getCollection();
+        const CollectionPtr& coll = ctx.getCollection();
         ASSERT(coll);
         const int targetDocIndex = 0;
         const BSONObj query = BSON("foo" << BSON("$gte" << targetDocIndex));

@@ -33,6 +33,12 @@
 
 namespace mongo {
 
+namespace repl {
+
+class ReplOperation;
+
+}
+
 class OpObserverImpl : public OpObserver {
     OpObserverImpl(const OpObserverImpl&) = delete;
     OpObserverImpl& operator=(const OpObserverImpl&) = delete;
@@ -40,6 +46,22 @@ class OpObserverImpl : public OpObserver {
 public:
     OpObserverImpl() = default;
     virtual ~OpObserverImpl() = default;
+
+    class DocumentKey {
+    public:
+        DocumentKey(BSONObj id, boost::optional<BSONObj> _shardKey)
+            : _id(id.getOwned()), _shardKey(std::move(_shardKey)) {
+            invariant(!id.isEmpty());
+        }
+
+        BSONObj getId() const;
+
+        BSONObj getShardKeyAndId() const;
+
+    private:
+        BSONObj _id;
+        boost::optional<BSONObj> _shardKey;
+    };
 
     void onCreateIndex(OperationContext* opCtx,
                        const NamespaceString& nss,
@@ -90,9 +112,13 @@ public:
                              const NamespaceString& nss,
                              const boost::optional<UUID> uuid,
                              const BSONObj& msgObj,
-                             const boost::optional<BSONObj> o2MsgObj) final;
+                             const boost::optional<BSONObj> o2MsgObj,
+                             const boost::optional<repl::OpTime> preImageOpTime,
+                             const boost::optional<repl::OpTime> postImageOpTime,
+                             const boost::optional<repl::OpTime> prevWriteOpTimeInTransaction,
+                             const boost::optional<OplogSlot> slot) final;
     void onCreateCollection(OperationContext* opCtx,
-                            Collection* coll,
+                            const CollectionPtr& coll,
                             const NamespaceString& collectionName,
                             const CollectionOptions& options,
                             const BSONObj& idIndex,
@@ -134,6 +160,14 @@ public:
                             OptionalCollectionUUID dropTargetUUID,
                             std::uint64_t numRecords,
                             bool stayTemp) final;
+    void onImportCollection(OperationContext* opCtx,
+                            const UUID& importUUID,
+                            const NamespaceString& nss,
+                            long long numRecords,
+                            long long dataSize,
+                            const BSONObj& catalogEntry,
+                            const BSONObj& storageMetadata,
+                            bool isDryRun) final;
     void onApplyOps(OperationContext* opCtx,
                     const std::string& dbName,
                     const BSONObj& applyOpCmd) final;
@@ -155,11 +189,16 @@ public:
     void onTransactionAbort(OperationContext* opCtx,
                             boost::optional<OplogSlot> abortOplogEntryOpTime) final;
     void onReplicationRollback(OperationContext* opCtx, const RollbackObserverInfo& rbInfo) final;
+    void onMajorityCommitPointUpdate(ServiceContext* service,
+                                     const repl::OpTime& newCommitPoint) final {}
 
-    // Contains the fields of the document that are in the collection's shard key, and "_id".
-    static BSONObj getDocumentKey(OperationContext* opCtx,
-                                  NamespaceString const& nss,
-                                  BSONObj const& doc);
+    /**
+     * Returns a DocumentKey constructed from the shard key fields, if the collection is sharded,
+     * and the _id field, of the given document.
+     */
+    static DocumentKey getDocumentKey(OperationContext* opCtx,
+                                      NamespaceString const& nss,
+                                      BSONObj const& doc);
 
 private:
     virtual void shardObserveAboutToDelete(OperationContext* opCtx,
@@ -188,6 +227,14 @@ private:
         OperationContext* opCtx,
         const std::vector<repl::ReplOperation>& stmts,
         const repl::OpTime& prepareOrCommitOptime) {}
+
+    virtual void shardAnnotateOplogEntry(OperationContext* opCtx,
+                                         const NamespaceString nss,
+                                         const BSONObj& doc,
+                                         repl::DurableReplOperation& op) {}
 };
+
+extern const OperationContext::Decoration<boost::optional<OpObserverImpl::DocumentKey>>
+    documentKeyDecoration;
 
 }  // namespace mongo

@@ -1,4 +1,8 @@
-// @tags: [requires_non_retryable_writes, assumes_balancer_off, requires_fcv_44]
+// @tags: [
+//   assumes_balancer_off,
+//   requires_non_retryable_writes,
+//   sbe_incompatible,
+// ]
 (function() {
 "use strict";
 
@@ -37,7 +41,7 @@ assert.eq(1, explain.executionStats.totalKeysExamined);
 assert(isIdhack(db, explain.queryPlanner.winningPlan));
 
 // ID hack cannot be used with hint().
-t.ensureIndex({_id: 1, a: 1});
+t.createIndex({_id: 1, a: 1});
 explain = t.find(query).hint({_id: 1, a: 1}).explain();
 assert(!isIdhack(db, explain.queryPlanner.winningPlan));
 

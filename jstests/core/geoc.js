@@ -1,4 +1,7 @@
-// @tags: [requires_getmore]
+// @tags: [
+//   requires_getmore,
+//   sbe_incompatible,
+// ]
 
 t = db.geoc;
 t.drop();
@@ -12,7 +15,7 @@ for (var i = 0; i < N; i++)
 for (var i = 0; i < N; i++)
     t.insert({loc: [-100 + Math.random(), -100 + Math.random()], z: 2});
 
-t.ensureIndex({loc: '2d'});
+t.createIndex({loc: '2d'});
 
 function test(z, l) {
     assert.lt(

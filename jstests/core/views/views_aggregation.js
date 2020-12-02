@@ -1,16 +1,14 @@
 /**
  * Tests aggregation on views for proper pipeline concatenation and semantics.
  *
- * The conditions under which sorts are pushed down were changed between 4.2 and 4.4. This test
- * expects the 4.4 version output of explain().
- * @tags: [requires_find_command,
- *         does_not_support_stepdowns,
- *         requires_getmore,
- *         requires_non_retryable_commands,
- *         # Requires FCV 4.4 because the test checks explain() output, and in 4.4 the conditions
- *         # under which sorts are pushed down were changed. Also uses $unionWith.
- *         requires_fcv_44,
- *         uses_$out]
+ * @tags: [
+ *   does_not_support_stepdowns,
+ *   requires_find_command,
+ *   requires_getmore,
+ *   requires_non_retryable_commands,
+ *   sbe_incompatible,
+ *   uses_$out,
+ * ]
  */
 (function() {
 "use strict";
@@ -76,7 +74,7 @@ assert.commandWorked(viewsDB.runCommand({
     // Aggregations work on views that sort.
     const doOrderedSort = true;
     assertAggResultEq("popSortedView", [], allDocuments.sort(byPopulation), doOrderedSort);
-    assertAggResultEq("popSortedView", [{$limit: 1}, {$project: {_id: 1}}], [{_id: "Palo Alto"}]);
+    assertAggResultEq("popSortedView", [{$limit: 1}, {$project: {_id: 1}}], [{_id: "Newark"}]);
 })();
 
 (function testAggStagesWritingToViews() {

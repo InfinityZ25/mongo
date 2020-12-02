@@ -37,15 +37,95 @@
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/lru_cache.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 
 /**
- * Extension over 'LRUCache', which provides thread-safety, introspection and most importantly the
- * ability to mark entries as invalid to indicate to potential callers that they should not be used
- * anymore.
+ * Type indicating that the specific cache instance does not support causal consistency. To be used
+ * as the default 'Time' parameter to the 'InvalidatingLRUCache' template, indicating that the cache
+ * is not causally consistent.
  */
-template <typename Key, typename Value>
+struct CacheNotCausallyConsistent {
+    bool operator==(const CacheNotCausallyConsistent&) const {
+        return true;
+    }
+    bool operator!=(const CacheNotCausallyConsistent&) const {
+        return false;
+    }
+    bool operator>(const CacheNotCausallyConsistent&) const {
+        return false;
+    }
+    bool operator>=(const CacheNotCausallyConsistent&) const {
+        return true;
+    }
+    bool operator<(const CacheNotCausallyConsistent&) const {
+        return false;
+    }
+    bool operator<=(const CacheNotCausallyConsistent&) const {
+        return true;
+    }
+};
+
+/**
+ * Helper for determining if a given type is CacheNotCausallyConsistent or not.
+ */
+template <typename T>
+struct isCausallyConsistentImpl : std::true_type {};
+
+template <>
+struct isCausallyConsistentImpl<CacheNotCausallyConsistent> : std::false_type {};
+
+template <class T>
+inline constexpr bool isCausallyConsistent = isCausallyConsistentImpl<T>::value;
+
+/**
+ * Specifies the desired causal consistency for calls to 'get' (and 'acquire', respectively in the
+ * ReadThroughCache, which is its main consumer).
+ */
+enum class CacheCausalConsistency {
+    // Provides the fastest acquire semantics, where if the cache already contains a
+    // (non-invalidated) value cached, it will be immediately returned. Otherwise, the 'acquire'
+    // call will block.
+    kLatestCached,
+
+    // Provides a causally-consistent semantics with respect to a previous call to
+    // 'advanceTimeInStore', where if the cache's (non-invalidated) value has time == timeInStore,
+    // the value will be immediately returned. Otherwise, the 'acquire' call will block.
+    kLatestKnown,
+};
+
+template <typename Key>
+struct DefaultKeyHasher : DefaultHasher<Key> {};
+
+template <typename Key>
+struct LruKeyTraits {
+    using hasher = DefaultKeyHasher<Key>;
+    using comparator = std::equal_to<Key>;
+};
+template <>
+struct LruKeyTraits<std::string> {
+    using hasher = StringMapHasher;
+    using comparator = std::equal_to<>;
+};
+
+template <typename Key>
+using LruKeyHasher = typename LruKeyTraits<Key>::hasher;
+template <typename Key>
+using LruKeyComparator = typename LruKeyTraits<Key>::comparator;
+
+template <typename Key>
+struct IsTrustedHasher<LruKeyHasher<Key>, Key> : std::true_type {};
+
+/**
+ * Extension built on top of 'LRUCache', which provides thread-safety, introspection and most
+ * importantly the ability to invalidate each entry and/or associate a logical timestamp in order to
+ * indicate to potential callers that the entry should not be used anymore.
+ *
+ * The type for 'Time' must support 'operator <' and its default constructor 'Time()' must provide
+ * the lowest possible value for the time.
+ */
+template <typename Key, typename Value, typename Time = CacheNotCausallyConsistent>
 class InvalidatingLRUCache {
     /**
      * Data structure representing the values stored in the cache.
@@ -55,35 +135,90 @@ class InvalidatingLRUCache {
          * The 'owningCache' and 'key' values can be nullptr/boost::none in order to support the
          * detached mode of ValueHandle below.
          */
-        StoredValue(InvalidatingLRUCache* in_owningCache,
-                    boost::optional<Key> in_key,
-                    Value&& in_value)
-            : owningCache(in_owningCache), key(in_key), value(std::move(in_value)) {}
-
-        ~StoredValue() {
-            if (owningCache) {
-                stdx::lock_guard<Latch> lg(owningCache->_mutex);
-                owningCache->_evictedCheckedOutValues.erase(*key);
-            }
+        StoredValue(InvalidatingLRUCache* owningCache,
+                    uint64_t epoch,
+                    boost::optional<Key>&& key,
+                    Value&& value,
+                    const Time& time,
+                    const Time& timeInStore)
+            : owningCache(owningCache),
+              epoch(epoch),
+              key(std::move(key)),
+              value(std::move(value)),
+              time(time),
+              timeInStore(timeInStore),
+              isValid(time == timeInStore) {
+            invariant(time <= timeInStore);
         }
 
+        ~StoredValue() {
+            if (!owningCache)
+                return;
+
+            stdx::unique_lock<Latch> ul(owningCache->_mutex);
+            auto& evictedCheckedOutValues = owningCache->_evictedCheckedOutValues;
+            auto it = evictedCheckedOutValues.find(*key);
+
+            // The lookup above can encounter the following cases:
+            //
+            // 1) The 'key' is not on the evictedCheckedOutValues map, because a second value for it
+            // was inserted, which was also evicted and all its handles expired (so it got removed)
+            if (it == evictedCheckedOutValues.end())
+                return;
+            auto storedValue = it->second.lock();
+            // 2) There are no more references to 'key', but it is stil on the map, which means
+            // either we are running its destrutor, or some other thread is running the destructor
+            // of a different epoch. In either case it is fine to remove the 'it' because we are
+            // under a mutex.
+            if (!storedValue) {
+                evictedCheckedOutValues.erase(it);
+                return;
+            }
+            ul.unlock();
+            // 3) The value for 'key' is for a different epoch, in which case we must dereference
+            // the '.lock()'ed storedValue outside of the mutex in order to avoid reentrancy while
+            // holding a mutex.
+            invariant(storedValue->epoch != epoch);
+        }
+
+        // Copy and move constructors need to be deleted in order to avoid having to make the
+        // destructor to account for the object having been moved
+        StoredValue(StoredValue&) = delete;
+        StoredValue& operator=(StoredValue&) = delete;
+        StoredValue(StoredValue&&) = delete;
+        StoredValue& operator=(StoredValue&&) = delete;
+
         // The cache which stores this key/value pair
-        InvalidatingLRUCache* owningCache;
+        InvalidatingLRUCache* const owningCache;
+
+        // Identity associated with this value. See the destructor for its usage.
+        const uint64_t epoch;
 
         // The key/value pair. See the comments on the constructor about why the key is optional.
-        boost::optional<Key> key;
+        const boost::optional<Key> key;
         Value value;
 
-        // Initially set to true to indicate that the entry is valid and can be read without
-        // synchronisation. Transitions to false only once, under `_mutex` in order to mark the
-        // entry as invalid.
-        AtomicWord<bool> isValid{true};
+        // Timestamp associated with the current 'value'. The semantics of the time is entirely up
+        // to the user of the cache, but it must be monotonically increasing for the same key.
+        const Time time;
+
+        // Timestamp which the store has indicated as available for 'key' (through a call to
+        // 'advanceTimeInStore'). Starts as equal to 'time' and always moves forward, under
+        // '_mutex'.
+        Time timeInStore;
+
+        // Can be read without synchronisation. Transitions to false only once, under `_mutex` in
+        // order to mark the entry as invalid either as a result of 'invalidate' or
+        // 'advanceTimeInStore'.
+        AtomicWord<bool> isValid;
     };
-    using Cache = LRUCache<Key, std::shared_ptr<StoredValue>>;
+
+    using Cache =
+        LRUCache<Key, std::shared_ptr<StoredValue>, LruKeyHasher<Key>, LruKeyComparator<Key>>;
 
 public:
-    using key_type = typename Cache::key_type;
-    using mapped_type = typename Cache::mapped_type;
+    template <typename T>
+    static constexpr bool IsComparable = Cache::template IsComparable<T>;
 
     /**
      * The 'cacheSize' parameter specifies the maximum size of the cache before the least recently
@@ -101,11 +236,16 @@ public:
      */
     class ValueHandle {
     public:
-        // The two constructors below are present in order to offset the fact that the cache doesn't
-        // support pinning items. Their only usage must be in the authorization mananager for the
-        // internal authentication user.
+        // The three constructors below are present in order to offset the fact that the cache
+        // doesn't support pinning items. Their only usage must be in the authorization mananager
+        // for the internal authentication user.
         explicit ValueHandle(Value&& value)
-            : _value(std::make_shared<StoredValue>(nullptr, boost::none, std::move(value))) {}
+            : _value(std::make_shared<StoredValue>(
+                  nullptr, 0, boost::none, std::move(value), Time(), Time())) {}
+
+        explicit ValueHandle(Value&& value, const Time& t)
+            : _value(
+                  std::make_shared<StoredValue>(nullptr, 0, boost::none, std::move(value), t, t)) {}
 
         ValueHandle() = default;
 
@@ -114,7 +254,13 @@ public:
         }
 
         bool isValid() const {
+            invariant(bool(*this));
             return _value->isValid.loadRelaxed();
+        }
+
+        const Time& getTime() const {
+            invariant(bool(*this));
+            return _value->time;
         }
 
         Value* get() {
@@ -154,12 +300,29 @@ public:
     /**
      * Inserts or updates a key with a new value. If 'key' was checked-out at the time this method
      * was called, it will become invalidated.
+     *
+     * The 'time' parameter is mandatory for causally-consistent caches, but not needed otherwise
+     * (since the time never changes).
      */
     void insertOrAssign(const Key& key, Value&& value) {
+        MONGO_STATIC_ASSERT_MSG(
+            !isCausallyConsistent<Time>,
+            "Time must be passed to insertOrAssign on causally consistent caches");
+        insertOrAssign(key, std::move(value), Time());
+    }
+
+    void insertOrAssign(const Key& key, Value&& value, const Time& time) {
         LockGuardWithPostUnlockDestructor guard(_mutex);
-        _invalidate(&guard, key, _cache.find(key));
-        if (auto evicted = _cache.add(
-                key, std::make_shared<StoredValue>(this, key, std::forward<Value>(value)))) {
+        Time currentTime, currentTimeInStore;
+        _invalidate(&guard, key, _cache.find(key), &currentTime, &currentTimeInStore);
+        if (auto evicted =
+                _cache.add(key,
+                           std::make_shared<StoredValue>(this,
+                                                         ++_epoch,
+                                                         key,
+                                                         std::forward<Value>(value),
+                                                         time,
+                                                         std::max(time, currentTimeInStore)))) {
             const auto& evictedKey = evicted->first;
             auto& evictedValue = evicted->second;
 
@@ -187,12 +350,29 @@ public:
      * For caches of size zero, this method will not cache the passed-in value, but it will be
      * returned and the `get` method will continue returning it until all returned handles are
      * destroyed.
+     *
+     * The 'time' parameter is mandatory for causally-consistent caches, but not needed otherwise
+     * (since the time never changes).
      */
     ValueHandle insertOrAssignAndGet(const Key& key, Value&& value) {
+        MONGO_STATIC_ASSERT_MSG(
+            !isCausallyConsistent<Time>,
+            "Time must be passed to insertOrAssignAndGet on causally consistent caches");
+        return insertOrAssignAndGet(key, std::move(value), Time());
+    }
+
+    ValueHandle insertOrAssignAndGet(const Key& key, Value&& value, const Time& time) {
         LockGuardWithPostUnlockDestructor guard(_mutex);
-        _invalidate(&guard, key, _cache.find(key));
-        if (auto evicted = _cache.add(
-                key, std::make_shared<StoredValue>(this, key, std::forward<Value>(value)))) {
+        Time currentTime, currentTimeInStore;
+        _invalidate(&guard, key, _cache.find(key), &currentTime, &currentTimeInStore);
+        if (auto evicted =
+                _cache.add(key,
+                           std::make_shared<StoredValue>(this,
+                                                         ++_epoch,
+                                                         key,
+                                                         std::forward<Value>(value),
+                                                         time,
+                                                         std::max(time, currentTimeInStore)))) {
             const auto& evictedKey = evicted->first;
             auto& evictedValue = evicted->second;
 
@@ -230,21 +410,98 @@ public:
      * it could still get evicted if the cache is under pressure. The returned handle must be
      * destroyed before the owning cache object itself is destroyed.
      */
-    ValueHandle get(const Key& key) {
+    TEMPLATE(typename KeyType)
+    REQUIRES(IsComparable<KeyType>)
+    ValueHandle get(
+        const KeyType& key,
+        CacheCausalConsistency causalConsistency = CacheCausalConsistency::kLatestCached) {
         stdx::lock_guard<Latch> lg(_mutex);
-        if (auto it = _cache.find(key); it != _cache.end())
-            return ValueHandle(it->second);
+        std::shared_ptr<StoredValue> storedValue;
+        if (auto it = _cache.find(key); it != _cache.end()) {
+            storedValue = it->second;
+        } else if (auto it = _evictedCheckedOutValues.find(key);
+                   it != _evictedCheckedOutValues.end()) {
+            storedValue = it->second.lock();
+        }
 
-        if (auto it = _evictedCheckedOutValues.find(key); it != _evictedCheckedOutValues.end())
-            return ValueHandle(it->second.lock());
+        if (causalConsistency == CacheCausalConsistency::kLatestKnown && storedValue &&
+            storedValue->time < storedValue->timeInStore)
+            return ValueHandle(nullptr);
+        return ValueHandle(std::move(storedValue));
+    }
 
-        return ValueHandle(nullptr);
+    /**
+     * Indicates to the cache that the backing store contains a new value for the specified key,
+     * with a timestamp of 'newTimeInStore'.
+     *
+     * Any already returned ValueHandles will start returning isValid = false. Subsequent calls to
+     * 'get' with a causal consistency of 'kLatestCached' will continue to return the value, which
+     * is currently cached, but with isValid = false. Calls to 'get' with a causal consistency of
+     * 'kLatestKnown' will return no value. It is up to the caller to this function to subsequently
+     * either 'insertOrAssign' a new value for the 'key', or to call 'invalidate'.
+     *
+     * Returns true if the passed 'newTimeInStore' is grater than the time of the currently cached
+     * value or if no value is cached for 'key'.
+     */
+    TEMPLATE(typename KeyType)
+    REQUIRES(IsComparable<KeyType>)
+    bool advanceTimeInStore(const KeyType& key, const Time& newTimeInStore) {
+        stdx::lock_guard<Latch> lg(_mutex);
+        std::shared_ptr<StoredValue> storedValue;
+        if (auto it = _cache.find(key); it != _cache.end()) {
+            storedValue = it->second;
+        } else if (auto it = _evictedCheckedOutValues.find(key);
+                   it != _evictedCheckedOutValues.end()) {
+            storedValue = it->second.lock();
+        }
+
+        if (!storedValue) {
+            return true;
+        }
+
+        if (storedValue->timeInStore < newTimeInStore) {
+            storedValue->timeInStore = newTimeInStore;
+            storedValue->isValid.store(false);
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * If 'key' is in the store, returns its currently cached value and its latest 'timeInStore',
+     * which can either be from the time of insertion or from the latest call to
+     * 'advanceTimeInStore'. Otherwise, returns a nullptr ValueHandle and Time().
+     */
+    TEMPLATE(typename KeyType)
+    REQUIRES(IsComparable<KeyType>)
+    std::pair<ValueHandle, Time> getCachedValueAndTimeInStore(const KeyType& key) {
+        stdx::lock_guard<Latch> lg(_mutex);
+        std::shared_ptr<StoredValue> storedValue;
+        if (auto it = _cache.find(key); it != _cache.end()) {
+            storedValue = it->second;
+        } else if (auto it = _evictedCheckedOutValues.find(key);
+                   it != _evictedCheckedOutValues.end()) {
+            storedValue = it->second.lock();
+        }
+
+        if (storedValue) {
+            auto timeInStore = storedValue->timeInStore;
+            return {ValueHandle(std::move(storedValue)), timeInStore};
+        }
+
+        return {ValueHandle(nullptr), Time()};
     }
 
     /**
      * Marks 'key' as invalid if it is found in the cache (whether checked-out or not).
+     *
+     * Any already returned ValueHandles will start returning isValid = false. Subsequent calls to
+     * 'get' will *not* return value for 'key' until the next call to 'insertOrAssign'.
      */
-    void invalidate(const Key& key) {
+    TEMPLATE(typename KeyType)
+    REQUIRES(IsComparable<KeyType>)
+    void invalidate(const KeyType& key) {
         LockGuardWithPostUnlockDestructor guard(_mutex);
         _invalidate(&guard, key, _cache.find(key));
     }
@@ -335,12 +592,20 @@ private:
      * the key may not exist, and after this call will no longer be valid and will not be in either
      * of the maps.
      */
+    TEMPLATE(typename KeyType)
+    REQUIRES(IsComparable<KeyType>)
     void _invalidate(LockGuardWithPostUnlockDestructor* guard,
-                     const Key& key,
-                     typename Cache::iterator it) {
+                     const KeyType& key,
+                     typename Cache::iterator it,
+                     Time* outTime = nullptr,
+                     Time* outTimeInStore = nullptr) {
         if (it != _cache.end()) {
             auto& storedValue = it->second;
             storedValue->isValid.store(false);
+            if (outTime)
+                *outTime = storedValue->time;
+            if (outTimeInStore)
+                *outTimeInStore = storedValue->timeInStore;
             guard->releasePtr(std::move(storedValue));
             _cache.erase(it);
             return;
@@ -354,6 +619,10 @@ private:
         // released and drops to zero
         if (auto evictedValue = itEvicted->second.lock()) {
             evictedValue->isValid.store(false);
+            if (outTime)
+                *outTime = evictedValue->time;
+            if (outTimeInStore)
+                *outTimeInStore = evictedValue->timeInStore;
             guard->releasePtr(std::move(evictedValue));
         }
 
@@ -370,8 +639,13 @@ private:
     //
     // It must be destroyed after the entries in '_cache' are destroyed, because their destructors
     // look-up into that map.
-    using EvictedCheckedOutValuesMap = stdx::unordered_map<Key, std::weak_ptr<StoredValue>>;
+    using EvictedCheckedOutValuesMap = stdx::
+        unordered_map<Key, std::weak_ptr<StoredValue>, LruKeyHasher<Key>, LruKeyComparator<Key>>;
     EvictedCheckedOutValuesMap _evictedCheckedOutValues;
+
+    // An always-incrementing counter from which to obtain "identities" for each value stored in the
+    // cache, so that different instantiations for the same key can be differentiated
+    uint64_t _epoch{0};
 
     Cache _cache;
 };

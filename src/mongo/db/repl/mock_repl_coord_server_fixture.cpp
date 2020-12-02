@@ -85,7 +85,6 @@ void MockReplCoordServerFixture::setUp() {
     ASSERT_TRUE(
         client.createCollection(NamespaceString::kRsOplogNamespace.ns(), 1024 * 1024, true));
 
-    repl::setOplogCollectionName(service);
     repl::acquireOplogCollectionForLogging(opCtx());
 
     repl::DropPendingCollectionReaper::set(
@@ -94,15 +93,16 @@ void MockReplCoordServerFixture::setUp() {
 }
 
 void MockReplCoordServerFixture::insertOplogEntry(const repl::OplogEntry& entry) {
-    AutoGetCollection autoColl(opCtx(), NamespaceString::kRsOplogNamespace, MODE_IX);
-    auto coll = autoColl.getCollection();
-    ASSERT_TRUE(coll != nullptr);
+    AutoGetCollection coll(opCtx(), NamespaceString::kRsOplogNamespace, MODE_IX);
+    ASSERT_TRUE(coll);
 
+    WriteUnitOfWork wuow(opCtx());
     auto status = coll->insertDocument(opCtx(),
                                        InsertStatement(entry.toBSON()),
                                        &CurOp::get(opCtx())->debug(),
                                        /* fromMigrate */ false);
     ASSERT_OK(status);
+    wuow.commit();
 }
 
 OperationContext* MockReplCoordServerFixture::opCtx() {

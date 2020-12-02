@@ -49,6 +49,7 @@ const std::string kSenderHostFieldName = "from";
 const std::string kSenderIdFieldName = "fromId";
 const std::string kSetNameFieldName = "replSetHeartbeat";
 const std::string kTermFieldName = "term";
+const std::string kPrimaryIdFieldName = "primaryId";
 }  // namespace
 
 Status ReplSetHeartbeatArgsV1::initialize(const BSONObj& argsObj) {
@@ -96,6 +97,13 @@ Status ReplSetHeartbeatArgsV1::initialize(const BSONObj& argsObj) {
         _hasSender = true;
     }
 
+    // If sender is in an older version, the request object may not have the 'primaryId' field, but
+    // we still parse and allow it whenever it is present.
+    status = bsonExtractIntegerFieldWithDefault(
+        argsObj, kPrimaryIdFieldName, kEmptyPrimaryId, &_primaryId);
+    if (!status.isOK())
+        return status;
+
     status = bsonExtractIntegerField(argsObj, kTermFieldName, &_term);
     if (!status.isOK())
         return status;
@@ -133,8 +141,8 @@ void ReplSetHeartbeatArgsV1::setSenderId(long long newVal) {
     _senderId = newVal;
 }
 
-void ReplSetHeartbeatArgsV1::setSetName(const std::string& newVal) {
-    _setName = newVal;
+void ReplSetHeartbeatArgsV1::setSetName(StringData newVal) {
+    _setName = newVal.toString();
 }
 
 void ReplSetHeartbeatArgsV1::setTerm(long long newVal) {
@@ -143,6 +151,10 @@ void ReplSetHeartbeatArgsV1::setTerm(long long newVal) {
 
 void ReplSetHeartbeatArgsV1::setCheckEmpty() {
     _checkEmpty = true;
+}
+
+void ReplSetHeartbeatArgsV1::setPrimaryId(long long primaryId) {
+    _primaryId = primaryId;
 }
 
 BSONObj ReplSetHeartbeatArgsV1::toBSON() const {
@@ -165,6 +177,13 @@ void ReplSetHeartbeatArgsV1::addToBSON(BSONObjBuilder* builder) const {
     builder->append(kSenderHostFieldName, _hasSender ? _senderHost.toString() : "");
     builder->appendIntOrLL(kSenderIdFieldName, _senderId);
     builder->appendIntOrLL(kTermFieldName, _term);
+
+    // TODO SERVER-49382: Remove this FCV check when 5.0 becomes last-lts.
+    if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+        serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
+            ServerGlobalParams::FeatureCompatibility::Version::kVersion47)) {
+        builder->append(kPrimaryIdFieldName, _primaryId);
+    }
 }
 
 }  // namespace repl

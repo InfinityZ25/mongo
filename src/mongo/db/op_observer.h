@@ -152,24 +152,37 @@ public:
     /**
      * Logs a no-op with "msgObj" in the o field into oplog.
      *
-     * This function should only be used internally. "nss", "uuid" and the o2 field should never be
-     * exposed to users (for instance through the appendOplogNote command).
+     * This function should only be used internally. "nss", "uuid", "o2", and the opTimes should
+     * never be exposed to users (for instance through the appendOplogNote command).
      */
-    virtual void onInternalOpMessage(OperationContext* opCtx,
-                                     const NamespaceString& nss,
-                                     const boost::optional<UUID> uuid,
-                                     const BSONObj& msgObj,
-                                     const boost::optional<BSONObj> o2MsgObj) = 0;
+    virtual void onInternalOpMessage(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        const boost::optional<UUID> uuid,
+        const BSONObj& msgObj,
+        const boost::optional<BSONObj> o2MsgObj,
+        const boost::optional<repl::OpTime> preImageOpTime,
+        const boost::optional<repl::OpTime> postImageOpTime,
+        const boost::optional<repl::OpTime> prevWriteOpTimeInTransaction,
+        const boost::optional<OplogSlot> slot) = 0;
 
     /**
      * Logs a no-op with "msgObj" in the o field into oplog.
      */
     void onOpMessage(OperationContext* opCtx, const BSONObj& msgObj) {
-        onInternalOpMessage(opCtx, {}, boost::none, msgObj, boost::none);
+        onInternalOpMessage(opCtx,
+                            {},
+                            boost::none,
+                            msgObj,
+                            boost::none,
+                            boost::none,
+                            boost::none,
+                            boost::none,
+                            boost::none);
     }
 
     virtual void onCreateCollection(OperationContext* opCtx,
-                                    Collection* coll,
+                                    const CollectionPtr& coll,
                                     const NamespaceString& collectionName,
                                     const CollectionOptions& options,
                                     const BSONObj& idIndex,
@@ -280,6 +293,15 @@ public:
                                     OptionalCollectionUUID dropTargetUUID,
                                     std::uint64_t numRecords,
                                     bool stayTemp) = 0;
+
+    virtual void onImportCollection(OperationContext* opCtx,
+                                    const UUID& importUUID,
+                                    const NamespaceString& nss,
+                                    long long numRecords,
+                                    long long dataSize,
+                                    const BSONObj& catalogEntry,
+                                    const BSONObj& storageMetadata,
+                                    bool isDryRun) = 0;
 
     virtual void onApplyOps(OperationContext* opCtx,
                             const std::string& dbName,
@@ -394,6 +416,16 @@ public:
      */
     virtual void onReplicationRollback(OperationContext* opCtx,
                                        const RollbackObserverInfo& rbInfo) = 0;
+
+    /**
+     * Called when the majority commit point is updated by replication.
+     *
+     * This is called while holding a very hot mutex (the ReplicationCoordinator mutex). Therefore
+     * it should avoid doing any work that can be done later, and avoid calling back into any
+     * replication functions that take this mutex (which would cause self-deadlock).
+     */
+    virtual void onMajorityCommitPointUpdate(ServiceContext* service,
+                                             const repl::OpTime& newCommitPoint) = 0;
 
     struct Times;
 

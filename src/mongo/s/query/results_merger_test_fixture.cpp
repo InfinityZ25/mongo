@@ -32,7 +32,6 @@
 #include "mongo/client/remote_command_targeter_factory_mock.h"
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/curop.h"
-#include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/query/results_merger_test_fixture.h"
@@ -50,6 +49,8 @@ const std::vector<HostAndPort> ResultsMergerTestFixture::kTestShardHosts = {
 const NamespaceString ResultsMergerTestFixture::kTestNss = NamespaceString{"testdb.testcoll"};
 
 void ResultsMergerTestFixture::setUp() {
+    ShardingTestFixture::setUp();
+
     setRemote(HostAndPort("ClientHost", 12345));
 
     configTargeter()->setFindHostReturnValue(kTestConfigShardHost);

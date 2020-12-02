@@ -38,29 +38,26 @@ namespace mongo {
 MONGO_FAIL_POINT_DEFINE(ExprMatchExpressionMatchesReturnsFalseOnException);
 
 ExprMatchExpression::ExprMatchExpression(boost::intrusive_ptr<Expression> expr,
-                                         const boost::intrusive_ptr<ExpressionContext>& expCtx)
-    : MatchExpression(MatchType::EXPRESSION), _expCtx(expCtx), _expression(expr) {}
+                                         const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                         clonable_ptr<ErrorAnnotation> annotation)
+    : MatchExpression(MatchType::EXPRESSION, std::move(annotation)),
+      _expCtx(expCtx),
+      _expression(expr) {}
 
 ExprMatchExpression::ExprMatchExpression(BSONElement elem,
-                                         const boost::intrusive_ptr<ExpressionContext>& expCtx)
-    : ExprMatchExpression(Expression::parseOperand(expCtx, elem, expCtx->variablesParseState),
-                          expCtx) {}
+                                         const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                         clonable_ptr<ErrorAnnotation> annotation)
+    : ExprMatchExpression(Expression::parseOperand(expCtx.get(), elem, expCtx->variablesParseState),
+                          expCtx,
+                          std::move(annotation)) {}
 
 bool ExprMatchExpression::matches(const MatchableDocument* doc, MatchDetails* details) const {
     if (_rewriteResult && _rewriteResult->matchExpression() &&
         !_rewriteResult->matchExpression()->matches(doc, details)) {
         return false;
     }
-
-    Document document(doc->toBSON());
-
-    // 'Variables' is not thread safe, and ExprMatchExpression may be used in a validator which
-    // processes documents from multiple threads simultaneously. Hence we make a copy of the
-    // 'Variables' object per-caller.
-    Variables variables = _expCtx->variables;
     try {
-        auto value = _expression->evaluate(document, &variables);
-        return value.coerceToBool();
+        return evaluateExpression(doc).coerceToBool();
     } catch (const DBException&) {
         if (MONGO_unlikely(ExprMatchExpressionMatchesReturnsFalseOnException.shouldFail())) {
             return false;
@@ -68,6 +65,16 @@ bool ExprMatchExpression::matches(const MatchableDocument* doc, MatchDetails* de
 
         throw;
     }
+}
+
+Value ExprMatchExpression::evaluateExpression(const MatchableDocument* doc) const {
+    Document document(doc->toBSON());
+
+    // 'Variables' is not thread safe, and ExprMatchExpression may be used in a validator which
+    // processes documents from multiple threads simultaneously. Hence we make a copy of the
+    // 'Variables' object per-caller.
+    Variables variables = _expCtx->variables;
+    return _expression->evaluate(document, &variables);
 }
 
 void ExprMatchExpression::serialize(BSONObjBuilder* out, bool includePath) const {
@@ -108,14 +115,15 @@ std::unique_ptr<MatchExpression> ExprMatchExpression::shallowClone() const {
     // TODO SERVER-31003: Replace Expression clone via serialization with Expression::clone().
     BSONObjBuilder bob;
     bob << "" << _expression->serialize(false);
-    boost::intrusive_ptr<Expression> clonedExpr =
-        Expression::parseOperand(_expCtx, bob.obj().firstElement(), _expCtx->variablesParseState);
+    boost::intrusive_ptr<Expression> clonedExpr = Expression::parseOperand(
+        _expCtx.get(), bob.obj().firstElement(), _expCtx->variablesParseState);
 
-    auto clone = std::make_unique<ExprMatchExpression>(std::move(clonedExpr), _expCtx);
+    auto clone =
+        std::make_unique<ExprMatchExpression>(std::move(clonedExpr), _expCtx, _errorAnnotation);
     if (_rewriteResult) {
         clone->_rewriteResult = _rewriteResult->clone();
     }
-    return std::move(clone);
+    return clone;
 }
 
 MatchExpression::ExpressionOptimizerFunc ExprMatchExpression::getOptimizer() const {

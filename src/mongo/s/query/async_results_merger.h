@@ -40,6 +40,7 @@
 #include "mongo/platform/mutex.h"
 #include "mongo/s/query/async_results_merger_params_gen.h"
 #include "mongo/s/query/cluster_query_result.h"
+#include "mongo/stdx/future.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
@@ -231,14 +232,11 @@ public:
 
     /**
      * Starts shutting down this ARM by canceling all pending requests and scheduling killCursors
-     * on all of the unexhausted remotes. Returns a handle to an event that is signaled when this
-     * ARM is safe to destroy.
+     * on all of the unexhausted remotes. Returns a 'future' that is signaled when this ARM is safe
+     * to destroy.
      *
-     * If there are no pending requests, schedules killCursors and signals the event immediately.
+     * If there are no pending requests, schedules killCursors and signals the future immediately.
      * Otherwise, the last callback that runs after kill() is called signals the event.
-     *
-     * Returns an invalid handle if the underlying task executor is shutting down. In this case,
-     * killing is considered complete and the ARM may be destroyed immediately.
      *
      * May be called multiple times (idempotent).
      *
@@ -246,7 +244,7 @@ public:
      * currently attached. This is so that a killing thread may call this method with its own
      * operation context.
      */
-    executor::TaskExecutor::EventHandle kill(OperationContext* opCtx);
+    stdx::shared_future<void> kill(OperationContext* opCtx);
 
 private:
     /**
@@ -281,6 +279,9 @@ private:
         // before it. This object represents a promise from the remote that it will never return a
         // result with a sort key lower than this.
         boost::optional<BSONObj> promisedMinSortKey;
+
+        // True if this remote is eligible to provide a high water mark sort key; false otherwise.
+        bool eligibleForHighWaterMark = false;
 
         // The cursor id for the remote cursor. If a remote cursor is not yet exhausted, this member
         // will be set to a valid non-zero cursor id. If a remote cursor is now exhausted, this
@@ -438,10 +439,10 @@ private:
     bool _haveOutstandingBatchRequests(WithLock);
 
     /**
-     * If a promisedMinSortKey has been obtained from all remotes, returns the lowest such key.
-     * Otherwise, returns an empty BSONObj.
+     * If a promisedMinSortKey has been received from all remotes, returns the lowest such key.
+     * Otherwise, returns boost::none.
      */
-    BSONObj _getMinPromisedSortKey(WithLock);
+    boost::optional<MinSortKeyRemoteIdPair> _getMinPromisedSortKey(WithLock);
 
     /**
      * Schedules a getMore on any remote hosts which we need another batch from.
@@ -457,6 +458,20 @@ private:
      * Updates the given remote's metadata (e.g. the cursor id) based on information in 'response'.
      */
     void _updateRemoteMetadata(WithLock, size_t remoteIndex, const CursorResponse& response);
+
+    /**
+     * Returns true if the given batch is eligible to provide a high water mark resume token for the
+     * stream, false otherwise.
+     */
+    bool _checkHighWaterMarkEligibility(WithLock,
+                                        BSONObj newMinSortKey,
+                                        const RemoteCursorData& remote,
+                                        const CursorResponse& response);
+
+    /**
+     * Sets the initial value of the high water mark sort key, if applicable.
+     */
+    void _setInitialHighWaterMark();
 
     OperationContext* _opCtx;
     std::shared_ptr<executor::TaskExecutor> _executor;
@@ -500,9 +515,28 @@ private:
 
     LifecycleState _lifecycleState = kAlive;
 
-    // Signaled when all outstanding batch request callbacks have run after kill() has been
-    // called. This means that the ARM is safe to delete.
-    executor::TaskExecutor::EventHandle _killCompleteEvent;
+    // Handles the promise/future mechanism used to cleanly shut down the ARM. This avoids race
+    // conditions in cases where the underlying TaskExecutor is simultaneously being torn down.
+    struct KillCompletePromiseFuture {
+        KillCompletePromiseFuture() : _future(_promise.get_future()){};
+
+        // Multiple calls to kill() can be made and each must return a future that will be notified
+        // when the ARM has been cleaned up.
+        stdx::shared_future<void> getFuture() {
+            return _future;
+        }
+
+        // Called by the ARM when all outstanding requests have run. Notifies all threads waiting on
+        // shared futures that the ARM has been cleaned up.
+        void signalFutures() {
+            _promise.set_value();
+        }
+
+    private:
+        stdx::promise<void> _promise;
+        stdx::shared_future<void> _future;
+    };
+    boost::optional<KillCompletePromiseFuture> _killCompleteInfo;
 };
 
 }  // namespace mongo

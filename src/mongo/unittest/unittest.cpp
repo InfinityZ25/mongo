@@ -40,12 +40,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
-
-#include "mongo/logger/console_appender.h"
-#include "mongo/logger/log_manager.h"
-#include "mongo/logger/logger.h"
-#include "mongo/logger/message_event_utf8_encoder.h"
-#include "mongo/logger/message_log_domain.h"
+#include <pcrecpp.h>
 
 #include "mongo/base/checked_cast.h"
 #include "mongo/base/init.h"
@@ -79,6 +74,10 @@ auto& suitesMap() {
 }
 
 }  // namespace
+
+bool searchRegex(const std::string& pattern, const std::string& string) {
+    return pcrecpp::RE(pattern).PartialMatch(string);
+}
 
 class Result {
 public:
@@ -155,12 +154,13 @@ namespace {
 
 // Attempting to read the featureCompatibilityVersion parameter before it is explicitly initialized
 // with a meaningful value will trigger failures as of SERVER-32630.
+// (Generic FCV reference): This FCV reference should exist across LTS binary versions.
 void setUpFCV() {
-    serverGlobalParams.featureCompatibility.setVersion(
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo46);
+    serverGlobalParams.mutableFeatureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::kLatest);
 }
 void tearDownFCV() {
-    serverGlobalParams.featureCompatibility.reset();
+    serverGlobalParams.mutableFeatureCompatibility.reset();
 }
 
 struct TestSuiteEnvironment {
@@ -194,9 +194,9 @@ public:
     void stopCapturingLogMessages();
     void stopCapturingLogMessagesIfNeeded();
     const std::vector<std::string>& getCapturedTextFormatLogMessages() const;
-    const std::vector<BSONObj> getCapturedBSONFormatLogMessages() const;
+    std::vector<BSONObj> getCapturedBSONFormatLogMessages() const;
     int64_t countTextFormatLogLinesContaining(const std::string& needle);
-    int64_t countBSONFormatLogLinesIsSubset(const BSONObj needle);
+    int64_t countBSONFormatLogLinesIsSubset(const BSONObj& needle);
     void printCapturedTextFormatLogLines() const;
 
 private:
@@ -245,40 +245,6 @@ void Test::run() {
 }
 
 namespace {
-class StringVectorAppender : public logger::MessageLogDomain::EventAppender {
-public:
-    explicit StringVectorAppender(std::vector<std::string>* lines) : _lines(lines) {}
-    virtual ~StringVectorAppender() {}
-    virtual Status append(const logger::MessageLogDomain::Event& event) {
-        std::ostringstream _os;
-        if (!_encoder.encode(event, _os)) {
-            return Status(ErrorCodes::LogWriteFailed, "Failed to append to LogTestAppender.");
-        }
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        if (_enabled) {
-            _lines->push_back(_os.str());
-        }
-        return Status::OK();
-    }
-
-    void enable() {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        invariant(!_enabled);
-        _enabled = true;
-    }
-
-    void disable() {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        invariant(_enabled);
-        _enabled = false;
-    }
-
-private:
-    stdx::mutex _mutex;  // NOLINT
-    bool _enabled = false;
-    logger::MessageEventDetailsEncoder _encoder;
-    std::vector<std::string>* _lines;
-};
 
 void CaptureLogs::startCapturingLogMessages() {
     invariant(!_isCapturingLogMessages);
@@ -321,7 +287,7 @@ const std::vector<std::string>& CaptureLogs::getCapturedTextFormatLogMessages() 
     return _capturedLogMessages;
 }
 
-const std::vector<BSONObj> CaptureLogs::getCapturedBSONFormatLogMessages() const {
+std::vector<BSONObj> CaptureLogs::getCapturedBSONFormatLogMessages() const {
     std::vector<BSONObj> objs;
     std::transform(_capturedBSONLogMessages.cbegin(),
                    _capturedBSONLogMessages.cend(),
@@ -380,7 +346,7 @@ bool isSubset(BSONObj haystack, BSONObj needle) {
     return true;
 }
 
-int64_t CaptureLogs::countBSONFormatLogLinesIsSubset(const BSONObj needle) {
+int64_t CaptureLogs::countBSONFormatLogLinesIsSubset(const BSONObj& needle) {
     const auto& msgs = getCapturedBSONFormatLogMessages();
     return std::count_if(
         msgs.begin(), msgs.end(), [&](const BSONObj s) { return isSubset(s, needle); });
@@ -397,13 +363,13 @@ void Test::stopCapturingLogMessages() {
 const std::vector<std::string>& Test::getCapturedTextFormatLogMessages() const {
     return getCaptureLogs()->getCapturedTextFormatLogMessages();
 }
-const std::vector<BSONObj> Test::getCapturedBSONFormatLogMessages() const {
+std::vector<BSONObj> Test::getCapturedBSONFormatLogMessages() const {
     return getCaptureLogs()->getCapturedBSONFormatLogMessages();
 }
 int64_t Test::countTextFormatLogLinesContaining(const std::string& needle) {
     return getCaptureLogs()->countTextFormatLogLinesContaining(needle);
 }
-int64_t Test::countBSONFormatLogLinesIsSubset(const BSONObj needle) {
+int64_t Test::countBSONFormatLogLinesIsSubset(const BSONObj& needle) {
     return getCaptureLogs()->countBSONFormatLogLinesIsSubset(needle);
 }
 void Test::printCapturedTextFormatLogLines() const {
@@ -433,6 +399,11 @@ std::unique_ptr<Result> Suite::run(const std::string& filter,
             continue;
         }
 
+        // This test hasn't been skipped, and is about to run. If it's the first one in this suite
+        // (ie. _tests is zero), then output the suite header before running it.
+        if (r->_tests == 0) {
+            LOGV2(23063, "Running", "suite"_attr = _name);
+        }
         ++r->_tests;
 
         struct Event {
@@ -478,7 +449,10 @@ std::unique_ptr<Result> Suite::run(const std::string& filter,
 
     r->_millis = timer.millis();
 
-    LOGV2(23060, "Done running tests");
+    // Only show the footer if some tests were run in this suite.
+    if (r->_tests > 0) {
+        LOGV2(23060, "Done running tests");
+    }
 
     return r;
 }
@@ -515,7 +489,6 @@ int Suite::run(const std::vector<std::string>& suites,
         std::shared_ptr<Suite>& s = suitesMap()[name];
         fassert(16145, s != nullptr);
 
-        LOGV2(23063, "Running", "suite"_attr = name);
         auto result = s->run(filter, fileNameFilter, runsPerTest);
         results.push_back(std::move(result));
     }
@@ -548,8 +521,11 @@ int Suite::run(const std::vector<std::string>& suites,
     totals._millis = millis;
 
     for (const auto& r : results) {
-        LOGV2_OPTIONS(
-            4680101, {logv2::LogTruncation::Disabled}, "Result", "suite"_attr = r->toBSON());
+        // Only show results from a suite if some tests were run in it.
+        if (r->_tests > 0) {
+            LOGV2_OPTIONS(
+                4680101, {logv2::LogTruncation::Disabled}, "Result", "suite"_attr = r->toBSON());
+        }
     }
     LOGV2(23065, "Totals", "totals"_attr = totals.toBSON());
 

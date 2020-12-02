@@ -29,10 +29,11 @@
 
 #pragma once
 
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/db/update/update_node.h"
+#include "mongo/db/update/v1_log_builder.h"
+#include "mongo/db/update/v2_log_builder.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -41,40 +42,62 @@ class UpdateNodeTest : public ServiceContextTest {
 public:
     ~UpdateNodeTest() override = default;
 
-protected:
-    void setUp() override {
-        resetApplyParams();
-
-        // Set up the logical clock needed by CurrentDateNode and ObjectReplaceExecutor.
-        auto service = mongo::getGlobalServiceContext();
-        auto logicalClock = std::make_unique<mongo::LogicalClock>(service);
-        mongo::LogicalClock::set(service, std::move(logicalClock));
+    void run() {
+        _useV2LogBuilder = false;
+        ServiceContextTest::run();
+        _useV2LogBuilder = true;
+        ServiceContextTest::run();
     }
 
-    void resetApplyParams() {
+protected:
+    // Creates a RuntimeUpdatePath from a string, assuming that all numeric path components are
+    // array indexes. Tests which use numeric field names in objects must manually create a
+    // RuntimeUpdatePath.
+    static RuntimeUpdatePath makeRuntimeUpdatePathForTest(StringData path) {
+        FieldRef fr(path);
+        std::vector<RuntimeUpdatePath::ComponentType> types;
+
+        for (int i = 0; i < fr.numParts(); ++i) {
+            types.push_back(fr.isNumericPathComponentStrict(i)
+                                ? RuntimeUpdatePath::ComponentType::kArrayIndex
+                                : RuntimeUpdatePath::ComponentType::kFieldName);
+        }
+
+        return RuntimeUpdatePath(fr, std::move(types));
+    }
+
+    void setUp() override {
+        resetApplyParams();
+    }
+
+    virtual void resetApplyParams() {
         _immutablePathsVector.clear();
         _immutablePaths.clear();
         _pathToCreate = std::make_shared<FieldRef>();
-        _pathTaken = std::make_shared<FieldRef>();
+        _pathTaken = std::make_shared<RuntimeUpdatePath>();
         _matchedField = StringData();
         _insert = false;
         _fromOplogApplication = false;
         _validateForStorage = true;
         _indexData.reset();
         _logDoc.reset();
-        _logBuilder = std::make_unique<LogBuilder>(_logDoc.root());
+        if (_useV2LogBuilder) {
+            _logBuilder = std::make_unique<v2_log_builder::V2LogBuilder>();
+        } else {
+            _logBuilder = std::make_unique<V1LogBuilder>(_logDoc.root());
+        }
         _modifiedPaths.clear();
     }
 
-    UpdateExecutor::ApplyParams getApplyParams(mutablebson::Element element) {
+    virtual UpdateExecutor::ApplyParams getApplyParams(mutablebson::Element element) {
         UpdateExecutor::ApplyParams applyParams(element, _immutablePaths);
         applyParams.matchedField = _matchedField;
         applyParams.insert = _insert;
         applyParams.fromOplogApplication = _fromOplogApplication;
         applyParams.validateForStorage = _validateForStorage;
         applyParams.indexData = _indexData.get();
-        applyParams.logBuilder = _logBuilder.get();
         applyParams.modifiedPaths = &_modifiedPaths;
+        applyParams.logMode = ApplyParams::LogMode::kGenerateOplogEntry;
         return applyParams;
     }
 
@@ -82,6 +105,7 @@ protected:
         UpdateNode::UpdateNodeApplyParams applyParams;
         applyParams.pathToCreate = _pathToCreate;
         applyParams.pathTaken = _pathTaken;
+        applyParams.logBuilder = _logBuilder.get();
         return applyParams;
     }
 
@@ -96,9 +120,8 @@ protected:
         _pathToCreate->parse(path);
     }
 
-    void setPathTaken(StringData path) {
-        _pathTaken->clear();
-        _pathTaken->parse(path);
+    void setPathTaken(const RuntimeUpdatePath& pathTaken) {
+        *_pathTaken = pathTaken;
     }
 
     void setMatchedField(StringData matchedField) {
@@ -128,27 +151,59 @@ protected:
         _logBuilder.reset();
     }
 
-    const mutablebson::Document& getLogDoc() {
-        return _logDoc;
-    }
-
     std::string getModifiedPaths() {
         return _modifiedPaths.toString();
+    }
+
+    bool v2LogBuilderUsed() const {
+        return _useV2LogBuilder;
+    }
+
+    BSONObj getOplogEntry() const {
+        return _logBuilder->serialize();
+    }
+
+    void assertOplogEntryIsNoop() const {
+        if (v2LogBuilderUsed()) {
+            ASSERT_BSONOBJ_BINARY_EQ(getOplogEntry(), fromjson("{$v:2, diff: {}}"));
+        } else {
+            ASSERT_TRUE(getOplogEntry().isEmpty());
+        }
+    }
+
+    void assertOplogEntry(const BSONObj& expectedV1Entry,
+                          const BSONObj& expectedV2Entry,
+                          bool checkBinaryEquality = true) {
+        auto assertFn = [checkBinaryEquality](auto expected, auto given) {
+            if (checkBinaryEquality) {
+                ASSERT_BSONOBJ_BINARY_EQ(expected, given);
+            } else {
+                ASSERT_BSONOBJ_EQ(expected, given);
+            }
+        };
+
+        if (v2LogBuilderUsed()) {
+            assertFn(expectedV2Entry, getOplogEntry());
+        } else {
+            assertFn(expectedV1Entry, getOplogEntry());
+        }
     }
 
 private:
     std::vector<std::unique_ptr<FieldRef>> _immutablePathsVector;
     FieldRefSet _immutablePaths;
     std::shared_ptr<FieldRef> _pathToCreate;
-    std::shared_ptr<FieldRef> _pathTaken;
+    std::shared_ptr<RuntimeUpdatePath> _pathTaken;
     StringData _matchedField;
     bool _insert;
     bool _fromOplogApplication;
     bool _validateForStorage;
     std::unique_ptr<UpdateIndexData> _indexData;
     mutablebson::Document _logDoc;
-    std::unique_ptr<LogBuilder> _logBuilder;
+    std::unique_ptr<LogBuilderInterface> _logBuilder;
     FieldRefSetWithStorage _modifiedPaths;
+
+    bool _useV2LogBuilder = false;
 };
 
 }  // namespace mongo

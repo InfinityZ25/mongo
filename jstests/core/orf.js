@@ -1,5 +1,7 @@
 // Test a query with 200 $or clauses
-// @tags: [assumes_balancer_off]
+// @tags: [
+//   assumes_balancer_off,
+// ]
 
 t = db.jstests_orf;
 t.drop();

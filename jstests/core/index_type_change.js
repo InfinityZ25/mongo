@@ -1,7 +1,10 @@
 // Cannot implicitly shard accessed collections because of following errmsg: A single
 // update/delete on a sharded collection must contain an exact match on _id or contain the shard
 // key.
-// @tags: [assumes_unsharded_collection]
+// @tags: [
+//   assumes_unsharded_collection,
+//   sbe_incompatible,
+// ]
 
 /**
  * Tests that replacing a document with an equivalent document with different types for the fields
@@ -15,7 +18,7 @@ load("jstests/libs/analyze_plan.js");  // For 'isIndexOnly'.
 
 var coll = db.index_type_change;
 coll.drop();
-assert.commandWorked(coll.ensureIndex({a: 1}));
+assert.commandWorked(coll.createIndex({a: 1}));
 
 assert.commandWorked(coll.insert({a: 2}));
 assert.eq(1, coll.find({a: {$type: "double"}}).itcount());

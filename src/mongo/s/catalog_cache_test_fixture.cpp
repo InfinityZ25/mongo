@@ -44,7 +44,7 @@
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog_cache.h"
-#include "mongo/s/database_version_helpers.h"
+#include "mongo/s/database_version.h"
 #include "mongo/s/grid.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/scopeguard.h"
@@ -59,7 +59,7 @@ void CatalogCacheTestFixture::setUp() {
     CollatorFactoryInterface::set(getServiceContext(), std::make_unique<CollatorFactoryMock>());
 }
 
-executor::NetworkTestEnv::FutureHandle<boost::optional<CachedCollectionRoutingInfo>>
+executor::NetworkTestEnv::FutureHandle<boost::optional<ChunkManager>>
 CatalogCacheTestFixture::scheduleRoutingInfoForcedRefresh(const NamespaceString& nss) {
     return launchAsync([this, nss] {
         auto client = getServiceContext()->makeClient("Test");
@@ -70,8 +70,28 @@ CatalogCacheTestFixture::scheduleRoutingInfoForcedRefresh(const NamespaceString&
     });
 }
 
-executor::NetworkTestEnv::FutureHandle<boost::optional<CachedCollectionRoutingInfo>>
+executor::NetworkTestEnv::FutureHandle<boost::optional<ChunkManager>>
 CatalogCacheTestFixture::scheduleRoutingInfoUnforcedRefresh(const NamespaceString& nss) {
+    return launchAsync([this, nss] {
+        auto client = getServiceContext()->makeClient("Test");
+        auto const catalogCache = Grid::get(getServiceContext())->catalogCache();
+
+        return boost::optional<ChunkManager>(
+            uassertStatusOK(catalogCache->getCollectionRoutingInfo(operationContext(), nss)));
+    });
+}
+
+executor::NetworkTestEnv::FutureHandle<boost::optional<ChunkManager>>
+CatalogCacheTestFixture::scheduleRoutingInfoIncrementalRefresh(const NamespaceString& nss) {
+    auto catalogCache = Grid::get(getServiceContext())->catalogCache();
+    const auto cm =
+        uassertStatusOK(catalogCache->getCollectionRoutingInfo(operationContext(), nss));
+    ASSERT(cm.isSharded());
+
+    // Simulates the shard wanting a higher version than the one sent by the router.
+    catalogCache->invalidateShardOrEntireCollectionEntryForShardedCollection(
+        nss, boost::none, cm.dbPrimary());
+
     return launchAsync([this, nss] {
         auto client = getServiceContext()->makeClient("Test");
         auto const catalogCache = Grid::get(getServiceContext())->catalogCache();
@@ -103,28 +123,31 @@ std::vector<ShardType> CatalogCacheTestFixture::setupNShards(int numShards) {
     return shards;
 }
 
-std::shared_ptr<ChunkManager> CatalogCacheTestFixture::makeChunkManager(
+ChunkManager CatalogCacheTestFixture::makeChunkManager(
     const NamespaceString& nss,
     const ShardKeyPattern& shardKeyPattern,
     std::unique_ptr<CollatorInterface> defaultCollator,
     bool unique,
-    const std::vector<BSONObj>& splitPoints) {
+    const std::vector<BSONObj>& splitPoints,
+    boost::optional<ReshardingFields> reshardingFields) {
     ChunkVersion version(1, 0, OID::gen());
 
     const BSONObj databaseBSON = [&]() {
-        DatabaseType db(nss.db().toString(), {"0"}, true, databaseVersion::makeNew());
+        DatabaseType db(nss.db().toString(), {"0"}, true, DatabaseVersion(UUID::gen()));
         return db.toBSON();
     }();
 
     const BSONObj collectionBSON = [&]() {
-        CollectionType coll;
-        coll.setNs(nss);
-        coll.setEpoch(version.epoch());
+        CollectionType coll(nss, version.epoch(), Date_t::now(), UUID::gen());
         coll.setKeyPattern(shardKeyPattern.getKeyPattern());
         coll.setUnique(unique);
 
         if (defaultCollator) {
             coll.setDefaultCollation(defaultCollator->getSpec().toBSON());
+        }
+
+        if (reshardingFields) {
+            coll.setReshardingFields(std::move(reshardingFields));
         }
 
         return coll.toBSON();
@@ -158,44 +181,37 @@ std::shared_ptr<ChunkManager> CatalogCacheTestFixture::makeChunkManager(
 
     expectFindSendBSONObjVector(kConfigHostAndPort, {databaseBSON});
     expectFindSendBSONObjVector(kConfigHostAndPort, {collectionBSON});
-    expectFindSendBSONObjVector(kConfigHostAndPort, {collectionBSON});
     expectFindSendBSONObjVector(kConfigHostAndPort, initialChunks);
 
-    auto routingInfo = future.default_timed_get();
-    ASSERT(routingInfo->cm());
-    ASSERT(routingInfo->db().primary());
-
-    return routingInfo->cm();
+    return *future.default_timed_get();
 }
 
 void CatalogCacheTestFixture::expectGetDatabase(NamespaceString nss, std::string shardId) {
     expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
-        DatabaseType db(nss.db().toString(), {shardId}, true, databaseVersion::makeNew());
+        DatabaseType db(nss.db().toString(), {shardId}, true, DatabaseVersion(UUID::gen()));
         return std::vector<BSONObj>{db.toBSON()};
     }());
 }
 
 void CatalogCacheTestFixture::expectGetCollection(NamespaceString nss,
                                                   OID epoch,
+                                                  UUID uuid,
                                                   const ShardKeyPattern& shardKeyPattern) {
     expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
-        CollectionType collType;
-        collType.setNs(nss);
-        collType.setEpoch(epoch);
+        CollectionType collType(nss, epoch, Date_t::now(), uuid);
         collType.setKeyPattern(shardKeyPattern.toBSON());
         collType.setUnique(false);
-
         return std::vector<BSONObj>{collType.toBSON()};
     }());
 }
 
-CachedCollectionRoutingInfo CatalogCacheTestFixture::loadRoutingTableWithTwoChunksAndTwoShards(
+ChunkManager CatalogCacheTestFixture::loadRoutingTableWithTwoChunksAndTwoShards(
     NamespaceString nss) {
 
     return loadRoutingTableWithTwoChunksAndTwoShardsImpl(nss, BSON("_id" << 1));
 }
 
-CachedCollectionRoutingInfo CatalogCacheTestFixture::loadRoutingTableWithTwoChunksAndTwoShardsHash(
+ChunkManager CatalogCacheTestFixture::loadRoutingTableWithTwoChunksAndTwoShardsHash(
     NamespaceString nss) {
 
     return loadRoutingTableWithTwoChunksAndTwoShardsImpl(nss,
@@ -203,17 +219,25 @@ CachedCollectionRoutingInfo CatalogCacheTestFixture::loadRoutingTableWithTwoChun
                                                               << "hashed"));
 }
 
-CachedCollectionRoutingInfo CatalogCacheTestFixture::loadRoutingTableWithTwoChunksAndTwoShardsImpl(
-    NamespaceString nss, const BSONObj& shardKey) {
+ChunkManager CatalogCacheTestFixture::loadRoutingTableWithTwoChunksAndTwoShardsImpl(
+    NamespaceString nss,
+    const BSONObj& shardKey,
+    boost::optional<std::string> primaryShardId,
+    UUID uuid) {
     const OID epoch = OID::gen();
     const ShardKeyPattern shardKeyPattern(shardKey);
 
     auto future = scheduleRoutingInfoForcedRefresh(nss);
 
     // Mock the expected config server queries.
-    expectGetDatabase(nss);
-    expectGetCollection(nss, epoch, shardKeyPattern);
-    expectGetCollection(nss, epoch, shardKeyPattern);
+    if (!nss.isAdminDB() && !nss.isConfigDB()) {
+        if (primaryShardId) {
+            expectGetDatabase(nss, *primaryShardId);
+        } else {
+            expectGetDatabase(nss);
+        }
+    }
+    expectGetCollection(nss, epoch, uuid, shardKeyPattern);
     expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
         ChunkVersion version(1, 0, epoch);
 
@@ -230,7 +254,7 @@ CachedCollectionRoutingInfo CatalogCacheTestFixture::loadRoutingTableWithTwoChun
         return std::vector<BSONObj>{chunk1.toConfigBSON(), chunk2.toConfigBSON()};
     }());
 
-    return future.default_timed_get().get();
+    return *future.default_timed_get();
 }
 
 }  // namespace mongo

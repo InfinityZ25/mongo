@@ -42,17 +42,16 @@
 #include "mongo/scripting/engine.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log_global_settings.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/ntservice.h"
 #include "mongo/util/processinfo.h"
-#include "mongo/util/ramlog.h"
 
 #include <string>
 #include <vector>
 
 namespace mongo {
 namespace {
+MONGO_FAIL_POINT_DEFINE(hangInGetLog);
 
 class FeaturesCmd : public BasicCommand {
 public:
@@ -246,6 +245,11 @@ public:
             uasserted(ErrorCodes::TypeMismatch,
                       str::stream() << "Argument to getLog must be of type String; found "
                                     << val.toString(false) << " of type " << typeName(val.type()));
+        }
+
+        if (MONGO_unlikely(hangInGetLog.shouldFail())) {
+            LOGV2(5113600, "Hanging in getLog");
+            hangInGetLog.pauseWhileSet();
         }
 
         std::string p = val.String();

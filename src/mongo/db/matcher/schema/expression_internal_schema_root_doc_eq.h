@@ -51,8 +51,10 @@ public:
     /**
      * Constructs a new match expression, taking ownership of 'rhs'.
      */
-    explicit InternalSchemaRootDocEqMatchExpression(BSONObj rhs)
-        : MatchExpression(MatchExpression::INTERNAL_SCHEMA_ROOT_DOC_EQ), _rhsObj(std::move(rhs)) {}
+    explicit InternalSchemaRootDocEqMatchExpression(
+        BSONObj rhs, clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : MatchExpression(MatchExpression::INTERNAL_SCHEMA_ROOT_DOC_EQ, std::move(annotation)),
+          _rhsObj(std::move(rhs)) {}
 
     bool matches(const MatchableDocument* doc, MatchDetails* details = nullptr) const final;
 
@@ -87,6 +89,14 @@ public:
 
     MatchCategory getCategory() const final {
         return MatchCategory::kOther;
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
     }
 
 protected:

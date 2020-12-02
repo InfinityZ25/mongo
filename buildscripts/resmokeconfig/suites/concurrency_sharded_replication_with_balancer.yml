@@ -62,7 +62,7 @@ selector:
   - jstests/concurrency/fsm_workloads/findAndModify_update_grow.js
 
 
-  # cannot ensureIndex after dropDatabase without sharding first
+  # cannot createIndex after dropDatabase without sharding first
   - jstests/concurrency/fsm_workloads/plan_cache_drop_database.js
 
   # reIndex is not supported in mongos.
@@ -97,9 +97,6 @@ selector:
   - jstests/concurrency/fsm_workloads/yield_and_hashed.js
   - jstests/concurrency/fsm_workloads/yield_and_sorted.js
 
-  # TODO Unblacklist (SERVER-35538).
-  - jstests/concurrency/fsm_workloads/database_versioning.js
-
   # TODO Unblacklist (SERVER-38852).
   - jstests/concurrency/fsm_workloads/agg_out_interrupt_cleanup.js
 
@@ -113,9 +110,14 @@ selector:
   # SERVER-44160 Modify cleanupOrphaned to wait for overlapping ranges to finish
   - jstests/concurrency/fsm_workloads/cleanupOrphanedWhileMigrating.js
 
+  # Inserts directly into system.views using applyOps, which is not available on mongos.
+  - jstests/concurrency/fsm_workloads/view_catalog_direct_system_writes.js
+
   exclude_with_any_tags:
   - assumes_balancer_off
   - requires_replication
+  # mongos has no system.profile collection.
+  - requires_profiling
 
 executor:
   archive:
@@ -147,6 +149,7 @@ executor:
     mongod_options:
       set_parameters:
         enableTestCommands: 1
+        roleGraphInvalidationIsFatal: 1
     num_rs_nodes_per_shard: 3
     num_shards: 2
     num_mongos: 2

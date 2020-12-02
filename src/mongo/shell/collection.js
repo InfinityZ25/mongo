@@ -66,8 +66,6 @@ DBCollection.prototype.help = function() {
           ".unhideIndex( \"indexName\" ) or db." + shortName +
           ".unhideIndex( { \"indexKey\" : 1 } )");
     print("\tdb." + shortName + ".dropIndexes()");
-    print("\tdb." + shortName +
-          ".ensureIndex(keypattern[,options]) - DEPRECATED, use createIndex() instead");
     print("\tdb." + shortName + ".explain().help() - show explain help");
     print("\tdb." + shortName + ".reIndex()");
     print(
@@ -125,13 +123,13 @@ DBCollection.prototype.help = function() {
     print("\tdb." + shortName + ".totalSize() - storage allocated for all data and indexes");
     print(
         "\tdb." + shortName +
-        ".update( query, <update object or pipeline>[, upsert_bool, multi_bool] ) - instead of two flags, you can pass an object with fields: upsert, multi, hint");
+        ".update( query, <update object or pipeline>[, upsert_bool, multi_bool] ) - instead of two flags, you can pass an object with fields: upsert, multi, hint, let");
     print(
         "\tdb." + shortName +
-        ".updateOne( filter, <update object or pipeline>, <optional params> ) - update the first matching document, optional parameters are: upsert, w, wtimeout, j, hint");
+        ".updateOne( filter, <update object or pipeline>, <optional params> ) - update the first matching document, optional parameters are: upsert, w, wtimeout, j, hint, let");
     print(
         "\tdb." + shortName +
-        ".updateMany( filter, <update object or pipeline>, <optional params> ) - update all matching documents, optional parameters are: upsert, w, wtimeout, j, hint");
+        ".updateMany( filter, <update object or pipeline>, <optional params> ) - update all matching documents, optional parameters are: upsert, w, wtimeout, j, hint, let");
     print("\tdb." + shortName + ".validate( <full> ) - SLOW");
     print("\tdb." + shortName + ".getShardVersion() - only for use with sharding");
     print("\tdb." + shortName +
@@ -274,6 +272,8 @@ DBCollection.prototype.insert = function(obj, options) {
     if (!obj)
         throw Error("no object passed to insert!");
 
+    options = typeof (options) === 'undefined' ? {} : options;
+
     var flags = 0;
 
     var wc = undefined;
@@ -299,7 +299,7 @@ DBCollection.prototype.insert = function(obj, options) {
     var ordered = ((flags & 1) == 0);
 
     if (!wc)
-        wc = this.getWriteConcern();
+        wc = this._createWriteConcern(options);
 
     var result = undefined;
     var startTime =
@@ -365,11 +365,14 @@ DBCollection.prototype._parseRemove = function(t, justOne) {
 
     var wc = undefined;
     var collation = undefined;
+    let letParams = undefined;
+
     if (typeof (justOne) === "object") {
         var opts = justOne;
         wc = opts.writeConcern;
         justOne = opts.justOne;
         collation = opts.collation;
+        letParams = opts.let;
     }
 
     // Normalize "justOne" to a bool.
@@ -380,7 +383,7 @@ DBCollection.prototype._parseRemove = function(t, justOne) {
         wc = this.getWriteConcern();
     }
 
-    return {"query": query, "justOne": justOne, "wc": wc, "collation": collation};
+    return {"query": query, "justOne": justOne, "wc": wc, "collation": collation, "let": letParams};
 };
 
 // Returns a WriteResult if write command succeeded, but may contain write errors.
@@ -391,6 +394,7 @@ DBCollection.prototype.remove = function(t, justOne) {
     var justOne = parsed.justOne;
     var wc = parsed.wc;
     var collation = parsed.collation;
+    var letParams = parsed.let;
 
     var result = undefined;
     var startTime =
@@ -398,6 +402,10 @@ DBCollection.prototype.remove = function(t, justOne) {
 
     if (this.getMongo().writeMode() != "legacy") {
         var bulk = this.initializeOrderedBulkOp();
+
+        if (letParams) {
+            bulk.setLetParams(letParams);
+        }
         var removeOp = bulk.find(query);
 
         if (collation) {
@@ -454,6 +462,7 @@ DBCollection.prototype._parseUpdate = function(query, updateSpec, upsert, multi)
     var collation = undefined;
     var arrayFilters = undefined;
     let hint = undefined;
+    let letParams = undefined;
 
     // can pass options via object for improved readability
     if (typeof (upsert) === "object") {
@@ -469,6 +478,7 @@ DBCollection.prototype._parseUpdate = function(query, updateSpec, upsert, multi)
         collation = opts.collation;
         arrayFilters = opts.arrayFilters;
         hint = opts.hint;
+        letParams = opts.let;
     }
 
     // Normalize 'upsert' and 'multi' to booleans.
@@ -487,7 +497,8 @@ DBCollection.prototype._parseUpdate = function(query, updateSpec, upsert, multi)
         "multi": multi,
         "wc": wc,
         "collation": collation,
-        "arrayFilters": arrayFilters
+        "arrayFilters": arrayFilters,
+        "let": letParams
     };
 };
 
@@ -503,6 +514,7 @@ DBCollection.prototype.update = function(query, updateSpec, upsert, multi) {
     var wc = parsed.wc;
     var collation = parsed.collation;
     var arrayFilters = parsed.arrayFilters;
+    let letParams = parsed.let;
 
     var result = undefined;
     var startTime =
@@ -510,6 +522,10 @@ DBCollection.prototype.update = function(query, updateSpec, upsert, multi) {
 
     if (this.getMongo().writeMode() != "legacy") {
         var bulk = this.initializeOrderedBulkOp();
+
+        if (letParams) {
+            bulk.setLetParams(letParams);
+        }
         var updateOp = bulk.find(query);
 
         if (hint) {
@@ -637,10 +653,18 @@ DBCollection.prototype._indexSpec = function(keys, options) {
 };
 
 DBCollection.prototype.createIndex = function(keys, options, commitQuorum) {
+    if (arguments.length > 3) {
+        throw new Error("createIndex accepts up to 3 arguments");
+    }
+
     return this.createIndexes([keys], options, commitQuorum);
 };
 
 DBCollection.prototype.createIndexes = function(keys, options, commitQuorum) {
+    if (arguments.length > 3) {
+        throw new Error("createIndexes accepts up to 3 arguments");
+    }
+
     if (!Array.isArray(keys)) {
         throw new Error("createIndexes first argument should be an array");
     }
@@ -659,20 +683,6 @@ DBCollection.prototype.createIndexes = function(keys, options, commitQuorum) {
     }
     return this._db.runCommand(
         {createIndexes: this.getName(), indexes: indexSpecs, commitQuorum: commitQuorum});
-};
-
-DBCollection.prototype.ensureIndex = function(keys, options) {
-    var result = this.createIndex(keys, options);
-
-    if (this.getMongo().writeMode() != "legacy") {
-        return result;
-    }
-
-    err = this.getDB().getLastErrorObj();
-    if (err.err) {
-        return err;
-    }
-    // nothing returned on success
 };
 
 DBCollection.prototype.reIndex = function() {
@@ -1297,20 +1307,30 @@ DBCollection.prototype.getSplitKeysForChunks = function(chunkSize) {
 };
 
 DBCollection.prototype.setSlaveOk = function(value) {
-    if (value == undefined)
-        value = true;
-    this._slaveOk = value;
+    print(
+        "WARNING: setSlaveOk() is deprecated and may be removed in the next major release. Please use setSecondaryOk() instead.");
+    this.setSecondaryOk(value);
 };
 
 DBCollection.prototype.getSlaveOk = function() {
-    if (this._slaveOk != undefined)
-        return this._slaveOk;
-    return this._db.getSlaveOk();
+    print(
+        "WARNING: getSlaveOk() is deprecated and may be removed in the next major release. Please use getSecondaryOk() instead.");
+    return this.getSecondaryOk();
+};
+
+DBCollection.prototype.setSecondaryOk = function(value = true) {
+    this._secondaryOk = value;
+};
+
+DBCollection.prototype.getSecondaryOk = function() {
+    if (this._secondaryOk !== undefined)
+        return this._secondaryOk;
+    return this._db.getSecondaryOk();
 };
 
 DBCollection.prototype.getQueryOptions = function() {
     // inherit this method from DB but use apply so
-    // that slaveOk will be set if is overridden on this DBCollection
+    // that secondaryOk will be set if is overridden on this DBCollection
     return this._db.getQueryOptions.apply(this, arguments);
 };
 

@@ -1,12 +1,18 @@
 /**
  * Confirms that aborting a background index builds on a secondary does not leave node in an
  * inconsistent state.
- * @tags: [requires_replication]
+ * @tags: [
+ *   requires_replication,
+ *   live_record_incompatible,
+ * ]
  */
 (function() {
 "use strict";
 
 load('jstests/noPassthrough/libs/index_build.js');
+
+// This test triggers an unclean shutdown (an fassert), which may cause inaccurate fast counts.
+TestData.skipEnforceFastCountOnValidate = true;
 
 const rst = new ReplSetTest({
     nodes: [
@@ -55,8 +61,7 @@ assert.soon(function() {
 });
 
 // After restarting the secondary, expect that the index build completes successfully.
-const fassertProcessExitCode = _isWindows() ? MongoRunner.EXIT_ABRUPT : MongoRunner.EXIT_ABORT;
-rst.stop(secondary.nodeId, undefined, {forRestart: true, allowedExitCode: fassertProcessExitCode});
+rst.stop(secondary.nodeId, undefined, {forRestart: true, allowedExitCode: MongoRunner.EXIT_ABORT});
 rst.start(secondary.nodeId, undefined, true /* restart */);
 
 secondary = rst.getSecondary();

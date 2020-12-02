@@ -20,7 +20,6 @@ load('jstests/ssl/libs/ssl_helpers.js');
 var noAuthOptions = {noauth: ''};
 var transitionToX509AllowSSL =
     Object.merge(allowSSL, {transitionToAuth: '', clusterAuthMode: 'x509'});
-var x509RequireSSL = Object.merge(requireSSL, {clusterAuthMode: 'x509'});
 
 print('=== Testing no-auth/transitionToAuth cluster ===');
 mixedShardTest(noAuthOptions, transitionToX509AllowSSL, true);

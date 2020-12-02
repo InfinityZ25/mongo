@@ -1,4 +1,4 @@
-/*
+/**
  * Tests that nodes in initial sync update their commit point and gossip their commit point to
  * other nodes. This is done starting with a 3 node replica set with one non-voting secondary. We
  * disconnect the non-voting secondary from the other nodes and then add a new node to the replica
@@ -7,12 +7,12 @@
  * commit point, and verify that the commit point on the initial syncing node is updated. Finally,
  * we ensure that the disconnected secondary is able to update its commit point from the initial
  * syncing node via heartbeats.
- * @tags: [requires_fcv_44]
  */
 (function() {
 "use strict";
 
 load("jstests/libs/fail_point_util.js");
+load("jstests/replsets/rslib.js");
 
 const name = jsTestName();
 const rst = new ReplSetTest({
@@ -41,6 +41,7 @@ function getLastCommittedOpTime(conn) {
 }
 
 const firstCommitPoint = getLastCommittedOpTime(primary);
+jsTestLog(`First commit point: ${tojson(firstCommitPoint)}`);
 
 // Disconnect the non-voting secondary from the other nodes so that it won't update its commit point
 // from the other nodes' heartbeats.
@@ -79,14 +80,18 @@ rst.awaitLastOpCommitted(undefined, [primary, secondary]);
 
 const secondCommitPointPrimary = getLastCommittedOpTime(primary);
 const secondCommitPointSecondary = getLastCommittedOpTime(secondary);
+jsTestLog(`Second commit point: ${tojson(secondCommitPointPrimary)}`);
 
 // Verify that the commit point has advanced on the primary and secondary.
 assert.eq(1, rs.compareOpTimes(secondCommitPointPrimary, firstCommitPoint));
 assert.eq(1, rs.compareOpTimes(secondCommitPointSecondary, firstCommitPoint));
 
 // Verify that the commit point has *NOT* advanced on the non-voting secondary.
-let commitPointNonVotingSecondary = getLastCommittedOpTime(nonVotingSecondary);
-assert.eq(rs.compareOpTimes(commitPointNonVotingSecondary, secondCommitPointPrimary), -1);
+const commitPointNonVotingSecondary = getLastCommittedOpTime(nonVotingSecondary);
+assert.eq(rs.compareOpTimes(commitPointNonVotingSecondary, secondCommitPointPrimary),
+          -1,
+          `commit point on the non-voting secondary should not have been advanced: ${
+              tojson(commitPointNonVotingSecondary)}`);
 
 // Allow the node to proceed to the oplog applying phase of initial sync and ensure that the oplog
 // fetcher thread is still running.
@@ -102,14 +107,11 @@ rst.awaitLastOpCommitted(undefined, [primary, secondary]);
 
 const thirdCommitPointPrimary = getLastCommittedOpTime(primary);
 const thirdCommitPointSecondary = getLastCommittedOpTime(secondary);
+jsTestLog(`Third commit point: ${tojson(thirdCommitPointPrimary)}`);
 
 // Verify that the commit point has advanced on the primary and secondary.
 assert.eq(1, rs.compareOpTimes(thirdCommitPointPrimary, secondCommitPointPrimary));
 assert.eq(1, rs.compareOpTimes(thirdCommitPointSecondary, secondCommitPointSecondary));
-
-// Verify that the commit point has *NOT* advanced on the non-voting secondary.
-commitPointNonVotingSecondary = getLastCommittedOpTime(nonVotingSecondary);
-assert.eq(rs.compareOpTimes(commitPointNonVotingSecondary, thirdCommitPointPrimary), -1);
 
 // Allow the initial sync node to complete oplog fetching but hang it before it completes initial
 // sync.
@@ -119,7 +121,12 @@ hangBeforeFinish.wait();
 // Verify that the initial sync node receives the commit point from the primary via oplog fetching.
 // We only assert that it is greater than or equal to the second commit point because it is possible
 // for the commit point to not yet be advanced by the primary when we fetch the oplog entry.
-assert.gte(rs.compareOpTimes(getLastCommittedOpTime(initialSyncNode), secondCommitPointPrimary), 0);
+const commitPointInitialSyncNode = getLastCommittedOpTime(initialSyncNode);
+assert.gte(
+    rs.compareOpTimes(commitPointInitialSyncNode, secondCommitPointPrimary),
+    0,
+    `commit point on initial sync node should be at least as up-to-date as the second commit point: ${
+        tojson(commitPointInitialSyncNode)}`);
 
 // Verify that the non-voting secondary has received the updated commit point via heartbeats from
 // the initial sync node.

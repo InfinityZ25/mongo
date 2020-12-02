@@ -43,6 +43,7 @@ namespace {
 IndexEntry buildSimpleIndexEntry(const BSONObj& kp, const std::string& indexName) {
     return {kp,
             IndexNames::nameToType(IndexNames::findPluginName(kp)),
+            IndexDescriptor::kLatestIndexVersion,
             false,
             {},
             {},
@@ -919,7 +920,7 @@ TEST_F(QueryPlannerTest, DollarResumeAfterFieldPropagatedFromQueryRequestToStage
     runQueryAsCommand(cmdObj);
     assertHasOnlyCollscan();
 
-    const auto* node = solns.front()->root.get();
+    const auto* node = solns.front()->root();
     const CollectionScanNode* csn = static_cast<const CollectionScanNode*>(node);
     ASSERT_EQUALS(RecordId(42LL), csn->resumeAfterRecordId.get());
 }

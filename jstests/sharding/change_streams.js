@@ -1,19 +1,11 @@
 // Tests the behavior of change streams on sharded collections.
-// @tags: [uses_change_streams]
+// @tags: [uses_change_streams, requires_majority_read_concern]
 (function() {
 "use strict";
 
 load('jstests/replsets/libs/two_phase_drops.js');  // For TwoPhaseDropCollectionTest.
 load('jstests/aggregation/extras/utils.js');       // For assertErrorCode().
 load('jstests/libs/change_stream_util.js');        // For assertChangeStreamEventEq.
-
-// For supportsMajorityReadConcern().
-load("jstests/multiVersion/libs/causal_consistency_helpers.js");
-
-if (!supportsMajorityReadConcern()) {
-    jsTestLog("Skipping test since storage engine doesn't support majority read concern.");
-    return;
-}
 
 function runTest(collName, shardKey) {
     const st = new ShardingTest({
@@ -136,22 +128,33 @@ function runTest(collName, shardKey) {
 
     assert.commandWorked(mongosColl.update({a: 0}, {$set: {b: 2}}, {multi: true}));
 
-    assert.soon(() => changeStream.hasNext());
-    assertChangeStreamEventEq(changeStream.next(), {
+    const expectedEvent1 = {
         operationType: "update",
         ns: {db: mongosDB.getName(), coll: mongosColl.getName()},
         documentKey: makeShardKeyDocument(-10),
-        updateDescription: {updatedFields: {b: 2}, removedFields: []},
-    });
+        updateDescription: {updatedFields: {b: 2}, removedFields: [], truncatedArrays: []},
+    };
 
-    assert.soon(() => changeStream.hasNext());
-    assertChangeStreamEventEq(changeStream.next(), {
+    const expectedEvent2 = {
         operationType: "update",
         ns: {db: mongosDB.getName(), coll: mongosColl.getName()},
         documentKey: makeShardKeyDocument(10),
-        updateDescription: {updatedFields: {b: 2}, removedFields: []},
-    });
+        updateDescription: {updatedFields: {b: 2}, removedFields: [], truncatedArrays: []},
+    };
+
+    // The multi-update events can be observed in any order, depending on the clusterTime at which
+    // they are written on each shard.
+    const expectedEvents = [expectedEvent1, expectedEvent2];
+
+    const actualEvents = [];
+    for (let expectedEvent of expectedEvents) {
+        assert.soon(() => changeStream.hasNext());
+        const actualEvent = changeStream.next();
+        actualEvents.push(canonicalizeEventForTesting(actualEvent, expectedEvent));
+    }
     changeStream.close();
+
+    assert.sameMembers(actualEvents, expectedEvents);
 
     // Test that it is legal to open a change stream, even if the
     // 'internalQueryProhibitMergingOnMongos' parameter is set.

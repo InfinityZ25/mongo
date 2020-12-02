@@ -27,29 +27,22 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/pipeline/pipeline.h"
 
 #include <algorithm>
 
 #include "mongo/base/error_codes.h"
 #include "mongo/db/bson/dotted_path_support.h"
-#include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/document_source.h"
-#include "mongo/db/pipeline/document_source_geo_near.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_merge.h"
 #include "mongo/db/pipeline/document_source_out.h"
-#include "mongo/db/pipeline/document_source_project.h"
-#include "mongo/db/pipeline/document_source_sort.h"
-#include "mongo/db/pipeline/document_source_unwind.h"
-#include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/str.h"
@@ -203,6 +196,12 @@ std::unique_ptr<Pipeline, PipelineDeleter> Pipeline::create(
 
 void Pipeline::validateCommon() const {
     size_t i = 0;
+
+    uassert(ErrorCodes::FailedToParse,
+            str::stream() << "Pipeline length must be no longer than "
+                          << internalPipelineLengthLimit << " stages",
+            static_cast<int>(_sources.size()) <= internalPipelineLengthLimit);
+
     for (auto&& stage : _sources) {
         auto constraints = stage->constraints(_splitState);
 
@@ -328,21 +327,16 @@ bool Pipeline::usedDisk() {
 }
 
 BSONObj Pipeline::getInitialQuery() const {
-    if (_sources.empty())
-        return BSONObj();
-
-    /* look for an initial $match */
-    DocumentSourceMatch* match = dynamic_cast<DocumentSourceMatch*>(_sources.front().get());
-    if (match) {
-        return match->getQuery();
+    if (_sources.empty()) {
+        return BSONObj{};
     }
 
-    DocumentSourceGeoNear* geoNear = dynamic_cast<DocumentSourceGeoNear*>(_sources.front().get());
-    if (geoNear) {
-        return geoNear->getQuery();
+    const DocumentSource* doc = _sources.front().get();
+    if (doc->hasQuery()) {
+        return doc->getQuery();
     }
 
-    return BSONObj();
+    return BSONObj{};
 }
 
 bool Pipeline::needsPrimaryShardMerger() const {
@@ -492,8 +486,7 @@ void Pipeline::addFinalSource(intrusive_ptr<DocumentSource> source) {
 
 DepsTracker Pipeline::getDependencies(QueryMetadataBitSet unavailableMetadata) const {
     DepsTracker deps(unavailableMetadata);
-    const bool scopeHasVariables = pCtx->variablesParseState.hasDefinedVariables();
-    bool skipFieldsAndMetadataDeps = false;
+    bool hasUnsupportedStage = false;
     bool knowAllFields = false;
     bool knowAllMeta = false;
     for (auto&& source : _sources) {
@@ -501,35 +494,27 @@ DepsTracker Pipeline::getDependencies(QueryMetadataBitSet unavailableMetadata) c
         DepsTracker::State status = source->getDependencies(&localDeps);
 
         deps.vars.insert(localDeps.vars.begin(), localDeps.vars.end());
+        deps.needRandomGenerator |= localDeps.needRandomGenerator;
 
-        if ((skipFieldsAndMetadataDeps |= (status == DepsTracker::State::NOT_SUPPORTED))) {
-            // Assume this stage needs everything. We may still know something about our
-            // dependencies if an earlier stage returned EXHAUSTIVE_FIELDS or EXHAUSTIVE_META. If
-            // this scope has variables, we need to keep enumerating the remaining stages but will
-            // skip adding any further field or metadata dependencies.
-            if (scopeHasVariables) {
-                continue;
-            } else {
-                break;
-            }
+        if (status == DepsTracker::State::NOT_SUPPORTED) {
+            // We don't know anything about this stage, so we have to assume it depends on
+            // everything. We may still know something about our dependencies if an earlier stage
+            // returned EXHAUSTIVE_FIELDS or EXHAUSTIVE_META.
+            hasUnsupportedStage = true;
         }
 
-        if (!knowAllFields) {
+        // If we ever saw an unsupported stage, don't bother continuing to track field and metadata
+        // deps: we already have to assume the pipeline depends on everything.
+        if (!hasUnsupportedStage && !knowAllFields) {
             deps.fields.insert(localDeps.fields.begin(), localDeps.fields.end());
             if (localDeps.needWholeDocument)
                 deps.needWholeDocument = true;
             knowAllFields = status & DepsTracker::State::EXHAUSTIVE_FIELDS;
         }
 
-        if (!knowAllMeta) {
+        if (!hasUnsupportedStage && !knowAllMeta) {
             deps.requestMetadata(localDeps.metadataDeps());
             knowAllMeta = status & DepsTracker::State::EXHAUSTIVE_META;
-        }
-
-        // If there are variables defined at this pipeline's scope, there may be dependencies upon
-        // them in subsequent stages. Keep enumerating.
-        if (knowAllMeta && knowAllFields && !scopeHasVariables) {
-            break;
         }
     }
 
@@ -537,13 +522,14 @@ DepsTracker Pipeline::getDependencies(QueryMetadataBitSet unavailableMetadata) c
         deps.needWholeDocument = true;  // don't know all fields we need
 
     if (!unavailableMetadata[DocumentMetadataFields::kTextScore]) {
-        // If there is a text score, assume we need to keep it if we can't prove we don't. If we are
-        // the first half of a pipeline which has been split, future stages might need it.
-        if (!knowAllMeta) {
+        // There is a text score available. If we are the first half of a split pipeline, then we
+        // have to assume future stages might depend on the textScore (unless we've encountered a
+        // stage that doesn't preserve metadata).
+        if (getContext()->needsMerge && !knowAllMeta) {
             deps.setNeedsMetadata(DocumentMetadataFields::kTextScore, true);
         }
     } else {
-        // If there is no text score available, then we don't need to ask for it.
+        // There is no text score available, so we don't need to ask for it.
         deps.setNeedsMetadata(DocumentMetadataFields::kTextScore, false);
     }
 

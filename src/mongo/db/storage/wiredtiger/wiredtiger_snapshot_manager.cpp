@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -48,20 +48,20 @@ void WiredTigerSnapshotManager::setCommittedSnapshot(const Timestamp& timestamp)
     _committedSnapshot = timestamp;
 }
 
-void WiredTigerSnapshotManager::setLocalSnapshot(const Timestamp& timestamp) {
-    stdx::lock_guard<Latch> lock(_localSnapshotMutex);
+void WiredTigerSnapshotManager::setLastApplied(const Timestamp& timestamp) {
+    stdx::lock_guard<Latch> lock(_lastAppliedMutex);
     if (timestamp.isNull())
-        _localSnapshot = boost::none;
+        _lastApplied = boost::none;
     else
-        _localSnapshot = timestamp;
+        _lastApplied = timestamp;
 }
 
-boost::optional<Timestamp> WiredTigerSnapshotManager::getLocalSnapshot() {
-    stdx::lock_guard<Latch> lock(_localSnapshotMutex);
-    return _localSnapshot;
+boost::optional<Timestamp> WiredTigerSnapshotManager::getLastApplied() {
+    stdx::lock_guard<Latch> lock(_lastAppliedMutex);
+    return _lastApplied;
 }
 
-void WiredTigerSnapshotManager::dropAllSnapshots() {
+void WiredTigerSnapshotManager::clearCommittedSnapshot() {
     stdx::lock_guard<Latch> lock(_committedSnapshotMutex);
     _committedSnapshot = boost::none;
 }
@@ -91,25 +91,6 @@ Timestamp WiredTigerSnapshotManager::beginTransactionOnCommittedSnapshot(
 
     txnOpen.done();
     return *_committedSnapshot;
-}
-
-Timestamp WiredTigerSnapshotManager::beginTransactionOnLocalSnapshot(
-    WT_SESSION* session,
-    PrepareConflictBehavior prepareConflictBehavior,
-    RoundUpPreparedTimestamps roundUpPreparedTimestamps) const {
-    WiredTigerBeginTxnBlock txnOpen(session, prepareConflictBehavior, roundUpPreparedTimestamps);
-
-    stdx::lock_guard<Latch> lock(_localSnapshotMutex);
-    invariant(_localSnapshot);
-    LOGV2_DEBUG(22427,
-                3,
-                "begin_transaction on local snapshot {localSnapshot_get}",
-                "localSnapshot_get"_attr = _localSnapshot.get().toString());
-    auto status = txnOpen.setReadSnapshot(_localSnapshot.get());
-    fassert(50775, status);
-
-    txnOpen.done();
-    return *_localSnapshot;
 }
 
 }  // namespace mongo

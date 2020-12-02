@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -40,6 +40,7 @@
 #include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/pipeline/document_path_support.h"
+#include "mongo/db/pipeline/variable_validation.h"
 #include "mongo/logv2/log.h"
 
 namespace mongo {
@@ -147,8 +148,8 @@ MergeStrategy makeInsertStrategy() {
 BatchTransform makeUpdateTransform(const std::string& updateOp) {
     return [updateOp](auto& batch) {
         for (auto&& obj : batch) {
-            std::get<UpdateModification>(obj) =
-                BSON(updateOp << std::get<UpdateModification>(obj).getUpdateClassic());
+            std::get<UpdateModification>(obj) = UpdateModification::parseFromClassicUpdate(
+                BSON(updateOp << std::get<UpdateModification>(obj).getUpdateClassic()));
         }
     };
 }
@@ -370,11 +371,11 @@ DocumentSourceMerge::DocumentSourceMerge(NamespaceString outputNs,
 
         for (auto&& varElem : *letVariables) {
             const auto varName = varElem.fieldNameStringData();
-            Variables::validateNameForUserWrite(varName);
+            variableValidation::validateNameForUserWrite(varName);
 
             _letVariables->emplace(
                 varName.toString(),
-                Expression::parseOperand(expCtx, varElem, expCtx->variablesParseState));
+                Expression::parseOperand(expCtx.get(), varElem, expCtx->variablesParseState));
         }
     }
 }
@@ -477,7 +478,8 @@ StageConstraints DocumentSourceMerge::constraints(Pipeline::SplitState pipeState
     // either choice will work correctly, we are simply applying a heuristic optimization.
     return {StreamType::kStreaming,
             PositionRequirement::kLast,
-            pExpCtx->mongoProcessInterface->isSharded(pExpCtx->opCtx, _outputNs)
+            pExpCtx->inMongos &&
+                    pExpCtx->mongoProcessInterface->isSharded(pExpCtx->opCtx, _outputNs)
                 ? HostTypeRequirement::kAnyShard
                 : HostTypeRequirement::kPrimaryShard,
             DiskUseRequirement::kWritesPersistentData,

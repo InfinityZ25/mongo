@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -44,7 +44,6 @@
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/replication_coordinator.h"
@@ -88,6 +87,22 @@ public:
         return false;
     }
 
+    ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
+                                                 repl::ReadConcernLevel level) const final {
+
+        static const Status kReadConcernNotSupported{ErrorCodes::InvalidOptions,
+                                                     "read concern not supported"};
+        static const Status kDefaultReadConcernNotPermitted{ErrorCodes::InvalidOptions,
+                                                            "default read concern not permitted"};
+        // The dbHash command only supports local and snapshot read concern. Additionally, snapshot
+        // read concern is only supported if test commands are enabled.
+        return {{level != repl::ReadConcernLevel::kLocalReadConcern &&
+                     (!getTestCommandsEnabled() ||
+                      level != repl::ReadConcernLevel::kSnapshotReadConcern),
+                 kReadConcernNotSupported},
+                kDefaultReadConcernNotPermitted};
+    }
+
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
                                        std::vector<Privilege>* out) const {
@@ -127,17 +142,11 @@ public:
                     " commands are enabled",
                     getTestCommandsEnabled());
 
-            auto* replCoord = repl::ReplicationCoordinator::get(opCtx);
+            auto replCoord = repl::ReplicationCoordinator::get(opCtx);
             uassert(ErrorCodes::InvalidOptions,
                     "The '$_internalReadAtClusterTime' option is only supported when replication is"
                     " enabled",
                     replCoord->isReplEnabled());
-
-            auto* storageEngine = opCtx->getServiceContext()->getStorageEngine();
-            uassert(ErrorCodes::InvalidOptions,
-                    "The '$_internalReadAtClusterTime' option is only supported by storage engines"
-                    " that support document-level concurrency",
-                    storageEngine->supportsDocLocking());
 
             uassert(ErrorCodes::TypeMismatch,
                     "The '$_internalReadAtClusterTime' option must be a Timestamp",
@@ -169,6 +178,7 @@ public:
             // down. This isn't an actual concern because the testing infrastructure won't use the
             // $_internalReadAtClusterTime option in any test suite where clean shutdown is expected
             // to occur concurrently with tests running.
+            auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
             auto allDurableTime = storageEngine->getAllDurableTimestamp();
             invariant(!allDurableTime.isNull());
 
@@ -221,48 +231,50 @@ public:
         std::set<std::string> cappedCollectionSet;
 
         bool noError = true;
-        catalog::forEachCollectionFromDb(opCtx, dbname, MODE_IS, [&](const Collection* collection) {
-            auto collNss = collection->ns();
+        catalog::forEachCollectionFromDb(
+            opCtx, dbname, MODE_IS, [&](const CollectionPtr& collection) {
+                auto collNss = collection->ns();
 
-            if (collNss.size() - 1 <= dbname.size()) {
-                errmsg = str::stream() << "weird fullCollectionName [" << collNss.toString() << "]";
-                noError = false;
-                return false;
-            }
+                if (collNss.size() - 1 <= dbname.size()) {
+                    errmsg = str::stream()
+                        << "weird fullCollectionName [" << collNss.toString() << "]";
+                    noError = false;
+                    return false;
+                }
 
-            if (repl::ReplicationCoordinator::isOplogDisabledForNS(collNss)) {
+                if (repl::ReplicationCoordinator::isOplogDisabledForNS(collNss)) {
+                    return true;
+                }
+
+                if (collNss.coll().startsWith("tmp.mr.")) {
+                    // We skip any incremental map reduce collections as they also aren't
+                    // replicated.
+                    return true;
+                }
+
+                if (desiredCollections.size() > 0 &&
+                    desiredCollections.count(collNss.coll().toString()) == 0)
+                    return true;
+
+                // Don't include 'drop pending' collections.
+                if (collNss.isDropPendingNamespace())
+                    return true;
+
+                if (collection->isCapped()) {
+                    cappedCollectionSet.insert(collNss.coll().toString());
+                }
+
+                if (OptionalCollectionUUID uuid = collection->uuid()) {
+                    collectionToUUIDMap[collNss.coll().toString()] = uuid;
+                }
+
+                // Compute the hash for this collection.
+                std::string hash = _hashCollection(opCtx, db, collNss);
+
+                collectionToHashMap[collNss.coll().toString()] = hash;
+
                 return true;
-            }
-
-            if (collNss.coll().startsWith("tmp.mr.")) {
-                // We skip any incremental map reduce collections as they also aren't
-                // replicated.
-                return true;
-            }
-
-            if (desiredCollections.size() > 0 &&
-                desiredCollections.count(collNss.coll().toString()) == 0)
-                return true;
-
-            // Don't include 'drop pending' collections.
-            if (collNss.isDropPendingNamespace())
-                return true;
-
-            if (collection->isCapped()) {
-                cappedCollectionSet.insert(collNss.coll().toString());
-            }
-
-            if (OptionalCollectionUUID uuid = collection->uuid()) {
-                collectionToUUIDMap[collNss.coll().toString()] = uuid;
-            }
-
-            // Compute the hash for this collection.
-            std::string hash = _hashCollection(opCtx, db, collNss);
-
-            collectionToHashMap[collNss.coll().toString()] = hash;
-
-            return true;
-        });
+            });
         if (!noError)
             return false;
 
@@ -305,8 +317,8 @@ public:
 private:
     std::string _hashCollection(OperationContext* opCtx, Database* db, const NamespaceString& nss) {
 
-        Collection* collection =
-            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
+        CollectionPtr collection =
+            CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss);
         invariant(collection);
 
         boost::optional<Lock::CollectionLock> collLock;
@@ -319,7 +331,7 @@ private:
             invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_IS));
 
             auto minSnapshot = collection->getMinimumVisibleSnapshot();
-            auto mySnapshot = opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
+            auto mySnapshot = opCtx->recoveryUnit()->getPointInTimeReadTimestamp(opCtx);
             invariant(mySnapshot);
 
             uassert(ErrorCodes::SnapshotUnavailable,
@@ -338,39 +350,43 @@ private:
         std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec;
         if (desc) {
             exec = InternalPlanner::indexScan(opCtx,
-                                              collection,
+                                              &collection,
                                               desc,
                                               BSONObj(),
                                               BSONObj(),
                                               BoundInclusion::kIncludeStartKeyOnly,
-                                              PlanExecutor::NO_YIELD,
+                                              PlanYieldPolicy::YieldPolicy::NO_YIELD,
                                               InternalPlanner::FORWARD,
                                               InternalPlanner::IXSCAN_FETCH);
         } else if (collection->isCapped()) {
             exec = InternalPlanner::collectionScan(
-                opCtx, nss.ns(), collection, PlanExecutor::NO_YIELD);
+                opCtx, nss.ns(), &collection, PlanYieldPolicy::YieldPolicy::NO_YIELD);
         } else {
-            LOGV2(20455, "can't find _id index for: {nss}", "nss"_attr = nss);
+            LOGV2(20455,
+                  "Can't find _id index for namespace: {namespace}",
+                  "Can't find _id index for namespace",
+                  "namespace"_attr = nss);
             return "no _id _index";
         }
 
         md5_state_t st;
         md5_init(&st);
 
-        long long n = 0;
-        PlanExecutor::ExecState state;
-        BSONObj c;
-        verify(nullptr != exec.get());
-        while (PlanExecutor::ADVANCED == (state = exec->getNext(&c, nullptr))) {
-            md5_append(&st, (const md5_byte_t*)c.objdata(), c.objsize());
-            n++;
+        try {
+            long long n = 0;
+            BSONObj c;
+            verify(nullptr != exec.get());
+            while (exec->getNext(&c, nullptr) == PlanExecutor::ADVANCED) {
+                md5_append(&st, (const md5_byte_t*)c.objdata(), c.objsize());
+                n++;
+            }
+        } catch (DBException& exception) {
+            LOGV2_WARNING(
+                20456, "Error while hashing, db possibly dropped", "namespace"_attr = nss);
+            exception.addContext("Plan executor error while running dbHash command");
+            throw;
         }
-        if (PlanExecutor::IS_EOF != state) {
-            LOGV2_WARNING(20456, "error while hashing, db dropped? ns={nss}", "nss"_attr = nss);
-            uasserted(34371,
-                      "Plan executor error while running dbHash command: " +
-                          WorkingSetCommon::toStatusString(c));
-        }
+
         md5digest d;
         md5_finish(&st, d);
         std::string hash = digestToString(d);

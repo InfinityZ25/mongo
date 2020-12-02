@@ -33,107 +33,159 @@
 
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/commands/feature_compatibility_version_document_gen.h"
 #include "mongo/db/commands/feature_compatibility_version_documentation.h"
 #include "mongo/db/namespace_string.h"
 
 namespace mongo {
 
-constexpr StringData FeatureCompatibilityVersionParser::kVersion44;
-constexpr StringData FeatureCompatibilityVersionParser::kVersion46;
-constexpr StringData FeatureCompatibilityVersionParser::kVersionDowngradingTo44;
-constexpr StringData FeatureCompatibilityVersionParser::kVersionUpgradingTo46;
-constexpr StringData FeatureCompatibilityVersionParser::kVersionUnset;
+using FeatureCompatibilityParams = ServerGlobalParams::FeatureCompatibility;
 
 constexpr StringData FeatureCompatibilityVersionParser::kParameterName;
-constexpr StringData FeatureCompatibilityVersionParser::kVersionField;
-constexpr StringData FeatureCompatibilityVersionParser::kTargetVersionField;
 
-StatusWith<ServerGlobalParams::FeatureCompatibility::Version>
-FeatureCompatibilityVersionParser::parse(const BSONObj& featureCompatibilityVersionDoc) {
-    ServerGlobalParams::FeatureCompatibility::Version version =
-        ServerGlobalParams::FeatureCompatibility::Version::kUnsetDefault44Behavior;
-    std::string versionString;
-    std::string targetVersionString;
+constexpr StringData FeatureCompatibilityVersionParser::kLastLTS;
+constexpr StringData FeatureCompatibilityVersionParser::kLastContinuous;
+constexpr StringData FeatureCompatibilityVersionParser::kLatest;
 
-    for (auto&& elem : featureCompatibilityVersionDoc) {
-        auto fieldName = elem.fieldNameStringData();
-        if (fieldName == "_id") {
-            continue;
-        } else if (fieldName == kVersionField || fieldName == kTargetVersionField) {
-            if (elem.type() != BSONType::String) {
-                return Status(ErrorCodes::TypeMismatch,
-                              str::stream()
-                                  << fieldName << " must be of type String, but was of type "
-                                  << typeName(elem.type()) << ". Contents of " << kParameterName
-                                  << " document in "
-                                  << NamespaceString::kServerConfigurationNamespace.toString()
-                                  << ": " << featureCompatibilityVersionDoc << ". See "
-                                  << feature_compatibility_version_documentation::kCompatibilityLink
-                                  << ".");
-            }
-
-            if (elem.String() != kVersion46 && elem.String() != kVersion44) {
-                return Status(ErrorCodes::BadValue,
-                              str::stream()
-                                  << "Invalid value for " << fieldName << ", found "
-                                  << elem.String() << ", expected '" << kVersion46 << "' or '"
-                                  << kVersion44 << "'. Contents of " << kParameterName
-                                  << " document in "
-                                  << NamespaceString::kServerConfigurationNamespace.toString()
-                                  << ": " << featureCompatibilityVersionDoc << ". See "
-                                  << feature_compatibility_version_documentation::kCompatibilityLink
-                                  << ".");
-            }
-
-            if (fieldName == kVersionField) {
-                versionString = elem.String();
-            } else if (fieldName == kTargetVersionField) {
-                targetVersionString = elem.String();
-            }
-        } else {
-            return Status(ErrorCodes::BadValue,
-                          str::stream()
-                              << "Unrecognized field '" << fieldName << "'. Contents of "
-                              << kParameterName << " document in "
-                              << NamespaceString::kServerConfigurationNamespace.toString() << ": "
-                              << featureCompatibilityVersionDoc << ". See "
-                              << feature_compatibility_version_documentation::kCompatibilityLink
-                              << ".");
-        }
+FeatureCompatibilityParams::Version FeatureCompatibilityVersionParser::parseVersion(
+    StringData versionString) {
+    if (versionString == kLastLTS) {
+        return FeatureCompatibilityParams::kLastLTS;
     }
+    if (versionString == kLastContinuous) {
+        return FeatureCompatibilityParams::kLastContinuous;
+    }
+    if (versionString == kLatest) {
+        return FeatureCompatibilityParams::kLatest;
+    }
+    uasserted(4926900,
+              str::stream() << "Invalid value for " << kParameterName << "document in "
+                            << NamespaceString::kServerConfigurationNamespace.toString()
+                            << ", found " << versionString << ", expected '" << kLastLTS << "' or '"
+                            << kLastContinuous << "' or '" << kLatest << ". See "
+                            << feature_compatibility_version_documentation::kCompatibilityLink
+                            << ".");
+}
 
-    if (versionString == kVersion44) {
-        if (targetVersionString == kVersion46) {
-            version = ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo46;
-        } else if (targetVersionString == kVersion44) {
-            version = ServerGlobalParams::FeatureCompatibility::Version::kDowngradingTo44;
-        } else {
-            version = ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo44;
+StringData FeatureCompatibilityVersionParser::serializeVersion(
+    FeatureCompatibilityParams::Version version) {
+    if (version == FeatureCompatibilityParams::kLastLTS) {
+        return kLastLTS;
+    }
+    if (version == FeatureCompatibilityParams::kLastContinuous) {
+        return kLastContinuous;
+    }
+    if (version == FeatureCompatibilityParams::kLatest) {
+        return kLatest;
+    }
+    // It is a bug if we hit here.
+    invariant(false, "Invalid version value for featureCompatibilityVersion documents");
+    MONGO_UNREACHABLE
+}
+
+Status FeatureCompatibilityVersionParser::validatePreviousVersionField(
+    FeatureCompatibilityParams::Version version) {
+    if (version == FeatureCompatibilityParams::kLatest) {
+        return Status::OK();
+    }
+    return Status(ErrorCodes::Error(4926901),
+                  "when present, 'previousVersion' field must be the latest binary version");
+}
+
+StatusWith<FeatureCompatibilityParams::Version> FeatureCompatibilityVersionParser::parse(
+    const BSONObj& featureCompatibilityVersionDoc) {
+    try {
+        auto fcvDoc = FeatureCompatibilityVersionDocument::parse(
+            IDLParserErrorContext("FeatureCompatibilityVersionParser"),
+            featureCompatibilityVersionDoc);
+        auto version = fcvDoc.getVersion();
+        auto targetVersion = fcvDoc.getTargetVersion();
+        auto previousVersion = fcvDoc.getPreviousVersion();
+
+        // Downgrading FCV.
+        if ((version == FeatureCompatibilityParams::kLastLTS ||
+             version == FeatureCompatibilityParams::kLastContinuous) &&
+            version == targetVersion) {
+            // Downgrading FCV must have a "previousVersion" field.
+            if (!previousVersion) {
+                return Status(ErrorCodes::Error(4926902),
+                              str::stream()
+                                  << "Missing field "
+                                  << FeatureCompatibilityVersionDocument::kPreviousVersionFieldName
+                                  << " in downgrading states for " << kParameterName
+                                  << " document in "
+                                  << NamespaceString::kServerConfigurationNamespace.toString()
+                                  << ": " << featureCompatibilityVersionDoc << ". See "
+                                  << feature_compatibility_version_documentation::kCompatibilityLink
+                                  << ".");
+            }
+            if (version == FeatureCompatibilityParams::kLastLTS) {
+                // Downgrading to last-lts.
+                return FeatureCompatibilityParams::kDowngradingFromLatestToLastLTS;
+            } else {
+                return FeatureCompatibilityParams::kDowngradingFromLatestToLastContinuous;
+            }
         }
-    } else if (versionString == kVersion46) {
-        if (targetVersionString == kVersion46 || targetVersionString == kVersion44) {
-            return Status(ErrorCodes::BadValue,
+
+        // Non-downgrading FCV must not have a "previousVersion" field.
+        if (previousVersion) {
+            return Status(ErrorCodes::Error(4926903),
                           str::stream()
-                              << "Invalid state for " << kParameterName << " document in "
+                              << "Unexpected field "
+                              << FeatureCompatibilityVersionDocument::kPreviousVersionFieldName
+                              << " in non-downgrading states for " << kParameterName
+                              << " document in "
                               << NamespaceString::kServerConfigurationNamespace.toString() << ": "
                               << featureCompatibilityVersionDoc << ". See "
                               << feature_compatibility_version_documentation::kCompatibilityLink
                               << ".");
-        } else {
-            version = ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo46;
         }
-    } else {
-        return Status(ErrorCodes::BadValue,
-                      str::stream()
-                          << "Missing required field '" << kVersionField << "''. Contents of "
-                          << kParameterName << " document in "
+
+        // Upgrading FCV.
+        if (targetVersion) {
+            // For upgrading FCV, "targetVersion" must be kLatest or kLastContinuous and "version"
+            // must be kLastContinuous or kLastLTS.
+            if (targetVersion == FeatureCompatibilityParams::kLastLTS ||
+                version == ServerGlobalParams::FeatureCompatibility::kLatest) {
+                return Status(ErrorCodes::Error(4926904),
+                              str::stream()
+                                  << "Invalid " << kParameterName << " document in "
+                                  << NamespaceString::kServerConfigurationNamespace.toString()
+                                  << ": " << featureCompatibilityVersionDoc << ". See "
+                                  << feature_compatibility_version_documentation::kCompatibilityLink
+                                  << ".");
+            }
+
+            if (version == FeatureCompatibilityParams::kLastLTS) {
+                return targetVersion == FeatureCompatibilityParams::kLastContinuous
+                    ? FeatureCompatibilityParams::kUpgradingFromLastLTSToLastContinuous
+                    : FeatureCompatibilityParams::kUpgradingFromLastLTSToLatest;
+            } else {
+                uassert(5070601,
+                        str::stream()
+                            << "Invalid " << kParameterName << " document in "
+                            << NamespaceString::kServerConfigurationNamespace.toString() << ": "
+                            << featureCompatibilityVersionDoc << ". See "
+                            << feature_compatibility_version_documentation::kCompatibilityLink
+                            << ".",
+                        version == ServerGlobalParams::FeatureCompatibility::kLastContinuous);
+                return FeatureCompatibilityParams::kUpgradingFromLastContinuousToLatest;
+            }
+        }
+
+        // No "targetVersion" or "previousVersion" field.
+        return version;
+    } catch (const DBException& e) {
+        auto status = e.toStatus();
+        status.addContext(str::stream()
+                          << "Invalid " << kParameterName << " document in "
                           << NamespaceString::kServerConfigurationNamespace.toString() << ": "
                           << featureCompatibilityVersionDoc << ". See "
                           << feature_compatibility_version_documentation::kCompatibilityLink
                           << ".");
+        return status;
     }
-
-    return version;
+    MONGO_UNREACHABLE
 }
 
 }  // namespace mongo

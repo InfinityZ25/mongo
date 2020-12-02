@@ -53,6 +53,10 @@ class ClusterCountCmd : public ErrmsgCommandDeprecated {
 public:
     ClusterCountCmd() : ErrmsgCommandDeprecated("count") {}
 
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
+
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
@@ -67,7 +71,10 @@ public:
 
     ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
                                                  repl::ReadConcernLevel level) const override {
-        return ReadConcernSupportResult::allSupportedAndDefaultPermitted();
+        static const Status kSnapshotNotSupported{ErrorCodes::InvalidOptions,
+                                                  "read concern snapshot not supported"};
+        return {{level == repl::ReadConcernLevel::kSnapshotReadConcern, kSnapshotNotSupported},
+                Status::OK()};
     }
 
     void addRequiredPrivileges(const std::string& dbname,
@@ -257,7 +264,7 @@ public:
 
         auto bodyBuilder = result->getBodyBuilder();
         return ClusterExplain::buildExplainResult(
-            opCtx, shardResponses, mongosStageName, millisElapsed, &bodyBuilder);
+            opCtx, shardResponses, mongosStageName, millisElapsed, cmdObj, &bodyBuilder);
     }
 
 private:

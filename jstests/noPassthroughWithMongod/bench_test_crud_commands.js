@@ -1,4 +1,5 @@
 // Tests the "writeCmd" and "readCmd" options to benchRun().
+
 (function() {
 "use strict";
 

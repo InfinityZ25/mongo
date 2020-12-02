@@ -33,14 +33,18 @@
 
 #include "mongo/db/repl/base_cloner.h"
 #include "mongo/db/repl/database_cloner.h"
+#include "mongo/db/repl/initial_sync_base_cloner.h"
+#include "mongo/db/repl/initial_sync_shared_data.h"
 
 namespace mongo {
 namespace repl {
 
-class AllDatabaseCloner final : public BaseCloner {
+class AllDatabaseCloner final : public InitialSyncBaseCloner {
 public:
     struct Stats {
         size_t databasesCloned{0};
+        size_t databasesToClone{0};
+        long long dataSize{0};
         std::vector<DatabaseCloner::Stats> databaseStats;
 
         std::string toString() const;

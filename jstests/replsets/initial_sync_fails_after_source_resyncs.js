@@ -1,7 +1,7 @@
 /**
  * Tests that initial sync will abort an attempt if the sync source enters and completes initial
  * sync during cloning (i.e. the source is resynced during an outage).
- * @tags: [requires_fcv_44]
+ * @tags: [live_record_incompatible]
  */
 (function() {
 "use strict";
@@ -9,12 +9,8 @@
 load("jstests/libs/fail_point_util.js");
 
 const testName = "initial_sync_fails_after_source_resyncs";
-const rst = new ReplSetTest({
-    name: testName,
-    nodes: [{}, {rsConfig: {priority: 0, votes: 0}}],
-    allowChaining: true,
-    useBridge: true
-});
+const rst = new ReplSetTest(
+    {name: testName, nodes: [{}, {rsConfig: {priority: 0, votes: 0}}], useBridge: true});
 const nodes = rst.startSet();
 rst.initiateWithHighElectionTimeout();
 
@@ -86,8 +82,19 @@ assert.commandWorked(initialSyncNodeDb.adminCommand(
 assert.commandWorked(initialSyncSource.getDB("admin").adminCommand(
     {configureFailPoint: "initialSyncHangBeforeFinish", mode: "off"}));
 
+// We want to ensure the initialSyncNode encounters the InitialSyncFailure error and shuts down.
+assert.soon(() => {
+    try {
+        initialSyncNodeDb.runCommand({ping: 1});
+    } catch (e) {
+        return true;
+    }
+    return false;
+}, "Node did not shutdown due to initial sync failure", ReplSetTest.kDefaultTimeoutMS);
+
 // We skip validation and dbhashes because the initial sync failed so the initial sync node is
 // invalid and unreachable.
 TestData.skipCheckDBHashes = true;
+rst.stop(initialSyncNode, null, {skipValidation: true, allowedExitCode: MongoRunner.EXIT_ABRUPT});
 rst.stopSet(null, null, {skipValidation: true});
 })();

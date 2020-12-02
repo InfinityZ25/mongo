@@ -10,12 +10,6 @@ load("jstests/noPassthrough/libs/index_build.js");
 const mongodOptions = {};
 const conn = MongoRunner.runMongod(mongodOptions);
 
-if (!IndexBuildTest.supportsTwoPhaseIndexBuild(conn)) {
-    jsTest.log("Not running because two phase index builds are not supported.");
-    MongoRunner.stopMongod(conn);
-    return;
-}
-
 const dbName = "drop_database_aborts_in_progress_index_builds";
 const firstCollName = "first";
 const secondCollName = "second";
@@ -68,7 +62,7 @@ try {
 
     checkLog.contains(
         testDB.getMongo(),
-        "dropDatabase - fail point dropDatabaseHangAfterWaitingForIndexBuilds enabled.");
+        "dropDatabase - fail point dropDatabaseHangAfterWaitingForIndexBuilds enabled");
 
     // Cannot create a collection on the database while it is drop pending.
     assert.commandFailedWithCode(testDB.createCollection("third"), ErrorCodes.DatabaseDropPending);

@@ -363,7 +363,7 @@ TEST_F(RemoteCommandRetrySchedulerTest,
 
 TEST_F(RemoteCommandRetrySchedulerTest, SchedulerInvokesCallbackOnNonRetryableErrorInResponse) {
     CallbackResponseSaver callback;
-    auto policy = RemoteCommandRetryScheduler::makeRetryPolicy<ErrorCategory::NotMasterError>(
+    auto policy = RemoteCommandRetryScheduler::makeRetryPolicy<ErrorCategory::NotPrimaryError>(
         10U, Milliseconds(1));
     auto request = makeRemoteCommandRequest();
 
@@ -558,9 +558,7 @@ TEST_F(RemoteCommandRetrySchedulerTest,
         request,
         [&result,
          sharedCallbackData](const executor::TaskExecutor::RemoteCommandCallbackArgs& rcba) {
-            LOGV2(20156,
-                  "setting result to {rcba_response_status}",
-                  "rcba_response_status"_attr = rcba.response.status);
+            LOGV2(20156, "Setting result", "result"_attr = rcba.response.status);
             result = rcba.response.status;
         },
         std::move(policy));

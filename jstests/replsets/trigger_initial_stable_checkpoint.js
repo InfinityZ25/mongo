@@ -1,15 +1,15 @@
 /**
  * Ensure that we properly trigger a stable checkpoint when starting up a replica set node.
  *
- * We don't support unclean shutdowns with restarts into a last-stable binary.
+ * We don't support unclean shutdowns with restarts into a last-lts binary.
  * @tags: [requires_persistence, multiversion_incompatible]
  */
 (function() {
 const rst = new ReplSetTest({
     nodes: 1,
     nodeOptions: {
-        // Turn up the syncdelay (in seconds) to effectively disable background checkpoints.
-        syncdelay: 600,
+        // Disable background checkpoints: a zero value disables checkpointing.
+        syncdelay: 0,
         setParameter: {logComponentVerbosity: tojson({storage: 2})}
     }
 });

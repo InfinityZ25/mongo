@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
 
 #include "mongo/platform/basic.h"
 
@@ -271,12 +271,6 @@ StatusWith<BSONObj> validateIndexSpec(
 
     boost::optional<IndexVersion> resolvedIndexVersion;
 
-    // Allow hidden index only if FCV is 4.6.
-    const auto isFeatureDisabled =
-        (!featureCompatibility.isVersionInitialized() ||
-         featureCompatibility.getVersion() <
-             ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo46);
-
     for (auto&& indexSpecElem : indexSpec) {
         auto indexSpecElemFieldName = indexSpecElem.fieldNameStringData();
         if (IndexDescriptor::kKeyPatternFieldName == indexSpecElemFieldName) {
@@ -299,10 +293,20 @@ StatusWith<BSONObj> validateIndexSpec(
                 keys.push_back(keyElemFieldName);
             }
 
+            // TODO SERVER-51871: When 5.0 becomes last-lts, this check should be moved into
+            // 'validateKeyPattern()'. It must currently be done here so that haystack indexes
+            // continue to replicate correctly before the upgrade to FCV "4.9" is complete.
+            const auto keyPattern = indexSpecElem.Obj();
+            if (IndexNames::findPluginName(keyPattern) == IndexNames::GEO_HAYSTACK) {
+                return {ErrorCodes::CannotCreateIndex,
+                        str::stream()
+                            << "GeoHaystack indexes cannot be created in version 4.9 and above"};
+            }
+
             // Here we always validate the key pattern according to the most recent rules, in order
             // to enforce that all new indexes have well-formed key patterns.
             Status keyPatternValidateStatus =
-                validateKeyPattern(indexSpecElem.Obj(), IndexDescriptor::kLatestIndexVersion);
+                validateKeyPattern(keyPattern, IndexDescriptor::kLatestIndexVersion);
             if (!keyPatternValidateStatus.isOK()) {
                 return keyPatternValidateStatus;
             }
@@ -326,10 +330,6 @@ StatusWith<BSONObj> validateIndexSpec(
 
             hasIndexNameField = true;
         } else if (IndexDescriptor::kHiddenFieldName == indexSpecElemFieldName) {
-            if (isFeatureDisabled) {
-                return {ErrorCodes::Error(31449),
-                        "Hidden indexes can only be created with FCV 4.6"};
-            }
             if (indexSpecElem.type() != BSONType::Bool) {
                 return {ErrorCodes::TypeMismatch,
                         str::stream()
@@ -444,6 +444,11 @@ StatusWith<BSONObj> validateIndexSpec(
                 return ex.toStatus(str::stream() << "Failed to parse: "
                                                  << IndexDescriptor::kPathProjectionFieldName);
             }
+        } else if (IndexDescriptor::kGeoHaystackBucketSize == indexSpecElemFieldName) {
+            return {ErrorCodes::CannotCreateIndex,
+                    str::stream()
+                        << "The 'bucketSize' parameter is disallowed because "
+                           "geoHaystack indexes are no longer supported in version 4.9 and above"};
         } else {
             // We can assume field name is valid at this point. Validation of fieldname is handled
             // prior to this in validateIndexSpecFieldNames().
@@ -603,6 +608,57 @@ StatusWith<BSONObj> validateIndexSpecCollation(OperationContext* opCtx,
         }
     }
     return indexSpec;
+}
+
+Status validateIndexSpecTTL(const BSONObj& indexSpec) {
+    if (!indexSpec.hasField(IndexDescriptor::kExpireAfterSecondsFieldName)) {
+        return Status::OK();
+    }
+
+    const BSONElement expireAfterSecondsElt =
+        indexSpec[IndexDescriptor::kExpireAfterSecondsFieldName];
+    if (!expireAfterSecondsElt.isNumber()) {
+        return {ErrorCodes::CannotCreateIndex,
+                str::stream() << "TTL index '" << IndexDescriptor::kExpireAfterSecondsFieldName
+                              << "' option must be numeric, but received a type of '"
+                              << typeName(expireAfterSecondsElt.type())
+                              << "'. Index spec: " << indexSpec};
+    }
+
+    if (expireAfterSecondsElt.safeNumberLong() < 0) {
+        return {ErrorCodes::CannotCreateIndex,
+                str::stream() << "TTL index '" << IndexDescriptor::kExpireAfterSecondsFieldName
+                              << "' option cannot be less than 0. Index spec: " << indexSpec};
+    }
+
+    const std::string tooLargeErr = str::stream()
+        << "TTL index '" << IndexDescriptor::kExpireAfterSecondsFieldName
+        << "' option must be within an acceptable range, try a lower number. Index spec: "
+        << indexSpec;
+
+    // There are two cases where we can encounter an issue here.
+    // The first case is when we try to cast to millseconds from seconds, which could cause an
+    // overflow. The second case is where 'expireAfterSeconds' is larger than the current epoch
+    // time.
+    try {
+        auto expireAfterMillis =
+            duration_cast<Milliseconds>(Seconds(expireAfterSecondsElt.safeNumberLong()));
+        if (expireAfterMillis > Date_t::now().toDurationSinceEpoch()) {
+            return {ErrorCodes::CannotCreateIndex, tooLargeErr};
+        }
+    } catch (const AssertionException&) {
+        return {ErrorCodes::CannotCreateIndex, tooLargeErr};
+    }
+
+    const BSONObj key = indexSpec["key"].Obj();
+    if (key.nFields() != 1) {
+        return {ErrorCodes::CannotCreateIndex,
+                str::stream() << "TTL indexes are single-field indexes, compound indexes do "
+                                 "not support TTL. Index spec: "
+                              << indexSpec};
+    }
+
+    return Status::OK();
 }
 
 GlobalInitializerRegisterer filterAllowedIndexFieldNamesInitializer(

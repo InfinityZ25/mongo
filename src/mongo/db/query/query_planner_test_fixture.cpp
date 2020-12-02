@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -71,6 +71,7 @@ void QueryPlannerTest::clearState() {
 void QueryPlannerTest::addIndex(BSONObj keyPattern, bool multikey) {
     params.indices.push_back({keyPattern,
                               IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                              IndexDescriptor::kLatestIndexVersion,
                               multikey,
                               {},
                               {},
@@ -86,6 +87,7 @@ void QueryPlannerTest::addIndex(BSONObj keyPattern, bool multikey) {
 void QueryPlannerTest::addIndex(BSONObj keyPattern, bool multikey, bool sparse) {
     params.indices.push_back({keyPattern,
                               IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                              IndexDescriptor::kLatestIndexVersion,
                               multikey,
                               {},
                               {},
@@ -102,6 +104,7 @@ void QueryPlannerTest::addIndex(BSONObj keyPattern, bool multikey, bool sparse, 
     params.indices.push_back(
         {keyPattern,
          IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+         IndexDescriptor::kLatestIndexVersion,
          multikey,
          {},
          {},
@@ -117,6 +120,7 @@ void QueryPlannerTest::addIndex(BSONObj keyPattern, bool multikey, bool sparse, 
 void QueryPlannerTest::addIndex(BSONObj keyPattern, BSONObj infoObj) {
     params.indices.push_back({keyPattern,
                               IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                              IndexDescriptor::kLatestIndexVersion,
                               false,  // multikey
                               {},
                               {},
@@ -132,6 +136,7 @@ void QueryPlannerTest::addIndex(BSONObj keyPattern, BSONObj infoObj) {
 void QueryPlannerTest::addIndex(BSONObj keyPattern, MatchExpression* filterExpr) {
     params.indices.push_back({keyPattern,
                               IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                              IndexDescriptor::kLatestIndexVersion,
                               false,  // multikey
                               {},
                               {},
@@ -159,6 +164,7 @@ void QueryPlannerTest::addIndex(BSONObj keyPattern, const MultikeyPaths& multike
     const BSONObj infoObj;
     IndexEntry entry(keyPattern,
                      type,
+                     IndexDescriptor::kLatestIndexVersion,
                      multikey,
                      {},
                      {},
@@ -183,6 +189,7 @@ void QueryPlannerTest::addIndex(BSONObj keyPattern, const CollatorInterface* col
     const BSONObj infoObj;
     IndexEntry entry(keyPattern,
                      type,
+                     IndexDescriptor::kLatestIndexVersion,
                      multikey,
                      {},
                      {},
@@ -209,6 +216,7 @@ void QueryPlannerTest::addIndex(BSONObj keyPattern,
     const BSONObj infoObj;
     IndexEntry entry(keyPattern,
                      type,
+                     IndexDescriptor::kLatestIndexVersion,
                      multikey,
                      {},
                      {},
@@ -234,6 +242,7 @@ void QueryPlannerTest::addIndex(BSONObj keyPattern,
     const BSONObj infoObj;
     IndexEntry entry(keyPattern,
                      type,
+                     IndexDescriptor::kLatestIndexVersion,
                      multikey,
                      {},
                      {},
@@ -477,7 +486,7 @@ size_t QueryPlannerTest::getNumSolutions() const {
 void QueryPlannerTest::dumpSolutions() const {
     str::stream ost;
     dumpSolutions(ost);
-    LOGV2(20985, "{std_string_ost}", "std_string_ost"_attr = std::string(ost));
+    LOGV2(20985, "Solutions", "value"_attr = std::string(ost));
 }
 
 void QueryPlannerTest::dumpSolutions(str::stream& ost) const {
@@ -501,8 +510,7 @@ size_t QueryPlannerTest::numSolutionMatches(const std::string& solnJson) const {
     BSONObj testSoln = fromjson(solnJson);
     size_t matches = 0;
     for (auto&& soln : solns) {
-        QuerySolutionNode* root = soln->root.get();
-        if (QueryPlannerTestLib::solutionMatches(testSoln, root, relaxBoundsCheck)) {
+        if (QueryPlannerTestLib::solutionMatches(testSoln, soln->root(), relaxBoundsCheck)) {
             ++matches;
         }
     }

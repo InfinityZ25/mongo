@@ -26,11 +26,10 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/client/sdam/json_test_arg_parser.h"
 
-#include "mongo/logger/logger.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/options_parser/environment.h"
 #include "mongo/util/options_parser/option_section.h"
@@ -51,7 +50,7 @@ ArgParser::ArgParser(int argc, char* argv[]) {
         MONGO_UNREACHABLE;
     }
 
-    ret = parser.run(options, toStringVector(argc, argv), {}, &environment);
+    ret = parser.run(options, toStringVector(argc, argv), &environment);
     if (argc <= 1 || !ret.isOK() || environment.count("help")) {
         if (!ret.isOK()) {
             std::cerr << "An error occurred: " << ret.toString() << std::endl;
@@ -86,12 +85,10 @@ ArgParser::ArgParser(int argc, char* argv[]) {
 }
 
 void ArgParser::LogParams() const {
-    LOGV2(20199, "Verbosity: {verbose}", "verbose"_attr = _verbose);
-    LOGV2(20200, "Source Directory: {sourceDirectory}", "sourceDirectory"_attr = _sourceDirectory);
+    LOGV2(20199, "Verbosity", "verbose"_attr = _verbose);
+    LOGV2(20200, "Source directory", "directory"_attr = _sourceDirectory);
     if (_testFilters.size()) {
-        LOGV2(20201,
-              "Filters: {boost_join_testFilters}",
-              "boost_join_testFilters"_attr = boost::join(_testFilters, ", "));
+        LOGV2(20201, "Test filters", "filters"_attr = boost::join(_testFilters, ", "));
     }
 }
 

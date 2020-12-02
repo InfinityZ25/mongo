@@ -72,24 +72,20 @@ public:
 
     void shutDown(OperationContext* opCtx) override;
 
-    StatusWith<repl::OpTimeWith<DatabaseType>> getDatabase(
-        OperationContext* opCtx,
-        const std::string& dbName,
-        repl::ReadConcernLevel readConcernLevel) override;
+    DatabaseType getDatabase(OperationContext* opCtx,
+                             StringData db,
+                             repl::ReadConcernLevel readConcernLevel) override;
 
-    StatusWith<repl::OpTimeWith<std::vector<DatabaseType>>> getAllDBs(
-        OperationContext* opCtx, repl::ReadConcernLevel readConcern) override;
+    std::vector<DatabaseType> getAllDBs(OperationContext* opCtx,
+                                        repl::ReadConcernLevel readConcern) override;
 
-    StatusWith<repl::OpTimeWith<CollectionType>> getCollection(
-        OperationContext* opCtx,
-        const NamespaceString& nss,
-        repl::ReadConcernLevel readConcernLevel) override;
+    CollectionType getCollection(OperationContext* opCtx,
+                                 const NamespaceString& nss,
+                                 repl::ReadConcernLevel readConcernLevel) override;
 
-    StatusWith<std::vector<CollectionType>> getCollections(
-        OperationContext* opCtx,
-        const std::string* dbName,
-        repl::OpTime* optime,
-        repl::ReadConcernLevel readConcernLevel) override;
+    std::vector<CollectionType> getCollections(OperationContext* opCtx,
+                                               StringData db,
+                                               repl::ReadConcernLevel readConcernLevel) override;
 
     std::vector<NamespaceString> getAllShardedCollectionsForDb(
         OperationContext* opCtx, StringData dbName, repl::ReadConcernLevel readConcern) override;
@@ -110,11 +106,11 @@ public:
     StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
         OperationContext* opCtx, repl::ReadConcernLevel readConcern) override;
 
-    bool runUserManagementWriteCommand(OperationContext* opCtx,
-                                       const std::string& commandName,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       BSONObjBuilder* result) override;
+    Status runUserManagementWriteCommand(OperationContext* opCtx,
+                                         StringData commandName,
+                                         StringData dbname,
+                                         const BSONObj& cmdObj,
+                                         BSONObjBuilder* result) override;
 
     bool runUserManagementReadCommand(OperationContext* opCtx,
                                       const std::string& dbname,
@@ -174,7 +170,7 @@ private:
      * useMultiUpdate is true) in the specified namespace on the config server. Must only be used
      * for updates to the 'config' database.
      *
-     * This method retries the operation on NotMaster or network errors, so it should only be used
+     * This method retries the operation on NotPrimary or network errors, so it should only be used
      * with modifications which are idempotent.
      *
      * Returns non-OK status if the command failed to run for some reason. If the command was

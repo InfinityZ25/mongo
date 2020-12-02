@@ -30,11 +30,13 @@
 #pragma once
 
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/ops/update_result.h"
 #include "mongo/db/record_id.h"
 
 namespace mongo {
 
 class Collection;
+class CollectionPtr;
 class Database;
 class OperationContext;
 class QueryRequest;
@@ -59,18 +61,18 @@ struct Helpers {
        @return true if object found
     */
     static bool findOne(OperationContext* opCtx,
-                        Collection* collection,
+                        const CollectionPtr& collection,
                         const BSONObj& query,
                         BSONObj& result,
                         bool requireIndex = false);
 
     static RecordId findOne(OperationContext* opCtx,
-                            Collection* collection,
+                            const CollectionPtr& collection,
                             const BSONObj& query,
                             bool requireIndex);
 
     static RecordId findOne(OperationContext* opCtx,
-                            Collection* collection,
+                            const CollectionPtr& collection,
                             std::unique_ptr<QueryRequest> qr,
                             bool requireIndex);
 
@@ -89,7 +91,9 @@ struct Helpers {
     /* TODO: should this move into Collection?
      * uasserts if no _id index.
      * @return null loc if not found */
-    static RecordId findById(OperationContext* opCtx, Collection* collection, const BSONObj& query);
+    static RecordId findById(OperationContext* opCtx,
+                             const CollectionPtr& collection,
+                             const BSONObj& query);
 
     /**
      * Get the first object generated from a forward natural-order scan on "ns".  Callers do not
@@ -114,14 +118,14 @@ struct Helpers {
     static void putSingleton(OperationContext* opCtx, const char* ns, BSONObj obj);
 
     /**
-     * you have to lock
+     * Callers are expected to hold the collection lock.
      * you do not have to have Context set
      * o has to have an _id field or will assert
      */
-    static void upsert(OperationContext* opCtx,
-                       const std::string& ns,
-                       const BSONObj& o,
-                       bool fromMigrate = false);
+    static UpdateResult upsert(OperationContext* opCtx,
+                               const std::string& ns,
+                               const BSONObj& o,
+                               bool fromMigrate = false);
 
     /**
      * Performs an upsert of 'updateMod' if we don't match the given 'filter'.
@@ -129,7 +133,19 @@ struct Helpers {
      * Note: Query yielding is turned off, so both read and writes are performed
      * on the same storage snapshot.
      */
-    static void upsert(OperationContext* opCtx,
+    static UpdateResult upsert(OperationContext* opCtx,
+                               const std::string& ns,
+                               const BSONObj& filter,
+                               const BSONObj& updateMod,
+                               bool fromMigrate = false);
+
+    /**
+     * Performs an update of 'updateMod' for the entry matching the given 'filter'.
+     * Callers are expected to hold the collection lock.
+     * Note: Query yielding is turned off, so both read and writes are performed
+     * on the same storage snapshot.
+     */
+    static void update(OperationContext* opCtx,
                        const std::string& ns,
                        const BSONObj& filter,
                        const BSONObj& updateMod,
@@ -155,6 +171,19 @@ struct Helpers {
      * Does not oplog the operation.
      */
     static void emptyCollection(OperationContext* opCtx, const NamespaceString& nss);
+
+    /*
+     * Finds the doc and then runs a no-op update by running an update using the doc just read. Used
+     * in order to force a conflict if a concurrent storage transaction writes to the doc we're
+     * reading.
+     * Callers must hold the collection lock in MODE_IX.
+     * Uasserts if no _id index.
+     * Returns true if object found
+     */
+    static bool findByIdAndNoopUpdate(OperationContext* opCtx,
+                                      const CollectionPtr& collection,
+                                      const BSONObj& idQuery,
+                                      BSONObj& result);
 };
 
 }  // namespace mongo

@@ -29,13 +29,9 @@
 
 #pragma once
 
-#include "mongo/db/query/collection_query_info.h"
-
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/collection_index_usage_tracker.h"
 #include "mongo/db/query/plan_cache.h"
 #include "mongo/db/query/plan_summary_stats.h"
-#include "mongo/db/query/query_settings.h"
 #include "mongo/db/update_index_data.h"
 
 namespace mongo {
@@ -44,24 +40,27 @@ class IndexDescriptor;
 class OperationContext;
 
 /**
- * this is for storing things that you want to cache about a single collection
- * life cycle is managed for you from inside Collection
+ * Query information for a particular point-in-time view of a collection.
+ *
+ * Decorates a Collection instance. Lifecycle is the same as the Collection instance.
  */
 class CollectionQueryInfo {
 public:
     CollectionQueryInfo();
 
-    inline static const auto get = Collection::declareDecoration<CollectionQueryInfo>();
+    inline static const auto getCollectionQueryInfo =
+        Collection::declareDecoration<CollectionQueryInfo>();
+    static const CollectionQueryInfo& get(const CollectionPtr& collection) {
+        return CollectionQueryInfo::getCollectionQueryInfo(collection.get());
+    }
+    static CollectionQueryInfo& get(Collection* collection) {
+        return CollectionQueryInfo::getCollectionQueryInfo(collection);
+    }
 
     /**
      * Get the PlanCache for this collection.
      */
     PlanCache* getPlanCache() const;
-
-    /**
-     * Get the QuerySettings for this collection.
-     */
-    QuerySettings* getQuerySettings() const;
 
     /* get set of index keys for this namespace.  handy to quickly check if a given
        field is indexed (Note it might be a secondary component of a compound index.)
@@ -69,67 +68,46 @@ public:
     const UpdateIndexData& getIndexKeys(OperationContext* opCtx) const;
 
     /**
-     * Returns cached index usage statistics for this collection.  The map returned will contain
-     * entry for each index in the collection along with both a usage counter and a timestamp
-     * representing the date/time the counter is valid from.
-     *
-     * Note for performance that this method returns a copy of a StringMap.
-     */
-    CollectionIndexUsageMap getIndexUsageStats() const;
-
-    CollectionIndexUsageTracker::CollectionScanStats getCollectionScanStats() const;
-
-    /**
      * Builds internal cache state based on the current state of the Collection's IndexCatalog.
      */
-    void init(OperationContext* opCtx);
+    void init(OperationContext* opCtx, const CollectionPtr& coll);
 
     /**
-     * Register a newly-created index with the cache.  Must be called whenever an index is
-     * built on the associated collection.
+     * Rebuilds cached index information. Must be called when an index is modified or an index is
+     * dropped/created.
      *
      * Must be called under exclusive collection lock.
      */
-    void addedIndex(OperationContext* opCtx, const IndexDescriptor* desc);
+    void rebuildIndexData(OperationContext* opCtx, const CollectionPtr& coll);
 
     /**
-     * Deregister a newly-dropped index with the cache.  Must be called whenever an index is
-     * dropped on the associated collection.
-     *
-     * Must be called under exclusive collection lock.
+     * Removes all cached query plans after ensuring that the PlanCache is uniquely owned. The
+     * PlanCache is made uniquely owned by creating a new instance and thus detaching from the
+     * shared instance.
      */
-    void droppedIndex(OperationContext* opCtx, StringData indexName);
+    void clearQueryCache(OperationContext* opCtx, const CollectionPtr& coll);
 
     /**
-     * Removes all cached query plans.
+     * Removes all cached query plans without ensuring that the PlanCache is uniquely owned, only
+     * allowed when setting an index to multikey. Setting an index to multikey can only go one way
+     * and has its own concurrency handling.
      */
-    void clearQueryCache();
+    void clearQueryCacheForSetMultikey(const CollectionPtr& coll) const;
 
-    void notifyOfQuery(OperationContext* opCtx, const PlanSummaryStats& summaryStats);
+    void notifyOfQuery(OperationContext* opCtx,
+                       const CollectionPtr& coll,
+                       const PlanSummaryStats& summaryStats) const;
 
 private:
-    void computeIndexKeys(OperationContext* opCtx);
-    void updatePlanCacheIndexEntries(OperationContext* opCtx);
-
-    /**
-     * Rebuilds cached information that is dependent on index composition. Must be called
-     * when index composition changes.
-     */
-    void rebuildIndexData(OperationContext* opCtx);
+    void computeIndexKeys(OperationContext* opCtx, const CollectionPtr& coll);
+    void updatePlanCacheIndexEntries(OperationContext* opCtx, const CollectionPtr& coll);
 
     // ---  index keys cache
     bool _keysComputed;
     UpdateIndexData _indexedPaths;
 
-    // A cache for query plans.
-    std::unique_ptr<PlanCache> _planCache;
-
-    // Query settings.
-    // Includes index filters.
-    std::unique_ptr<QuerySettings> _querySettings;
-
-    // Tracks index usage statistics for this collection.
-    CollectionIndexUsageTracker _indexUsageTracker;
+    // A cache for query plans. Shared across cloned Collection instances.
+    std::shared_ptr<PlanCache> _planCache;
 };
 
 }  // namespace mongo

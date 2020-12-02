@@ -1,4 +1,7 @@
-// @tags: [requires_getmore]
+// @tags: [
+//   requires_getmore,
+//   sbe_incompatible,
+// ]
 
 // Unsorted plan on {a:1}, sorted plan on {b:1}.  The unsorted plan exhausts its memory limit before
 // the sorted plan is chosen by the query optimizer.
@@ -6,8 +9,8 @@
 t = db.jstests_sortf;
 t.drop();
 
-t.ensureIndex({a: 1});
-t.ensureIndex({b: 1});
+t.createIndex({a: 1});
+t.createIndex({b: 1});
 
 for (i = 0; i < 100; ++i) {
     t.save({a: 0, b: 0});

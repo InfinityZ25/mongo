@@ -27,14 +27,11 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/security_key.h"
 
 #include <algorithm>
-#include <cctype>
 #include <string>
 #include <sys/stat.h>
 #include <vector>

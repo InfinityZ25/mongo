@@ -34,6 +34,7 @@
 #include "mongo/stdx/thread.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/concepts.h"
 #include "mongo/util/executor_test_util.h"
 
 #if !defined(__has_feature)
@@ -149,7 +150,7 @@ void FUTURE_SUCCESS_TEST(const CompletionFunc& completion, const TestFunc& test)
     }
 
     if constexpr (doExecutorFuture) {  // immediate executor future
-        auto exec = InlineCountingExecutor::make();
+        auto exec = InlineQueuedCountingExecutor::make();
         test(Future<CompletionType>::makeReady(completion()).thenRunOn(exec));
     }
 }
@@ -178,7 +179,7 @@ void FUTURE_SUCCESS_TEST(const CompletionFunc& completion, const TestFunc& test)
 
     if constexpr (doExecutorFuture) {  // immediate executor future
         completion();
-        auto exec = InlineCountingExecutor::make();
+        auto exec = InlineQueuedCountingExecutor::make();
         test(Future<CompletionType>::makeReady().thenRunOn(exec));
     }
 }
@@ -203,8 +204,26 @@ void FUTURE_FAIL_TEST(const TestFunc& test) {
         }));
     }
     if constexpr (doExecutorFuture) {  // immediate executor future
-        auto exec = InlineCountingExecutor::make();
+        auto exec = InlineQueuedCountingExecutor::make();
         test(Future<CompletionType>::makeReady(failStatus()).thenRunOn(exec));
     }
 }
+
+/**
+ * True if PromiseT::setFrom(ArgT) is valid.
+ */
+template <typename PromiseT, typename ArgT, typename = void>
+inline constexpr bool canSetFrom = false;
+
+template <typename PromiseT>
+inline constexpr bool canSetFrom<PromiseT,  //
+                                 void,      //
+                                 decltype(std::declval<PromiseT&>().setFrom())> = true;
+
+template <typename PromiseT, typename ArgT>
+inline constexpr bool
+    canSetFrom<PromiseT,  //
+               ArgT,      //
+               decltype(std::declval<PromiseT&>().setFrom(std::declval<ArgT>()))> = true;
+
 }  // namespace mongo

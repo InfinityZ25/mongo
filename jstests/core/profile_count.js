@@ -1,4 +1,8 @@
-// @tags: [does_not_support_stepdowns, requires_fastcount, requires_profiling]
+// @tags: [
+//   does_not_support_stepdowns,
+//   requires_fastcount,
+//   requires_profiling,
+// ]
 
 // Confirms that profiled count execution contains all expected metrics with proper values.
 

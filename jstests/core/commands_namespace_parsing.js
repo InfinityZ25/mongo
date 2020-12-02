@@ -52,9 +52,9 @@ function assertFailsWithInvalidNamespacesForField(
     }
 }
 
-const isMaster = db.runCommand("ismaster");
-assert.commandWorked(isMaster);
-const isMongos = (isMaster.msg === "isdbgrid");
+const hello = db.runCommand("hello");
+assert.commandWorked(hello);
+const isMongos = (hello.msg === "isdbgrid");
 
 db.commands_namespace_parsing.drop();
 assert.commandWorked(db.commands_namespace_parsing.insert({a: 1}));
@@ -138,15 +138,6 @@ assertFailsWithInvalidNamespacesForField("out.reduce",
                                          },
                                          isNotFullyQualified,
                                          isNotAdminCommand);
-
-if (!isMongos) {
-    // Test geoSearch fails with an invalid collection name.
-    assertFailsWithInvalidNamespacesForField(
-        "geoSearch",
-        {geoSearch: "", search: {}, near: [0.0, 0.0], maxDistance: 10},
-        isNotFullyQualified,
-        isNotAdminCommand);
-}
 
 // Test find fails with an invalid collection name.
 assertFailsWithInvalidNamespacesForField(

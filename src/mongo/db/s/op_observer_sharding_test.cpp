@@ -33,8 +33,8 @@
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/op_observer_sharding_impl.h"
 #include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/s/type_shard_identity.h"
-#include "mongo/s/shard_server_test_fixture.h"
 
 namespace mongo {
 namespace {
@@ -43,34 +43,46 @@ const NamespaceString kTestNss("TestDB", "TestColl");
 
 void setCollectionFilteringMetadata(OperationContext* opCtx, CollectionMetadata metadata) {
     AutoGetCollection autoColl(opCtx, kTestNss, MODE_X);
+    const auto version = metadata.getShardVersion();
     CollectionShardingRuntime::get(opCtx, kTestNss)
         ->setFilteringMetadata(opCtx, std::move(metadata));
 
     auto& oss = OperationShardingState::get(opCtx);
-    const auto version = metadata.getShardVersion();
     BSONObjBuilder builder;
     version.appendToCommand(&builder);
     oss.initializeClientRoutingVersionsFromCommand(kTestNss, builder.obj());
 }
 
-/**
- * Constructs a CollectionMetadata suitable for refreshing a CollectionShardingState. The only
- * salient detail is the argument `keyPattern` which, defining the shard key, selects the fields
- * that DeleteState's constructor will extract from its `doc` argument into its member
- * DeleteState::documentKey.
- */
-CollectionMetadata makeAMetadata(BSONObj const& keyPattern) {
-    const OID epoch = OID::gen();
-    auto range = ChunkRange(BSON("key" << MINKEY), BSON("key" << MAXKEY));
-    auto chunk = ChunkType(kTestNss, std::move(range), ChunkVersion(1, 0, epoch), ShardId("other"));
-    auto rt = RoutingTableHistory::makeNew(
-        kTestNss, UUID::gen(), KeyPattern(keyPattern), nullptr, false, epoch, {std::move(chunk)});
-    std::shared_ptr<ChunkManager> cm = std::make_shared<ChunkManager>(rt, Timestamp(100, 0));
+class DeleteStateTest : public ShardServerTestFixture {
+protected:
+    /**
+     * Constructs a CollectionMetadata suitable for refreshing a CollectionShardingState. The only
+     * salient detail is the argument `keyPattern` which, defining the shard key, selects the fields
+     * that DeleteState's constructor will extract from its `doc` argument into its member
+     * DeleteState::documentKey.
+     */
+    static CollectionMetadata makeAMetadata(BSONObj const& keyPattern) {
+        const OID epoch = OID::gen();
+        auto range = ChunkRange(BSON("key" << MINKEY), BSON("key" << MAXKEY));
+        auto chunk =
+            ChunkType(kTestNss, std::move(range), ChunkVersion(1, 0, epoch), ShardId("other"));
+        auto rt = RoutingTableHistory::makeNew(kTestNss,
+                                               UUID::gen(),
+                                               KeyPattern(keyPattern),
+                                               nullptr,
+                                               false,
+                                               epoch,
+                                               boost::none,
+                                               true,
+                                               {std::move(chunk)});
 
-    return CollectionMetadata(std::move(cm), ShardId("this"));
-}
-
-class DeleteStateTest : public ShardServerTestFixture {};
+        return CollectionMetadata(ChunkManager(ShardId("this"),
+                                               DatabaseVersion(UUID::gen()),
+                                               makeStandaloneRoutingTableHistory(std::move(rt)),
+                                               Timestamp(100, 0)),
+                                  ShardId("this"));
+    }
+};
 
 TEST_F(DeleteStateTest, MakeDeleteStateUnsharded) {
     setCollectionFilteringMetadata(operationContext(), CollectionMetadata());
@@ -84,9 +96,10 @@ TEST_F(DeleteStateTest, MakeDeleteStateUnsharded) {
                     << "key2" << true);
 
     // Check that an order for deletion from an unsharded collection extracts just the "_id" field
-    ASSERT_BSONOBJ_EQ(OpObserverImpl::getDocumentKey(operationContext(), kTestNss, doc),
-                      BSON("_id"
-                           << "hello"));
+    ASSERT_BSONOBJ_EQ(
+        OpObserverImpl::getDocumentKey(operationContext(), kTestNss, doc).getShardKeyAndId(),
+        BSON("_id"
+             << "hello"));
     ASSERT_FALSE(OpObserverShardingImpl::isMigrating(operationContext(), kTestNss, doc));
 }
 
@@ -105,11 +118,12 @@ TEST_F(DeleteStateTest, MakeDeleteStateShardedWithoutIdInShardKey) {
                     << "key2" << true);
 
     // Verify the shard key is extracted, in correct order, followed by the "_id" field.
-    ASSERT_BSONOBJ_EQ(OpObserverImpl::getDocumentKey(operationContext(), kTestNss, doc),
-                      BSON("key" << 100 << "key3"
-                                 << "abc"
-                                 << "_id"
-                                 << "hello"));
+    ASSERT_BSONOBJ_EQ(
+        OpObserverImpl::getDocumentKey(operationContext(), kTestNss, doc).getShardKeyAndId(),
+        BSON("key" << 100 << "key3"
+                   << "abc"
+                   << "_id"
+                   << "hello"));
     ASSERT_FALSE(OpObserverShardingImpl::isMigrating(operationContext(), kTestNss, doc));
 }
 
@@ -128,10 +142,11 @@ TEST_F(DeleteStateTest, MakeDeleteStateShardedWithIdInShardKey) {
                            << "key" << 100);
 
     // Verify the shard key is extracted with "_id" in the right place.
-    ASSERT_BSONOBJ_EQ(OpObserverImpl::getDocumentKey(operationContext(), kTestNss, doc),
-                      BSON("key" << 100 << "_id"
-                                 << "hello"
-                                 << "key2" << true));
+    ASSERT_BSONOBJ_EQ(
+        OpObserverImpl::getDocumentKey(operationContext(), kTestNss, doc).getShardKeyAndId(),
+        BSON("key" << 100 << "_id"
+                   << "hello"
+                   << "key2" << true));
     ASSERT_FALSE(OpObserverShardingImpl::isMigrating(operationContext(), kTestNss, doc));
 }
 
@@ -148,9 +163,10 @@ TEST_F(DeleteStateTest, MakeDeleteStateShardedWithIdHashInShardKey) {
                            << "key" << 100);
 
     // Verify the shard key is extracted with "_id" in the right place, not hashed.
-    ASSERT_BSONOBJ_EQ(OpObserverImpl::getDocumentKey(operationContext(), kTestNss, doc),
-                      BSON("_id"
-                           << "hello"));
+    ASSERT_BSONOBJ_EQ(
+        OpObserverImpl::getDocumentKey(operationContext(), kTestNss, doc).getShardKeyAndId(),
+        BSON("_id"
+             << "hello"));
     ASSERT_FALSE(OpObserverShardingImpl::isMigrating(operationContext(), kTestNss, doc));
 }
 

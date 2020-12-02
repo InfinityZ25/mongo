@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
 
 #include "mongo/db/index/s2_access_method.h"
 
@@ -79,7 +79,8 @@ S2AccessMethod::S2AccessMethod(IndexCatalogEntry* btreeState,
     if (descriptor->isSparse()) {
         LOGV2_WARNING(23742,
                       "Sparse option ignored for index spec {descriptor_keyPattern}",
-                      "descriptor_keyPattern"_attr = descriptor->keyPattern().toString());
+                      "Sparse option ignored for index spec",
+                      "indexSpec"_attr = descriptor->keyPattern());
     }
 }
 
@@ -133,7 +134,8 @@ void S2AccessMethod::doGetKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
                                KeyStringSet* multikeyMetadataKeys,
                                MultikeyPaths* multikeyPaths,
                                boost::optional<RecordId> id) const {
-    ExpressionKeysPrivate::getS2Keys(obj,
+    ExpressionKeysPrivate::getS2Keys(pooledBufferBuilder,
+                                     obj,
                                      _descriptor->keyPattern(),
                                      _params,
                                      keys,

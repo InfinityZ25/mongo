@@ -1,12 +1,26 @@
 /**
  * Test that mongos getShardVersion returns the correct version and chunks.
- *
- * @tags: [need_fixing_for_46]
+ * @tags: [live_record_incompatible]
  */
 (function() {
 'use strict';
 
-const st = new ShardingTest({shards: 2, mongos: 1});
+// If the server has been compiled with the code coverage flag, then the splitChunk command can take
+// significantly longer than the 8-second interval for the continuous stepdown thread. This causes
+// the test to fail because retrying the interrupted splitChunk command won't ever succeed. To check
+// whether the server has been compiled with the code coverage flag, we assume the compiler flags
+// used to build the mongo shell are the same as the ones used to build the server.
+const isCodeCoverageEnabled = buildInfo().buildEnvironment.ccflags.includes('-ftest-coverage');
+const isStepdownSuite = typeof ContinuousStepdown !== 'undefined';
+if (isStepdownSuite && isCodeCoverageEnabled) {
+    print('Skipping test during stepdown suite because splitChunk command would take too long');
+    return;
+}
+
+const st = new ShardingTest({
+    shards: 2,
+    other: {mongosOptions: {setParameter: {enableFinerGrainedCatalogCacheRefresh: true}}}
+});
 const dbName = "test";
 const collName = "foo";
 const ns = dbName + "." + collName;
@@ -85,6 +99,10 @@ assert.commandWorked(st.rs0.getPrimary().getDB('admin').runCommand({
     epoch: res.versionEpoch,
 }));
 
+// Ensure all the config nodes agree on a config optime that reflects the second split in case a new
+// primary config server steps up.
+st.configRS.awaitLastOpCommitted();
+
 // Perform a read on the config primary to have the mongos get the latest config optime since the
 // last two splits were performed directly on the shards.
 assert.neq(null, st.s.getDB('config').databases.findOne());
@@ -98,8 +116,8 @@ assert.commandWorked(
 // because the chunk size exceeds the limit.
 res = st.s.adminCommand({getShardVersion: ns, fullMetadata: true});
 assert.commandWorked(res);
-assert.eq(res.version.t, 3);
-assert.eq(res.version.i, 10001);
+assert.eq(res.version.t, 1);
+assert.eq(res.version.i, 20002);
 assert.eq(undefined, res.chunks);
 
 st.stop();

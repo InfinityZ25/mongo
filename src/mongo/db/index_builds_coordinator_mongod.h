@@ -78,6 +78,19 @@ public:
         IndexBuildProtocol protocol,
         IndexBuildOptions indexBuildOptions) override;
 
+    /**
+     * Reconstructs the in-memory state of the index build, then passes the build off to an
+     * asynchronous thread to run. A Future is returned so that the user can await the asynchronous
+     * build result.
+     */
+    StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>> resumeIndexBuild(
+        OperationContext* opCtx,
+        std::string dbName,
+        CollectionUUID collectionUUID,
+        const std::vector<BSONObj>& specs,
+        const UUID& buildUUID,
+        const ResumeIndexInfo& resumeInfo) override;
+
     Status voteCommitIndexBuild(OperationContext* opCtx,
                                 const UUID& buildUUID,
                                 const HostAndPort& hostAndPort) override;
@@ -86,11 +99,6 @@ public:
                            const NamespaceString& nss,
                            const std::vector<StringData>& indexNames,
                            const CommitQuorumOptions& newCommitQuorum) override;
-
-    void setSignalAndCancelVoteRequestCbkIfActive(WithLock ReplIndexBuildStateLk,
-                                                  OperationContext* opCtx,
-                                                  std::shared_ptr<ReplIndexBuildState> replState,
-                                                  IndexBuildAction signal) override;
 
 private:
     /**
@@ -159,8 +167,22 @@ private:
                                                std::shared_ptr<ReplIndexBuildState> replState,
                                                const IndexBuildOptions& indexBuildOptions) override;
 
+    StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>> _startIndexBuild(
+        OperationContext* opCtx,
+        std::string dbName,
+        CollectionUUID collectionUUID,
+        const std::vector<BSONObj>& specs,
+        const UUID& buildUUID,
+        IndexBuildProtocol protocol,
+        IndexBuildOptions indexBuildOptions,
+        const boost::optional<ResumeIndexInfo>& resumeInfo);
+
     // Thread pool on which index builds are run.
     ThreadPool _threadPool;
+
+    // Manages _numActiveIndexBuilds and _indexBuildFinished.
+    mutable Mutex _throttlingMutex =
+        MONGO_MAKE_LATCH("IndexBuildsCoordinatorMongod::_throttlingMutex");
 
     // Protected by _mutex.
     int _numActiveIndexBuilds = 0;

@@ -186,12 +186,6 @@ void addNodeAtPathHelper(ProjectionPathASTNode* root,
     addNodeAtPathHelper(childPathNode, path, componentIndex + 1, std::move(newChild));
 }
 
-void addNodeAtPath(ProjectionPathASTNode* root,
-                   const FieldPath& path,
-                   std::unique_ptr<ASTNode> newChild) {
-    addNodeAtPathHelper(root, path, 0, std::move(newChild));
-}
-
 bool hasPositionalOperator(StringData path) {
     return path.endsWith(".$");
 }
@@ -295,7 +289,7 @@ bool attemptToParseGenericExpression(ParseContext* parseCtx,
     }
 
     auto expr = Expression::parseExpression(
-        parseCtx->expCtx, subObj, parseCtx->expCtx->variablesParseState);
+        parseCtx->expCtx.get(), subObj, parseCtx->expCtx->variablesParseState);
     addNodeAtPath(parent, path, std::make_unique<ExpressionASTNode>(expr));
     parseCtx->hasMeta = parseCtx->hasMeta || isMeta;
     return true;
@@ -468,7 +462,7 @@ void parseExclusion(ParseContext* ctx, BSONElement elem, ProjectionPathASTNode* 
 void parseLiteral(ParseContext* ctx, BSONElement elem, ProjectionPathASTNode* parent) {
     verifyComputedFieldsAllowed(ctx->policies);
 
-    auto expr = Expression::parseOperand(ctx->expCtx, elem, ctx->expCtx->variablesParseState);
+    auto expr = Expression::parseOperand(ctx->expCtx.get(), elem, ctx->expCtx->variablesParseState);
 
     FieldPath pathFromParent(elem.fieldNameStringData());
     addNodeAtPath(parent, pathFromParent, std::make_unique<ExpressionASTNode>(expr));
@@ -641,5 +635,12 @@ Projection parse(boost::intrusive_ptr<ExpressionContext> expCtx,
                  ProjectionPolicies policies) {
     return parse(std::move(expCtx), obj, nullptr, BSONObj(), std::move(policies));
 }
+
+void addNodeAtPath(ProjectionPathASTNode* root,
+                   const FieldPath& path,
+                   std::unique_ptr<ASTNode> newChild) {
+    addNodeAtPathHelper(root, path, 0, std::move(newChild));
+}
+
 }  // namespace projection_ast
 }  // namespace mongo

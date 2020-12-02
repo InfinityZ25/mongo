@@ -50,7 +50,7 @@ var BackupRestoreTest = function(options) {
             let iteration = 0;
 
             var coll = db.getSiblingDB(dbName).getCollection(collectionName);
-            coll.ensureIndex({x: 1});
+            coll.createIndex({x: 1});
 
             var largeValue = new Array(1024).join('L');
 
@@ -122,8 +122,8 @@ var BackupRestoreTest = function(options) {
     function _fsmClient(host) {
         // Launch FSM client
         const suite = 'concurrency_replication_for_backup_restore';
-        const resmokeCmd = 'python buildscripts/resmoke.py --shuffle --continueOnFailure' +
-            ' --repeat=99999 --mongo=' + MongoRunner.mongoShellPath +
+        const resmokeCmd = 'python buildscripts/resmoke.py run --shuffle --continueOnFailure' +
+            ' --repeat=99999 --internalParam=is_inner_level --mongo=' + MongoRunner.mongoShellPath +
             ' --shellConnString=mongodb://' + host + ' --suites=' + suite;
 
         // Returns the pid of the FSM test client so it can be terminated without waiting for its

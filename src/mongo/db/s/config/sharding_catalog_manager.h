@@ -30,12 +30,15 @@
 #pragma once
 
 #include "mongo/base/status_with.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/logical_session_cache.h"
 #include "mongo/db/repl/optime_with.h"
 #include "mongo/db/s/config/namespace_serializer.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard.h"
@@ -161,10 +164,10 @@ public:
      * the shard key, the range will be converted into a new range with full shard key filled with
      * MinKey values.
      */
-    Status assignKeyRangeToZone(OperationContext* opCtx,
-                                const NamespaceString& nss,
-                                const ChunkRange& range,
-                                const std::string& zoneName);
+    void assignKeyRangeToZone(OperationContext* opCtx,
+                              const NamespaceString& nss,
+                              const ChunkRange& range,
+                              const std::string& zoneName);
 
     /**
      * Removes a range from a zone.
@@ -172,9 +175,9 @@ public:
      * NOTE: unlike assignKeyRangeToZone, the given range will never be converted to include the
      * full shard key.
      */
-    Status removeKeyRangeFromZone(OperationContext* opCtx,
-                                  const NamespaceString& nss,
-                                  const ChunkRange& range);
+    void removeKeyRangeFromZone(OperationContext* opCtx,
+                                const NamespaceString& nss,
+                                const ChunkRange& range);
 
     /**
      * Exposes the zone operations mutex to external callers in order to allow them to synchronize
@@ -183,32 +186,74 @@ public:
     Lock::ExclusiveLock lockZoneMutex(OperationContext* opCtx);
 
     //
+    // General utilities related to the ShardingCatalogManager
+    //
+
+    /**
+     * Starts and commits a transaction on the config server, with a no-op find on the specified
+     * namespace in order to internally start the transaction. All writes done inside the
+     * passed-in function must assume that they are run inside a transaction that will be commited
+     * after the function itself has completely finished.
+     */
+    static void withTransaction(OperationContext* opCtx,
+                                const NamespaceString& namespaceForInitialFind,
+                                unique_function<void(OperationContext*, TxnNumber)> func);
+
+    /**
+     * Runs the write 'request' on namespace 'nss' in a transaction with 'txnNumber'. Write must be
+     * on a collection in the config database. If expectedNumModified is specified, the number of
+     * documents modified must match expectedNumModified - throws otherwise.
+     */
+    BSONObj writeToConfigDocumentInTxn(OperationContext* opCtx,
+                                       const NamespaceString& nss,
+                                       const BatchedCommandRequest& request,
+                                       TxnNumber txnNumber);
+
+    /**
+     * Inserts 'docs' to namespace 'nss' in a transaction with 'txnNumber'. Breaks into multiple
+     * batches if 'docs' is larger than the max batch size. Write must be on a collection in the
+     * config database.
+     */
+    void insertConfigDocumentsInTxn(OperationContext* opCtx,
+                                    const NamespaceString& nss,
+                                    std::vector<BSONObj> docs,
+                                    TxnNumber txnNumber);
+
+    //
     // Chunk Operations
     //
 
     /**
      * Updates metadata in the config.chunks collection to show the given chunk as split into
      * smaller chunks at the specified split points.
+     *
+     * Returns a BSON object with the newly produced chunk versions after the migration:
+     *   - shardVersion - The new shard version of the source shard
+     *   - collectionVersion - The new collection version after the commit
      */
-    Status commitChunkSplit(OperationContext* opCtx,
-                            const NamespaceString& nss,
-                            const OID& requestEpoch,
-                            const ChunkRange& range,
-                            const std::vector<BSONObj>& splitPoints,
-                            const std::string& shardName);
+    StatusWith<BSONObj> commitChunkSplit(OperationContext* opCtx,
+                                         const NamespaceString& nss,
+                                         const OID& requestEpoch,
+                                         const ChunkRange& range,
+                                         const std::vector<BSONObj>& splitPoints,
+                                         const std::string& shardName);
 
     /**
      * Updates metadata in the config.chunks collection so the chunks with given boundaries are seen
      * merged into a single larger chunk.
      * If 'validAfter' is not set, this means the commit request came from an older server version,
      * which is not history-aware.
+     *
+     * Returns a BSON object with the newly produced chunk versions after the migration:
+     *   - shardVersion - The new shard version of the source shard
+     *   - collectionVersion - The new collection version after the commit
      */
-    Status commitChunkMerge(OperationContext* opCtx,
-                            const NamespaceString& nss,
-                            const OID& requestEpoch,
-                            const std::vector<BSONObj>& chunkBoundaries,
-                            const std::string& shardName,
-                            const boost::optional<Timestamp>& validAfter);
+    StatusWith<BSONObj> commitChunkMerge(OperationContext* opCtx,
+                                         const NamespaceString& nss,
+                                         const OID& requestEpoch,
+                                         const std::vector<BSONObj>& chunkBoundaries,
+                                         const std::string& shardName,
+                                         const boost::optional<Timestamp>& validAfter);
 
     /**
      * Updates metadata in config.chunks collection to show the given chunk in its new shard.
@@ -216,10 +261,8 @@ public:
      * which is not history-aware.
      *
      * Returns a BSON object with the newly produced chunk versions after the migration:
-     *  - migratedChunkVersion - the version of the chunk, which was migrated
-     *  - controlChunkVersion (optional) - the version of the "control" chunk, which was changed in
-     *      order to reflect the change on the donor. This value will be missing if the last chunk
-     *      on the donor shard was migrated out.
+     *   - shardVersion - The new shard version of the source shard
+     *   - collectionVersion - The new collection version after the commit
      */
     StatusWith<BSONObj> commitChunkMigration(OperationContext* opCtx,
                                              const NamespaceString& nss,
@@ -244,6 +287,20 @@ public:
                                          const BSONObj& minKey,
                                          const BSONObj& maxKey,
                                          const ChunkVersion& version);
+
+    /**
+     * In a single transaction, effectively bumps the shard version for each shard in the collection
+     * to be the current collection version's major version + 1 inside an already-running
+     * transaction.
+     *
+     * Note: it's the responsibility of the caller to ensure that the list of shards is stable,
+     * as any shards added after the shard ids have been passed in will be missed.
+     */
+    void bumpCollShardVersionsAndChangeMetadataInTxn(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        const std::vector<ShardId>& shardIds,
+        unique_function<void(OperationContext*, TxnNumber)> changeMetadataFunc);
 
     //
     // Database Operations
@@ -316,14 +373,6 @@ public:
     void ensureDropCollectionCompleted(OperationContext* opCtx, const NamespaceString& nss);
 
     /**
-     * Iterates through each entry in config.collections that does not have a UUID, generates a UUID
-     * for the collection, and updates the entry with the generated UUID.
-     *
-     * If this function is not necessary for SERVER-33247, it can be removed.
-     */
-    void generateUUIDsForExistingShardedCollections(OperationContext* opCtx);
-
-    /**
      * Refines the shard key of an existing collection with namespace 'nss'. Here, 'shardKey'
      * denotes the new shard key, which must contain the old shard key as a prefix.
      *
@@ -332,6 +381,18 @@ public:
     void refineCollectionShardKey(OperationContext* opCtx,
                                   const NamespaceString& nss,
                                   const ShardKeyPattern& newShardKey);
+
+    /**
+     * Runs a replacement update on config.collections for the collection entry for 'nss' in a
+     * transaction with 'txnNumber'. 'coll' is used as the replacement doc.
+     *
+     * Throws exception on errors.
+     */
+    void updateShardingCatalogEntryForCollectionInTxn(OperationContext* opCtx,
+                                                      const NamespaceString& nss,
+                                                      const CollectionType& coll,
+                                                      const bool upsert,
+                                                      TxnNumber txnNumber);
 
     /**
      * Creates a ScopedLock on the collection name in _namespaceSerializer. This is to prevent
@@ -382,6 +443,33 @@ public:
      * Runs the setFeatureCompatibilityVersion command on all shards.
      */
     Status setFeatureCompatibilityVersionOnShards(OperationContext* opCtx, const BSONObj& cmdObj);
+
+    /**
+     * Removes all entries from the config server's config.collections where 'dropped' is true.
+     *
+     * Before v5.0, when a collection was dropped, its entry in config.collections remained, tagged
+     * as 'dropped: true'. As those are no longer needed, this method cleans up the leftover
+     * metadata.
+     *
+     * It shall be called when upgrading to 4.9 or newer versions.
+     */
+    void removePre49LegacyMetadata(OperationContext* opCtx);
+
+    /**
+     * Creates a 'timestamp' for each one of the entries in the config server's config.collections,
+     * where 'timestamp' does not already exist.
+     *
+     * It shall be called when upgrading to 4.9.
+     */
+    void createCollectionTimestampsFor49(OperationContext* opCtx);
+
+    /**
+     * Downgrades the config.collections entries to prior 4.9 version. More specifically, it removes
+     * the 'timestamp' field from all the documents in config.collections.
+     *
+     * It shall be called when downgrading from 4.9 to an earlier version.
+     */
+    void downgradeConfigCollectionEntriesToPre49(OperationContext* opCtx);
 
     //
     // For Diagnostics

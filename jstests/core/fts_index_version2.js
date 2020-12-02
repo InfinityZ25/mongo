@@ -1,4 +1,7 @@
 // Integration tests for version 2 text index, ensuring that it maintains old behavior.
+// @tags: [
+//   sbe_incompatible,
+// ]
 
 load('jstests/libs/fts.js');
 
@@ -12,7 +15,7 @@ assert.commandWorked(coll.insert(
     {_id: 0, a: "O próximo Vôo à Noite sobre o Atlântico, Põe Freqüentemente o único Médico."}));
 
 assert.commandWorked(
-    coll.ensureIndex({a: "text"}, {default_language: "portuguese", textIndexVersion: 2}));
+    coll.createIndex({a: "text"}, {default_language: "portuguese", textIndexVersion: 2}));
 
 assert.eq([0], queryIDS(coll, "próximo vôo à", null));
 assert.eq([0], queryIDS(coll, "atlântico", null));

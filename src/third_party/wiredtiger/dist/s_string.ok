@@ -13,14 +13,13 @@ API
 APIs
 ARG
 ARGS
+ASAN
 ASM
-ASYNC
 Addr
 Ailamaki
 Alakuijala
 Alexandrescu's
 Alloc
-Async
 AsyncOp
 Athanassoulis
 Athlon
@@ -43,7 +42,8 @@ Barack
 BerkeleyDB
 Bitfield
 Bitwise
-BlqRr
+BlqR
+BqRt
 Brueckner
 Bsearch
 Btree
@@ -220,7 +220,6 @@ LOGREC
 LOGSCAN
 LOOKASIDE
 LRU
-LRrSVv
 LSB
 LSM
 LSN
@@ -232,7 +231,8 @@ LZO
 LeafGreen
 LevelDB
 Levyx
-LmT
+LmRrSVv
+LmsT
 LoadLoad
 LockFile
 Lookaside
@@ -298,6 +298,7 @@ Obama
 Opcode
 Outfmt
 PARAM
+PFX
 POSIX
 PPC
 PREDEFINE
@@ -323,7 +324,6 @@ RCS
 RDNOLOCK
 RDONLY
 READONLY
-REBALANCE
 RECNO
 REF's
 REFs
@@ -334,21 +334,23 @@ RLEs
 RMW
 RNG
 RPC
+RTS
 RUNDIR
 RWLOCK
 RXB
 Radu
 ReadFile
 Readonly
-Rebalance
 RedHat
 Redistributions
 Refactor
 Resize
 RocksDB
+Runtime
 SIMD
 SLIST
 SLVG
+SMT
 SOURCE's
 SPINLOCK
 SQL
@@ -384,6 +386,7 @@ TCMalloc
 TESTUTIL
 TIMESTAMP
 TIMESTAMPS
+TMP
 TODO
 TORTIOUS
 TSO
@@ -495,14 +498,13 @@ asm
 aspell
 assertfmt
 async
-asyncopp
-asyncops
 atomicity
 autocommit
 autoconf
 automake
 bInheritHandle
 backoff
+backport
 bal
 basecfg
 basho
@@ -560,6 +562,8 @@ cb
 ccc
 ccr
 cd
+ce
+ceh
 centric
 cfg
 cfko
@@ -631,6 +635,7 @@ curconfig
 curdump
 curextract
 curfile
+curhs
 curindex
 curjoin
 curlog
@@ -697,12 +702,14 @@ dll
 dlopen
 dlsym
 dmalloc
+dmb
 dmsg
 doxgen
 doxygen
 drealloc
 ds
 dsb
+dsbs
 dsk
 dsrc
 dst
@@ -890,9 +897,14 @@ io
 ip
 isalnum
 isalpha
+isascii
+isb
 iscntrl
 isdigit
 isgraph
+ish
+ishld
+ishst
 islocked
 islower
 ispo
@@ -908,7 +920,7 @@ iteratively
 iters
 jjj
 jnr
-jrx
+jprx
 json
 kb
 kbits
@@ -949,7 +961,9 @@ localkey
 localtime
 localvalue
 logf
+logfile
 logmgr
+logmsg
 lognum
 logop
 logpath
@@ -961,7 +975,6 @@ lookaside
 lookup
 lookups
 lossy
-lqRrt
 lr
 lrt
 lru
@@ -1022,6 +1035,7 @@ multithreaded
 munmap
 mutex
 mutexes
+mx
 mytable
 mytxn
 namespace
@@ -1145,6 +1159,7 @@ pv
 pvA
 pwrite
 py
+qRrT
 qdown
 qqq
 qrrSS
@@ -1168,7 +1183,6 @@ readunlock
 readv
 realloc
 rebalance
-rebalanced
 rebalancing
 recno
 recnos
@@ -1206,6 +1220,7 @@ rwlock
 sH
 sHQ
 sT
+sanitizer
 sanitizers
 scalability
 sched
@@ -1220,6 +1235,7 @@ setstr
 setv
 setvbuf
 sfence
+shareability
 signalled
 sii
 sizeof
@@ -1242,6 +1258,7 @@ srch
 ssize
 startup
 statlog
+stb
 stderr
 stdin
 stdout
@@ -1264,6 +1281,7 @@ struct
 structs
 su
 subdirectory
+subget
 subgetraw
 subgets
 subinit
@@ -1299,6 +1317,8 @@ timedwait
 timestamp
 timestamped
 timestamps
+tinfo
+tlb
 tmp
 todo
 tokenizer
@@ -1319,6 +1339,7 @@ trylock
 tsc
 tupdate
 tvalue
+tw
 txn
 txnc
 txnid

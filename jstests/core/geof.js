@@ -2,6 +2,9 @@ t = db.geof;
 t.drop();
 
 // corners (dist ~0.98)
+// @tags: [
+//   sbe_incompatible,
+// ]
 t.insert({loc: [0.7, 0.7]});
 t.insert({loc: [0.7, -0.7]});
 t.insert({loc: [-0.7, 0.7]});
@@ -11,7 +14,7 @@ t.insert({loc: [-0.7, -0.7]});
 t.insert({loc: [-0.9, 0]});
 t.insert({loc: [-0.9, 0]});
 
-t.ensureIndex({loc: "2d"});
+t.createIndex({loc: "2d"});
 
 t.find({loc: {$near: [0, 0]}}).limit(2).forEach(function(o) {
     // printjson(o);

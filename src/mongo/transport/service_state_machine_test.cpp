@@ -44,7 +44,7 @@
 #include "mongo/transport/mock_session.h"
 #include "mongo/transport/service_entry_point.h"
 #include "mongo/transport/service_executor.h"
-#include "mongo/transport/service_executor_task_names.h"
+#include "mongo/transport/service_executor_utils.h"
 #include "mongo/transport/service_state_machine.h"
 #include "mongo/transport/transport_layer_mock.h"
 #include "mongo/unittest/unittest.h"
@@ -72,7 +72,8 @@ public:
 
     void startSession(transport::SessionHandle session) override {}
 
-    DbResponse handleRequest(OperationContext* opCtx, const Message& request) override {
+    Future<DbResponse> handleRequest(OperationContext* opCtx,
+                                     const Message& request) noexcept override try {
         LOGV2(22994, "In handleRequest");
         _ranHandler = true;
         ASSERT_TRUE(haveClient());
@@ -98,7 +99,10 @@ public:
         }
         dbResponse.response = res;
 
-        return dbResponse;
+        return Future<DbResponse>::makeReady(std::move(dbResponse));
+    } catch (const DBException& e) {
+        LOGV2_ERROR(4879805, "Failed to handle request", "error"_attr = redact(e));
+        return e.toStatus();
     }
 
     void endAllSessions(transport::Session::TagMask tags) override {}
@@ -194,7 +198,8 @@ public:
         }
     };
 
-    MockTL() {
+    explicit MockTL(const WireSpec& wireSpec = WireSpec::instance())
+        : TransportLayerMock(wireSpec) {
         createSessionHook = [](TransportLayer* tl) { return std::make_unique<Session>(tl); };
     }
 
@@ -253,7 +258,7 @@ public:
     Status shutdown(Milliseconds timeout) override {
         return Status::OK();
     }
-    Status schedule(Task task, ScheduleFlags flags, ServiceExecutorTaskName taskName) override {
+    Status scheduleTask(Task task, ScheduleFlags flags) override {
         if (!_scheduleHook) {
             return Status::OK();
         } else {
@@ -265,6 +270,11 @@ public:
 
     Mode transportMode() const override {
         return Mode::kSynchronous;
+    }
+
+    void runOnDataAvailable(Session* session,
+                            OutOfLineExecutor::Task onCompletionCallback) override {
+        scheduleCallbackOnDataAvailable(session, std::move(onCompletionCallback), this);
     }
 
     void appendStats(BSONObjBuilder* bob) const override {}

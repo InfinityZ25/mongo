@@ -29,12 +29,11 @@
 """Transform idl.syntax trees from the parser into well-defined idl.ast trees."""
 
 import re
-from typing import cast, List, Set, Union
+from typing import Type, TypeVar, cast, List, Set, Union
 
 from . import ast
 from . import bson
 from . import common
-from . import cpp_types
 from . import enum_types
 from . import errors
 from . import syntax
@@ -142,6 +141,10 @@ def _validate_cpp_type(ctxt, idl_type, syntax_type):
 
     # Support vector for variable length BinData.
     if idl_type.cpp_type == "std::vector<std::uint8_t>":
+        return
+
+    # Support variant for writeConcernW.
+    if idl_type.cpp_type == "stdx::variant<std::string, std::int64_t>":
         return
 
     # Check for std fixed integer types which are not allowed. These are not allowed even if they
@@ -334,6 +337,52 @@ def _bind_struct(ctxt, parsed_spec, struct):
     return ast_struct
 
 
+def _bind_field_list_entry(field_list_entry):
+    # type: (syntax.FieldListEntry) -> ast.FieldListEntry
+    """Bind a generic argument or reply field list entry."""
+    ast_entry = ast.FieldListEntry(field_list_entry.file_name, field_list_entry.line,
+                                   field_list_entry.column)
+    ast_entry.name = field_list_entry.name
+    ast_entry.forward_to_shards = field_list_entry.forward_to_shards
+    ast_entry.forward_from_shards = field_list_entry.forward_from_shards
+    return ast_entry
+
+
+ASTFieldListBaseClass = TypeVar("ASTFieldListBaseClass", bound=ast.FieldListBase, covariant=True)
+
+
+def _bind_field_list(field_list, ast_class):
+    # type: (syntax.FieldListBase, Type[ASTFieldListBaseClass]) -> ASTFieldListBaseClass
+    """Bind a generic argument or reply field list (helper method).
+
+    The ast_class param must be a subclass of ast.FieldListBase. The returned value is an
+    instance of ast_class.
+    """
+    ast_field_list = ast_class(field_list.file_name, field_list.line, field_list.column)
+    ast_field_list.description = field_list.description
+    ast_field_list.cpp_name = field_list.name
+    if field_list.cpp_name:
+        ast_field_list.cpp_name = field_list.cpp_name
+
+    return ast_field_list
+
+
+def _bind_generic_argument_list(field_list):
+    # type: (syntax.GenericArgumentList) -> ast.GenericArgumentList
+    """Bind a generic argument list."""
+    ast_field_list = _bind_field_list(field_list, ast.GenericArgumentList)
+    ast_field_list.fields = [_bind_field_list_entry(f) for f in field_list.fields]
+    return ast_field_list
+
+
+def _bind_generic_reply_field_list(field_list):
+    # type: (syntax.GenericReplyFieldList) -> ast.GenericReplyFieldList
+    """Bind a generic reply field list."""
+    ast_field_list = _bind_field_list(field_list, ast.GenericReplyFieldList)
+    ast_field_list.fields = [_bind_field_list_entry(f) for f in field_list.fields]
+    return ast_field_list
+
+
 def _inject_hidden_command_fields(command):
     # type: (syntax.Command) -> None
     """Inject hidden fields to aid deserialization/serialization for OpMsg parsing of commands."""
@@ -417,6 +466,28 @@ def _bind_command_type(ctxt, parsed_spec, command):
     return ast_field
 
 
+def _bind_command_reply_type(ctxt, parsed_spec, command):
+    # type: (errors.ParserContext, syntax.IDLSpec, syntax.Command) -> ast.Field
+    """Bind the reply_type field in a command."""
+    ast_field = ast.Field(command.file_name, command.line, command.column)
+    ast_field.name = "replyType"
+    ast_field.description = f"{command.name} reply type"
+
+    # Resolve the command type as a field
+    syntax_symbol = parsed_spec.symbols.resolve_field_type(ctxt, command, command.name,
+                                                           command.reply_type)
+    if syntax_symbol is None:
+        # Resolution failed, we've recorded an error.
+        return None
+
+    if not isinstance(syntax_symbol, syntax.Struct):
+        ctxt.add_reply_type_invalid_type(ast_field, command.name, command.reply_type)
+    else:
+        ast_field.struct_type = syntax_symbol.name
+
+    return ast_field
+
+
 def _bind_command(ctxt, parsed_spec, command):
     # type: (errors.ParserContext, syntax.IDLSpec, syntax.Command) -> ast.Command
     """
@@ -427,6 +498,9 @@ def _bind_command(ctxt, parsed_spec, command):
     """
 
     ast_command = ast.Command(command.file_name, command.line, command.column)
+    ast_command.api_version = command.api_version
+    ast_command.is_deprecated = command.is_deprecated
+    ast_command.command_name = command.command_name
 
     # Inject special fields used for command parsing
     _inject_hidden_command_fields(command)
@@ -437,6 +511,9 @@ def _bind_command(ctxt, parsed_spec, command):
 
     if command.type:
         ast_command.command_field = _bind_command_type(ctxt, parsed_spec, command)
+
+    if command.reply_type:
+        ast_command.reply_type = _bind_command_reply_type(ctxt, parsed_spec, command)
 
     if [field for field in ast_command.fields if field.name == ast_command.name]:
         ctxt.add_bad_command_name_duplicates_field(ast_command, ast_command.name)
@@ -625,6 +702,7 @@ def _bind_field(ctxt, parsed_spec, field):
     ast_field.constructed = field.constructed
     ast_field.comparison_order = field.comparison_order
     ast_field.non_const_getter = field.non_const_getter
+    ast_field.unstable = field.unstable
 
     ast_field.cpp_name = field.name
     if field.cpp_name:
@@ -1005,6 +1083,38 @@ def _bind_server_parameter(ctxt, param):
         return None
 
 
+def _bind_feature_flags(ctxt, param):
+    # type: (errors.ParserContext, syntax.FeatureFlag) -> ast.ServerParameter
+    """Bind a FeatureFlag as a serverParameter setting."""
+    ast_param = ast.ServerParameter(param.file_name, param.line, param.column)
+    ast_param.name = param.name
+    ast_param.description = param.description
+
+    ast_param.set_at = "ServerParameterType::kStartupOnly"
+
+    ast_param.cpp_vartype = "::mongo::FeatureFlag"
+
+    # Feature flags that default to false must not have a version
+    if param.default.literal == "false" and param.version:
+        ctxt.add_feature_flag_default_false_has_version(param)
+        return None
+
+    # Feature flags that default to true are required to have a version
+    if param.default.literal == "true" and not param.version:
+        ctxt.add_feature_flag_default_true_missing_version(param)
+        return None
+
+    expr = syntax.Expression(param.default.file_name, param.default.line, param.default.column)
+    expr.expr = '%s, "%s"_sd' % (param.default.literal, param.version if param.version else '')
+
+    ast_param.default = _bind_expression(expr)
+    ast_param.default.export = False
+    ast_param.cpp_varname = param.cpp_varname
+    ast_param.feature_flag = True
+
+    return ast_param
+
+
 def _is_invalid_config_short_name(name):
     # type: (str) -> bool
     """Check if a given name is valid as a short name."""
@@ -1167,6 +1277,15 @@ def bind(parsed_spec):
     for struct in parsed_spec.symbols.structs:
         if not struct.imported:
             bound_spec.structs.append(_bind_struct(ctxt, parsed_spec, struct))
+
+    for arg_list in parsed_spec.symbols.generic_argument_lists:
+        bound_spec.generic_argument_lists.append(_bind_generic_argument_list(arg_list))
+
+    for field_list in parsed_spec.symbols.generic_reply_field_lists:
+        bound_spec.generic_reply_field_lists.append(_bind_generic_reply_field_list(field_list))
+
+    for feature_flag in parsed_spec.feature_flags:
+        bound_spec.server_parameters.append(_bind_feature_flags(ctxt, feature_flag))
 
     for server_parameter in parsed_spec.server_parameters:
         bound_spec.server_parameters.append(_bind_server_parameter(ctxt, server_parameter))

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -394,7 +394,7 @@ size_t Exchange::loadNextBatch() {
 
     // We have reached the end so send EOS to all consumers.
     for (auto& c : _consumers) {
-        c->appendDocument(input, _maxBufferSize);
+        [[maybe_unused]] auto full = c->appendDocument(input, _maxBufferSize);
     }
 
     return kInvalidThreadId;

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -35,10 +35,10 @@
 
 #include <boost/optional.hpp>
 
-#include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/bson_extract_optime.h"
+#include "mongo/idl/command_generic_argument.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
@@ -51,6 +51,9 @@ const char kBatchSizeField[] = "batchSize";
 const char kAwaitDataTimeoutField[] = "maxTimeMS";
 const char kTermField[] = "term";
 const char kLastKnownCommittedOpTimeField[] = "lastKnownCommittedOpTime";
+const char kApiVersion[] = "apiVersion";
+const char kApiStrict[] = "apiStrict";
+const char kApiDeprecationErrors[] = "apiDeprecationErrors";
 
 }  // namespace
 
@@ -105,6 +108,13 @@ StatusWith<GetMoreRequest> GetMoreRequest::parseFromBSON(const std::string& dbna
 
     for (BSONElement el : cmdObj) {
         const auto fieldName = el.fieldNameStringData();
+
+        auto containsAPIParamField = fieldName == kApiVersion || fieldName == kApiStrict ||
+            fieldName == kApiDeprecationErrors;
+        uassert(4937600,
+                str::stream() << "Cannot pass in API parameter field " << fieldName,
+                !containsAPIParamField);
+
         if (fieldName == kGetMoreCommandName) {
             if (el.type() != BSONType::NumberLong) {
                 return {ErrorCodes::TypeMismatch,

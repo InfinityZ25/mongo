@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -116,7 +116,7 @@ public:
             ReadPreferenceSetting(ReadPreference::PrimaryOnly),
             "admin",
             CommandHelpers::appendMajorityWriteConcern(
-                CommandHelpers::appendPassthroughFields(cmdObj, configMovePrimaryRequest.toBSON()),
+                CommandHelpers::appendGenericCommandArgs(cmdObj, configMovePrimaryRequest.toBSON()),
                 opCtx->getWriteConcern()),
             Shard::RetryPolicy::kIdempotent));
 

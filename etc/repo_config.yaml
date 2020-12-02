@@ -106,6 +106,14 @@ repos:
       - yum/redhat/8/mongodb-org
       - yum/redhat/8Server/mongodb-org
 
+  - name: rhel82
+    type: rpm
+    edition: org
+    bucket: repo.mongodb.org
+    repos:
+      - yum/redhat/8/mongodb-org
+      - yum/redhat/8Server/mongodb-org
+
   - name: amazon
     type: rpm
     edition: org
@@ -238,6 +246,19 @@ repos:
     repos:
       - apt/ubuntu/dists/bionic/mongodb-org
 
+  - name: ubuntu2004
+    type: deb
+    code_name: "focal"
+    edition: org
+    bucket: repo.mongodb.org
+    component: multiverse
+    architectures:
+      - amd64
+      - s390x
+      - arm64
+    repos:
+      - apt/ubuntu/dists/focal/mongodb-org
+
 ####################
 #
 # Enterprise Repos:
@@ -285,6 +306,22 @@ repos:
       - yum/redhat/7Server/mongodb-enterprise
 
   - name: rhel80
+    type: rpm
+    edition: enterprise
+    bucket: repo.mongodb.com
+    repos:
+      - yum/redhat/8/mongodb-enterprise
+      - yum/redhat/8Server/mongodb-enterprise
+
+  - name: rhel81
+    type: rpm
+    edition: enterprise
+    bucket: repo.mongodb.com
+    repos:
+      - yum/redhat/8/mongodb-enterprise
+      - yum/redhat/8Server/mongodb-enterprise
+
+  - name: rhel82
     type: rpm
     edition: enterprise
     bucket: repo.mongodb.com
@@ -434,3 +471,17 @@ repos:
       - arm64
     repos:
       - apt/ubuntu/dists/bionic/mongodb-enterprise
+
+  - name: ubuntu2004
+    type: deb
+    code_name: "focal"
+    edition: enterprise
+    bucket: repo.mongodb.com
+    component: multiverse
+    architectures:
+      - amd64
+      - ppc64el
+      - s390x
+      - arm64
+    repos:
+      - apt/ubuntu/dists/focal/mongodb-enterprise

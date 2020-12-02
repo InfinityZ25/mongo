@@ -37,6 +37,7 @@
 #include "mongo/db/index/skipped_record_tracker.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/storage/temporary_record_store.h"
+#include "mongo/db/yieldable.h"
 #include "mongo/platform/atomic_word.h"
 
 namespace mongo {
@@ -68,15 +69,31 @@ public:
      * table to store any duplicate key constraint violations found during the build, if the index
      * being built has uniqueness constraints.
      *
-     * deleteTemporaryTable() must be called before destruction to delete the temporary tables.
+     * finalizeTemporaryTables() must be called before destruction to delete or keep the temporary
+     * tables.
      */
     IndexBuildInterceptor(OperationContext* opCtx, IndexCatalogEntry* entry);
 
     /**
-     * Deletes the temporary side writes and duplicate key constraint violations tables. Must be
-     * called before object destruction.
+     * Finds the temporary table associated with storing writes during this index build. Only used
+     * Only used when resuming an index build and the temporary table already exists on disk.
+     * Additionally will find the tmeporary table associated with storing duplicate key constraint
+     * violations found during the build, if the index being built has uniqueness constraints.
+     *
+     * finalizeTemporaryTable() must be called before destruction.
      */
-    void deleteTemporaryTables(OperationContext* opCtx);
+    IndexBuildInterceptor(OperationContext* opCtx,
+                          IndexCatalogEntry* entry,
+                          StringData sideWritesIdent,
+                          boost::optional<StringData> duplicateKeyTrackerIdent,
+                          boost::optional<StringData> skippedRecordTrackerIdent);
+
+    /**
+     * Deletes or keeps the temporary side writes and duplicate key constraint violations tables.
+     * Must be called before object destruction.
+     */
+    void finalizeTemporaryTables(OperationContext* opCtx,
+                                 TemporaryRecordStore::FinalizationAction action);
 
     /**
      * Client writes that are concurrent with an index build will have their index updates written
@@ -94,10 +111,10 @@ public:
                      int64_t* const numKeysOut);
 
     /**
-     * Given a set of duplicate keys, record the keys for later verification by a call to
+     * Given a duplicate key, record the key for later verification by a call to
      * checkDuplicateKeyConstraints();
      */
-    Status recordDuplicateKeys(OperationContext* opCtx, const std::vector<BSONObj>& keys);
+    Status recordDuplicateKey(OperationContext* opCtx, const KeyString::Value& key) const;
 
     /**
      * Returns Status::OK if all previously recorded duplicate key constraint violations have been
@@ -114,19 +131,11 @@ public:
      *
      * This is resumable, so subsequent calls will start the scan at the record immediately
      * following the last inserted record from a previous call to drainWritesIntoIndex.
-     *
-     * TODO (SERVER-40894): Implement draining while reading at a timestamp. The following comment
-     * does not apply.
-     * When 'readSource' is not kUnset, perform the drain by reading at the timestamp described by
-     * the ReadSource. This will always reset the ReadSource to its original value before returning.
-     * The drain otherwise reads at the pre-existing ReadSource on the RecoveryUnit. This may be
-     * necessary by callers that can only guarantee consistency of data up to a certain point in
-     * time.
      */
     Status drainWritesIntoIndex(OperationContext* opCtx,
+                                const CollectionPtr& coll,
                                 const InsertDeleteOptions& options,
                                 TrackDuplicates trackDups,
-                                RecoveryUnit::ReadSource readSource,
                                 DrainYieldPolicy drainYieldPolicy);
 
     SkippedRecordTracker* getSkippedRecordTracker() {
@@ -142,7 +151,7 @@ public:
      * successful, keys are written directly to the index. Unsuccessful key generation or writes
      * will return errors.
      */
-    Status retrySkippedRecords(OperationContext* opCtx, const Collection* collection);
+    Status retrySkippedRecords(OperationContext* opCtx, const CollectionPtr& collection);
 
     /**
      * Returns 'true' if there are no visible records remaining to be applied from the side writes
@@ -156,10 +165,22 @@ public:
      */
     boost::optional<MultikeyPaths> getMultikeyPaths() const;
 
+    std::string getSideWritesTableIdent() const {
+        return _sideWritesTable->rs()->getIdent();
+    }
+
+    boost::optional<std::string> getDuplicateKeyTrackerTableIdent() const {
+        return _duplicateKeyTracker ? boost::make_optional(_duplicateKeyTracker->getTableIdent())
+                                    : boost::none;
+    }
+
 private:
     using SideWriteRecord = std::pair<RecordId, BSONObj>;
 
+
+    void _initializeMultiKeyPaths(IndexCatalogEntry* entry);
     Status _applyWrite(OperationContext* opCtx,
+                       const CollectionPtr& coll,
                        const BSONObj& doc,
                        const InsertDeleteOptions& options,
                        TrackDuplicates trackDups,
@@ -169,7 +190,11 @@ private:
     /**
      * Yield lock manager locks and abandon the current storage engine snapshot.
      */
-    void _yield(OperationContext* opCtx);
+    void _yield(OperationContext* opCtx, const Yieldable* yieldable);
+
+    void _checkDrainPhaseFailPoint(OperationContext* opCtx,
+                                   FailPoint* fp,
+                                   long long iteration) const;
 
     // The entry for the index that is being built.
     IndexCatalogEntry* _indexCatalogEntry;
@@ -190,7 +215,13 @@ private:
     // additional fields that have to be referenced in commit/rollback handlers, this counter should
     // be moved to a new IndexBuildsInterceptor::InternalState structure that will be managed as a
     // shared resource.
-    std::shared_ptr<AtomicWord<long long>> _sideWritesCounter;
+    std::shared_ptr<AtomicWord<long long>> _sideWritesCounter =
+        std::make_shared<AtomicWord<long long>>(0);
+
+    // Whether to skip the check the the number of writes applied is equal to the number of writes
+    // recorded. Resumable index builds to not preserve these counts, so we skip this check for
+    // index builds that were resumed.
+    const bool _skipNumAppliedCheck = false;
 
     mutable Mutex _multikeyPathMutex =
         MONGO_MAKE_LATCH("IndexBuildInterceptor::_multikeyPathMutex");

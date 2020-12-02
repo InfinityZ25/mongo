@@ -59,7 +59,7 @@ function assertInvalidateOp({cursor, opType}) {
     return null;
 }
 
-function pruneOptionalFields(event, expected) {
+function canonicalizeEventForTesting(event, expected) {
     if (!expected.hasOwnProperty("_id"))
         delete event._id;
 
@@ -72,6 +72,22 @@ function pruneOptionalFields(event, expected) {
     if (!expected.hasOwnProperty("lsid"))
         delete event.lsid;
 
+    // TODO SERVER-50301: The 'truncatedArrays' field may not appear in the updateDescription
+    // depending on whether $v:2 update oplog entries are enabled. When the expected event has an
+    // empty 'truncatedFields' we do not require that the actual event contain the field. This
+    // logic can be removed when $v:2 update oplog entries are enabled on all configurations.
+    if (
+        // If the expected event has an empty 'truncatedArrays' field...
+        expected.hasOwnProperty("updateDescription") &&
+        Array.isArray(expected.updateDescription.truncatedArrays) &&
+        expected.updateDescription.truncatedArrays.length == 0 &&
+        // ...And the actual event has no truncated arrays field.
+        event.hasOwnProperty("updateDescription") &&
+        !event.updateDescription.hasOwnProperty("truncatedArrays")) {
+        // Treat the actual event as if it had an empty 'truncatedArrays' field.
+        event.updateDescription.truncatedArrays = [];
+    }
+
     return event;
 }
 /**
@@ -79,7 +95,7 @@ function pruneOptionalFields(event, expected) {
  * resume token and clusterTime unless they are explicitly listed in the expectedEvent.
  */
 function assertChangeStreamEventEq(actualEvent, expectedEvent) {
-    const testEvent = pruneOptionalFields(Object.assign({}, actualEvent), expectedEvent);
+    const testEvent = canonicalizeEventForTesting(Object.assign({}, actualEvent), expectedEvent);
 
     assert.docEq(testEvent,
                  expectedEvent,
@@ -234,8 +250,14 @@ function ChangeStreamTest(_db, name = "ChangeStreamTest") {
      *
      * Returns a list of the changes seen.
      */
-    self.assertNextChangesEqual = function(
-        {cursor, expectedChanges, expectedNumChanges, expectInvalidate, skipFirstBatch}) {
+    self.assertNextChangesEqual = function({
+        cursor,
+        expectedChanges,
+        expectedNumChanges,
+        expectInvalidate,
+        skipFirstBatch,
+        ignoreOrder
+    }) {
         expectInvalidate = expectInvalidate || false;
         skipFirstBatch = skipFirstBatch || false;
 
@@ -260,8 +282,22 @@ function ChangeStreamTest(_db, name = "ChangeStreamTest") {
         }
 
         let changes = self.getNextChanges(cursor, expectedNumChanges, skipFirstBatch);
-        for (let i = 0; i < changes.length; i++) {
-            assertChangeIsExpected(expectedChanges, i, changes, expectInvalidate);
+        if (ignoreOrder) {
+            const errMsgFunc = () => `${tojson(changes)} != ${tojson(expectedChanges)}`;
+            assert.eq(changes.length, expectedNumChanges, errMsgFunc);
+            for (let i = 0; i < changes.length; i++) {
+                assert(expectedChanges.some(expectedChange => {
+                    return _convertExceptionToReturnStatus(() => {
+                        assertChangeStreamEventEq(changes[i], expectedChange);
+                        return true;
+                    })();
+                }),
+                       errMsgFunc);
+            }
+        } else {
+            for (let i = 0; i < changes.length; i++) {
+                assertChangeIsExpected(expectedChanges, i, changes, expectInvalidate);
+            }
         }
 
         // If we expect invalidation, the final change should have operation type "invalidate".
@@ -278,16 +314,22 @@ function ChangeStreamTest(_db, name = "ChangeStreamTest") {
     };
 
     /**
-     * Iterates through the change stream and asserts that the next 'expected.length' changes are
-     * among the expected ones. The order of the change events from the cursor relative to their
-     * order in the list of expected changes is ignored, however.
+     * Iterates through the change stream and asserts that the next changes are the expected ones.
+     * The order of the change events from the cursor relative to their order in the list of
+     * expected changes is ignored, however.
+     *
+     * Returns a list of the changes seen.
      */
-    self.assertNextChangesEqualUnordered = function(cursor, expected) {
-        const changes = self.getNextChanges(cursor, expected.length).map(event => {
-            return pruneOptionalFields(event, expected[0]);
+    self.assertNextChangesEqualUnordered = function(
+        {cursor, expectedChanges, expectedNumChanges, expectInvalidate, skipFirstBatch}) {
+        return self.assertNextChangesEqual({
+            cursor: cursor,
+            expectedChanges: expectedChanges,
+            expectedNumChanges: expectedNumChanges,
+            expectInvalidate: expectInvalidate,
+            skipFirstBatch: skipFirstBatch,
+            ignoreOrder: true
         });
-
-        assert.sameMembers(changes, expected);
     };
 
     /**
@@ -409,27 +451,27 @@ function ChangeStreamTest(_db, name = "ChangeStreamTest") {
 }
 
 /**
- * Asserts that the given pipeline will eventually return an error with the provided code,
- * either in the initial aggregate, or a subsequent getMore. Throws an exception if there are
- * any results from running the pipeline, or if it doesn't throw an error within the window of
- * assert.soon().  If 'doNotModifyInPassthroughs' is 'true' and the test is running in a
- * $changeStream upconversion passthrough, then this stream will not be modified and will run as
- * though no passthrough were active.
+ * Asserts that the given pipeline will eventually return an error with the provided code, either in
+ * the initial aggregate, or a subsequent getMore. Throws an exception if there are any results from
+ * running the pipeline, or if it doesn't throw an error within the window of assert.soon(). If
+ * 'doNotModifyInPassthroughs' is 'true' and the test is running in a $changeStream upconversion
+ * passthrough, then this stream will not be modified and will run as though no passthrough were
+ * active.
  */
 ChangeStreamTest.assertChangeStreamThrowsCode = function assertChangeStreamThrowsCode(
     {db, collName, pipeline, expectedCode, doNotModifyInPassthroughs}) {
     try {
+        // Run a passthrough-aware initial 'aggregate' command to open the change stream.
         const res = assert.commandWorked(runCommandChangeStreamPassthroughAware(
             db,
             {aggregate: collName, pipeline: pipeline, cursor: {batchSize: 1}},
             doNotModifyInPassthroughs));
 
-        // Extract the collection name from the cursor since the change stream may be on the whole
-        // database. The 'collName' parameter will be the integer 1 in that case and the getMore
-        // command requires 'collection' to be a string.
-        const getMoreCollName = getCollectionNameFromFullNamespace(res.cursor.ns);
-        assert.commandWorked(
-            db.runCommand({getMore: res.cursor.id, collection: getMoreCollName, batchSize: 1}));
+        // Create a cursor using the command response, and begin issuing getMores. We expect
+        // csCursor.hasNext() to throw the expected code before assert.soon() times out.
+        const csCursor = new DBCommandCursor(db, res, 1);
+        assert.soon(() => csCursor.hasNext());
+        assert(false, `Unexpected result from cursor: ${tojson(csCursor.next())}`);
     } catch (error) {
         assert.eq(error.code, expectedCode, `Caught unexpected error: ${tojson(error)}`);
         return true;

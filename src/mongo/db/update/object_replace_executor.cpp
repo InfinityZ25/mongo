@@ -32,11 +32,12 @@
 #include "mongo/db/update/object_replace_executor.h"
 
 #include "mongo/base/data_view.h"
+#include "mongo/bson/mutable/document.h"
 #include "mongo/db/bson/dotted_path_support.h"
-#include "mongo/db/logical_clock.h"
-#include "mongo/db/logical_time.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/update/storage_validation.h"
+#include "mongo/db/update/update_oplog_entry_serialization.h"
+#include "mongo/db/vector_clock_mutable.h"
 
 namespace mongo {
 
@@ -63,7 +64,7 @@ ObjectReplaceExecutor::ObjectReplaceExecutor(BSONObj replacement)
             unsigned long long timestamp = timestampView.read<unsigned long long>();
             if (timestamp == 0) {
                 ServiceContext* service = getGlobalServiceContext();
-                auto ts = LogicalClock::get(service)->reserveTicks(1).asTimestamp();
+                auto ts = VectorClockMutable::get(service)->tickClusterTime(1).asTimestamp();
                 timestampView.write(tagLittleEndian(ts.asULL()));
             }
         }
@@ -141,20 +142,16 @@ UpdateExecutor::ApplyResult ObjectReplaceExecutor::applyReplacementUpdate(
         }
     }
 
-    if (applyParams.logBuilder) {
-        auto replacementObject = applyParams.logBuilder->getDocument().end();
-        invariant(applyParams.logBuilder->getReplacementObject(&replacementObject));
-        for (auto current = applyParams.element.leftChild(); current.ok();
-             current = current.rightSibling()) {
-            invariant(replacementObject.appendElement(current.getValue()));
-        }
-    }
-
-    return ApplyResult();
+    return ApplyResult{};
 }
 
 UpdateExecutor::ApplyResult ObjectReplaceExecutor::applyUpdate(ApplyParams applyParams) const {
-    return applyReplacementUpdate(applyParams, _replacementDoc, _containsId);
-}
+    auto ret = applyReplacementUpdate(applyParams, _replacementDoc, _containsId);
 
+    if (!ret.noop && applyParams.logMode != ApplyParams::LogMode::kDoNotGenerateOplogEntry) {
+        ret.oplogEntry = update_oplog_entry::makeReplacementOplogEntry(
+            applyParams.element.getDocument().getObject());
+    }
+    return ret;
+}
 }  // namespace mongo

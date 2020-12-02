@@ -4,13 +4,19 @@
  *
  * With majority reads disabled, we are not guaranteed to be able to service reads at the majority
  * commit point. We can only provide reads within a window behind the primary's 'lastApplied'. The
- * size of that window is controlled by 'maxTargetSnapshotHistoryWindowInSeconds', which is 5
+ * size of that window is controlled by 'minSnapshotHistoryWindowInSeconds', which is 5
  * seconds by default. If the commit point lag is greater than that amount, reading at that time
  * fails with a SnapshotTooOld error. Therefore, in order for the transaction to succeed, mongos
  * needs to pick a read timestamp that is not derived from the commit point, but rather from the
  * 'lastApplied' optime on the primary.
  *
- * @tags: [uses_transactions, requires_find_command]
+ * Requires fcv_47 because parameter minSnapshotHistoryWindowInSeconds has been introduced in 4.7
+ *
+ * @tags: [
+ *   uses_transactions,
+ *   requires_find_command,
+ *   requires_fcv_47
+ * ]
  */
 
 (function() {
@@ -49,10 +55,10 @@ assert.commandWorked(mongosColl.insert({_id: 1, x: 10}, {writeConcern: {w: "majo
 // We want the secondary to lag for an amount generously greater than the history window.
 const secondary = rst.getSecondary();
 const maxWindowResult = assert.commandWorked(secondary.getDB("admin").runCommand(
-    {"getParameter": 1, "maxTargetSnapshotHistoryWindowInSeconds": 1}));
+    {"getParameter": 1, "minSnapshotHistoryWindowInSeconds": 1}));
 stopServerReplication(secondary);
 
-const maxWindowInMS = maxWindowResult.maxTargetSnapshotHistoryWindowInSeconds * 1000;
+const maxWindowInMS = maxWindowResult.minSnapshotHistoryWindowInSeconds * 1000;
 const lagTimeMS = maxWindowInMS * 2;
 const startTime = Date.now();
 let nextId = 1000;

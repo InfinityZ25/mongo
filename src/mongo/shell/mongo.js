@@ -1,6 +1,6 @@
 // mongo.js
 
-// Defined in mongo.cpp
+// Defined in mongojs.cpp
 
 if (!Mongo.prototype) {
     throw Error("Mongo.prototype not defined");
@@ -28,13 +28,23 @@ if (typeof mongoInject == "function") {
 }
 
 Mongo.prototype.setSlaveOk = function(value) {
-    if (value == undefined)
-        value = true;
-    this.slaveOk = value;
+    print(
+        "WARNING: setSlaveOk() is deprecated and may be removed in the next major release. Please use setSecondaryOk() instead.");
+    this.setSecondaryOk(value);
 };
 
 Mongo.prototype.getSlaveOk = function() {
-    return this.slaveOk || false;
+    print(
+        "WARNING: getSlaveOk() is deprecated and may be removed in the next major release. Please use getSecondaryOk() instead.");
+    return this.getSecondaryOk();
+};
+
+Mongo.prototype.setSecondaryOk = function(value = true) {
+    this.secondaryOk = value;
+};
+
+Mongo.prototype.getSecondaryOk = function() {
+    return this.secondaryOk || false;
 };
 
 Mongo.prototype.getDB = function(name) {
@@ -308,7 +318,7 @@ Mongo.prototype.getReadConcern = function() {
     return this._readConcernLevel;
 };
 
-connect = function(url, user, pass) {
+connect = function(url, user, pass, apiParameters) {
     if (url instanceof MongoURI) {
         user = url.user;
         pass = url.password;
@@ -359,11 +369,18 @@ connect = function(url, user, pass) {
     }
     chatty("connecting to: " + safeURL);
     try {
-        var m = new Mongo(url);
+        var m = new Mongo(url, undefined /* encryptedDBClientCallback */, apiParameters);
     } catch (e) {
-        if (url.indexOf(".mongodb.net") != -1) {
-            print("\n\n*** It looks like this is a MongoDB Atlas cluster. Please ensure that your" +
-                  " IP whitelist allows connections from your network.\n\n");
+        var dest;
+        if (url.indexOf(".query.mongodb.net") != -1) {
+            dest = "MongoDB Atlas Data Lake";
+        } else if (url.indexOf(".mongodb.net") != -1) {
+            dest = "MongoDB Atlas cluster";
+        }
+
+        if (dest) {
+            print(`\n\n*** You have failed to connect to a ${dest}. Please ensure` +
+                  " that your IP whitelist allows connections from your network.\n\n");
         }
 
         throw e;

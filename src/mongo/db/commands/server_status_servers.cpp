@@ -27,14 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/config.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/transport/message_compressor_registry.h"
 #include "mongo/transport/service_entry_point.h"
+#include "mongo/transport/service_executor_synchronous.h"
 #include "mongo/util/net/hostname_canonicalization.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/net/ssl_manager.h"
@@ -79,12 +78,13 @@ public:
         return true;
     }
 
+    // TODO: need to track connections in server stats (see SERVER-49073)
     BSONObj generateSection(OperationContext* opCtx,
                             const BSONElement& configElement) const override {
         BSONObjBuilder b;
         networkCounter.append(b);
         appendMessageCompressionStats(&b);
-        auto executor = opCtx->getServiceContext()->getServiceExecutor();
+        auto executor = transport::ServiceExecutorSynchronous::get(opCtx->getServiceContext());
         if (executor) {
             BSONObjBuilder section(b.subobjStart("serviceExecutorTaskStats"));
             executor->appendStats(&section);
@@ -112,8 +112,11 @@ public:
         result.append("authentication", auth.obj());
 
 #ifdef MONGO_CONFIG_SSL
-        if (getSSLManager()) {
-            getSSLManager()->getSSLConfiguration().getServerStatusBSON(&result);
+        if (SSLManagerCoordinator::get()) {
+            SSLManagerCoordinator::get()
+                ->getSSLManager()
+                ->getSSLConfiguration()
+                .getServerStatusBSON(&result);
         }
 #endif
 

@@ -1,4 +1,7 @@
-// @tags: [does_not_support_stepdowns, requires_capped]
+// @tags: [
+//   does_not_support_stepdowns,
+//   requires_capped,
+// ]
 
 // Check that a warning message about doing a capped collection scan for a query with an _id
 // constraint is printed at appropriate times.  SERVER-5353
@@ -80,7 +83,7 @@ t.find({_id: 0, a: 0}).itcount();
 assertNoNewWarnings();
 
 // Warnings should not be printed when an index is added on _id.
-t.ensureIndex({_id: 1});
+t.createIndex({_id: 1});
 
 t.find({_id: 0}).itcount();
 assertNoNewWarnings();

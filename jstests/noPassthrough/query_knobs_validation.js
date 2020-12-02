@@ -14,11 +14,13 @@ const expectedParamDefaults = {
     internalQueryPlanEvaluationWorks: 10000,
     internalQueryPlanEvaluationCollFraction: 0.3,
     internalQueryPlanEvaluationMaxResults: 101,
+    internalQueryCacheMaxEntriesPerCollection: 5000,
+    // This is a deprecated alias for "internalQueryCacheMaxEntriesPerCollection".
     internalQueryCacheSize: 5000,
-    internalQueryCacheFeedbacksStored: 20,
     internalQueryCacheEvictionRatio: 10.0,
     internalQueryCacheWorksGrowthCoefficient: 2.0,
     internalQueryCacheDisableInactiveEntries: false,
+    internalQueryCacheMaxSizeBytesBeforeStripDebugInfo: 512 * 1024 * 1024,
     internalQueryPlannerMaxIndexedSolutions: 64,
     internalQueryEnumerationMaxOrSolutions: 10,
     internalQueryEnumerationMaxIntersectPerAnd: 3,
@@ -35,6 +37,7 @@ const expectedParamDefaults = {
     internalDocumentSourceLookupCacheSizeBytes: 100 * 1024 * 1024,
     internalLookupStageIntermediateDocumentMaxSizeBytes: 100 * 1024 * 1024,
     internalDocumentSourceGroupMaxMemoryBytes: 100 * 1024 * 1024,
+    internalPipelineLengthLimit: 1000,
     internalQueryMaxJsEmitBytes: 100 * 1024 * 1024,
     internalQueryMaxPushBytes: 100 * 1024 * 1024,
     internalQueryMaxAddToSetBytes: 100 * 1024 * 1024,
@@ -43,6 +46,7 @@ const expectedParamDefaults = {
     internalQueryPlannerGenerateCoveredWholeIndexScans: false,
     internalQueryIgnoreUnknownJSONSchemaKeywords: false,
     internalQueryProhibitBlockingMergeOnMongoS: false,
+    internalQuerySlotBasedExecutionMaxStaticIndexScanIntervals: 1000,
 };
 
 function assertDefaultParameterValues() {
@@ -86,13 +90,17 @@ assertSetParameterSucceeds("internalQueryPlanEvaluationMaxResults", 11);
 assertSetParameterSucceeds("internalQueryPlanEvaluationMaxResults", 0);
 assertSetParameterFails("internalQueryPlanEvaluationMaxResults", -1);
 
+assertSetParameterSucceeds("internalQueryCacheMaxEntriesPerCollection", 1);
+assertSetParameterSucceeds("internalQueryCacheMaxEntriesPerCollection", 0);
+assertSetParameterFails("internalQueryCacheMaxEntriesPerCollection", -1);
+// "internalQueryCacheSize" is a deprecated alias for "internalQueryCacheMaxEntriesPerCollection".
 assertSetParameterSucceeds("internalQueryCacheSize", 1);
 assertSetParameterSucceeds("internalQueryCacheSize", 0);
 assertSetParameterFails("internalQueryCacheSize", -1);
 
-assertSetParameterSucceeds("internalQueryCacheFeedbacksStored", 1);
-assertSetParameterSucceeds("internalQueryCacheFeedbacksStored", 0);
-assertSetParameterFails("internalQueryCacheFeedbacksStored", -1);
+assertSetParameterSucceeds("internalQueryCacheMaxSizeBytesBeforeStripDebugInfo", 1);
+assertSetParameterSucceeds("internalQueryCacheMaxSizeBytesBeforeStripDebugInfo", 0);
+assertSetParameterFails("internalQueryCacheMaxSizeBytesBeforeStripDebugInfo", -1);
 
 assertSetParameterSucceeds("internalQueryCacheEvictionRatio", 1.0);
 assertSetParameterSucceeds("internalQueryCacheEvictionRatio", 0.0);
@@ -156,7 +164,7 @@ assertSetParameterFails("internalQueryMaxAddToSetBytes", -1);
 
 // Internal BSON max object size is slightly larger than the max user object size, to
 // accommodate command metadata.
-const bsonUserSizeLimit = assert.commandWorked(testDB.isMaster()).maxBsonObjectSize;
+const bsonUserSizeLimit = assert.commandWorked(testDB.hello()).maxBsonObjectSize;
 const bsonObjMaxInternalSize = bsonUserSizeLimit + 16 * 1024;
 
 assertSetParameterFails("internalLookupStageIntermediateDocumentMaxSizeBytes", 1);
@@ -174,6 +182,10 @@ assertSetParameterFails("internalDocumentSourceCursorBatchSizeBytes", -1);
 assertSetParameterSucceeds("internalDocumentSourceLookupCacheSizeBytes", 11);
 assertSetParameterSucceeds("internalDocumentSourceLookupCacheSizeBytes", 0);
 assertSetParameterFails("internalDocumentSourceLookupCacheSizeBytes", -1);
+
+assertSetParameterSucceeds("internalQuerySlotBasedExecutionMaxStaticIndexScanIntervals", 1001);
+assertSetParameterFails("internalQuerySlotBasedExecutionMaxStaticIndexScanIntervals", 0);
+assertSetParameterFails("internalQuerySlotBasedExecutionMaxStaticIndexScanIntervals", -1);
 
 MongoRunner.stopMongod(conn);
 })();

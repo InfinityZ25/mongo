@@ -68,6 +68,7 @@ class ExpressionExp;
 class ExpressionFieldPath;
 class ExpressionFilter;
 class ExpressionFloor;
+class ExpressionToHashedIndexKey;
 class ExpressionHour;
 class ExpressionIfNull;
 class ExpressionIn;
@@ -103,6 +104,7 @@ class ExpressionSize;
 class ExpressionReverseArray;
 class ExpressionSlice;
 class ExpressionIsArray;
+class ExpressionRandom;
 class ExpressionRound;
 class ExpressionSecond;
 class ExpressionSplit;
@@ -150,7 +152,7 @@ class ExpressionInternalJsEmit;
 class ExpressionFunction;
 class ExpressionDegreesToRadians;
 class ExpressionRadiansToDegrees;
-class ExpressionInternalRemoveFieldTombstones;
+class ExpressionDateDiff;
 
 class AccumulatorAvg;
 class AccumulatorMax;
@@ -198,6 +200,7 @@ public:
     virtual void visit(ExpressionCond*) = 0;
     virtual void visit(ExpressionDateFromString*) = 0;
     virtual void visit(ExpressionDateFromParts*) = 0;
+    virtual void visit(ExpressionDateDiff*) = 0;
     virtual void visit(ExpressionDateToParts*) = 0;
     virtual void visit(ExpressionDateToString*) = 0;
     virtual void visit(ExpressionDivide*) = 0;
@@ -210,7 +213,6 @@ public:
     virtual void visit(ExpressionIndexOfArray*) = 0;
     virtual void visit(ExpressionIndexOfBytes*) = 0;
     virtual void visit(ExpressionIndexOfCP*) = 0;
-    virtual void visit(ExpressionInternalRemoveFieldTombstones*) = 0;
     virtual void visit(ExpressionIsNumber*) = 0;
     virtual void visit(ExpressionLet*) = 0;
     virtual void visit(ExpressionLn*) = 0;
@@ -237,6 +239,7 @@ public:
     virtual void visit(ExpressionReverseArray*) = 0;
     virtual void visit(ExpressionSlice*) = 0;
     virtual void visit(ExpressionIsArray*) = 0;
+    virtual void visit(ExpressionRandom*) = 0;
     virtual void visit(ExpressionRound*) = 0;
     virtual void visit(ExpressionSplit*) = 0;
     virtual void visit(ExpressionSqrt*) = 0;
@@ -299,6 +302,7 @@ public:
     virtual void visit(ExpressionInternalFindSlice*) = 0;
     virtual void visit(ExpressionInternalFindPositional*) = 0;
     virtual void visit(ExpressionInternalFindElemMatch*) = 0;
+    virtual void visit(ExpressionToHashedIndexKey*) = 0;
 };
 
 }  // namespace mongo

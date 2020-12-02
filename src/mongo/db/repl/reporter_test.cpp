@@ -94,9 +94,9 @@ private:
         ProgressInfo(const OpTime& lastDurableOpTime, const OpTime& lastAppliedOpTime)
             : lastDurableOpTime(lastDurableOpTime), lastAppliedOpTime(lastAppliedOpTime) {}
 
-        // Our last known OpTime that this slave has applied and journaled to.
+        // Our last known OpTime that this secondary has applied and journaled to.
         OpTime lastDurableOpTime;
-        // Our last known OpTime that this slave has applied, whether journaled or unjournaled.
+        // Our last known OpTime that this secondary has applied, whether journaled or unjournaled.
         OpTime lastAppliedOpTime;
     };
 
@@ -114,7 +114,7 @@ public:
      */
     BSONObj processNetworkResponse(const BSONObj& obj,
                                    bool expectReadyRequestsAfterProcessing = false);
-    BSONObj processNetworkResponse(const RemoteCommandResponse rs,
+    BSONObj processNetworkResponse(RemoteCommandResponse rs,
                                    bool expectReadyRequestsAfterProcessing = false);
 
     void runUntil(Date_t when, bool expectReadyRequestsAfterAdvancingClock = false);
@@ -202,7 +202,7 @@ BSONObj ReporterTest::processNetworkResponse(const BSONObj& obj,
     return cmdObj;
 }
 
-BSONObj ReporterTest::processNetworkResponse(const RemoteCommandResponse rs,
+BSONObj ReporterTest::processNetworkResponse(RemoteCommandResponse rs,
                                              bool expectReadyRequestsAfterProcessing) {
     auto net = getNet();
     net->enterNetwork();
@@ -407,55 +407,6 @@ TEST_F(ReporterTest, UnsuccessfulCommandResponseStopsTheReporter) {
 
     ASSERT_EQUALS(Status(ErrorCodes::UnknownError, "unknown error"), reporter->join());
     assertReporterDone();
-}
-
-TEST_F(ReporterTestNoTriggerAtSetUp,
-       InvalidReplicaSetResponseToARequestWithoutConfigVersionStopsTheReporter) {
-    posUpdater->setConfigVersion(-1);
-    ASSERT_OK(reporter->trigger());
-    ASSERT_TRUE(reporter->isActive());
-
-    processNetworkResponse(BSON("ok" << 0 << "code" << int(ErrorCodes::InvalidReplicaSetConfig)
-                                     << "errmsg"
-                                     << "newer config"
-                                     << "configVersion" << 100));
-
-    ASSERT_EQUALS(Status(ErrorCodes::InvalidReplicaSetConfig, "invalid config"), reporter->join());
-    assertReporterDone();
-}
-
-TEST_F(ReporterTest, InvalidReplicaSetResponseWithoutConfigVersionOnSyncTargetStopsTheReporter) {
-    processNetworkResponse(BSON("ok" << 0 << "code" << int(ErrorCodes::InvalidReplicaSetConfig)
-                                     << "errmsg"
-                                     << "invalid config"));
-
-    ASSERT_EQUALS(Status(ErrorCodes::InvalidReplicaSetConfig, "invalid config"), reporter->join());
-    assertReporterDone();
-}
-
-TEST_F(ReporterTest, InvalidReplicaSetResponseWithSameConfigVersionOnSyncTargetStopsTheReporter) {
-    processNetworkResponse(BSON("ok" << 0 << "code" << int(ErrorCodes::InvalidReplicaSetConfig)
-                                     << "errmsg"
-                                     << "invalid config"
-                                     << "configVersion" << posUpdater->getConfigVersion()));
-
-    ASSERT_EQUALS(Status(ErrorCodes::InvalidReplicaSetConfig, "invalid config"), reporter->join());
-    assertReporterDone();
-}
-
-TEST_F(ReporterTest,
-       InvalidReplicaSetResponseWithNewerConfigVersionOnSyncTargetDoesNotStopTheReporter) {
-    // Reporter should not retry update command on sync source immediately after seeing newer
-    // configuration.
-    ASSERT_OK(reporter->trigger());
-    ASSERT_TRUE(reporter->isWaitingToSendReport());
-
-    processNetworkResponse(BSON("ok" << 0 << "code" << int(ErrorCodes::InvalidReplicaSetConfig)
-                                     << "errmsg"
-                                     << "newer config"
-                                     << "configVersion" << posUpdater->getConfigVersion() + 1));
-
-    ASSERT_TRUE(reporter->isActive());
 }
 
 // Schedule while we are already scheduled, it should set "isWaitingToSendReport", then

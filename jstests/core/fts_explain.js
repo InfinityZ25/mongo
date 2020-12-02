@@ -1,6 +1,9 @@
 // Cannot implicitly shard accessed collections because of extra shard key index in sharded
 // collection.
-// @tags: [assumes_no_implicit_index_creation]
+// @tags: [
+//   assumes_no_implicit_index_creation,
+//   sbe_incompatible,
+// ]
 
 // Test $text explain.  SERVER-12037.
 
@@ -11,7 +14,7 @@ const coll = db.fts_explain;
 let res;
 
 coll.drop();
-res = coll.ensureIndex({content: "text"}, {default_language: "none"});
+res = coll.createIndex({content: "text"}, {default_language: "none"});
 assert.commandWorked(res);
 
 res = coll.insert({content: "some data"});

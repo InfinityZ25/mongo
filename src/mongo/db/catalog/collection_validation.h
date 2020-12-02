@@ -29,35 +29,50 @@
 
 #pragma once
 
+#include "mongo/db/catalog/validate_results.h"
 #include "mongo/db/namespace_string.h"
 
 namespace mongo {
 
 class OperationContext;
 class Collection;
-struct ValidateResults;
+class CollectionPtr;
 class BSONObjBuilder;
 class Status;
 
 namespace CollectionValidation {
 
-enum class ValidateOptions {
-    kNoFullValidation = 0,
+enum class ValidateMode {
+    kBackground,
+    kForeground,
 
-    // If the FullRecordStoreValidation option is set, validate() will do a full validation of the
-    // underlying record store using the storage engine's validation functionality. For WiredTiger
-    // this results in a call to verify().
-    kFullRecordStoreValidation = 1 << 0,
-    // If set, validate() will validate the internal structure of each index, and checks consistency
-    // of the number of keys in the index compared to the internal structure.
-    kFullIndexValidation = 1 << 1,
-    // Includes all of the full validations above.
-    kFullValidation = kFullRecordStoreValidation | kFullIndexValidation,
+    // The standard foreground validation above, plus a full validation of the underlying
+    // SortedDataInterface using the storage engine's validation functionality. For WiredTiger,
+    // this results in a call to verify() for each index.
+    //
+    // This mode is only used by repair to avoid revalidating the record store.
+    kForegroundFullIndexOnly,
+
+    // The full index validation above, plus a full validation of the underlying record store using
+    // the storage engine's validation functionality. For WiredTiger, this results in a call to
+    // verify().
+    kForegroundFull,
+
+    // The full index and record store validation above, plus enforce that the fast count is equal
+    // to the number of records (as opposed to correcting the fast count if it is incorrect).
+    kForegroundFullEnforceFastCount,
 };
 
-inline bool operator&(ValidateOptions lhs, ValidateOptions rhs) {
-    return (static_cast<int>(lhs) & static_cast<int>(rhs)) != 0;
-}
+/**
+ * RepairMode indicates whether validate should repair the data inconsistencies it detects. When set
+ * to kRepair, if any repairs are made, the 'repaired' flag in ValidateResults will be set to true.
+ * If all errors are fixed, then 'valid' will also be set to true. kRepair is incompatible with the
+ * ValidateModes kBackground and kForegroundFullEnforceFastCount.
+ */
+enum class RepairMode {
+    kNone,
+    kRepair,
+};
 
 /**
  * Expects the caller to hold no locks.
@@ -72,8 +87,8 @@ inline bool operator&(ValidateOptions lhs, ValidateOptions rhs) {
  */
 Status validate(OperationContext* opCtx,
                 const NamespaceString& nss,
-                ValidateOptions options,
-                bool background,
+                ValidateMode mode,
+                RepairMode repairMode,
                 ValidateResults* results,
                 BSONObjBuilder* output,
                 bool turnOnExtraLoggingForTest = false);

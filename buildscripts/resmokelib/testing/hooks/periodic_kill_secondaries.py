@@ -6,13 +6,13 @@ import bson
 import pymongo
 import pymongo.errors
 
-from . import dbhash
-from . import interface
-from . import oplog
-from . import validate
-from ..fixtures import interface as fixture
-from ..fixtures import replicaset
-from ... import errors
+from buildscripts.resmokelib import errors
+from buildscripts.resmokelib.testing.fixtures import interface as fixture
+from buildscripts.resmokelib.testing.fixtures import replicaset
+from buildscripts.resmokelib.testing.hooks import dbhash
+from buildscripts.resmokelib.testing.hooks import interface
+from buildscripts.resmokelib.testing.hooks import oplog
+from buildscripts.resmokelib.testing.hooks import validate
 
 
 class PeriodicKillSecondaries(interface.Hook):
@@ -79,7 +79,7 @@ class PeriodicKillSecondaries(interface.Hook):
     def _run(self, test_report):
         try:
             hook_test_case = PeriodicKillSecondariesTestCase.create_after_test(
-                self.logger.test_case_logger, self._last_test, self, test_report)
+                self.logger, self._last_test, self, test_report)
             hook_test_case.configure(self.fixture)
             hook_test_case.run_dynamic_test(test_report)
         finally:
@@ -193,6 +193,7 @@ class PeriodicKillSecondariesTestCase(interface.DynamicTestCase):
             # Start the 'secondary' mongod back up as part of the replica set and wait for it to
             # reach state SECONDARY.
             secondary.setup()
+            self.logger.info(fixture.create_fixture_table(self.fixture))
             secondary.await_ready()
             self._await_secondary_state(secondary)
 
@@ -208,6 +209,7 @@ class PeriodicKillSecondariesTestCase(interface.DynamicTestCase):
 
         try:
             self.fixture.setup()
+            self.logger.info(fixture.create_fixture_table(self.fixture))
             self.fixture.await_ready()
         finally:
             for (i, node) in enumerate(self.fixture.nodes):
@@ -250,6 +252,7 @@ class PeriodicKillSecondariesTestCase(interface.DynamicTestCase):
 
         self.logger.info("Starting the fixture back up again with no data...")
         self.fixture.setup()
+        self.logger.info(fixture.create_fixture_table(self.fixture))
         self.fixture.await_ready()
 
     def _check_invariants_as_standalone(self, secondary):  # pylint: disable=too-many-locals
@@ -262,6 +265,7 @@ class PeriodicKillSecondariesTestCase(interface.DynamicTestCase):
 
         try:
             secondary.setup()
+            self.logger.info(fixture.create_fixture_table(self.fixture))
             secondary.await_ready()
 
             client = secondary.mongo_client()

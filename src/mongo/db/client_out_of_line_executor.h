@@ -33,7 +33,6 @@
 #include <memory>
 
 #include "mongo/db/client.h"
-#include "mongo/util/clock_source.h"
 #include "mongo/util/out_of_line_executor.h"
 #include "mongo/util/producer_consumer_queue.h"
 
@@ -55,6 +54,8 @@ public:
     static ClientOutOfLineExecutor* get(const Client*) noexcept;
 
     using Task = OutOfLineExecutor::Task;
+
+    void shutdown();
 
     void schedule(Task) override;
 
@@ -81,9 +82,13 @@ public:
     }
 
 private:
+    class Impl;
+    std::unique_ptr<Impl> _impl;
+
     std::shared_ptr<QueueType> _taskQueue;
 
-    ClockSource::StopWatch _stopWatch;
+    // Provides the means to ensure `shutdown()` always precedes the destructor.
+    bool _isShutdown = false;
 };
 
 }  // namespace mongo

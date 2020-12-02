@@ -39,22 +39,29 @@ namespace mongo::sdam {
 class TopologyStateMachineTestFixture : public SdamTestFixture {
 protected:
     static inline const auto kReplicaSetName = "replica_set";
-    static inline const auto kLocalServer = "localhost:123";
-    static inline const auto kLocalServer2 = "localhost:456";
+    static inline const auto kLocalServer = HostAndPort("localhost:123");
+    static inline const auto kLocalServer2 = HostAndPort("localhost:456");
+
+    static inline const auto kNotUsedMs = Milliseconds(100);
+    static inline const auto kFiveHundredMs = Milliseconds(500);
 
     static inline const auto kTwoSeedConfig =
-        SdamConfiguration(std::vector<ServerAddress>{kLocalServer, kLocalServer2},
+        SdamConfiguration(std::vector<HostAndPort>{kLocalServer, kLocalServer2},
                           TopologyType::kUnknown,
-                          mongo::Milliseconds(500));
-    static inline const auto kTwoSeedReplicaSetNoPrimaryConfig =
-        SdamConfiguration(std::vector<ServerAddress>{kLocalServer, kLocalServer2},
-                          TopologyType::kReplicaSetNoPrimary,
-                          mongo::Milliseconds(500),
-                          std::string("setName"));
-    static inline const auto kSingleConfig =
-        SdamConfiguration(std::vector<ServerAddress>{kLocalServer}, TopologyType::kSingle);
+                          kFiveHundredMs);
 
-    // Given we in 'starting' state with initial config 'initialConfig'. We receive a
+    static inline const auto kTwoSeedReplicaSetNoPrimaryConfig =
+        SdamConfiguration(std::vector<HostAndPort>{kLocalServer, kLocalServer2},
+                          TopologyType::kReplicaSetNoPrimary,
+                          kFiveHundredMs,
+                          kNotUsedMs,
+                          kNotUsedMs,
+                          std::string("setName"));
+
+    static inline const auto kSingleConfig =
+        SdamConfiguration(std::vector<HostAndPort>{kLocalServer}, TopologyType::kSingle);
+
+    // Given we are in 'starting' state with initial config 'initialConfig'. We receive a
     // ServerDescription with type 'incoming', and expected the ending topology state to be
     // 'ending'.
     struct TopologyTypeTestCase {
@@ -126,7 +133,7 @@ TEST_F(TopologyStateMachineTestFixture, ShouldInstallServerDescriptionInSingleTo
     TopologyStateMachine stateMachine(kSingleConfig);
     auto topologyDescription = std::make_shared<TopologyDescription>(kSingleConfig);
 
-    auto updatedMeAddress = "foo:1234";
+    auto updatedMeAddress = HostAndPort("foo:1234");
     auto serverDescription = ServerDescriptionBuilder()
                                  .withAddress(kLocalServer)
                                  .withMe(updatedMeAddress)
@@ -177,14 +184,48 @@ TEST_F(TopologyStateMachineTestFixture,
                                  .instance();
 
     ASSERT_EQUALS(static_cast<size_t>(2), topologyDescription->getServers().size());
-    auto serversBefore = map<ServerDescriptionPtr, ServerAddress>(topologyDescription->getServers(),
-                                                                  getServerDescriptionAddress);
+    auto serversBefore = map(topologyDescription->getServers(), getServerDescriptionAddress);
 
     stateMachine.onServerDescription(*topologyDescription, serverDescription);
 
-    auto serversAfter = map<ServerDescriptionPtr, ServerAddress>(topologyDescription->getServers(),
-                                                                 getServerDescriptionAddress);
-    ASSERT_EQUALS(serversBefore, serversAfter);
+    auto serversAfter = map(topologyDescription->getServers(), getServerDescriptionAddress);
+    ASSERT_EQUALS(adaptForAssert(serversBefore), adaptForAssert(serversAfter));
+}
+
+TEST_F(TopologyStateMachineTestFixture,
+       ShouldChangeStandaloneServerToUnknownAndPreserveTopologyType) {
+    const auto primary = (*kTwoSeedConfig.getSeedList()).front();
+    const auto otherMember = (*kTwoSeedConfig.getSeedList()).back();
+
+    TopologyStateMachine stateMachine(kTwoSeedConfig);
+    auto topologyDescription = std::make_shared<TopologyDescription>(kTwoSeedConfig);
+
+    const auto primaryDescription = ServerDescriptionBuilder()
+                                        .withAddress(primary)
+                                        .withMe(primary)
+                                        .withHost(primary)
+                                        .withHost(otherMember)
+                                        .withSetName(kReplicaSetName)
+                                        .withType(ServerType::kRSPrimary)
+                                        .instance();
+    stateMachine.onServerDescription(*topologyDescription, primaryDescription);
+    ASSERT_EQUALS(topologyDescription->getType(), TopologyType::kReplicaSetWithPrimary);
+
+    // Primary transforms to a standalone
+    const auto standaloneDescription = ServerDescriptionBuilder()
+                                           .withType(ServerType::kStandalone)
+                                           .withMe(primary)
+                                           .withAddress(primary)
+                                           .withHost(primary)
+                                           .instance();
+    stateMachine.onServerDescription(*topologyDescription, standaloneDescription);
+
+    ASSERT_EQUALS(topologyDescription->getType(), TopologyType::kReplicaSetNoPrimary);
+    ASSERT_EQUALS(2, topologyDescription->getServers().size());
+
+    const auto finalServerDescription = topologyDescription->findServerByAddress(primary);
+    ASSERT(finalServerDescription);
+    ASSERT_EQUALS(ServerType::kUnknown, (*finalServerDescription)->getType());
 }
 
 TEST_F(TopologyStateMachineTestFixture,
@@ -216,23 +257,22 @@ TEST_F(TopologyStateMachineTestFixture,
     ASSERT_EQUALS(topologyDescription->getType(), TopologyType::kReplicaSetWithPrimary);
     ASSERT_EQUALS(static_cast<size_t>(2), topologyDescription->getServers().size());
 
-    auto serversBefore = map<ServerDescriptionPtr, ServerAddress>(topologyDescription->getServers(),
-                                                                  getServerDescriptionAddress);
+    auto serversBefore = map(topologyDescription->getServers(), getServerDescriptionAddress);
 
     stateMachine.onServerDescription(*topologyDescription, serverDescription);
-    ASSERT_EQUALS(topologyDescription->getType(), TopologyType::kReplicaSetWithPrimary);
+    ASSERT_EQUALS(adaptForAssert(topologyDescription->getType()),
+                  adaptForAssert(TopologyType::kReplicaSetWithPrimary));
 
-    auto serversAfter = map<ServerDescriptionPtr, ServerAddress>(topologyDescription->getServers(),
-                                                                 getServerDescriptionAddress);
-    ASSERT_EQUALS(serversBefore, serversAfter);
+    auto serversAfter = map(topologyDescription->getServers(), getServerDescriptionAddress);
+    ASSERT_EQUALS(adaptForAssert(serversBefore), adaptForAssert(serversAfter));
 }
 
 TEST_F(TopologyStateMachineTestFixture,
        ShouldRemoveNonPrimaryServerWhenTopologyIsReplicaSetNoPrimaryAndMeDoesntMatchAddress) {
     const auto serverAddress = (*kTwoSeedReplicaSetNoPrimaryConfig.getSeedList()).front();
-    const auto expectedRemainingServerAddress =
+    const auto expectedRemainingHostAndPort =
         (*kTwoSeedReplicaSetNoPrimaryConfig.getSeedList()).back();
-    const auto me = std::string("foo") + serverAddress;
+    const auto me = HostAndPort(std::string("foo") + serverAddress.toString());
 
     TopologyStateMachine stateMachine(kTwoSeedReplicaSetNoPrimaryConfig);
     auto topologyDescription =
@@ -247,7 +287,7 @@ TEST_F(TopologyStateMachineTestFixture,
     ASSERT_EQUALS(static_cast<size_t>(2), topologyDescription->getServers().size());
     stateMachine.onServerDescription(*topologyDescription, serverDescription);
     ASSERT_EQUALS(static_cast<size_t>(1), topologyDescription->getServers().size());
-    ASSERT_EQUALS(expectedRemainingServerAddress,
+    ASSERT_EQUALS(expectedRemainingHostAndPort,
                   topologyDescription->getServers().front()->getAddress());
 }
 
@@ -255,7 +295,7 @@ TEST_F(TopologyStateMachineTestFixture,
        ShouldAddServerDescriptionIfInHostsListButNotInTopologyDescription) {
     const auto primary = (*kTwoSeedConfig.getSeedList()).front();
     const auto secondary = (*kTwoSeedConfig.getSeedList()).back();
-    const auto newHost = ServerAddress("newhost:123");
+    const auto newHost = HostAndPort("newhost:123");
 
     TopologyStateMachine stateMachine(kTwoSeedConfig);
     auto topologyDescription = std::make_shared<TopologyDescription>(kTwoSeedConfig);

@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/client/mongo_uri.h"
@@ -48,6 +46,8 @@
 #include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/stdx/utility.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/ctype.h"
 #include "mongo/util/dns_name.h"
 #include "mongo/util/dns_query.h"
 #include "mongo/util/hex.h"
@@ -74,7 +74,7 @@ const std::vector<std::pair<std::string, std::string>> permittedTXTOptions = {{"
  */
 void mongo::uriEncode(std::ostream& ss, StringData toEncode, StringData passthrough) {
     for (const auto& c : toEncode) {
-        if ((c == '-') || (c == '_') || (c == '.') || (c == '~') || isalnum(c) ||
+        if ((c == '-') || (c == '_') || (c == '.') || (c == '~') || ctype::isAlnum(c) ||
             (passthrough.find(c) != std::string::npos)) {
             ss << c;
         } else {
@@ -87,24 +87,22 @@ void mongo::uriEncode(std::ostream& ss, StringData toEncode, StringData passthro
 mongo::StatusWith<std::string> mongo::uriDecode(StringData toDecode) {
     StringBuilder out;
     for (size_t i = 0; i < toDecode.size(); ++i) {
-        const char c = toDecode[i];
+        char c = toDecode[i];
         if (c == '%') {
             if (i + 2 >= toDecode.size()) {
                 return Status(ErrorCodes::FailedToParse,
                               "Encountered partial escape sequence at end of string");
             }
-            auto swHex = fromHex(toDecode.substr(i + 1, 2));
-            if (swHex.isOK()) {
-                out << swHex.getValue();
-            } else {
+            try {
+                c = hexblob::decodePair(toDecode.substr(i + 1, 2));
+            } catch (const ExceptionFor<ErrorCodes::FailedToParse>&) {
                 return Status(ErrorCodes::Error(51040),
                               "The characters after the % do not form a hex value. Please escape "
                               "the % or pass a valid hex value. ");
             }
             i += 2;
-        } else {
-            out << c;
         }
+        out << c;
     }
     return out.str();
 }
@@ -322,13 +320,11 @@ std::string MongoURI::redact(StringData url) {
     return out.str();
 }
 
-MongoURI MongoURI::parseImpl(const std::string& url) {
-    const StringData urlSD(url);
-
+MongoURI MongoURI::parseImpl(StringData url) {
     // 1. Validate and remove the scheme prefix `mongodb://` or `mongodb+srv://`
-    const bool isSeedlist = urlSD.startsWith(kURISRVPrefix);
-    if (!(urlSD.startsWith(kURIPrefix) || isSeedlist)) {
-        return MongoURI(uassertStatusOK(ConnectionString::parse(url)));
+    const bool isSeedlist = url.startsWith(kURISRVPrefix);
+    if (!(url.startsWith(kURIPrefix) || isSeedlist)) {
+        return MongoURI(uassertStatusOK(ConnectionString::parse(url.toString())));
     }
 
     // 2. Split up the URI into its components for further parsing and validation
@@ -460,12 +456,12 @@ MongoURI MongoURI::parseImpl(const std::string& url) {
     auto options =
         addTXTOptions(parseOptions(connectionOptions, url), canonicalHost, url, isSeedlist);
 
-    // If a replica set option was specified, store it in the 'setName' field.
+    // If a replica set option was specified, store it in the 'replicaSetName' field.
     auto optIter = options.find("replicaSet");
-    std::string setName;
+    std::string replicaSetName;
     if (optIter != end(options)) {
-        setName = optIter->second;
-        invariant(!setName.empty());
+        replicaSetName = optIter->second;
+        invariant(!replicaSetName.empty());
     }
 
     // If an appName option was specified, validate that is 128 bytes or less.
@@ -488,6 +484,20 @@ MongoURI MongoURI::parseImpl(const std::string& url) {
         }
     }
 
+    const auto helloOk = [&options]() -> boost::optional<bool> {
+        if (auto optIter = options.find("helloOk"); optIter != end(options)) {
+            if (auto value = optIter->second; value == "true") {
+                return true;
+            } else if (value == "false") {
+                return false;
+            } else {
+                uasserted(ErrorCodes::FailedToParse,
+                          "helloOk must be either \"true\" or \"false\"");
+            }
+        }
+        return boost::none;
+    }();
+
     transport::ConnectSSLMode sslMode = transport::kGlobalSSLMode;
     auto sslModeIter = std::find_if(options.begin(), options.end(), [](auto pred) {
         return pred.first == CaseInsensitiveString("ssl") ||
@@ -504,18 +514,20 @@ MongoURI MongoURI::parseImpl(const std::string& url) {
         }
     }
 
-    ConnectionString cs(
-        setName.empty() ? ConnectionString::MASTER : ConnectionString::SET, servers, setName);
+    auto cs = replicaSetName.empty()
+        ? ConnectionString::forStandalones(std::move(servers))
+        : ConnectionString::forReplicaSet(replicaSetName, std::move(servers));
     return MongoURI(std::move(cs),
                     username,
                     password,
                     database,
                     std::move(retryWrites),
                     sslMode,
+                    helloOk,
                     std::move(options));
 }
 
-StatusWith<MongoURI> MongoURI::parse(const std::string& url) try {
+StatusWith<MongoURI> MongoURI::parse(StringData url) try {
     return parseImpl(url);
 } catch (const std::exception&) {
     return exceptionToStatus();

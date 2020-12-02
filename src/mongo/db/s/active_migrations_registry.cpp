@@ -101,9 +101,23 @@ StatusWith<ScopedDonateChunk> ActiveMigrationsRegistry::registerDonateChunk(
 
     if (_activeMoveChunkState) {
         if (_activeMoveChunkState->args == args) {
+            LOGV2(5004704,
+                  "registerDonateChunk ",
+                  "keys"_attr = ChunkRange(args.getMinKey(), args.getMaxKey()).toString(),
+                  "toShardId"_attr = args.getToShardId(),
+                  "ns"_attr = args.getNss().ns());
             return {ScopedDonateChunk(nullptr, false, _activeMoveChunkState->notification)};
         }
 
+        LOGV2(5004700,
+              "registerDonateChunk ",
+              "currentKeys"_attr = ChunkRange(_activeMoveChunkState->args.getMinKey(),
+                                              _activeMoveChunkState->args.getMaxKey())
+                                       .toString(),
+              "currentToShardId"_attr = _activeMoveChunkState->args.getToShardId(),
+              "newKeys"_attr = ChunkRange(args.getMinKey(), args.getMaxKey()).toString(),
+              "newToShardId"_attr = args.getToShardId(),
+              "ns"_attr = args.getNss().ns());
         return _activeMoveChunkState->constructErrorStatus();
     }
 
@@ -129,6 +143,13 @@ StatusWith<ScopedReceiveChunk> ActiveMigrationsRegistry::registerReceiveChunk(
     }
 
     if (_activeMoveChunkState) {
+        LOGV2(5004701,
+              "registerReceiveChink ",
+              "currentKeys"_attr = ChunkRange(_activeMoveChunkState->args.getMinKey(),
+                                              _activeMoveChunkState->args.getMaxKey())
+                                       .toString(),
+              "currentToShardId"_attr = _activeMoveChunkState->args.getToShardId(),
+              "ns"_attr = _activeMoveChunkState->args.getNss().ns());
         return _activeMoveChunkState->constructErrorStatus();
     }
 
@@ -177,6 +198,12 @@ BSONObj ActiveMigrationsRegistry::getActiveMigrationStatusReport(OperationContex
 void ActiveMigrationsRegistry::_clearDonateChunk() {
     stdx::lock_guard<Latch> lk(_mutex);
     invariant(_activeMoveChunkState);
+    LOGV2(5004702,
+          "clearDonateChunk ",
+          "currentKeys"_attr = ChunkRange(_activeMoveChunkState->args.getMinKey(),
+                                          _activeMoveChunkState->args.getMaxKey())
+                                   .toString(),
+          "currentToShardId"_attr = _activeMoveChunkState->args.getToShardId());
     _activeMoveChunkState.reset();
     _lockCond.notify_all();
 }
@@ -218,6 +245,7 @@ ScopedDonateChunk::~ScopedDonateChunk() {
         invariant(*_completionNotification);
         _registry->_clearDonateChunk();
     }
+    LOGV2(5004703, "~ScopedDonateChunk", "_shouldExecute"_attr = _shouldExecute);
 }
 
 ScopedDonateChunk::ScopedDonateChunk(ScopedDonateChunk&& other) {

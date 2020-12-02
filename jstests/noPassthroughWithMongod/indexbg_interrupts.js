@@ -6,6 +6,7 @@
  * and tries to perform another task in parallel while the background index task is
  * active. The problem is that this is timing dependent and the current test setup
  * tries to achieve this by inserting insane amount of documents.
+ *
  * @tags: [requires_replication]
  */
 
@@ -31,7 +32,8 @@ var checkOp = function(checkDB) {
 
 var dbname = 'bgIndexSec';
 var collection = 'jstests_feh';
-var size = 100000;
+// Reduce the amount of data on live-record buildvariant
+var size = (TestData.undoRecorderPath ? 10000 : 100000);
 
 // Set up replica set
 var replTest = new ReplSetTest({name: 'bgIndex', nodes: 3});
@@ -48,10 +50,10 @@ replTest.initiate({
     ]
 });
 
-var master = replTest.getPrimary();
+var primary = replTest.getPrimary();
 var second = replTest.getSecondary();
 
-var masterDB = master.getDB(dbname);
+var primaryDB = primary.getDB(dbname);
 var secondDB = second.getDB(dbname);
 
 var dropAction = [
@@ -67,17 +69,17 @@ for (var idx = 0; idx < dropAction.length; idx++) {
     jsTest.log("Setting up collection " + collection + " for test of: " + JSON.stringify(dc));
 
     // set up collections
-    masterDB.dropDatabase();
+    primaryDB.dropDatabase();
     jsTest.log("creating test data " + size + " documents");
-    var bulk = masterDB.getCollection(collection).initializeUnorderedBulkOp();
+    var bulk = primaryDB.getCollection(collection).initializeUnorderedBulkOp();
     for (var i = 0; i < size; ++i) {
         bulk.insert({i: i});
     }
     assert.commandWorked(bulk.execute());
 
     jsTest.log("Starting background indexing for test of: " + JSON.stringify(dc));
-    masterDB.getCollection(collection).ensureIndex({i: 1}, {background: true});
-    assert.eq(2, masterDB.getCollection(collection).getIndexes().length);
+    primaryDB.getCollection(collection).createIndex({i: 1}, {background: true});
+    assert.eq(2, primaryDB.getCollection(collection).getIndexes().length);
 
     // Wait for the secondary to get the index entry
     assert.soon(function() {
@@ -87,7 +89,7 @@ for (var idx = 0; idx < dropAction.length; idx++) {
     jsTest.log("Index created and index info exists on secondary");
 
     jsTest.log("running command " + JSON.stringify(dc));
-    assert.commandWorked(masterDB.runCommand(dc));
+    assert.commandWorked(primaryDB.runCommand(dc));
 
     jsTest.log("Waiting on replication");
     replTest.awaitReplication();

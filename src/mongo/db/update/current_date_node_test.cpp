@@ -42,6 +42,22 @@
 namespace mongo {
 namespace {
 
+void assertOplogEntryIsUpdateOfExpectedType(const BSONObj& obj,
+                                            bool v2LogBuilderUsed,
+                                            StringData fieldName,
+                                            BSONType expectedType = BSONType::Date) {
+    if (v2LogBuilderUsed) {
+        ASSERT_EQUALS(obj.nFields(), 2);
+        ASSERT_EQUALS(obj["$v"].numberInt(), 2);
+        ASSERT_EQUALS(obj["diff"]["u"][fieldName].type(), expectedType);
+    } else {
+        ASSERT_EQUALS(obj.nFields(), 1);
+        ASSERT_TRUE(obj["$set"].type() == BSONType::Object);
+        ASSERT_EQUALS(obj["$set"].embeddedObject().nFields(), 1U);
+        ASSERT_EQUALS(obj["$set"][fieldName].type(), expectedType);
+    }
+}
+
 using CurrentDateNodeTest = UpdateNodeTest;
 using mongo::mutablebson::countChildren;
 using mongo::mutablebson::Element;
@@ -132,7 +148,7 @@ TEST_F(CurrentDateNodeTest, ApplyTrue) {
     ASSERT_OK(node.init(update["$currentDate"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 0}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
@@ -142,11 +158,7 @@ TEST_F(CurrentDateNodeTest, ApplyTrue) {
     ASSERT_TRUE(doc.root()["a"].ok());
     ASSERT_EQUALS(doc.root()["a"].getType(), BSONType::Date);
 
-    ASSERT_EQUALS(getLogDoc().root().countChildren(), 1U);
-    ASSERT_TRUE(getLogDoc().root()["$set"].ok());
-    ASSERT_EQUALS(getLogDoc().root()["$set"].countChildren(), 1U);
-    ASSERT_TRUE(getLogDoc().root()["$set"]["a"].ok());
-    ASSERT_EQUALS(getLogDoc().root()["$set"]["a"].getType(), BSONType::Date);
+    assertOplogEntryIsUpdateOfExpectedType(getOplogEntry(), v2LogBuilderUsed(), "a");
 }
 
 TEST_F(CurrentDateNodeTest, ApplyFalse) {
@@ -156,7 +168,7 @@ TEST_F(CurrentDateNodeTest, ApplyFalse) {
     ASSERT_OK(node.init(update["$currentDate"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 0}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
@@ -166,11 +178,7 @@ TEST_F(CurrentDateNodeTest, ApplyFalse) {
     ASSERT_TRUE(doc.root()["a"].ok());
     ASSERT_EQUALS(doc.root()["a"].getType(), BSONType::Date);
 
-    ASSERT_EQUALS(getLogDoc().root().countChildren(), 1U);
-    ASSERT_TRUE(getLogDoc().root()["$set"].ok());
-    ASSERT_EQUALS(getLogDoc().root()["$set"].countChildren(), 1U);
-    ASSERT_TRUE(getLogDoc().root()["$set"]["a"].ok());
-    ASSERT_EQUALS(getLogDoc().root()["$set"]["a"].getType(), BSONType::Date);
+    assertOplogEntryIsUpdateOfExpectedType(getOplogEntry(), v2LogBuilderUsed(), "a");
 }
 
 TEST_F(CurrentDateNodeTest, ApplyDate) {
@@ -180,7 +188,7 @@ TEST_F(CurrentDateNodeTest, ApplyDate) {
     ASSERT_OK(node.init(update["$currentDate"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 0}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
@@ -190,11 +198,7 @@ TEST_F(CurrentDateNodeTest, ApplyDate) {
     ASSERT_TRUE(doc.root()["a"].ok());
     ASSERT_EQUALS(doc.root()["a"].getType(), BSONType::Date);
 
-    ASSERT_EQUALS(getLogDoc().root().countChildren(), 1U);
-    ASSERT_TRUE(getLogDoc().root()["$set"].ok());
-    ASSERT_EQUALS(getLogDoc().root()["$set"].countChildren(), 1U);
-    ASSERT_TRUE(getLogDoc().root()["$set"]["a"].ok());
-    ASSERT_EQUALS(getLogDoc().root()["$set"]["a"].getType(), BSONType::Date);
+    assertOplogEntryIsUpdateOfExpectedType(getOplogEntry(), v2LogBuilderUsed(), "a");
 }
 
 TEST_F(CurrentDateNodeTest, ApplyTimestamp) {
@@ -204,7 +208,7 @@ TEST_F(CurrentDateNodeTest, ApplyTimestamp) {
     ASSERT_OK(node.init(update["$currentDate"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 0}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
@@ -214,11 +218,8 @@ TEST_F(CurrentDateNodeTest, ApplyTimestamp) {
     ASSERT_TRUE(doc.root()["a"].ok());
     ASSERT_EQUALS(doc.root()["a"].getType(), BSONType::bsonTimestamp);
 
-    ASSERT_EQUALS(getLogDoc().root().countChildren(), 1U);
-    ASSERT_TRUE(getLogDoc().root()["$set"].ok());
-    ASSERT_EQUALS(getLogDoc().root()["$set"].countChildren(), 1U);
-    ASSERT_TRUE(getLogDoc().root()["$set"]["a"].ok());
-    ASSERT_EQUALS(getLogDoc().root()["$set"]["a"].getType(), BSONType::bsonTimestamp);
+    assertOplogEntryIsUpdateOfExpectedType(
+        getOplogEntry(), v2LogBuilderUsed(), "a", BSONType::bsonTimestamp);
 }
 
 TEST_F(CurrentDateNodeTest, ApplyFieldDoesNotExist) {
@@ -238,11 +239,14 @@ TEST_F(CurrentDateNodeTest, ApplyFieldDoesNotExist) {
     ASSERT_TRUE(doc.root()["a"].ok());
     ASSERT_EQUALS(doc.root()["a"].getType(), BSONType::Date);
 
-    ASSERT_EQUALS(getLogDoc().root().countChildren(), 1U);
-    ASSERT_TRUE(getLogDoc().root()["$set"].ok());
-    ASSERT_EQUALS(getLogDoc().root()["$set"].countChildren(), 1U);
-    ASSERT_TRUE(getLogDoc().root()["$set"]["a"].ok());
-    ASSERT_EQUALS(getLogDoc().root()["$set"]["a"].getType(), BSONType::Date);
+    if (v2LogBuilderUsed()) {
+        ASSERT_EQUALS(getOplogEntry().nFields(), 2);
+        ASSERT_EQUALS(getOplogEntry()["$v"].numberInt(), 2);
+        ASSERT_EQUALS(getOplogEntry()["diff"]["i"]["a"].type(), BSONType::Date);
+    } else {
+        ASSERT_EQUALS(getOplogEntry().nFields(), 1);
+        ASSERT_EQUALS(getOplogEntry()["$set"]["a"].type(), BSONType::Date);
+    }
 }
 
 TEST_F(CurrentDateNodeTest, ApplyIndexesNotAffected) {
@@ -252,21 +256,13 @@ TEST_F(CurrentDateNodeTest, ApplyIndexesNotAffected) {
     ASSERT_OK(node.init(update["$currentDate"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 0}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("b");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
 
-    ASSERT_EQUALS(doc.root().countChildren(), 1U);
-    ASSERT_TRUE(doc.root()["a"].ok());
-    ASSERT_EQUALS(doc.root()["a"].getType(), BSONType::Date);
-
-    ASSERT_EQUALS(getLogDoc().root().countChildren(), 1U);
-    ASSERT_TRUE(getLogDoc().root()["$set"].ok());
-    ASSERT_EQUALS(getLogDoc().root()["$set"].countChildren(), 1U);
-    ASSERT_TRUE(getLogDoc().root()["$set"]["a"].ok());
-    ASSERT_EQUALS(getLogDoc().root()["$set"]["a"].getType(), BSONType::Date);
+    assertOplogEntryIsUpdateOfExpectedType(getOplogEntry(), v2LogBuilderUsed(), "a");
 }
 
 TEST_F(CurrentDateNodeTest, ApplyNoIndexDataOrLogBuilder) {
@@ -276,7 +272,7 @@ TEST_F(CurrentDateNodeTest, ApplyNoIndexDataOrLogBuilder) {
     ASSERT_OK(node.init(update["$currentDate"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 0}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     setLogBuilderToNull();
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);

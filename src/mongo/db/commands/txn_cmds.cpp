@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kTransaction
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTransaction
 
 #include "mongo/platform/basic.h"
 
@@ -61,6 +61,10 @@ class CmdCommitTxn : public BasicCommand {
 public:
     CmdCommitTxn() : BasicCommand("commitTransaction") {}
 
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
+
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
@@ -70,6 +74,10 @@ public:
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
+
+    bool collectsResourceConsumptionMetrics() const override {
         return true;
     }
 
@@ -98,9 +106,10 @@ public:
         LOGV2_DEBUG(20507,
                     3,
                     "Received commitTransaction for transaction with txnNumber "
-                    "{opCtx_getTxnNumber} on session {opCtx_getLogicalSessionId}",
-                    "opCtx_getTxnNumber"_attr = opCtx->getTxnNumber(),
-                    "opCtx_getLogicalSessionId"_attr = opCtx->getLogicalSessionId()->toBSON());
+                    "{txnNumber} on session {sessionId}",
+                    "Received commitTransaction",
+                    "txnNumber"_attr = opCtx->getTxnNumber(),
+                    "sessionId"_attr = opCtx->getLogicalSessionId()->toBSON());
 
         // commitTransaction is retryable.
         if (txnParticipant.transactionIsCommitted()) {
@@ -160,6 +169,10 @@ class CmdAbortTxn : public BasicCommand {
 public:
     CmdAbortTxn() : BasicCommand("abortTransaction") {}
 
+    virtual const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    };
+
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
@@ -169,6 +182,10 @@ public:
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
+
+    bool collectsResourceConsumptionMetrics() const override {
         return true;
     }
 
@@ -205,10 +222,11 @@ public:
 
         LOGV2_DEBUG(20508,
                     3,
-                    "Received abortTransaction for transaction with txnNumber {opCtx_getTxnNumber} "
-                    "on session {opCtx_getLogicalSessionId}",
-                    "opCtx_getTxnNumber"_attr = opCtx->getTxnNumber(),
-                    "opCtx_getLogicalSessionId"_attr = opCtx->getLogicalSessionId()->toBSON());
+                    "Received abortTransaction for transaction with txnNumber {txnNumber} "
+                    "on session {sessionId}",
+                    "Received abortTransaction",
+                    "txnNumber"_attr = opCtx->getTxnNumber(),
+                    "sessionId"_attr = opCtx->getLogicalSessionId()->toBSON());
 
         uassert(ErrorCodes::NoSuchTransaction,
                 "Transaction isn't in progress",

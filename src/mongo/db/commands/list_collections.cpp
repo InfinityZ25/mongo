@@ -27,6 +27,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 #include "mongo/platform/basic.h"
 
 #include <memory>
@@ -52,14 +54,17 @@
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/list_collections_gen.h"
 #include "mongo/db/query/cursor_request.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/find_common.h"
+#include "mongo/db/query/plan_executor_factory.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/views/view_catalog.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
@@ -162,7 +167,7 @@ BSONObj buildViewBson(const ViewDefinition& view, bool nameOnly) {
  * Return an object describing the collection. Takes a collection lock if nameOnly is false.
  */
 BSONObj buildCollectionBson(OperationContext* opCtx,
-                            const Collection* collection,
+                            const CollectionPtr& collection,
                             bool includePendingDrops,
                             bool nameOnly) {
     if (!collection) {
@@ -209,8 +214,20 @@ BSONObj buildCollectionBson(OperationContext* opCtx,
     return b.obj();
 }
 
+void appendListCollectionsCursorReply(CursorId cursorId,
+                                      const NamespaceString& cursorNss,
+                                      std::vector<mongo::ListCollectionsReplyItem>&& firstBatch,
+                                      BSONObjBuilder& result) {
+    auto reply = ListCollectionsReply(
+        ListCollectionsReplyCursor(cursorId, cursorNss, std::move(firstBatch)));
+    reply.serialize(&result);
+}
+
 class CmdListCollections : public BasicCommand {
 public:
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
         return AllowedOnSecondary::kOptIn;
     }
@@ -222,6 +239,10 @@ public:
     }
     bool supportsWriteConcern(const BSONObj& cmd) const final {
         return false;
+    }
+
+    bool collectsResourceConsumptionMetrics() const override {
+        return true;
     }
 
     std::string help() const final {
@@ -252,31 +273,20 @@ public:
         unique_ptr<MatchExpression> matcher;
         const auto as = AuthorizationSession::get(opCtx->getClient());
 
-        const bool nameOnly = jsobj["nameOnly"].trueValue();
-        const bool authorizedCollections = jsobj["authorizedCollections"].trueValue();
+        auto parsed = ListCollections::parse(
+            IDLParserErrorContext("listCollections",
+                                  APIParameters::get(opCtx).getAPIStrict().value_or(false)),
+            jsobj);
+        const bool nameOnly = parsed.getNameOnly();
+        const bool authorizedCollections = parsed.getAuthorizedCollections();
 
         // The collator is null because collection objects are compared using binary comparison.
         auto expCtx = make_intrusive<ExpressionContext>(
             opCtx, std::unique_ptr<CollatorInterface>(nullptr), NamespaceString(dbname));
 
-        // Check for 'filter' argument.
-        BSONElement filterElt = jsobj["filter"];
-        if (!filterElt.eoo()) {
-            if (filterElt.type() != mongo::Object) {
-                uasserted(ErrorCodes::BadValue, "\"filter\" must be an object");
-            }
-
-            StatusWithMatchExpression statusWithMatcher =
-                MatchExpressionParser::parse(filterElt.Obj(), std::move(expCtx));
-            uassertStatusOK(statusWithMatcher.getStatus());
-            matcher = std::move(statusWithMatcher.getValue());
+        if (parsed.getFilter()) {
+            matcher = uassertStatusOK(MatchExpressionParser::parse(*parsed.getFilter(), expCtx));
         }
-
-        const long long defaultBatchSize = std::numeric_limits<long long>::max();
-        long long batchSize;
-        Status parseCursorStatus =
-            CursorRequest::parseCommandCursorOptions(jsobj, defaultBatchSize, &batchSize);
-        uassertStatusOK(parseCursorStatus);
 
         // Check for 'includePendingDrops' flag. The default is to not include drop-pending
         // collections.
@@ -287,7 +297,7 @@ public:
 
         const NamespaceString cursorNss = NamespaceString::makeListCollectionsNSS(dbname);
         std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec;
-        BSONArrayBuilder firstBatch;
+        std::vector<mongo::ListCollectionsReplyItem> firstBatch;
         {
             AutoGetDb autoDb(opCtx, dbname, MODE_IS);
             Database* db = autoDb.getDb();
@@ -316,8 +326,8 @@ public:
                         }
 
                         Lock::CollectionLock clk(opCtx, nss, MODE_IS);
-                        Collection* collection =
-                            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
+                        CollectionPtr collection =
+                            CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss);
                         BSONObj collBson =
                             buildCollectionBson(opCtx, collection, includePendingDrops, nameOnly);
                         if (!collBson.isEmpty()) {
@@ -327,7 +337,7 @@ public:
                     }
                 } else {
                     mongo::catalog::forEachCollectionFromDb(
-                        opCtx, dbname, MODE_IS, [&](const Collection* collection) {
+                        opCtx, dbname, MODE_IS, [&](const CollectionPtr& collection) {
                             if (authorizedCollections &&
                                 (!as->isAuthorizedForAnyActionOnResource(
                                     ResourcePattern::forExactNamespace(collection->ns())))) {
@@ -344,9 +354,10 @@ public:
                 }
 
                 // Skipping views is only necessary for internal cloning operations.
-                bool skipViews = filterElt.type() == mongo::Object &&
+                bool skipViews = parsed.getFilter() &&
                     SimpleBSONObjComparator::kInstance.evaluate(
-                        filterElt.Obj() == ListCollectionsFilter::makeTypeCollectionFilter());
+                        *parsed.getFilter() == ListCollectionsFilter::makeTypeCollectionFilter());
+
                 if (!skipViews) {
                     ViewCatalog::get(db)->iterate(opCtx, [&](const ViewDefinition& view) {
                         if (authorizedCollections &&
@@ -364,15 +375,22 @@ public:
                 }
             }
 
-            exec = uassertStatusOK(PlanExecutor::make(expCtx,
-                                                      std::move(ws),
-                                                      std::move(root),
-                                                      nullptr,
-                                                      PlanExecutor::NO_YIELD,
-                                                      cursorNss));
+            exec =
+                uassertStatusOK(plan_executor_factory::make(expCtx,
+                                                            std::move(ws),
+                                                            std::move(root),
+                                                            &CollectionPtr::null,
+                                                            PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                                            cursorNss));
 
+            long long batchSize = std::numeric_limits<long long>::max();
+            if (parsed.getCursor() && parsed.getCursor()->getBatchSize()) {
+                batchSize = *parsed.getCursor()->getBatchSize();
+            }
+
+            int bytesBuffered = 0;
             for (long long objCount = 0; objCount < batchSize; objCount++) {
-                Document nextDoc;
+                BSONObj nextDoc;
                 PlanExecutor::ExecState state = exec->getNext(&nextDoc, nullptr);
                 if (state == PlanExecutor::IS_EOF) {
                     break;
@@ -380,16 +398,26 @@ public:
                 invariant(state == PlanExecutor::ADVANCED);
 
                 // If we can't fit this result inside the current batch, then we stash it for later.
-                BSONObj next = nextDoc.toBson();
-                if (!FindCommon::haveSpaceForNext(next, objCount, firstBatch.len())) {
-                    exec->enqueue(next);
+                if (!FindCommon::haveSpaceForNext(nextDoc, objCount, bytesBuffered)) {
+                    exec->enqueue(nextDoc);
                     break;
                 }
 
-                firstBatch.append(next);
+                try {
+                    firstBatch.push_back(ListCollectionsReplyItem::parse(
+                        IDLParserErrorContext("ListCollectionsReplyItem"), nextDoc));
+                } catch (const DBException& exc) {
+                    LOGV2_ERROR(5254300,
+                                "Could not parse catalog entry while replying to listCollections",
+                                "entry"_attr = nextDoc,
+                                "error"_attr = exc);
+                    fassertFailed(5254301);
+                }
+                bytesBuffered += nextDoc.objsize();
             }
             if (exec->isEOF()) {
-                appendCursorResponseObject(0LL, cursorNss.ns(), firstBatch.arr(), &result);
+                appendListCollectionsCursorReply(
+                    0 /* cursorId */, cursorNss, std::move(firstBatch), result);
                 return true;
             }
             exec->saveState();
@@ -398,22 +426,18 @@ public:
 
         auto pinnedCursor = CursorManager::get(opCtx)->registerCursor(
             opCtx,
-            {
-                std::move(exec),
-                cursorNss,
-                AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
-                opCtx->getWriteConcern(),
-                repl::ReadConcernArgs::get(opCtx),
-                jsobj,
-                ClientCursorParams::LockPolicy::kLocksInternally,
-                uassertStatusOK(AuthorizationSession::get(opCtx->getClient())
-                                    ->checkAuthorizedToListCollections(dbname, jsobj)),
-                false  // needsMerge always 'false' for listCollections.
-            });
+            {std::move(exec),
+             cursorNss,
+             AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
+             APIParameters::get(opCtx),
+             opCtx->getWriteConcern(),
+             repl::ReadConcernArgs::get(opCtx),
+             jsobj,
+             uassertStatusOK(AuthorizationSession::get(opCtx->getClient())
+                                 ->checkAuthorizedToListCollections(dbname, jsobj))});
 
-        appendCursorResponseObject(
-            pinnedCursor.getCursor()->cursorid(), cursorNss.ns(), firstBatch.arr(), &result);
-
+        appendListCollectionsCursorReply(
+            pinnedCursor.getCursor()->cursorid(), cursorNss, std::move(firstBatch), result);
         return true;
     }
 } cmdListCollections;

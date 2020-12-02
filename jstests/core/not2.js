@@ -1,4 +1,6 @@
-// @tags: [requires_non_retryable_writes]
+// @tags: [
+//   requires_non_retryable_writes,
+// ]
 
 (function() {
 "use strict";
@@ -84,6 +86,6 @@ function doTest() {
 doTest();
 
 // Run the test with an index present.
-assert.commandWorked(coll.ensureIndex({i: 1}));
+assert.commandWorked(coll.createIndex({i: 1}));
 doTest();
 }());

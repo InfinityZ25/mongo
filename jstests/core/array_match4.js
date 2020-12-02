@@ -1,4 +1,3 @@
-// @tags: [requires_fcv_44]
 var t = db.array_match4;
 
 t.drop();
@@ -17,7 +16,7 @@ assert.eq(1, t.find(query_gte).itcount(), '$gte (without index)');
 // with index
 //
 
-t.ensureIndex({a: 1});
+t.createIndex({a: 1});
 assert.eq(1, t.find({a: [1, 2]}).count(), '$eq (with index)');
 
 // display explain output (for index bounds)

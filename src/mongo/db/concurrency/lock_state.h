@@ -135,9 +135,6 @@ public:
     virtual void lockGlobal(OperationContext* opCtx,
                             LockMode mode,
                             Date_t deadline = Date_t::max());
-    virtual void lockGlobal(LockMode mode, Date_t deadline = Date_t::max()) {
-        return lockGlobal(nullptr, mode, deadline);
-    }
 
     virtual bool unlockGlobal();
 
@@ -318,6 +315,8 @@ private:
      */
     bool _acquireTicket(OperationContext* opCtx, LockMode mode, Date_t deadline);
 
+    void _setWaitingResource(ResourceId resId);
+
     // Used to disambiguate different lockers
     const LockerId _id;
 
@@ -371,6 +370,10 @@ private:
 
     // Tracks whether this operation should be killed on step down.
     AtomicWord<bool> _wasGlobalLockTakenInModeConflictingWithWrites{false};
+
+    // If isValid(), the ResourceId of the resource currently waiting for the lock. If not valid,
+    // there is no resource currently waiting.
+    ResourceId _waitingResource;
 
     //////////////////////////////////////////////////////////////////////////////////////////
     //

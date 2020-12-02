@@ -11,9 +11,6 @@ selector:
   - jstests/core/txns/transactions_profiling.js
   - jstests/core/txns/transactions_profiling_with_drops.js
 
-  # No featureCompatibilityVersion parameter on mongos.
-  - jstests/core/txns/abort_unprepared_transactions_on_FCV_downgrade.js
-
   # Implicitly creates a database through a collection rename, which does not
   # work in a sharded cluster.
   - jstests/core/txns/transactions_block_ddl.js
@@ -29,9 +26,6 @@ selector:
   # Does not use the transactions shell helpers so afterClusterTime read concern is incorrectly
   # attached to statements in a transaction beyond the first one.
   - jstests/core/txns/non_transactional_operations_on_session_with_transaction.js
-
-    # TODO SERVER-46187: maxTimeMS doesn't work correctly for insert on mongos.
-  - jstests/core/txns/write_conflicts_with_non_txns.js
 
   exclude_with_any_tags:
   - assumes_against_mongod_not_mongos

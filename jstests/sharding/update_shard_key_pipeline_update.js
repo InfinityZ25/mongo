@@ -6,6 +6,7 @@
 (function() {
 'use strict';
 
+load("jstests/sharding/libs/sharded_transactions_helpers.js");
 load("jstests/sharding/libs/update_shard_key_helpers.js");
 
 const st = new ShardingTest({mongos: 1, shards: {rs0: {nodes: 3}, rs1: {nodes: 3}}});
@@ -15,6 +16,7 @@ const shard0 = st.shard0.shardName;
 const shard1 = st.shard1.shardName;
 const ns = kDbName + '.foo';
 
+enableCoordinateCommitReturnImmediatelyAfterPersistingDecision(st);
 assert.commandWorked(mongos.adminCommand({enableSharding: kDbName}));
 st.ensurePrimaryShard(kDbName, shard0);
 

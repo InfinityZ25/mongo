@@ -1,11 +1,14 @@
 t = db.geo_s2meridian;
 t.drop();
-t.ensureIndex({geo: "2dsphere"});
+t.createIndex({geo: "2dsphere"});
 
-/*
+/**
  * Test 1: check that intersection works on the meridian.  We insert a line
  * that crosses the meridian, and then run a geoIntersect with a line
  * that runs along the meridian.
+ * @tags: [
+ *   sbe_incompatible,
+ * ]
  */
 
 meridianCrossingLine = {
@@ -23,7 +26,7 @@ result = t.find({geo: {$geoIntersects: {$geometry: lineAlongMeridian}}});
 assert.eq(result.itcount(), 1);
 
 t.drop();
-t.ensureIndex({geo: "2dsphere"});
+t.createIndex({geo: "2dsphere"});
 /*
  * Test 2: check that within work across the meridian.  We insert points
  * on the meridian, and immediately on either side, and confirm that a poly
@@ -52,7 +55,7 @@ result = t.find({geo: {$geoWithin: {$geometry: meridianCrossingPoly}}});
 assert.eq(result.itcount(), 3);
 
 t.drop();
-t.ensureIndex({geo: "2dsphere"});
+t.createIndex({geo: "2dsphere"});
 /*
  * Test 3: Check that near works around the meridian.  Insert two points, one
  * closer, but across the meridian, and confirm they both come back, and

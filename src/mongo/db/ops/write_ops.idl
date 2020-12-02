@@ -33,7 +33,7 @@ global:
 
 imports:
     - "mongo/db/logical_session_id.idl"
-    - "mongo/db/pipeline/runtime_constants.idl"
+    - "mongo/db/pipeline/legacy_runtime_constants.idl"
     - "mongo/idl/basic_types.idl"
     - "mongo/db/query/hint.idl"
 
@@ -163,6 +163,7 @@ commands:
 
     insert:
         description: "Parser for the 'insert' command."
+        command_name: insert
         strict: true
         namespace: concatenate_with_db
         chained_structs:
@@ -175,6 +176,7 @@ commands:
 
     update:
         description: "Parser for the 'update' command."
+        command_name: update
         strict: true
         namespace: concatenate_with_db
         chained_structs:
@@ -184,14 +186,21 @@ commands:
                 description: "An array of one or more update statements to perform."
                 type: array<UpdateOpEntry>
                 supports_doc_sequence: true
+            let:
+                description: "A set of user-specified constants used by pipeline-style update
+                              operations and $expr."
+                type: object
+                optional: true
             runtimeConstants:
-                description: "A collection of values that do not change once computed. These are
-                              used by pipeline-style update operations."
-                type: RuntimeConstants
+                description: "A legacy way to specify constant variables available during execution.
+                             'let' is now preferred."
+                cpp_name: legacyRuntimeConstants
+                type: LegacyRuntimeConstants
                 optional: true
 
     delete:
         description: "Parser for the 'delete' command."
+        command_name: delete
         strict: true
         namespace: concatenate_with_db
         chained_structs:
@@ -201,3 +210,13 @@ commands:
                 description: "An array of one or more delete statements to perform."
                 type: array<DeleteOpEntry>
                 supports_doc_sequence: true
+            let:
+                description: "A set of user-specified constants used by $expr."
+                type: object
+                optional: true
+            runtimeConstants:
+                description: "A legacy way to specify constant variables available during execution.
+                             'let' is now preferred."
+                cpp_name: legacyRuntimeConstants
+                type: LegacyRuntimeConstants
+                optional: true

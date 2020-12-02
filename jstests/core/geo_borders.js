@@ -4,6 +4,9 @@ t.drop();
 epsilon = 0.0001;
 
 // For these tests, *required* that step ends exactly on max
+// @tags: [
+//   sbe_incompatible,
+// ]
 min = -1;
 max = 1;
 step = 1;
@@ -21,11 +24,11 @@ overallMax = 1;
 
 // Create a point index slightly smaller than the points we have
 var res =
-    t.ensureIndex({loc: "2d"}, {max: overallMax - epsilon / 2, min: overallMin + epsilon / 2});
+    t.createIndex({loc: "2d"}, {max: overallMax - epsilon / 2, min: overallMin + epsilon / 2});
 assert.commandFailed(res);
 
 // Create a point index only slightly bigger than the points we have
-res = t.ensureIndex({loc: "2d"}, {max: overallMax + epsilon, min: overallMin - epsilon});
+res = t.createIndex({loc: "2d"}, {max: overallMax + epsilon, min: overallMin - epsilon});
 assert.commandWorked(res);
 
 // ************

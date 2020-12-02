@@ -31,7 +31,7 @@
  * Connect to a Mongo database as a database, from C++.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -341,8 +341,9 @@ void DBClientCursor::dataReceived(const Message& reply, bool& retry, string& hos
     }
 
     if (_useFindCommand) {
+        const auto replyObj = commandDataReceived(reply);
         cursorId = 0;  // Don't try to kill cursor if we get back an error.
-        auto cr = uassertStatusOK(CursorResponse::parseFromBSON(commandDataReceived(reply)));
+        auto cr = uassertStatusOK(CursorResponse::parseFromBSON(replyObj));
         cursorId = cr.getCursorId();
         uassert(50935,
                 "Received a getMore response with a cursor id of 0 and the moreToCome flag set.",
@@ -352,17 +353,21 @@ void DBClientCursor::dataReceived(const Message& reply, bool& retry, string& hos
         // Store the resume token, if we got one.
         _postBatchResumeToken = cr.getPostBatchResumeToken();
         batch.objs = cr.releaseBatch();
+
+        if (replyObj.hasField(LogicalTime::kOperationTimeFieldName)) {
+            _operationTime = LogicalTime::fromOperationTime(replyObj).asTimestamp();
+        }
         return;
     }
 
     QueryResult::View qr = reply.singleData().view2ptr();
     resultFlags = qr.getResultFlags();
 
-    if (qr.getResultFlags() & ResultFlag_ErrSet) {
+    if (resultFlags & ResultFlag_ErrSet) {
         wasError = true;
     }
 
-    if (qr.getResultFlags() & ResultFlag_CursorNotFound) {
+    if (resultFlags & ResultFlag_CursorNotFound) {
         // cursor id no longer valid at the server.
         invariant(qr.getCursorId() == 0);
 
@@ -401,13 +406,11 @@ void DBClientCursor::dataReceived(const Message& reply, bool& retry, string& hos
             "Got invalid reply from external server while reading from cursor",
             data.atEof());
 
-    _client->checkResponse(batch.objs, false, &retry, &host);  // watches for "not master"
+    _client->checkResponse(batch.objs, false, &retry, &host);  // watches for "not primary"
 
-    if (qr.getResultFlags() & ResultFlag_ShardConfigStale) {
-        BSONObj error;
-        verify(peekError(&error));
-        uasserted(StaleConfigInfo::parseFromCommandError(error), "stale config on lazy receive");
-    }
+    tassert(5262101,
+            "Deprecated ShardConfigStale flag encountered in query result",
+            !(resultFlags & ResultFlag_ShardConfigStaleDeprecated));
 
     /* this assert would fire the way we currently work:
         verify( nReturned || cursorId == 0 );
@@ -498,7 +501,7 @@ void DBClientCursor::attach(AScopedConnection* conn) {
     verify(conn);
     verify(conn->get());
 
-    if (conn->get()->type() == ConnectionString::SET) {
+    if (conn->get()->type() == ConnectionString::ConnectionType::kReplicaSet) {
         if (_lazyHost.size() > 0)
             _scopedHost = _lazyHost;
         else if (_client)
@@ -583,13 +586,40 @@ DBClientCursor::DBClientCursor(DBClientBase* client,
       cursorId(cursorId),
       _ownCursor(true),
       wasError(false),
-      _enabledBSONVersion(Validator<BSONObj>::enabledBSONVersion()),
       _readConcernObj(readConcernObj) {
     if (queryOptions & QueryOptionLocal_forceOpQuery) {
         // Legacy OP_QUERY does not support UUIDs.
         invariant(!_nsOrUuid.uuid());
         _useFindCommand = false;
     }
+}
+
+/* static */
+StatusWith<std::unique_ptr<DBClientCursor>> DBClientCursor::fromAggregationRequest(
+    DBClientBase* client, AggregationRequest aggRequest, bool secondaryOk, bool useExhaust) {
+    BSONObj ret;
+    try {
+        if (!client->runCommand(aggRequest.getNamespaceString().db().toString(),
+                                aggRequest.serializeToCommandObj().toBson(),
+                                ret,
+                                secondaryOk ? QueryOption_SecondaryOk : 0)) {
+            return {ErrorCodes::CommandFailed, ret.toString()};
+        }
+    } catch (...) {
+        return exceptionToStatus();
+    }
+    long long cursorId = ret["cursor"].Obj()["id"].Long();
+    std::vector<BSONObj> firstBatch;
+    for (BSONElement elem : ret["cursor"].Obj()["firstBatch"].Array()) {
+        firstBatch.emplace_back(elem.Obj().getOwned());
+    }
+
+    return {std::make_unique<DBClientCursor>(client,
+                                             aggRequest.getNamespaceString(),
+                                             cursorId,
+                                             0,
+                                             useExhaust ? QueryOption_Exhaust : 0,
+                                             firstBatch)};
 }
 
 DBClientCursor::~DBClientCursor() {
@@ -608,13 +638,11 @@ void DBClientCursor::kill() {
                 }
             };
 
+            // We only need to kill the cursor if there aren't pending replies. Pending replies
+            // indicates that this is an exhaust cursor, so the connection must be closed and the
+            // cursor will automatically be cleaned up by the upstream server.
             if (_client && !_connectionHasPendingReplies) {
                 killCursor(_client);
-            } else {
-                // Use a side connection to send the kill cursor request.
-                verify(_scopedHost.size() || (_client && _connectionHasPendingReplies));
-                DBClientBase::withConnection_do_not_use(
-                    _client ? _client->getServerAddress() : _scopedHost, killCursor);
             }
         }
     });

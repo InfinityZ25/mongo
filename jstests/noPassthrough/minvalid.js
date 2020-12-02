@@ -10,14 +10,14 @@ var host = getHostName();
 var nodes = replTest.startSet();
 replTest.initiate();
 
-var master = replTest.getPrimary();
-var mdb = master.getDB("foo");
+var primary = replTest.getPrimary();
+var mdb = primary.getDB("foo");
 
 print("1: initial insert");
 mdb.foo.save({a: 1000});
 
 print("2. get last op");
-var local = master.getDB("local");
+var local = primary.getDB("local");
 var lastOp = local.oplog.rs.find().sort({$natural: -1}).limit(1).next();
 printjson(lastOp);
 
@@ -32,7 +32,7 @@ replTest.restart(0);
 print("5: make sure it stays in recovering");
 var timeout = (new Date()).getTime() + 30000;
 while ((new Date().getTime()) < timeout) {
-    var status = replTest.nodes[0].getDB("admin").runCommand({isMaster: 1});
+    var status = replTest.nodes[0].getDB("admin").runCommand({hello: 1});
     assert(!status.secondary && !status.primary, tojson(status));
     sleep(2000);
 }

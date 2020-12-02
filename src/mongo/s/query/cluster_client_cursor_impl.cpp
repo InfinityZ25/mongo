@@ -205,8 +205,16 @@ void ClusterClientCursorImpl::incNBatches() {
     ++_nBatchesReturned;
 }
 
+APIParameters ClusterClientCursorImpl::getAPIParameters() const {
+    return _params.apiParameters;
+}
+
 boost::optional<ReadPreferenceSetting> ClusterClientCursorImpl::getReadPreference() const {
     return _params.readPreference;
+}
+
+boost::optional<ReadConcernArgs> ClusterClientCursorImpl::getReadConcern() const {
+    return _params.readConcern;
 }
 
 std::unique_ptr<RouterExecStage> ClusterClientCursorImpl::buildMergerPlan(

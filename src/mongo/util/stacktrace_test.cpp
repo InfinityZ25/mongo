@@ -161,8 +161,7 @@ TEST(StackTrace, PosixFormat) {
     stack_trace_test_detail::recurseWithLinkage(param, 3);
 
     if (kSuperVerbose) {
-        LOGV2_OPTIONS(
-            24153, {logv2::LogTruncation::Disabled}, "trace:{{{trace}}}", "trace"_attr = trace);
+        LOGV2_OPTIONS(24153, {logv2::LogTruncation::Disabled}, "Trace", "trace"_attr = trace);
     }
 
     // Expect log to be a "BACKTRACE:" 1-line record, followed by some "Frame:" lines.
@@ -378,6 +377,8 @@ TEST(StackTrace, MetadataGeneratorFunctionMeasure) {
 #endif  // _WIN32
 
 #ifdef HAVE_SIGALTSTACK
+extern "C" typedef void(sigAction_t)(int signum, siginfo_t* info, void* context);
+
 class StackTraceSigAltStackTest : public unittest::Test {
 public:
     using unittest::Test::Test;
@@ -391,29 +392,26 @@ public:
 
     static void handlerPreamble(int sig) {
         LOGV2(23387,
-              "tid:{ostr_stdx_this_thread_get_id}, caught signal {sig}!\n",
-              "ostr_stdx_this_thread_get_id"_attr = ostr(stdx::this_thread::get_id()),
+              "Thread caught signal!",
+              "tid"_attr = ostr(stdx::this_thread::get_id()),
               "sig"_attr = sig);
         char storage;
-        LOGV2(23388,
-              "local var:{reinterpret_cast_uint64_t_storage}",
-              "reinterpret_cast_uint64_t_storage"_attr = reinterpret_cast<uintptr_t>(&storage));
+        LOGV2(
+            23388, "Local var", "var"_attr = "{:X}"_format(reinterpret_cast<uintptr_t>(&storage)));
     }
 
-    static void tryHandler(void (*handler)(int, siginfo_t*, void*)) {
+    static void tryHandler(sigAction_t* handler) {
         constexpr int sig = SIGUSR1;
         constexpr size_t kStackSize = size_t{1} << 20;  // 1 MiB
         auto buf = std::make_unique<std::array<unsigned char, kStackSize>>();
         constexpr unsigned char kSentinel = 0xda;
         std::fill(buf->begin(), buf->end(), kSentinel);
         LOGV2(24157,
-              "sigaltstack buf: [{size}] @{data}",
-              "size"_attr = integerToHex(buf->size()),
-              "data"_attr = integerToHex(reinterpret_cast<uintptr_t>(buf->data())));
+              "sigaltstack buf",
+              "size"_attr = "{:X}"_format(buf->size()),
+              "data"_attr = "{:X}"_format(reinterpret_cast<uintptr_t>(buf->data())));
         stdx::thread thr([&] {
-            LOGV2(23389,
-                  "tid:{ostr_stdx_this_thread_get_id} running\n",
-                  "ostr_stdx_this_thread_get_id"_attr = ostr(stdx::this_thread::get_id()));
+            LOGV2(23389, "Thread running", "tid"_attr = ostr(stdx::this_thread::get_id()));
             {
                 stack_t ss;
                 ss.ss_sp = buf->data();
@@ -447,27 +445,35 @@ public:
         size_t used = std::distance(
             std::find_if(buf->begin(), buf->end(), [](unsigned char x) { return x != kSentinel; }),
             buf->end());
-        LOGV2(23390, "stack used: {used} bytes\n", "used"_attr = used);
+        LOGV2(23390, "Stack used", "bytes"_attr = used);
     }
 };
 
+extern "C" void stackTraceSigAltStackMinimalAction(int sig, siginfo_t*, void*) {
+    StackTraceSigAltStackTest::handlerPreamble(sig);
+}
+
 TEST_F(StackTraceSigAltStackTest, Minimal) {
-    tryHandler([](int sig, siginfo_t*, void*) { handlerPreamble(sig); });
+    StackTraceSigAltStackTest::tryHandler(stackTraceSigAltStackMinimalAction);
+}
+
+extern "C" void stackTraceSigAltStackPrintAction(int sig, siginfo_t*, void*) {
+    StackTraceSigAltStackTest::handlerPreamble(sig);
+    printStackTrace();
 }
 
 TEST_F(StackTraceSigAltStackTest, Print) {
-    tryHandler([](int sig, siginfo_t*, void*) {
-        handlerPreamble(sig);
-        printStackTrace();
-    });
+    StackTraceSigAltStackTest::tryHandler(&stackTraceSigAltStackPrintAction);
+}
+
+extern "C" void stackTraceSigAltStackBacktraceAction(int sig, siginfo_t*, void*) {
+    StackTraceSigAltStackTest::handlerPreamble(sig);
+    std::array<void*, kStackTraceFrameMax> addrs;
+    rawBacktrace(addrs.data(), addrs.size());
 }
 
 TEST_F(StackTraceSigAltStackTest, Backtrace) {
-    tryHandler([](int sig, siginfo_t*, void*) {
-        handlerPreamble(sig);
-        std::array<void*, kStackTraceFrameMax> addrs;
-        rawBacktrace(addrs.data(), addrs.size());
-    });
+    StackTraceSigAltStackTest::tryHandler(stackTraceSigAltStackBacktraceAction);
 }
 #endif  // HAVE_SIGALTSTACK
 
@@ -552,7 +558,7 @@ public:
         printAllThreadStacks(sink);
         if (kSuperVerbose)
             LOGV2_OPTIONS(
-                24156, {logv2::LogTruncation::Disabled}, "{dumped}", "dumped"_attr = dumped);
+                24156, {logv2::LogTruncation::Disabled}, "Dumped", "dumped"_attr = dumped);
 
         reapWorkers();
 
@@ -661,13 +667,12 @@ TEST(StackTrace, BacktraceThroughLibc) {
         capture.notify();
         return static_cast<int>(static_cast<const int*>(a) < static_cast<const int*>(b));
     });
-    LOGV2(23391, "caught [{capture_arrSize}]:", "capture_arrSize"_attr = capture.arrSize);
+    LOGV2(23391, "Captured", "frameCount"_attr = capture.arrSize);
     for (size_t i = 0; i < capture.arrSize; ++i) {
         LOGV2(23392,
-              "  [{i}] {reinterpret_cast_uint64_t_capture_arr_i}",
+              "Frame",
               "i"_attr = i,
-              "reinterpret_cast_uint64_t_capture_arr_i"_attr =
-                  reinterpret_cast<uint64_t>(capture.arr[i]));
+              "frame"_attr = "{:X}"_format(reinterpret_cast<uintptr_t>(capture.arr[i])));
     }
 }
 #endif  // mongo stacktrace backend

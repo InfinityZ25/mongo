@@ -1,7 +1,7 @@
 // Check db name duplication constraint SERVER-2111
 
-a = db.getSisterDB("dbcasetest_dbnamea");
-b = db.getSisterDB("dbcasetest_dbnameA");
+a = db.getSiblingDB("dbcasetest_dbnamea");
+b = db.getSiblingDB("dbcasetest_dbnameA");
 
 a.dropDatabase();
 b.dropDatabase();
@@ -20,7 +20,7 @@ b.dropDatabase();
 
 ai = db.getMongo().getDBNames().indexOf(a.getName());
 bi = db.getMongo().getDBNames().indexOf(b.getName());
-// One of these dbs may exist if there is a slave active, but they must
+// One of these dbs may exist if there is a secondary active, but they must
 // not both exist.
 assert(ai == -1 || bi == -1);
 printjson(db.getMongo().getDBs().databases);

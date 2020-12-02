@@ -31,7 +31,6 @@
 
 #include <boost/optional/optional_io.hpp>
 #include <memory>
-
 #include <pcrecpp.h>
 
 #include "mongo/bson/util/builder.h"
@@ -47,6 +46,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer_impl.h"
 #include "mongo/db/op_observer_registry.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
@@ -56,19 +56,13 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_mock.h"
-#include "mongo/db/s/op_observer_sharding_impl.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/scopeguard.h"
 
+namespace mongo {
 namespace {
-
-using namespace mongo;
-
-ServiceContext::UniqueOperationContext makeOpCtx() {
-    return cc().makeOperationContext();
-}
 
 class DatabaseTest : public ServiceContextMongoDTest {
 private:
@@ -95,7 +89,6 @@ void DatabaseTest::setUp() {
     // Set up ReplicationCoordinator and create oplog.
     repl::ReplicationCoordinator::set(service,
                                       std::make_unique<repl::ReplicationCoordinatorMock>(service));
-    repl::setOplogCollectionName(service);
     repl::createOplog(_opCtx.get());
 
     // Ensure that we are primary.
@@ -106,7 +99,7 @@ void DatabaseTest::setUp() {
     // repl::logOp(). repl::logOp() will also store the oplog entry's optime in ReplClientInfo.
     OpObserverRegistry* opObserverRegistry =
         dynamic_cast<OpObserverRegistry*>(service->getOpObserver());
-    opObserverRegistry->addObserver(std::make_unique<OpObserverShardingImpl>());
+    opObserverRegistry->addObserver(std::make_unique<OpObserverImpl>());
 
     _nss = NamespaceString("test.foo");
 }
@@ -194,11 +187,11 @@ void _testDropCollection(OperationContext* opCtx,
 
         WriteUnitOfWork wuow(opCtx);
         if (!createCollectionBeforeDrop) {
-            ASSERT_FALSE(CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss));
+            ASSERT_FALSE(CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss));
         }
 
         ASSERT_OK(db->dropCollection(opCtx, nss, dropOpTime));
-        ASSERT_FALSE(CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss));
+        ASSERT_FALSE(CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss));
         wuow.commit();
     });
 }
@@ -315,7 +308,7 @@ void _testDropCollectionThrowsExceptionIfThereAreIndexesInProgress(OperationCont
                                      << "a_1");
 
         auto indexBuildBlock = std::make_unique<IndexBuildBlock>(
-            indexCatalog, collection->ns(), indexInfoObj, IndexBuildMethod::kHybrid, UUID::gen());
+            collection->ns(), indexInfoObj, IndexBuildMethod::kHybrid, UUID::gen());
         {
             WriteUnitOfWork wuow(opCtx);
             ASSERT_OK(indexBuildBlock->init(opCtx, collection));
@@ -325,7 +318,8 @@ void _testDropCollectionThrowsExceptionIfThereAreIndexesInProgress(OperationCont
             WriteUnitOfWork wuow(opCtx);
             indexBuildBlock->success(opCtx, collection);
             wuow.commit();
-            indexBuildBlock->deleteTemporaryTables(opCtx);
+            indexBuildBlock->finalizeTemporaryTables(
+                opCtx, TemporaryRecordStore::FinalizationAction::kDelete);
         });
 
         ASSERT_GREATER_THAN(indexCatalog->numIndexesInProgress(opCtx), 0);
@@ -361,15 +355,15 @@ TEST_F(DatabaseTest, RenameCollectionPreservesUuidOfSourceCollectionAndUpdatesUu
     ASSERT_TRUE(db);
 
     auto fromUuid = UUID::gen();
-    auto& catalog = CollectionCatalog::get(opCtx);
     writeConflictRetry(opCtx, "create", fromNss.ns(), [&] {
-        ASSERT_EQUALS(boost::none, catalog.lookupNSSByUUID(opCtx, fromUuid));
+        auto catalog = CollectionCatalog::get(opCtx);
+        ASSERT_EQUALS(boost::none, catalog->lookupNSSByUUID(opCtx, fromUuid));
 
         WriteUnitOfWork wuow(opCtx);
         CollectionOptions fromCollectionOptions;
         fromCollectionOptions.uuid = fromUuid;
         ASSERT_TRUE(db->createCollection(opCtx, fromNss, fromCollectionOptions));
-        ASSERT_EQUALS(fromNss, *catalog.lookupNSSByUUID(opCtx, fromUuid));
+        ASSERT_EQUALS(fromNss, *catalog->lookupNSSByUUID(opCtx, fromUuid));
         wuow.commit();
     });
 
@@ -378,8 +372,9 @@ TEST_F(DatabaseTest, RenameCollectionPreservesUuidOfSourceCollectionAndUpdatesUu
         auto stayTemp = false;
         ASSERT_OK(db->renameCollection(opCtx, fromNss, toNss, stayTemp));
 
-        ASSERT_FALSE(CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, fromNss));
-        auto toCollection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, toNss);
+        auto catalog = CollectionCatalog::get(opCtx);
+        ASSERT_FALSE(catalog->lookupCollectionByNamespace(opCtx, fromNss));
+        auto toCollection = catalog->lookupCollectionByNamespace(opCtx, toNss);
         ASSERT_TRUE(toCollection);
 
         auto toCollectionOptions =
@@ -389,7 +384,7 @@ TEST_F(DatabaseTest, RenameCollectionPreservesUuidOfSourceCollectionAndUpdatesUu
         ASSERT_TRUE(toUuid);
         ASSERT_EQUALS(fromUuid, *toUuid);
 
-        ASSERT_EQUALS(toNss, *catalog.lookupNSSByUUID(opCtx, *toUuid));
+        ASSERT_EQUALS(toNss, *catalog->lookupNSSByUUID(opCtx, *toUuid));
 
         wuow.commit();
     });
@@ -508,7 +503,7 @@ TEST_F(DatabaseTest, AutoGetCollectionForReadCommandSucceedsWithDeadlineNow) {
     ASSERT(_opCtx.get()->lockState()->isCollectionLockedForMode(nss, MODE_X));
     try {
         AutoGetCollectionForReadCommand db(
-            _opCtx.get(), nss, AutoGetCollection::kViewsForbidden, Date_t::now());
+            _opCtx.get(), nss, AutoGetCollectionViewMode::kViewsForbidden, Date_t::now());
     } catch (const ExceptionFor<ErrorCodes::LockTimeout>&) {
         FAIL("Should get the db within the timeout");
     }
@@ -522,7 +517,7 @@ TEST_F(DatabaseTest, AutoGetCollectionForReadCommandSucceedsWithDeadlineMin) {
     ASSERT(_opCtx.get()->lockState()->isCollectionLockedForMode(nss, MODE_X));
     try {
         AutoGetCollectionForReadCommand db(
-            _opCtx.get(), nss, AutoGetCollection::kViewsForbidden, Date_t());
+            _opCtx.get(), nss, AutoGetCollectionViewMode::kViewsForbidden, Date_t());
     } catch (const ExceptionFor<ErrorCodes::LockTimeout>&) {
         FAIL("Should get the db within the timeout");
     }
@@ -553,5 +548,5 @@ TEST_F(DatabaseTest, CreateCollectionProhibitsReplicatedCollectionsWithoutIdInde
                        });
 }
 
-
 }  // namespace
+}  // namespace mongo

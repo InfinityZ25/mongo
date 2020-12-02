@@ -123,7 +123,8 @@ public:
             MODE_X);
 
         WriteUnitOfWork wuow(opCtx);
-        Status s = _viewCatalog->createView(opCtx, viewName, viewOn, pipeline, collation);
+        Status s =
+            _viewCatalog->createView(opCtx, viewName, viewOn, pipeline, collation, boost::none);
         wuow.commit();
 
         return s;
@@ -386,6 +387,9 @@ TEST_F(ViewCatalogFixture, CreateViewCycles) {
 }
 
 TEST_F(ViewCatalogFixture, CanSuccessfullyCreateViewWhosePipelineIsExactlyAtMaxSizeInBytes) {
+    internalPipelineLengthLimit = 100000;
+    ON_BLOCK_EXIT([] { internalPipelineLengthLimit = 1000; });
+
     ASSERT_EQ(ViewGraph::kMaxViewPipelineSizeBytes % kOneKiBMatchStage.objsize(), 0);
 
     BSONArrayBuilder builder(ViewGraph::kMaxViewPipelineSizeBytes);
@@ -405,6 +409,9 @@ TEST_F(ViewCatalogFixture, CanSuccessfullyCreateViewWhosePipelineIsExactlyAtMaxS
 }
 
 TEST_F(ViewCatalogFixture, CannotCreateViewWhosePipelineExceedsMaxSizeInBytes) {
+    internalPipelineLengthLimit = 100000;
+    ON_BLOCK_EXIT([] { internalPipelineLengthLimit = 1000; });
+
     // Fill the builder to exactly the maximum size, then push it just over the limit by adding an
     // additional tiny match stage.
     BSONArrayBuilder builder(ViewGraph::kMaxViewPipelineSizeBytes);
@@ -422,6 +429,9 @@ TEST_F(ViewCatalogFixture, CannotCreateViewWhosePipelineExceedsMaxSizeInBytes) {
 }
 
 TEST_F(ViewCatalogFixture, CannotCreateViewIfItsFullyResolvedPipelineWouldExceedMaxSizeInBytes) {
+    internalPipelineLengthLimit = 100000;
+    ON_BLOCK_EXIT([] { internalPipelineLengthLimit = 1000; });
+
     BSONArrayBuilder builder1;
     BSONArrayBuilder builder2;
 
@@ -504,8 +514,8 @@ TEST_F(ViewCatalogFixture, LookupRIDExistingView) {
     ASSERT_OK(createView(operationContext(), viewName, viewOn, emptyPipeline, emptyCollation));
 
     auto resourceID = ResourceId(RESOURCE_COLLECTION, "db.view"_sd);
-    auto& collectionCatalog = CollectionCatalog::get(operationContext());
-    ASSERT(collectionCatalog.lookupResourceName(resourceID).get() == "db.view");
+    auto collectionCatalog = CollectionCatalog::get(operationContext());
+    ASSERT(collectionCatalog->lookupResourceName(resourceID).get() == "db.view");
 }
 
 TEST_F(ViewCatalogFixture, LookupRIDExistingViewRollback) {
@@ -521,11 +531,11 @@ TEST_F(ViewCatalogFixture, LookupRIDExistingViewRollback) {
 
         WriteUnitOfWork wunit(operationContext());
         ASSERT_OK(getViewCatalog()->createView(
-            operationContext(), viewName, viewOn, emptyPipeline, emptyCollation));
+            operationContext(), viewName, viewOn, emptyPipeline, emptyCollation, boost::none));
     }
     auto resourceID = ResourceId(RESOURCE_COLLECTION, "db.view"_sd);
-    auto& collectionCatalog = CollectionCatalog::get(operationContext());
-    ASSERT(!collectionCatalog.lookupResourceName(resourceID));
+    auto collectionCatalog = CollectionCatalog::get(operationContext());
+    ASSERT(!collectionCatalog->lookupResourceName(resourceID));
 }
 
 TEST_F(ViewCatalogFixture, LookupRIDAfterDrop) {
@@ -536,8 +546,8 @@ TEST_F(ViewCatalogFixture, LookupRIDAfterDrop) {
     ASSERT_OK(dropView(operationContext(), viewName));
 
     auto resourceID = ResourceId(RESOURCE_COLLECTION, "db.view"_sd);
-    auto& collectionCatalog = CollectionCatalog::get(operationContext());
-    ASSERT(!collectionCatalog.lookupResourceName(resourceID));
+    auto collectionCatalog = CollectionCatalog::get(operationContext());
+    ASSERT(!collectionCatalog->lookupResourceName(resourceID));
 }
 
 TEST_F(ViewCatalogFixture, LookupRIDAfterDropRollback) {
@@ -545,11 +555,11 @@ TEST_F(ViewCatalogFixture, LookupRIDAfterDropRollback) {
     const NamespaceString viewOn("db.coll");
 
     auto resourceID = ResourceId(RESOURCE_COLLECTION, "db.view"_sd);
-    auto& collectionCatalog = CollectionCatalog::get(operationContext());
     {
         WriteUnitOfWork wunit(operationContext());
         ASSERT_OK(createView(operationContext(), viewName, viewOn, emptyPipeline, emptyCollation));
-        ASSERT(collectionCatalog.lookupResourceName(resourceID).get() == viewName.ns());
+        ASSERT(CollectionCatalog::get(operationContext())->lookupResourceName(resourceID).get() ==
+               viewName.ns());
         wunit.commit();
     }
 
@@ -565,7 +575,8 @@ TEST_F(ViewCatalogFixture, LookupRIDAfterDropRollback) {
         ASSERT_OK(getViewCatalog()->dropView(operationContext(), viewName));
     }
 
-    ASSERT(collectionCatalog.lookupResourceName(resourceID).get() == viewName.ns());
+    ASSERT(CollectionCatalog::get(operationContext())->lookupResourceName(resourceID).get() ==
+           viewName.ns());
 }
 
 TEST_F(ViewCatalogFixture, LookupRIDAfterModify) {
@@ -573,10 +584,10 @@ TEST_F(ViewCatalogFixture, LookupRIDAfterModify) {
     const NamespaceString viewOn("db.coll");
 
     auto resourceID = ResourceId(RESOURCE_COLLECTION, "db.view"_sd);
-    auto& collectionCatalog = CollectionCatalog::get(operationContext());
     ASSERT_OK(createView(operationContext(), viewName, viewOn, emptyPipeline, emptyCollation));
     ASSERT_OK(modifyView(operationContext(), viewName, viewOn, emptyPipeline));
-    ASSERT(collectionCatalog.lookupResourceName(resourceID).get() == viewName.ns());
+    ASSERT(CollectionCatalog::get(operationContext())->lookupResourceName(resourceID).get() ==
+           viewName.ns());
 }
 
 TEST_F(ViewCatalogFixture, LookupRIDAfterModifyRollback) {
@@ -584,11 +595,11 @@ TEST_F(ViewCatalogFixture, LookupRIDAfterModifyRollback) {
     const NamespaceString viewOn("db.coll");
 
     auto resourceID = ResourceId(RESOURCE_COLLECTION, "db.view"_sd);
-    auto& collectionCatalog = CollectionCatalog::get(operationContext());
     {
         WriteUnitOfWork wunit(operationContext());
         ASSERT_OK(createView(operationContext(), viewName, viewOn, emptyPipeline, emptyCollation));
-        ASSERT(collectionCatalog.lookupResourceName(resourceID).get() == viewName.ns());
+        ASSERT(CollectionCatalog::get(operationContext())->lookupResourceName(resourceID).get() ==
+               viewName.ns());
         wunit.commit();
     }
     {
@@ -602,9 +613,11 @@ TEST_F(ViewCatalogFixture, LookupRIDAfterModifyRollback) {
         WriteUnitOfWork wunit(operationContext());
         ASSERT_OK(
             getViewCatalog()->modifyView(operationContext(), viewName, viewOn, emptyPipeline));
-        ASSERT(collectionCatalog.lookupResourceName(resourceID).get() == viewName.ns());
+        ASSERT(CollectionCatalog::get(operationContext())->lookupResourceName(resourceID).get() ==
+               viewName.ns());
     }
-    ASSERT(collectionCatalog.lookupResourceName(resourceID).get() == viewName.ns());
+    ASSERT(CollectionCatalog::get(operationContext())->lookupResourceName(resourceID).get() ==
+           viewName.ns());
 }
 
 TEST_F(ViewCatalogFixture, CreateViewThenDropAndLookup) {

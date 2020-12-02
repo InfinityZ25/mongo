@@ -36,8 +36,10 @@
 #include "mongo/base/status.h"  // NOTE: This is safe as utils depend on base
 #include "mongo/base/status_with.h"
 #include "mongo/platform/compiler.h"
+#include "mongo/platform/source_location.h"
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/debug_util.h"
+#include "mongo/util/exit_code.h"
 
 #define MONGO_INCLUDE_INVARIANT_H_WHITELISTED
 #include "mongo/util/invariant.h"
@@ -55,12 +57,11 @@ public:
     AtomicWord<int> warning;
     AtomicWord<int> msg;
     AtomicWord<int> user;
+    AtomicWord<int> tripwire;
     AtomicWord<int> rollovers;
 };
 
 extern AssertionCount assertionCount;
-
-
 class DBException;
 std::string causedBy(const DBException& e);
 std::string causedBy(const std::string& e);
@@ -114,7 +115,7 @@ public:
     /**
      * Returns the generic ErrorExtraInfo if present.
      */
-    const ErrorExtraInfo* extraInfo() const {
+    const std::shared_ptr<const ErrorExtraInfo> extraInfo() const {
         return _status.extraInfo();
     }
 
@@ -122,7 +123,7 @@ public:
      * Returns a specific subclass of ErrorExtraInfo if the error code matches that type.
      */
     template <typename ErrorDetail>
-    const ErrorDetail* extraInfo() const {
+    std::shared_ptr<const ErrorDetail> extraInfo() const {
         return _status.extraInfo<ErrorDetail>();
     }
 
@@ -186,7 +187,7 @@ public:
     // This is only a template to enable SFINAE. It will only be instantiated with the default
     // value.
     template <ErrorCodes::Error code_copy = kCode>
-    const ErrorExtraInfoFor<code_copy>* operator->() const {
+    std::shared_ptr<const ErrorExtraInfoFor<code_copy>> operator->() const {
         MONGO_STATIC_ASSERT(code_copy == kCode);
         return this->template extraInfo<ErrorExtraInfoFor<kCode>>();
     }
@@ -436,6 +437,81 @@ inline void massertStatusOKWithLocation(const Status& status, const char* file, 
 }
 
 /**
+ * `iassert` is provided as an alternative for `uassert` variants (e.g., `uassertStatusOK`)
+ * to support cases where we expect a failure, the failure is recoverable, or accounting for the
+ * failure, updating assertion counters, isn't desired. `iassert` logs at D3 instead of D1,
+ * which helps with reducing the noise of assertions in production. The goal is to keep one
+ * interface (i.e., `iassert(...)`) for all possible assertion variants, and use function
+ * overloading to expand type support as needed.
+ */
+#define iassert(...) ::mongo::iassertWithLocation(MONGO_SOURCE_LOCATION(), __VA_ARGS__)
+
+void iassertWithLocation(SourceLocationHolder loc, const Status& status);
+
+inline void iassertWithLocation(SourceLocationHolder loc, int msgid, std::string msg, bool expr) {
+    if (MONGO_unlikely(!expr))
+        iassertWithLocation(std::move(loc), Status(ErrorCodes::Error(msgid), std::move(msg)));
+}
+
+template <typename T>
+void iassertWithLocation(SourceLocationHolder loc, const StatusWith<T>& sw) {
+    iassertWithLocation(std::move(loc), sw.getStatus());
+}
+
+/**
+ * "tripwire/test assert". Like uassert, but with a deferred-fatality tripwire that gets
+ * checked prior to normal shutdown. Used to ensure that this assertion will both fail the
+ * operation and also cause a test suite failure.
+ */
+#define tassert(...) ::mongo::tassertWithLocation(MONGO_SOURCE_LOCATION(), __VA_ARGS__)
+
+MONGO_COMPILER_NORETURN void tassertFailedWithLocation(SourceLocationHolder loc,
+                                                       const Status& status);
+
+#define tasserted(...) ::mongo::tassertFailedWithLocation(MONGO_SOURCE_LOCATION(), __VA_ARGS__)
+
+MONGO_COMPILER_NORETURN inline void tassertFailedWithLocation(SourceLocationHolder loc,
+                                                              int msgid,
+                                                              const std::string& msg) {
+    tassertFailedWithLocation(std::move(loc), Status(ErrorCodes::Error(msgid), msg));
+}
+
+void tassertWithLocation(SourceLocationHolder loc, const Status& status);
+
+inline void tassertWithLocation(SourceLocationHolder loc, Status&& status) {
+    tassertWithLocation(std::move(loc), status);
+}
+
+inline void tassertWithLocation(SourceLocationHolder loc,
+                                int msgid,
+                                const std::string& msg,
+                                bool expr) {
+    if (MONGO_unlikely(!expr))
+        tassertWithLocation(std::move(loc), Status(ErrorCodes::Error(msgid), msg));
+}
+
+template <typename T>
+inline void tassertWithLocation(SourceLocationHolder loc, const StatusWith<T>& sw) {
+    tassertWithLocation(std::move(loc), sw.getStatus());
+}
+
+template <typename T>
+inline void tassertWithLocation(SourceLocationHolder loc, StatusWith<T>&& sw) {
+    tassertWithLocation(std::move(loc), sw);
+}
+
+/**
+ * Handle tassert failures during exit with a given exit code.
+ *
+ * If the exit code is success (ie. EXIT_CLEAN, EXIT_SUCCESS, or 0) and there have been any tassert
+ * failures, then abort the process.
+ *
+ * Otherwise, if the exit code is an error, then just log the number of tassert failures (and then
+ * continue exiting with that exit code).
+ */
+void checkForTripwireAssertions(int code = EXIT_CLEAN);
+
+/**
  * verify is deprecated. It is like invariant() in debug builds and massert() in release builds.
  */
 #define verify(expression) MONGO_verify(expression)
@@ -606,3 +682,8 @@ Status exceptionToStatus() noexcept;
  */
 
 #define MONGO_UNREACHABLE ::mongo::invariantFailed("Hit a MONGO_UNREACHABLE!", __FILE__, __LINE__);
+
+#define MONGO_UNREACHABLE_TASSERT(msgid) \
+    ::mongo::tassertFailedWithLocation(  \
+        MONGO_SOURCE_LOCATION(),         \
+        Status(ErrorCodes::Error(msgid), "Hit a MONGO_UNREACHABLE_TASSERT!"));

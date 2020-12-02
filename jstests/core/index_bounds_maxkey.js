@@ -1,5 +1,9 @@
 // Index bounds generation tests for MaxKey values.
-// @tags: [requires_non_retryable_writes, assumes_unsharded_collection, requires_fcv_44]
+// @tags: [
+//   assumes_unsharded_collection,
+//   requires_non_retryable_writes,
+//   sbe_incompatible,
+// ]
 (function() {
 "use strict";
 

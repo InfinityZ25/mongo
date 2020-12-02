@@ -1,10 +1,10 @@
-/* Tests simple cases of creating a collection inside a multi-document transaction, both
+/**
+ * Tests simple cases of creating a collection inside a multi-document transaction, both
  * committing and aborting.
  *
- * @tags: [uses_transactions,
- *         # Creating collections inside multi-document transactions is supported only in v4.4
- *         # onwards.
- *         requires_fcv_44]
+ * @tags: [
+ *   uses_transactions,
+ * ]
  */
 (function() {
 "use strict";
@@ -16,7 +16,9 @@ load("jstests/libs/auto_retry_transaction_in_sharding.js");
 function runCollectionCreateTest(command, explicitCreate) {
     const session = db.getMongo().startSession();
     const collName = "create_new_collection";
-    const secondCollName = collName + "_second";
+    // Note: using strange collection name here to test sorting of operations by namespace,
+    // SERVER-48628
+    const secondCollName = "\n" + collName + "_second";
 
     let sessionDB = session.getDatabase("test");
     let sessionColl = sessionDB[collName];

@@ -33,7 +33,6 @@
 #include "mongo/db/auth/authz_manager_external_state_local.h"
 #include "mongo/db/auth/authz_manager_external_state_mock.h"
 #include "mongo/db/client.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_client_info.h"
@@ -41,6 +40,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_entry_point_common.h"
 #include "mongo/db/service_entry_point_mongod.h"
+#include "mongo/db/vector_clock_mutable.h"
 #include "mongo/platform/basic.h"
 #include "mongo/transport/service_entry_point_impl.h"
 #include "mongo/transport/session.h"
@@ -62,7 +62,7 @@ extern "C" int LLVMFuzzerTestOneInput(const char* Data, size_t Size) {
         mongo::LogicalTime(mongo::Timestamp(3, 1));
 
     static const auto ret = [&]() {
-        auto ret = mongo::runGlobalInitializers(0, nullptr, nullptr);
+        auto ret = mongo::runGlobalInitializers(std::vector<std::string>{});
         invariant(ret.isOK());
 
         setGlobalServiceContext(mongo::ServiceContext::make());
@@ -97,9 +97,7 @@ extern "C" int LLVMFuzzerTestOneInput(const char* Data, size_t Size) {
     }
     mongo::ServiceContext::UniqueOperationContext opCtx =
         serviceContext->makeOperationContext(client.get());
-    auto logicalClock = std::make_unique<mongo::LogicalClock>(serviceContext);
-    logicalClock->setClusterTimeFromTrustedSource(kInMemoryLogicalTime);
-    mongo::LogicalClock::set(serviceContext, std::move(logicalClock));
+    mongo::VectorClockMutable::get(serviceContext)->tickClusterTimeTo(kInMemoryLogicalTime);
 
     int new_size = Size + sizeof(int);
     auto sb = mongo::SharedBuffer::allocate(new_size);
@@ -108,7 +106,9 @@ extern "C" int LLVMFuzzerTestOneInput(const char* Data, size_t Size) {
     mongo::Message msg(std::move(sb));
 
     try {
-        serviceContext->getServiceEntryPoint()->handleRequest(opCtx.get(), msg);
+        // TODO SERVER-51278: Replace `AlternativeClientRegion` with `ClientStrand`.
+        mongo::AlternativeClientRegion acr(client);
+        serviceContext->getServiceEntryPoint()->handleRequest(opCtx.get(), msg).get();
     } catch (const mongo::AssertionException&) {
         // We need to catch exceptions caused by invalid inputs
     }

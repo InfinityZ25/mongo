@@ -1,6 +1,5 @@
 // Tests for the mongos explain command to ensure that the 'executionStats' section of the explain
 // output is populated correctly for each shard.
-// @tags: [requires_fcv_44]
 (function() {
 'use strict';
 
@@ -99,7 +98,7 @@ st.ensurePrimaryShard(db.getName(), st.shard0.shardName);
     // Setup an unsharded collection.
     const unshardedColl = db.getCollection(`${jsTest.name()}_unsharded`);
     unshardedColl.drop();
-    assert.commandWorked(unshardedColl.ensureIndex({a: 1}));
+    assert.commandWorked(unshardedColl.createIndex({a: 1}));
 
     // Add documents to the collection.
     const numDocs = 10;

@@ -8,7 +8,9 @@
 // replication. If the storage engine supports snapshot reads, secondary reads do not acquire PBWM
 // locks. So in order to not block secondary oplog application while the secondary read is blocked
 // on a failpoint, we only run this test with storage engine that supports snapshot read.
-// @tags: [requires_fcv_44, requires_snapshot_read]
+// @tags: [
+//   requires_snapshot_read,
+// ]
 
 (function() {
 'use strict';
@@ -54,7 +56,7 @@ let waitForGetMoreToFinish = startParallelShell(() => {
     load('jstests/replsets/rslib.js');
 
     const secondary = db.getMongo();
-    secondary.setSlaveOk();
+    secondary.setSecondaryOk();
 
     const dbName = 'test';
     const collName = 'coll';

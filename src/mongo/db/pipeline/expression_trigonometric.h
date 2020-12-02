@@ -103,8 +103,11 @@ struct ExclusiveBoundType {
 template <typename BoundedTrigType, typename BoundType>
 class ExpressionBoundedTrigonometric : public ExpressionSingleNumericArg<BoundedTrigType> {
 public:
-    explicit ExpressionBoundedTrigonometric(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+    explicit ExpressionBoundedTrigonometric(ExpressionContext* const expCtx)
         : ExpressionSingleNumericArg<BoundedTrigType>(expCtx) {}
+    explicit ExpressionBoundedTrigonometric(ExpressionContext* const expCtx,
+                                            Expression::ExpressionVector&& children)
+        : ExpressionSingleNumericArg<BoundedTrigType>(expCtx, std::move(children)) {}
 
     std::string toString(double d) const {
         return str::stream() << d;
@@ -135,8 +138,9 @@ public:
     void assertBounds(T input) const {
         uassert(50989,
                 str::stream() << "cannot apply " << getOpName() << " to " << toString(input)
-                              << ", value must in " << BoundType::leftBracket() << getLowerBound()
-                              << "," << getUpperBound() << BoundType::rightBracket(),
+                              << ", value must be in " << BoundType::leftBracket()
+                              << getLowerBound() << "," << getUpperBound()
+                              << BoundType::rightBracket(),
                 checkBounds(input));
     }
 
@@ -198,8 +202,11 @@ public:
 template <typename TrigType>
 class ExpressionUnboundedTrigonometric : public ExpressionSingleNumericArg<TrigType> {
 public:
-    explicit ExpressionUnboundedTrigonometric(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+    explicit ExpressionUnboundedTrigonometric(ExpressionContext* const expCtx)
         : ExpressionSingleNumericArg<TrigType>(expCtx) {}
+    explicit ExpressionUnboundedTrigonometric(ExpressionContext* const expCtx,
+                                              Expression::ExpressionVector&& children)
+        : ExpressionSingleNumericArg<TrigType>(expCtx, std::move(children)) {}
 
     /**
      * evaluateNumericArg evaluates the implented trig function on one numericArg.
@@ -230,4 +237,216 @@ public:
      */
     virtual const char* getOpName() const = 0;
 };
+
+class ExpressionArcTangent2 final : public ExpressionTwoNumericArgs<ExpressionArcTangent2> {
+public:
+    explicit ExpressionArcTangent2(ExpressionContext* const expCtx)
+        : ExpressionTwoNumericArgs(expCtx) {}
+
+    ExpressionArcTangent2(ExpressionContext* const expCtx, ExpressionVector&& children)
+        : ExpressionTwoNumericArgs(expCtx, std::move(children)) {}
+
+    Value evaluateNumericArgs(const Value& numericArg1, const Value& numericArg2) const final {
+        auto totalType = BSONType::NumberDouble;
+        // If the type of either argument is NumberDecimal, we promote to Decimal128.
+        if (numericArg1.getType() == BSONType::NumberDecimal ||
+            numericArg2.getType() == BSONType::NumberDecimal) {
+            totalType = BSONType::NumberDecimal;
+        }
+        switch (totalType) {
+            case BSONType::NumberDecimal: {
+                auto dec = numericArg1.coerceToDecimal();
+                return Value(dec.atan2(numericArg2.coerceToDecimal()));
+            }
+            case BSONType::NumberDouble: {
+                return Value(
+                    std::atan2(numericArg1.coerceToDouble(), numericArg2.coerceToDouble()));
+            }
+            default:
+                MONGO_UNREACHABLE;
+        }
+    }
+
+    const char* getOpName() const final {
+        return "$atan2";
+    }
+
+    void acceptVisitor(ExpressionVisitor* visitor) final {
+        return visitor->visit(this);
+    }
+};
+
+
+/* ----------------------- Inclusive Bounded Trigonometric Functions ---------------------------- */
+
+#define CREATE_BOUNDED_TRIGONOMETRIC_CLASS(className, funcName, boundType, lowerBound, upperBound) \
+    class Expression##className final                                                              \
+        : public ExpressionBoundedTrigonometric<Expression##className, boundType> {                \
+    public:                                                                                        \
+        explicit Expression##className(ExpressionContext* const expCtx)                            \
+            : ExpressionBoundedTrigonometric(expCtx) {}                                            \
+        explicit Expression##className(ExpressionContext* const expCtx,                            \
+                                       ExpressionVector&& children)                                \
+            : ExpressionBoundedTrigonometric(expCtx, std::move(children)) {}                       \
+        double getLowerBound() const final {                                                       \
+            return lowerBound;                                                                     \
+        }                                                                                          \
+                                                                                                   \
+        double getUpperBound() const final {                                                       \
+            return upperBound;                                                                     \
+        }                                                                                          \
+                                                                                                   \
+        double doubleFunc(double arg) const final {                                                \
+            return std::funcName(arg);                                                             \
+        }                                                                                          \
+                                                                                                   \
+        Decimal128 decimalFunc(Decimal128 arg) const final {                                       \
+            return arg.funcName();                                                                 \
+        }                                                                                          \
+                                                                                                   \
+        const char* getOpName() const final {                                                      \
+            return "$" #funcName;                                                                  \
+        }                                                                                          \
+                                                                                                   \
+        void acceptVisitor(ExpressionVisitor* visitor) final {                                     \
+            return visitor->visit(this);                                                           \
+        }                                                                                          \
+    };
+
+
+/**
+ * Inclusive Bounds
+ */
+CREATE_BOUNDED_TRIGONOMETRIC_CLASS(ArcCosine, acos, InclusiveBoundType, -1.0, 1.0);
+
+CREATE_BOUNDED_TRIGONOMETRIC_CLASS(ArcSine, asin, InclusiveBoundType, -1.0, 1.0);
+
+CREATE_BOUNDED_TRIGONOMETRIC_CLASS(HyperbolicArcTangent, atanh, InclusiveBoundType, -1.0, 1.0);
+
+CREATE_BOUNDED_TRIGONOMETRIC_CLASS(
+    HyperbolicArcCosine, acosh, InclusiveBoundType, 1.0, std::numeric_limits<double>::infinity());
+
+/**
+ * Exclusive Bounds
+ */
+CREATE_BOUNDED_TRIGONOMETRIC_CLASS(Cosine,
+                                   cos,
+                                   ExclusiveBoundType,
+                                   -std::numeric_limits<double>::infinity(),
+                                   std::numeric_limits<double>::infinity());
+
+CREATE_BOUNDED_TRIGONOMETRIC_CLASS(Sine,
+                                   sin,
+                                   ExclusiveBoundType,
+                                   -std::numeric_limits<double>::infinity(),
+                                   std::numeric_limits<double>::infinity());
+
+CREATE_BOUNDED_TRIGONOMETRIC_CLASS(Tangent,
+                                   tan,
+                                   ExclusiveBoundType,
+                                   -std::numeric_limits<double>::infinity(),
+                                   std::numeric_limits<double>::infinity());
+
+#undef CREATE_BOUNDED_TRIGONOMETRIC_CLASS
+
+/* ----------------------- Unbounded Trigonometric Functions ---------------------------- */
+
+
+#define CREATE_TRIGONOMETRIC_CLASS(className, funcName)                        \
+    class Expression##className final                                          \
+        : public ExpressionUnboundedTrigonometric<Expression##className> {     \
+    public:                                                                    \
+        explicit Expression##className(ExpressionContext* const expCtx)        \
+            : ExpressionUnboundedTrigonometric(expCtx) {}                      \
+        explicit Expression##className(ExpressionContext* const expCtx,        \
+                                       ExpressionVector&& children)            \
+            : ExpressionUnboundedTrigonometric(expCtx, std::move(children)) {} \
+                                                                               \
+        double doubleFunc(double arg) const final {                            \
+            return std::funcName(arg);                                         \
+        }                                                                      \
+                                                                               \
+        Decimal128 decimalFunc(Decimal128 arg) const final {                   \
+            return arg.funcName();                                             \
+        }                                                                      \
+                                                                               \
+        const char* getOpName() const final {                                  \
+            return "$" #funcName;                                              \
+        }                                                                      \
+                                                                               \
+        void acceptVisitor(ExpressionVisitor* visitor) final {                 \
+            return visitor->visit(this);                                       \
+        }                                                                      \
+    };
+
+CREATE_TRIGONOMETRIC_CLASS(ArcTangent, atan);
+CREATE_TRIGONOMETRIC_CLASS(HyperbolicArcSine, asinh);
+CREATE_TRIGONOMETRIC_CLASS(HyperbolicCosine, cosh);
+CREATE_TRIGONOMETRIC_CLASS(HyperbolicSine, sinh);
+CREATE_TRIGONOMETRIC_CLASS(HyperbolicTangent, tanh);
+
+#undef CREATE_TRIGONOMETRIC_CLASS
+
+/* ----------------------- ExpressionDegreesToRadians and ExpressionRadiansToDegrees ---- */
+
+static constexpr double kDoublePi = 3.141592653589793;
+static constexpr double kDoublePiOver180 = kDoublePi / 180.0;
+static constexpr double kDouble180OverPi = 180.0 / kDoublePi;
+
+static Value doDegreeRadiansConversion(const Value& numericArg,
+                                       Decimal128 decimalFactor,
+                                       double doubleFactor) {
+    switch (numericArg.getType()) {
+        case BSONType::NumberDecimal:
+            return Value(numericArg.getDecimal().multiply(decimalFactor));
+        default:
+            return Value(numericArg.coerceToDouble() * doubleFactor);
+    }
+}
+
+class ExpressionDegreesToRadians final
+    : public ExpressionSingleNumericArg<ExpressionDegreesToRadians> {
+public:
+    explicit ExpressionDegreesToRadians(ExpressionContext* const expCtx)
+        : ExpressionSingleNumericArg(expCtx) {}
+    explicit ExpressionDegreesToRadians(ExpressionContext* const expCtx,
+                                        ExpressionVector&& children)
+        : ExpressionSingleNumericArg(expCtx, std::move(children)) {}
+
+    Value evaluateNumericArg(const Value& numericArg) const final {
+        return doDegreeRadiansConversion(numericArg, Decimal128::kPiOver180, kDoublePiOver180);
+    }
+
+    const char* getOpName() const final {
+        return "$degreesToRadians";
+    }
+
+    void acceptVisitor(ExpressionVisitor* visitor) final {
+        return visitor->visit(this);
+    }
+};
+
+class ExpressionRadiansToDegrees final
+    : public ExpressionSingleNumericArg<ExpressionRadiansToDegrees> {
+public:
+    explicit ExpressionRadiansToDegrees(ExpressionContext* const expCtx)
+        : ExpressionSingleNumericArg(expCtx) {}
+    explicit ExpressionRadiansToDegrees(ExpressionContext* const expCtx,
+                                        ExpressionVector&& children)
+        : ExpressionSingleNumericArg(expCtx, std::move(children)) {}
+
+    Value evaluateNumericArg(const Value& numericArg) const final {
+        return doDegreeRadiansConversion(numericArg, Decimal128::k180OverPi, kDouble180OverPi);
+    }
+
+    const char* getOpName() const final {
+        return "$radiansToDegrees";
+    }
+
+    void acceptVisitor(ExpressionVisitor* visitor) final {
+        return visitor->visit(this);
+    }
+};
+
+
 }  // namespace mongo

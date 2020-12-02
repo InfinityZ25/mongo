@@ -31,17 +31,12 @@
 
 #include <mutex>
 
-#include "mongo/base/status.h"
-#include "mongo/base/string_data.h"
+#include "mongo/db/repl/repl_sync_shared_data.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/wire_version.h"
-#include "mongo/platform/mutex.h"
-#include "mongo/util/clock_source.h"
-#include "mongo/util/uuid.h"
 
 namespace mongo {
 namespace repl {
-class InitialSyncSharedData {
+class InitialSyncSharedData final : public ReplSyncSharedData {
 private:
     class RetryingOperation;
 
@@ -49,34 +44,12 @@ public:
     typedef boost::optional<RetryingOperation> RetryableOperation;
 
     InitialSyncSharedData(int rollBackId, Milliseconds allowedOutageDuration, ClockSource* clock)
-        : _rollBackId(rollBackId), _clock(clock), _allowedOutageDuration(allowedOutageDuration) {}
+        : ReplSyncSharedData(clock),
+          _rollBackId(rollBackId),
+          _allowedOutageDuration(allowedOutageDuration) {}
 
     int getRollBackId() const {
         return _rollBackId;
-    }
-
-    ClockSource* getClock() const {
-        return _clock;
-    }
-
-    /**
-     * In all cases below, the lock must be a lock on this object itself for access to be valid.
-     */
-
-    Status getInitialSyncStatus(WithLock lk) {
-        return _initialSyncStatus;
-    }
-
-    void setInitialSyncStatus(WithLock lk, Status newStatus) {
-        _initialSyncStatus = newStatus;
-    }
-
-    /**
-     * Sets the initialSyncStatus to the new status if and only if the old status is "OK".
-     */
-    void setInitialSyncStatusIfOK(WithLock lk, Status newStatus) {
-        if (_initialSyncStatus.isOK())
-            _initialSyncStatus = newStatus;
     }
 
     int getRetryingOperationsCount(WithLock lk) {
@@ -127,14 +100,6 @@ public:
     Milliseconds getCurrentOutageDuration(WithLock lk);
 
     /**
-     * Returns the total time the sync source may be unreachable in a single outage before
-     * shouldRetryOperation() returns false.
-     */
-    Milliseconds getAllowedOutageDuration(WithLock lk) {
-        return _allowedOutageDuration;
-    }
-
-    /**
      * Returns the time the current outage (if any) began.  Returns Date_t() if no outage in
      * progress.
      */
@@ -152,16 +117,11 @@ public:
     bool shouldRetryOperation(WithLock lk, RetryableOperation* retryableOp);
 
     /**
-     * BasicLockable C++ methods; they merely delegate to the mutex.
-     * The presence of these methods means we can use stdx::unique_lock<InitialSyncSharedData> and
-     * stdx::lock_guard<InitialSyncSharedData>.
+     * Returns the total time the sync source may be unreachable in a single outage before
+     * shouldRetryOperation() returns false.
      */
-    void lock() {
-        _mutex.lock();
-    }
-
-    void unlock() {
-        _mutex.unlock();
+    Milliseconds getAllowedOutageDuration(WithLock lk) {
+        return _allowedOutageDuration;
     }
 
     void setAllowedOutageDuration_forTest(WithLock, Milliseconds allowedOutageDuration) {
@@ -185,9 +145,6 @@ private:
         RetryingOperation& operator=(const RetryingOperation&) = delete;
         RetryingOperation& operator=(RetryingOperation&&) = default;
 
-    private:
-        friend class InitialSyncSharedData;
-
         /**
          * release() is used by shouldRetryOperation to allow destroying a RetryingOperation
          * while holding the lock.
@@ -197,6 +154,11 @@ private:
             _sharedData = nullptr;
         }
 
+        InitialSyncSharedData* getSharedData() {
+            return _sharedData;
+        }
+
+    private:
         InitialSyncSharedData* _sharedData;
     };
 
@@ -219,23 +181,12 @@ private:
         _totalRetries++;
     }
 
-    // The const members above the mutex may be accessed without the mutex.
-
-    // Rollback ID at start of initial sync
+    // Rollback ID at start of initial sync.
     const int _rollBackId;
 
-    // Clock source used for timing outages
-    ClockSource* const _clock;
-
-    // This mutex controls access to all members below it.
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("InitialSyncSharedData::_mutex"_sd);
-
-    // Time allowed for an outage before "shouldRetryOperation" returns false.
-    Milliseconds _allowedOutageDuration;
-
-    // Status of the entire initial sync.  All initial sync tasks should exit if this becomes
-    // non-OK.
-    Status _initialSyncStatus = Status::OK();
+    /**
+     * This object must be locked when accessing the members below.
+     */
 
     // Number of operations currently being retried due to a transient error.
     int _retryingOperationsCount = 0;
@@ -251,6 +202,12 @@ private:
     // The total time across all outages in this initial sync attempt, but excluding any current
     // outage, that we were retrying because we were unable to reach the sync source.
     Milliseconds _totalTimeUnreachable;
+
+    // Time allowed for an outage before "shouldRetryOperation" returns false.
+    Milliseconds _allowedOutageDuration;
+
+    // Operation that may currently be retrying.
+    RetryableOperation _retryableOp;
 
     // The sync source wire version at the start of data cloning.
     boost::optional<WireVersion> _syncSourceWireVersion;

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -77,9 +77,9 @@ ScopedMigrationRequest::~ScopedMigrationRequest() {
 }
 
 ScopedMigrationRequest::ScopedMigrationRequest(ScopedMigrationRequest&& other) {
+    // This function relies on the move assigment to nullify 'other._opCtx'. If this is no longer
+    // the case, this function should be updated to ensure that it nulls out 'other._opCtx'.
     *this = std::move(other);
-    // Set opCtx to null so that the destructor will do nothing.
-    other._opCtx = nullptr;
 }
 
 ScopedMigrationRequest& ScopedMigrationRequest::operator=(ScopedMigrationRequest&& other) {

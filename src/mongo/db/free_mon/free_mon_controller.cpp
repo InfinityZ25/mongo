@@ -27,14 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/free_mon/free_mon_controller.h"
 
 #include "mongo/db/ftdc/collector.h"
-#include "mongo/logger/logstream_builder.h"
 #include "mongo/logv2/log.h"
 
 namespace mongo {
@@ -85,7 +84,7 @@ void FreeMonController::registerServerStartup(RegistrationType registrationType,
 }
 
 boost::optional<Status> FreeMonController::registerServerCommand(Milliseconds timeout) {
-    auto msg = FreeMonRegisterCommandMessage::createNow(std::vector<std::string>());
+    auto msg = FreeMonRegisterCommandMessage::createNow({std::vector<std::string>(), boost::none});
     _enqueue(msg);
 
     if (timeout > Milliseconds::min()) {
@@ -189,7 +188,11 @@ void FreeMonController::stop() {
 
     _thread.join();
 
-    _state = State::kDone;
+    {
+        stdx::lock_guard<Latch> lock(_mutex);
+
+        _state = State::kDone;
+    }
 }
 
 void FreeMonController::turnCrankForTest(size_t countMessagesToIgnore) {
@@ -198,11 +201,20 @@ void FreeMonController::turnCrankForTest(size_t countMessagesToIgnore) {
         invariant(_state == State::kStarted);
     }
 
-    LOGV2(20610,
-          "Turning Crank: {countMessagesToIgnore}",
-          "countMessagesToIgnore"_attr = countMessagesToIgnore);
+    LOGV2(20610, "Turning Crank", "count"_attr = countMessagesToIgnore);
 
     _processor->turnCrankForTest(countMessagesToIgnore);
+}
+
+void FreeMonController::deprioritizeFirstMessageForTest(FreeMonMessageType type) {
+    {
+        stdx::lock_guard<Latch> lock(_mutex);
+        invariant(_state == State::kStarted);
+    }
+
+    LOGV2(5167901, "Deprioritize message", "type"_attr = static_cast<int>(type));
+
+    _processor->deprioritizeFirstMessageForTest(type);
 }
 
 void FreeMonController::getStatus(OperationContext* opCtx, BSONObjBuilder* status) {

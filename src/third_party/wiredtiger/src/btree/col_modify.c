@@ -31,30 +31,38 @@ __wt_col_modify(WT_CURSOR_BTREE *cbt, uint64_t recno, const WT_ITEM *value, WT_U
     u_int i, skipdepth;
     bool append, logged;
 
-    btree = cbt->btree;
+    btree = CUR2BT(cbt);
     ins = NULL;
     page = cbt->ref->page;
-    session = (WT_SESSION_IMPL *)cbt->iface.session;
+    session = CUR2S(cbt);
     upd = upd_arg;
     append = logged = false;
 
     /*
-     * We should have EITHER:
-     * - A full update list to instantiate with.
-     * - An update to append the existing update list with.
+     * We should have one of the following:
+     * - A full update list to instantiate.
+     * - An update to append to the existing update list.
      * - A key/value pair to create an update with and append to the update list.
+     * - A key with no value to create a reserved or tombstone update to append to the update list.
+     *
+     * A "full update list" is distinguished from "an update" by checking whether it has a "next"
+     * update.
      */
-    WT_ASSERT(session, (value == NULL && upd_arg != NULL) || (value != NULL && upd_arg == NULL));
+    WT_ASSERT(session,
+      ((modify_type == WT_UPDATE_RESERVE || modify_type == WT_UPDATE_TOMBSTONE) && value == NULL &&
+        upd_arg == NULL) ||
+        (!(modify_type == WT_UPDATE_RESERVE || modify_type == WT_UPDATE_TOMBSTONE) &&
+          ((value == NULL && upd_arg != NULL) || (value != NULL && upd_arg == NULL))));
+
+    /* If we don't yet have a modify structure, we'll need one. */
+    WT_RET(__wt_page_modify_init(session, page));
+    mod = page->modify;
 
     if (upd_arg == NULL) {
-        if (modify_type == WT_UPDATE_RESERVE || modify_type == WT_UPDATE_TOMBSTONE) {
-            /*
-             * Fixed-size column-store doesn't have on-page deleted values, it's a nul byte.
-             */
-            if (modify_type == WT_UPDATE_TOMBSTONE && btree->type == BTREE_COL_FIX) {
-                modify_type = WT_UPDATE_STANDARD;
-                value = &col_fix_remove;
-            }
+        /* Fixed-size column-store doesn't have on-page deleted values, it's a nul byte. */
+        if (modify_type == WT_UPDATE_TOMBSTONE && btree->type == BTREE_COL_FIX) {
+            modify_type = WT_UPDATE_STANDARD;
+            value = &col_fix_remove;
         }
 
         /*
@@ -66,17 +74,13 @@ __wt_col_modify(WT_CURSOR_BTREE *cbt, uint64_t recno, const WT_ITEM *value, WT_U
         WT_ASSERT(session, recno != WT_RECNO_OOB || cbt->compare != 0);
         if (cbt->compare != 0 &&
           (recno == WT_RECNO_OOB ||
-              recno > (btree->type == BTREE_COL_VAR ? __col_var_last_recno(cbt->ref) :
-                                                      __col_fix_last_recno(cbt->ref)))) {
+            recno > (btree->type == BTREE_COL_VAR ? __col_var_last_recno(cbt->ref) :
+                                                    __col_fix_last_recno(cbt->ref)))) {
             append = true;
             cbt->ins = NULL;
             cbt->ins_head = NULL;
         }
     }
-
-    /* If we don't yet have a modify structure, we'll need one. */
-    WT_RET(__wt_page_modify_init(session, page));
-    mod = page->modify;
 
     /*
      * If modifying a record not previously modified, but which is in the same update slot as a
@@ -124,7 +128,7 @@ __wt_col_modify(WT_CURSOR_BTREE *cbt, uint64_t recno, const WT_ITEM *value, WT_U
             WT_ERR(__wt_txn_update_check(session, cbt, old_upd));
 
             /* Allocate a WT_UPDATE structure and transaction ID. */
-            WT_ERR(__wt_update_alloc(session, value, &upd, &upd_size, modify_type));
+            WT_ERR(__wt_upd_alloc(session, value, modify_type, &upd, &upd_size));
             WT_ERR(__wt_txn_modify(session, upd));
             logged = true;
         } else {
@@ -133,7 +137,7 @@ __wt_col_modify(WT_CURSOR_BTREE *cbt, uint64_t recno, const WT_ITEM *value, WT_U
         }
 
         /* Avoid a data copy in WT_CURSOR.update. */
-        cbt->modify_update = upd;
+        __wt_upd_value_assign(cbt->modify_update, upd);
 
         /*
          * Point the new WT_UPDATE item to the next element in the list. If we get it right, the
@@ -175,16 +179,17 @@ __wt_col_modify(WT_CURSOR_BTREE *cbt, uint64_t recno, const WT_ITEM *value, WT_U
          * Check for insert split and checkpoint races in column-store: it's easy (as opposed to in
          * row-store) and a difficult bug to otherwise diagnose.
          */
-        WT_ASSERT(session, mod->mod_col_split_recno == WT_RECNO_OOB ||
+        WT_ASSERT(session,
+          mod->mod_col_split_recno == WT_RECNO_OOB ||
             (recno != WT_RECNO_OOB && mod->mod_col_split_recno > recno));
 
         if (upd_arg == NULL) {
-            WT_ERR(__wt_update_alloc(session, value, &upd, &upd_size, modify_type));
+            WT_ERR(__wt_upd_alloc(session, value, modify_type, &upd, &upd_size));
             WT_ERR(__wt_txn_modify(session, upd));
             logged = true;
 
             /* Avoid a data copy in WT_CURSOR.update. */
-            cbt->modify_update = upd;
+            __wt_upd_value_assign(cbt->modify_update, upd);
         } else
             upd_size = __wt_update_list_memsize(upd);
         ins->upd = upd;

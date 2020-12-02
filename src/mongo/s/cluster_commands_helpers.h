@@ -65,6 +65,18 @@ void appendWriteConcernErrorToCmdResponse(const ShardId& shardID,
 std::unique_ptr<WriteConcernErrorDetail> getWriteConcernErrorDetailFromBSONObj(const BSONObj& obj);
 
 /**
+ * Makes an expression context suitable for canonicalization of queries that contain let parameters
+ * and runtimeConstants on mongos.
+ */
+boost::intrusive_ptr<ExpressionContext> makeExpressionContextWithDefaultsForTargeter(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const BSONObj& collation,
+    const boost::optional<ExplainOptions::Verbosity>& verbosity,
+    const boost::optional<BSONObj>& letParameters,
+    const boost::optional<LegacyRuntimeConstants>& runtimeConstants);
+
+/**
  * Consults the routing info to build requests for:
  * 1. If sharded, shards that own chunks for the namespace, or
  * 2. If unsharded, the primary shard for the database.
@@ -75,7 +87,7 @@ std::unique_ptr<WriteConcernErrorDetail> getWriteConcernErrorDetailFromBSONObj(c
 std::vector<AsyncRequestsSender::Request> buildVersionedRequestsForTargetedShards(
     OperationContext* opCtx,
     const NamespaceString& nss,
-    const CachedCollectionRoutingInfo& routingInfo,
+    const ChunkManager& cm,
     const std::set<ShardId>& shardsToSkip,
     const BSONObj& cmdObj,
     const BSONObj& query,
@@ -180,7 +192,7 @@ std::vector<AsyncRequestsSender::Response> scatterGatherVersionedTargetByRouting
     OperationContext* opCtx,
     StringData dbName,
     const NamespaceString& nss,
-    const CachedCollectionRoutingInfo& routingInfo,
+    const ChunkManager& cm,
     const BSONObj& cmdObj,
     const ReadPreferenceSetting& readPref,
     Shard::RetryPolicy retryPolicy,
@@ -203,7 +215,7 @@ scatterGatherVersionedTargetByRoutingTableNoThrowOnStaleShardVersionErrors(
     OperationContext* opCtx,
     StringData dbName,
     const NamespaceString& nss,
-    const CachedCollectionRoutingInfo& routingInfo,
+    const ChunkManager& cm,
     const std::set<ShardId>& shardsToSkip,
     const BSONObj& cmdObj,
     const ReadPreferenceSetting& readPref,
@@ -231,12 +243,22 @@ std::vector<AsyncRequestsSender::Response> scatterGatherOnlyVersionIfUnsharded(
     const std::set<ErrorCodes::Error>& ignorableErrors = {});
 
 /**
- * Utility for dispatching commands against the primary of a database and attach the appropriate
- * database version.
- *
- * Does not retry on StaleDbVersion.
+ * Utility for dispatching commands against the primary of a database and attaching the appropriate
+ * database version. Also attaches UNSHARDED to the command. Does not retry on stale version.
  */
 AsyncRequestsSender::Response executeCommandAgainstDatabasePrimary(
+    OperationContext* opCtx,
+    StringData dbName,
+    const CachedDatabaseInfo& dbInfo,
+    const BSONObj& cmdObj,
+    const ReadPreferenceSetting& readPref,
+    Shard::RetryPolicy retryPolicy);
+
+/**
+ * Utility for dispatching commands against the primary of a database. Does not attach a database or
+ * shard version to the command object, but instead issues it exactly as provided. Does not retry.
+ */
+AsyncRequestsSender::Response executeRawCommandAgainstDatabasePrimary(
     OperationContext* opCtx,
     StringData dbName,
     const CachedDatabaseInfo& dbInfo,
@@ -253,7 +275,7 @@ AsyncRequestsSender::Response executeCommandAgainstDatabasePrimary(
 AsyncRequestsSender::Response executeCommandAgainstShardWithMinKeyChunk(
     OperationContext* opCtx,
     const NamespaceString& nss,
-    const CachedCollectionRoutingInfo& routingInfo,
+    const ChunkManager& cm,
     const BSONObj& cmdObj,
     const ReadPreferenceSetting& readPref,
     Shard::RetryPolicy retryPolicy);
@@ -313,8 +335,8 @@ void createShardDatabase(OperationContext* opCtx, StringData dbName);
  * Returns the shards that would be targeted for the given query according to the given routing
  * info.
  */
-std::set<ShardId> getTargetedShardsForQuery(OperationContext* opCtx,
-                                            const CachedCollectionRoutingInfo& routingInfo,
+std::set<ShardId> getTargetedShardsForQuery(boost::intrusive_ptr<ExpressionContext> expCtx,
+                                            const ChunkManager& cm,
                                             const BSONObj& query,
                                             const BSONObj& collation);
 
@@ -325,7 +347,7 @@ std::set<ShardId> getTargetedShardsForQuery(OperationContext* opCtx,
 std::vector<std::pair<ShardId, BSONObj>> getVersionedRequestsForTargetedShards(
     OperationContext* opCtx,
     const NamespaceString& nss,
-    const CachedCollectionRoutingInfo& routingInfo,
+    const ChunkManager& cm,
     const BSONObj& cmdObj,
     const BSONObj& query,
     const BSONObj& collation);
@@ -338,8 +360,8 @@ std::vector<std::pair<ShardId, BSONObj>> getVersionedRequestsForTargetedShards(
  *
  * Should be used by all router commands that can be run in a transaction when targeting shards.
  */
-StatusWith<CachedCollectionRoutingInfo> getCollectionRoutingInfoForTxnCmd(
-    OperationContext* opCtx, const NamespaceString& nss);
+StatusWith<ChunkManager> getCollectionRoutingInfoForTxnCmd(OperationContext* opCtx,
+                                                           const NamespaceString& nss);
 
 /**
  * Loads all of the indexes for the given namespace from the appropriate shard. For unsharded

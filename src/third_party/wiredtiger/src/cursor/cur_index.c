@@ -103,7 +103,7 @@ __curindex_move(WT_CURSOR_INDEX *cindex)
     WT_SESSION_IMPL *session;
     u_int i;
 
-    session = (WT_SESSION_IMPL *)cindex->iface.session;
+    session = CUR2S(cindex);
     first = NULL;
 
     /* Point the public cursor to the key in the child. */
@@ -509,8 +509,7 @@ __wt_curindex_open(WT_SESSION_IMPL *session, const char *uri, WT_CURSOR *owner, 
      */
     if (WT_CURSOR_RECNO(cursor))
         WT_ERR_MSG(session, WT_ERROR,
-          "Column store indexes based on a record number primary "
-          "key are not supported");
+          "Column store indexes based on a record number primary key are not supported");
 
     /* Handle projections. */
     if (columns != NULL) {

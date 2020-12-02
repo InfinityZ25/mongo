@@ -27,15 +27,19 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
 #include <set>
 
+#include "mongo/db/catalog/catalog_test_fixture.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/s/catalog_cache_test_fixture.h"
 #include "mongo/s/chunk_manager.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace {
@@ -54,7 +58,7 @@ protected:
         auto chunkManager = makeChunkManager(kNss, shardKeyPattern, nullptr, false, splitPoints);
 
         std::set<ShardId> shardIds;
-        chunkManager->getShardIdsForRange(min, max, &shardIds);
+        chunkManager.getShardIdsForRange(min, max, &shardIds);
 
         _assertShardIdsMatch(expectedShardIds, shardIds);
     }
@@ -71,8 +75,18 @@ protected:
             makeChunkManager(kNss, shardKeyPattern, std::move(defaultCollator), false, splitPoints);
 
         std::set<ShardId> shardIds;
-        chunkManager->getShardIdsForQuery(operationContext(), query, queryCollation, &shardIds);
 
+        auto&& cif = [&]() {
+            if (queryCollation.isEmpty()) {
+                return std::unique_ptr<CollatorInterface>{};
+            } else {
+                return uassertStatusOK(CollatorFactoryInterface::get(getServiceContext())
+                                           ->makeFromBSON(queryCollation));
+            }
+        }();
+        auto expCtx =
+            make_intrusive<ExpressionContextForTest>(operationContext(), kNss, std::move(cif));
+        chunkManager.getShardIdsForQuery(expCtx, query, queryCollation, &shardIds);
         _assertShardIdsMatch(expectedShardIds, shardIds);
     }
 
@@ -498,8 +512,15 @@ TEST_F(ChunkManagerQueryTest, SnapshotQueryWithMoreShardsThanLatestMetadata) {
     ChunkType chunk1(kNss, {BSON("x" << 0), BSON("x" << MAXKEY)}, version, ShardId("1"));
     chunk1.setName(OID::gen());
 
-    auto oldRoutingTable = RoutingTableHistory::makeNew(
-        kNss, boost::none, BSON("x" << 1), nullptr, false, epoch, {chunk0, chunk1});
+    auto oldRoutingTable = RoutingTableHistory::makeNew(kNss,
+                                                        boost::none,
+                                                        BSON("x" << 1),
+                                                        nullptr,
+                                                        false,
+                                                        epoch,
+                                                        boost::none,
+                                                        true,
+                                                        {chunk0, chunk1});
 
     // Simulate move chunk {x: 0} to shard 0. Effectively moving all remaining chunks to shard 0.
     version.incMajor();
@@ -508,16 +529,19 @@ TEST_F(ChunkManagerQueryTest, SnapshotQueryWithMoreShardsThanLatestMetadata) {
     chunk1.setHistory({ChunkHistory(Timestamp(20, 0), ShardId("0")),
                        ChunkHistory(Timestamp(1, 0), ShardId("1"))});
 
-    auto newRoutingTable = oldRoutingTable->makeUpdated({chunk1});
-    ChunkManager chunkManager(newRoutingTable, Timestamp(5, 0));
+    ChunkManager chunkManager(
+        ShardId("0"),
+        DatabaseVersion(UUID::gen()),
+        makeStandaloneRoutingTableHistory(oldRoutingTable.makeUpdated(boost::none, true, {chunk1})),
+        Timestamp(5, 0));
 
     std::set<ShardId> shardIds;
     chunkManager.getShardIdsForRange(BSON("x" << MINKEY), BSON("x" << MAXKEY), &shardIds);
     ASSERT_EQ(2, shardIds.size());
 
+    const auto expCtx = make_intrusive<ExpressionContextForTest>();
     shardIds.clear();
-    chunkManager.getShardIdsForQuery(
-        operationContext(), BSON("x" << BSON("$gt" << -20)), {}, &shardIds);
+    chunkManager.getShardIdsForQuery(expCtx, BSON("x" << BSON("$gt" << -20)), {}, &shardIds);
     ASSERT_EQ(2, shardIds.size());
 }
 

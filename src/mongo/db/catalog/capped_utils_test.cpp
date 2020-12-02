@@ -80,7 +80,9 @@ void CappedUtilsTest::tearDown() {
  * Creates an OperationContext.
  */
 ServiceContext::UniqueOperationContext makeOpCtx() {
-    return cc().makeOperationContext();
+    auto opCtx = cc().makeOperationContext();
+    repl::createOplog(opCtx.get());
+    return opCtx;
 }
 
 /**
@@ -94,8 +96,7 @@ bool collectionExists(OperationContext* opCtx, const NamespaceString& nss) {
  * Returns collection options.
  */
 CollectionOptions getCollectionOptions(OperationContext* opCtx, const NamespaceString& nss) {
-    AutoGetCollectionForRead autoColl(opCtx, nss);
-    auto collection = autoColl.getCollection();
+    AutoGetCollectionForRead collection(opCtx, nss);
     ASSERT_TRUE(collection) << "Unable to get collections options for " << nss
                             << " because collection does not exist.";
     return DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, collection->getCatalogId());

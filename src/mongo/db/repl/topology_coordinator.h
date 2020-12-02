@@ -31,10 +31,11 @@
 
 #include <functional>
 #include <iosfwd>
+#include <queue>
 #include <string>
 
 #include "mongo/client/read_preference.h"
-#include "mongo/db/repl/is_master_response.h"
+#include "mongo/db/repl/hello_response.h"
 #include "mongo/db/repl/last_vote.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
@@ -75,6 +76,37 @@ class TopologyCoordinator {
     TopologyCoordinator& operator=(const TopologyCoordinator&) = delete;
 
 public:
+    /**
+     * RecentSyncSourceChanges stores the times that recent sync source changes happened. It will
+     * maintain a max size of maxSyncSourceChangesPerHour. If any additional entries are added,
+     * older entries will be removed. It is used to restrict the number of sync source changes that
+     * happen per hour when the node already has a valid sync source.
+     */
+    class RecentSyncSourceChanges {
+    public:
+        /**
+         * Checks if all the entries occurred within the last hour or not. It will remove additional
+         * entries if it sees that there are more than maxSyncSourceChangesPerHour entries. If there
+         * are fewer than maxSyncSourceChangesPerHour entries, it returns false.
+         */
+        bool changedTooOftenRecently(Date_t now);
+
+        /**
+         * Adds a new entry. It will remove additional entries if it sees that there are more than
+         * maxSyncSourceChangesPerHour entries. This should only be called if the sync source was
+         * changed to another node, not if the sync source was cleared.
+         */
+        void addNewEntry(Date_t now);
+
+        /**
+         * Return the underlying queue. Used for testing purposes only.
+         */
+        std::queue<Date_t> getChanges_forTest();
+
+    private:
+        std::queue<Date_t> _recentChanges;
+    };
+
     /**
      * Type that denotes the role of a node in the replication protocol.
      *
@@ -171,6 +203,16 @@ public:
 
     enum class UpdateTermResult { kAlreadyUpToDate, kTriggerStepDown, kUpdatedTerm };
 
+    /**
+     * Returns true if we are a one-node replica set, we're the one member,
+     * we're electable, we're not in maintenance mode, and we are currently in followerMode
+     * SECONDARY.
+     *
+     * This is used to decide if we should start an election in a one-node replica set.
+     */
+    bool isElectableNodeInSingleNodeReplicaSet() const;
+
+
     ////////////////////////////////////////////////////////////
     //
     // Basic state manipulation methods.
@@ -189,18 +231,12 @@ public:
      */
     void setForceSyncSourceIndex(int index);
 
-    enum class ChainingPreference { kAllowChaining, kUseConfiguration };
-
     /**
      * Chooses and sets a new sync source, based on our current knowledge of the world.
-     * If chaining is disabled in the configuration and chainingPreference is kUseConfiguration,
-     * only the primary will be selected (regardless of read preference).  Otherwise,
-     * the readPreference is respected.  Chaining disabled with SecondaryOnly read preference is
-     * not allowed.
+     * If readPreference is PrimaryOnly, only the primary will be selected.
      */
     HostAndPort chooseNewSyncSource(Date_t now,
                                     const OpTime& lastOpTimeFetched,
-                                    ChainingPreference chainingPreference,
                                     ReadPreference readPreference);
 
     /**
@@ -234,6 +270,16 @@ public:
                                 const rpc::OplogQueryMetadata& oqMetadata,
                                 const OpTime& lastOpTimeFetched,
                                 Date_t now) const;
+
+    /**
+     * Returns true if we find an eligible sync source that is significantly closer than our current
+     * sync source.
+     */
+    bool shouldChangeSyncSourceDueToPingTime(const HostAndPort& currentSource,
+                                             const MemberState& memberState,
+                                             const OpTime& previousOpTimeFetched,
+                                             Date_t now,
+                                             const ReadPreference readPreference);
 
     /**
      * Sets the reported mode of this node to one of RS_SECONDARY, RS_STARTUP2, RS_ROLLBACK or
@@ -272,7 +318,7 @@ public:
     OpTimeAndWallTime getLastCommittedOpTimeAndWallTime() const;
 
     /**
-     * Returns true if it's safe to transition to LeaderMode::kMaster.
+     * Returns true if it's safe to transition to LeaderMode::kWritablePrimary.
      */
     bool canCompleteTransitionToPrimary(long long termWhenDrainCompleted) const;
 
@@ -282,9 +328,8 @@ public:
      * "firstOpTimeOfTerm" is a floor on the OpTimes this node will be allowed to consider committed
      * for this tenure as primary. This prevents entries from before our election from counting as
      * committed in our view, until our election (the "firstOpTimeOfTerm" op) has been committed.
-     * Returns PrimarySteppedDown if this node is no longer eligible to begin accepting writes.
      */
-    Status completeTransitionToPrimary(const OpTime& firstOpTimeOfTerm);
+    void completeTransitionToPrimary(const OpTime& firstOpTimeOfTerm);
 
     /**
      * Adjusts the maintenance mode count by "inc".
@@ -308,13 +353,13 @@ public:
     // produce a reply to a V1 heartbeat
     Status prepareHeartbeatResponseV1(Date_t now,
                                       const ReplSetHeartbeatArgsV1& args,
-                                      const std::string& ourSetName,
+                                      StringData ourSetName,
                                       ReplSetHeartbeatResponse* response);
 
     struct ReplSetStatusArgs {
         const Date_t now;
         const unsigned selfUptime;
-        const OpTimeAndWallTime readConcernMajorityOpTime;
+        const OpTime readConcernMajorityOpTime;
         const BSONObj initialSyncStatus;
         const BSONObj electionCandidateMetrics;
         const BSONObj electionParticipantMetrics;
@@ -338,11 +383,11 @@ public:
     StatusWith<BSONObj> prepareReplSetUpdatePositionCommand(
         OpTime currentCommittedSnapshotOpTime) const;
 
-    // Produce a reply to an ismaster request.  It is only valid to call this if we are a
-    // replset.  Drivers interpret the isMaster fields according to the Server Discovery and
+    // Produce a reply to a hello request.  It is only valid to call this if we are a
+    // replset.  Drivers interpret the hello fields according to the Server Discovery and
     // Monitoring Spec, see the "Parsing an isMaster response" section.
-    void fillIsMasterForReplSet(std::shared_ptr<IsMasterResponse> response,
-                                const StringData& horizonString) const;
+    void fillHelloForReplSet(std::shared_ptr<HelloResponse> response,
+                             const StringData& horizonString) const;
 
     // Produce member data for the serverStatus command and diagnostic logging.
     void fillMemberData(BSONObjBuilder* result);
@@ -389,7 +434,7 @@ public:
      * processHeartbeatResponse for the same "target".
      */
     std::pair<ReplSetHeartbeatArgsV1, Milliseconds> prepareHeartbeatRequestV1(
-        Date_t now, const std::string& ourSetName, const HostAndPort& target);
+        Date_t now, StringData ourSetName, const HostAndPort& target);
 
     /**
      * Processes a heartbeat response from "target" that arrived around "now", having spent
@@ -479,11 +524,6 @@ public:
     HeartbeatResponseAction checkMemberTimeouts(Date_t now);
 
     /**
-     * Set all nodes in memberData to not stale with a lastUpdate of "now".
-     */
-    void resetAllMemberTimeouts(Date_t now);
-
-    /**
      * Set all nodes in memberData that are present in member_set
      * to not stale with a lastUpdate of "now".
      */
@@ -528,9 +568,7 @@ public:
      * Returns a Status if the position could not be set, false if the last optimes for the node
      * did not change, or true if either the last applied or last durable optime did change.
      */
-    StatusWith<bool> setLastOptime(const UpdatePositionArgs::UpdateInfo& args,
-                                   Date_t now,
-                                   long long* configVersion);
+    StatusWith<bool> setLastOptime(const UpdatePositionArgs::UpdateInfo& args, Date_t now);
 
     /**
      * Sets the latest optime committed in the previous config to the current lastCommitted optime.
@@ -585,11 +623,11 @@ public:
      * when we receive a stepdown command (which can fail if not enough secondaries are caught up)
      * to ensure that we never process more than one stepdown request at a time.
      * Returns OK if it is safe to continue with the stepdown attempt, or returns:
-     * - NotMaster if this node is not a leader.
+     * - NotWritablePrimary if this node is not a leader.
      * - ConflictingOperationInProgess if this node is already processing a stepdown request of any
      * kind.
      * On an OK return status also returns a function object that can be called to abort the
-     * pending stepdown attempt and return this node to normal primary/master state.
+     * pending stepdown attempt and return this node to normal (writable) primary state.
      */
     StatusWith<StepDownAttemptAbortFn> prepareForStepDownAttempt();
 
@@ -709,9 +747,9 @@ public:
     void setStorageEngineSupportsReadCommitted(bool supported);
 
     /**
-     * Reset the booleans to record the last heartbeat restart.
+     * Reset the booleans to record the last heartbeat restart for the target node.
      */
-    void restartHeartbeats();
+    void restartHeartbeat(const Date_t now, const HostAndPort& target);
 
     /**
      * Increments the counter field of the current TopologyVersion.
@@ -770,10 +808,22 @@ public:
                                    const Timestamp& electionTime = Timestamp(0, 0));
 
     /**
+     * Get a raw pointer to the list of recent sync source changes. It is the caller's
+     * responsibility to not use this pointer beyond the lifetime of the object. Used for testing
+     * only.
+     */
+    RecentSyncSourceChanges* getRecentSyncSourceChanges_forTest();
+
+    /**
      * Change config (version, term) of each member in the initial test config so that
      * it will be majority replicated without having to mock heartbeats.
      */
     void populateAllMembersConfigVersionAndTerm_forTest();
+
+    /**
+     * Records the ping for the given host. For use only in testing.
+     */
+    void setPing_forTest(const HostAndPort& host, const Milliseconds ping);
 
     // Returns _electionTime.  Only used in unittests.
     Timestamp getElectionTime() const;
@@ -802,7 +852,7 @@ private:
      *          |    ^  |                |                |
      *          |    |  |                |                |
      *          v    |  |                |                |
-     *       kMaster --------------------------           |
+     *       kWritablePrimary -----------------           |
      *        |  ^   |  |                |    |           |
      *        |  |   |  |                |    |           |
      *        |  |   |  |                |    |           |
@@ -810,11 +860,12 @@ private:
      *  kAttemptingStepDown----------->kSteppingDown------|
      */
     enum class LeaderMode {
-        kNotLeader,           // This node is not currently a leader.
-        kLeaderElect,         // This node has been elected leader, but can't yet accept writes.
-        kMaster,              // This node reports ismaster:true and can accept writes.
-        kSteppingDown,        // This node is in the middle of a hb, force reconfig or stepdown
-                              // command that must complete.
+        kNotLeader,        // This node is not currently a leader.
+        kLeaderElect,      // This node has been elected leader, but can't yet accept writes.
+        kWritablePrimary,  // This node can accept writes. Depending on whether the client sent
+                           // hello or isMaster, will report isWritablePrimary:true or ismaster:true
+        kSteppingDown,     // This node is in the middle of a hb, force reconfig or stepdown
+                           // command that must complete.
         kAttemptingStepDown,  // This node is in the middle of a cmd initiated step down that might
                               // fail.
     };
@@ -835,16 +886,16 @@ private:
     // Set what type of PRIMARY this node currently is.
     void _setLeaderMode(LeaderMode mode);
 
-    // Returns the number of heartbeat pings which have occurred.
-    int _getTotalPings();
+    // Returns a HostAndPort if one is forced via the 'replSetSyncFrom' command.
+    boost::optional<HostAndPort> _chooseSyncSourceReplSetSyncFrom(Date_t now);
 
     // Does preliminary checks involved in choosing sync source
     // * Do we have a valid configuration?
-    // * Do we have a forced sync source?
+    // * Is the 'forceSyncSourceCandidate' failpoint enabled?
     // * Have we gotten enough pings?
     // Returns a HostAndPort if one is decided (may be empty), boost:none if we need to move to the
     // next step.
-    boost::optional<HostAndPort> _chooseSyncSourceInitialStep(Date_t now);
+    boost::optional<HostAndPort> _chooseSyncSourceInitialChecks(Date_t now);
 
     // Returns the primary node if it is a valid sync source, otherwise returns an empty
     // HostAndPort.
@@ -857,7 +908,29 @@ private:
                                         const OpTime& lastOpTimeFetched,
                                         ReadPreference readPreference);
 
-    // Returns the current "ping" value for the given member by their address
+    /*
+     * Clear this node's sync source.
+     */
+    void _clearSyncSource();
+
+    /**
+     * Sets this node's sync source. It will also update whether the sync source was forced and add
+     * a new entry to recent sync source changes.
+     */
+    void _setSyncSource(HostAndPort newSyncSource, Date_t now, bool forced = false);
+
+    // Returns the oldest acceptable OpTime that a node must have for us to choose it as our sync
+    // source.
+    const OpTime _getOldestSyncOpTime() const;
+
+    // Returns true if the candidate node is viable as our sync source.
+    bool _isEligibleSyncSource(int candidateIndex,
+                               Date_t now,
+                               const OpTime& lastOpTimeFetched,
+                               ReadPreference readPreference,
+                               bool firstAttempt) const;
+
+    // Returns the current "ping" value for the given member by their address.
     Milliseconds _getPing(const HostAndPort& host);
 
     // Returns the index of the member with the matching id, or -1 if none match.
@@ -909,13 +982,14 @@ private:
     MemberData* _findMemberDataByMemberId(const int memberId);
 
     /**
-     * Performs updating "_currentPrimaryIndex" for processHeartbeatResponse(), and determines if an
-     * election or stepdown should commence.
+     * Performs updating "_currentPrimaryIndex" for processHeartbeatResponse().
      */
-    HeartbeatResponseAction _updatePrimaryFromHBDataV1(int updatedConfigIndex,
-                                                       const MemberState& originalState,
-                                                       Date_t now);
+    void _updatePrimaryFromHBDataV1(Date_t now);
 
+    /**
+     * Determine if the node should run PriorityTakeover or CatchupTakeover.
+     */
+    HeartbeatResponseAction _shouldTakeOverPrimary(int updatedConfigIndex);
     /**
      * Updates _memberData based on the newConfig, ensuring that every member in the newConfig
      * has an entry in _memberData.  If any nodes in the newConfig are also present in
@@ -945,15 +1019,6 @@ private:
      * returns false.
      **/
     bool _memberIsBlacklisted(const MemberConfig& memberConfig, Date_t now) const;
-
-    /**
-     * Returns true if we are a one-node replica set, we're the one member,
-     * we're electable, we're not in maintenance mode, and we are currently in followerMode
-     * SECONDARY.
-     *
-     * This is used to decide if we should transition to Role::candidate in a one-node replica set.
-     */
-    bool _isElectableNodeInSingleNodeReplicaSet() const;
 
     // Returns a string representation of the current replica set status for logging purposes.
     std::string _getReplSetStatusString();
@@ -985,6 +1050,8 @@ private:
     std::map<HostAndPort, Date_t> _syncSourceBlacklist;
     // The next sync source to be chosen, requested via a replSetSyncFrom command
     int _forceSyncSourceIndex;
+    // Whether the current sync source has been set via a replSetSyncFrom command
+    bool _replSetSyncFromSet;
 
     // Options for this TopologyCoordinator
     Options _options;
@@ -1058,6 +1125,8 @@ private:
 
     // Whether or not the storage engine supports read committed.
     ReadCommittedSupport _storageEngineSupportsReadCommitted{ReadCommittedSupport::kUnknown};
+
+    RecentSyncSourceChanges _recentSyncSourceChanges;
 };
 
 /**
@@ -1081,6 +1150,11 @@ public:
      * were spent for a single network roundtrip plus remote processing time.
      */
     void hit(Milliseconds millis);
+
+    /**
+     * Sets the ping time without considering previous pings. For use only in testing.
+     */
+    void set_forTest(Milliseconds millis);
 
     /**
      * Records that a heartbeat request failed.

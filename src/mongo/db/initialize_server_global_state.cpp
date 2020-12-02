@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
@@ -50,20 +49,10 @@
 #include "mongo/base/init.h"
 #include "mongo/config.h"
 #include "mongo/db/server_options.h"
-#include "mongo/logger/console_appender.h"
-#include "mongo/logger/logger.h"
-#include "mongo/logger/message_event.h"
-#include "mongo/logger/message_event_utf8_encoder.h"
-#include "mongo/logger/ramlog.h"
-#include "mongo/logger/rotatable_file_appender.h"
-#include "mongo/logger/rotatable_file_manager.h"
-#include "mongo/logger/rotatable_file_writer.h"
-#include "mongo/logger/syslog_appender.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_domain_global.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/util/exit_code.h"
-#include "mongo/util/log_global_settings.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/str.h"
@@ -298,21 +287,12 @@ void forkServerOrDie() {
 }
 
 MONGO_INITIALIZER_GENERAL(ServerLogRedirection,
-                          ("GlobalLogManager", "EndStartupOptionHandling", "ForkServer"),
+                          ("EndStartupOptionHandling", "ForkServer"),
                           ("default"))
 (InitializerContext*) {
-    using logger::LogManager;
-    using logger::MessageEventDetailsEncoder;
-    using logger::MessageEventEphemeral;
-    using logger::MessageEventWithContextEncoder;
-    using logger::MessageLogDomain;
-    using logger::RotatableFileAppender;
-    using logger::StatusWithRotatableFileWriter;
-
     // Hook up this global into our logging encoder
     auto& lv2Manager = logv2::LogManager::global();
     logv2::LogDomainGlobal::ConfigurationOptions lv2Config;
-    MessageEventDetailsEncoder::setMaxLogSizeKBSource(gMaxLogAttributeSizeKB);
     lv2Config.maxAttributeSizeKB = &gMaxLogAttributeSizeKB;
     bool writeServerRestartedAfterLogConfig = false;
 
@@ -349,7 +329,7 @@ MONGO_INITIALIZER_GENERAL(ServerLogRedirection,
             }
 
             if (!serverGlobalParams.logAppend && boost::filesystem::is_regular(absoluteLogpath)) {
-                std::string renameTarget = absoluteLogpath + "." + terseCurrentTime(false);
+                std::string renameTarget = absoluteLogpath + "." + terseCurrentTimeForFilename();
                 boost::system::error_code ec;
                 boost::filesystem::rename(absoluteLogpath, renameTarget, ec);
                 if (!ec) {
@@ -386,12 +366,11 @@ MONGO_INITIALIZER_GENERAL(ServerLogRedirection,
 
     lv2Config.timestampFormat = serverGlobalParams.logTimestampFormat;
     Status result = lv2Manager.getGlobalDomainInternal().configure(lv2Config);
-    if (result.isOK() && writeServerRestartedAfterLogConfig)
-        LOGV2_WARNING_OPTIONS(
-            20698, {logv2::LogTag::kStartupWarnings}, "***** SERVER RESTARTED *****");
-    return result;
+    if (result.isOK() && writeServerRestartedAfterLogConfig) {
+        LOGV2(20698, "***** SERVER RESTARTED *****");
+    }
 
-    return Status::OK();
+    return result;
 }
 
 /**

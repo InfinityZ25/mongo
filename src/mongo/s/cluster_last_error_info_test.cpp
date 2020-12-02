@@ -27,14 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include <vector>
 
 #include "mongo/db/operation_context.h"
-#include "mongo/executor/network_interface_mock.h"
 #include "mongo/rpc/metadata/sharding_metadata.h"
 #include "mongo/s/cluster_last_error_info.h"
 #include "mongo/s/sharding_router_test_fixture.h"

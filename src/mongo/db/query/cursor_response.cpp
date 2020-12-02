@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -44,6 +44,7 @@ const char kCursorsField[] = "cursors";
 const char kCursorField[] = "cursor";
 const char kIdField[] = "id";
 const char kNsField[] = "ns";
+const char kAtClusterTimeField[] = "atClusterTime";
 const char kBatchField[] = "nextBatch";
 const char kBatchFieldInitial[] = "firstBatch";
 const char kBatchDocSequenceField[] = "cursor.nextBatch";
@@ -84,6 +85,9 @@ void CursorResponseBuilder::done(CursorId cursorId, StringData cursorNamespace) 
     }
     _cursorObject->append(kIdField, cursorId);
     _cursorObject->append(kNsField, cursorNamespace);
+    if (_options.atClusterTime) {
+        _cursorObject->append(kAtClusterTimeField, _options.atClusterTime->asTimestamp());
+    }
     _cursorObject.reset();
 
     _bodyBuilder.reset();
@@ -125,6 +129,7 @@ void appendGetMoreResponseObject(long long cursorId,
 CursorResponse::CursorResponse(NamespaceString nss,
                                CursorId cursorId,
                                std::vector<BSONObj> batch,
+                               boost::optional<Timestamp> atClusterTime,
                                boost::optional<long long> numReturnedSoFar,
                                boost::optional<BSONObj> postBatchResumeToken,
                                boost::optional<BSONObj> writeConcernError,
@@ -132,6 +137,7 @@ CursorResponse::CursorResponse(NamespaceString nss,
     : _nss(std::move(nss)),
       _cursorId(cursorId),
       _batch(std::move(batch)),
+      _atClusterTime(std::move(atClusterTime)),
       _numReturnedSoFar(numReturnedSoFar),
       _postBatchResumeToken(std::move(postBatchResumeToken)),
       _writeConcernError(std::move(writeConcernError)),
@@ -231,6 +237,14 @@ StatusWith<CursorResponse> CursorResponse::parseFromBSON(const BSONObj& cmdRespo
                               << postBatchResumeTokenElem.type()};
     }
 
+    auto atClusterTimeElem = cursorObj[kAtClusterTimeField];
+    if (atClusterTimeElem && atClusterTimeElem.type() != BSONType::bsonTimestamp) {
+        return {ErrorCodes::BadValue,
+                str::stream() << kAtClusterTimeField
+                              << " format is invalid; expected Timestamp, but found: "
+                              << atClusterTimeElem.type()};
+    }
+
     auto partialResultsReturned = cursorObj[kPartialResultsReturnedField];
 
     if (partialResultsReturned) {
@@ -253,6 +267,7 @@ StatusWith<CursorResponse> CursorResponse::parseFromBSON(const BSONObj& cmdRespo
     return {{NamespaceString(fullns),
              cursorId,
              std::move(batch),
+             atClusterTimeElem ? atClusterTimeElem.timestamp() : boost::optional<Timestamp>{},
              boost::none,
              postBatchResumeTokenElem ? postBatchResumeTokenElem.Obj().getOwned()
                                       : boost::optional<BSONObj>{},
@@ -277,6 +292,10 @@ void CursorResponse::addToBSON(CursorResponse::ResponseType responseType,
 
     if (_postBatchResumeToken && !_postBatchResumeToken->isEmpty()) {
         cursorBuilder.append(kPostBatchResumeTokenField, *_postBatchResumeToken);
+    }
+
+    if (_atClusterTime) {
+        cursorBuilder.append(kAtClusterTimeField, *_atClusterTime);
     }
 
     if (_partialResultsReturned) {

@@ -42,7 +42,7 @@
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_executor_factory.h"
 #include "mongo/db/query/query_test_service_context.h"
 #include "mongo/db/repl/read_concern_level.h"
 #include "mongo/dbtests/dbtests.h"
@@ -56,12 +56,17 @@ const NamespaceString kTestNss{"test.collection"};
 
 class CursorManagerTest : public unittest::Test {
 public:
-    CursorManagerTest()
-        : _queryServiceContext(std::make_unique<QueryTestServiceContext>()),
-          _opCtx(_queryServiceContext->makeOperationContext()) {
-        _opCtx->getServiceContext()->setPreciseClockSource(std::make_unique<ClockSourceMock>());
-        _clock =
-            static_cast<ClockSourceMock*>(_opCtx->getServiceContext()->getPreciseClockSource());
+    CursorManagerTest() : _queryServiceContext(std::make_unique<QueryTestServiceContext>()) {
+        _queryServiceContext->getServiceContext()->setPreciseClockSource(
+            std::make_unique<ClockSourceMock>());
+    }
+
+    void setUp() override {
+        _opCtx = _queryServiceContext->makeOperationContext();
+    }
+
+    void tearDown() override {
+        // Do nothing.
     }
 
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeFakePlanExecutor() {
@@ -75,12 +80,13 @@ public:
 
         auto workingSet = std::make_unique<WorkingSet>();
         auto queuedDataStage = std::make_unique<QueuedDataStage>(expCtx.get(), workingSet.get());
-        return unittest::assertGet(PlanExecutor::make(expCtx,
-                                                      std::move(workingSet),
-                                                      std::move(queuedDataStage),
-                                                      nullptr,
-                                                      PlanExecutor::YieldPolicy::NO_YIELD,
-                                                      kTestNss));
+        return unittest::assertGet(
+            plan_executor_factory::make(expCtx,
+                                        std::move(workingSet),
+                                        std::move(queuedDataStage),
+                                        &CollectionPtr::null,
+                                        PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                        kTestNss));
     }
 
     ClientCursorParams makeParams(OperationContext* opCtx) {
@@ -88,12 +94,11 @@ public:
             makeFakePlanExecutor(opCtx),
             kTestNss,
             {},
+            APIParameters(),
             opCtx->getWriteConcern(),
             repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
             BSONObj(),
-            ClientCursorParams::LockPolicy::kLocksInternally,
             PrivilegeVector(),
-            false  // needsMerge
         };
     }
 
@@ -102,7 +107,8 @@ public:
     }
 
     ClockSourceMock* useClock() {
-        return _clock;
+        auto svcCtx = _queryServiceContext->getServiceContext();
+        return static_cast<ClockSourceMock*>(svcCtx->getPreciseClockSource());
     }
 
     CursorManager* useCursorManager() {
@@ -114,17 +120,16 @@ protected:
     ServiceContext::UniqueOperationContext _opCtx;
 
 private:
-    ClockSourceMock* _clock;
     CursorManager _cursorManager;
 };
 
 class CursorManagerTestCustomOpCtx : public CursorManagerTest {
     void setUp() override {
-        _queryServiceContext->getClient()->resetOperationContext();
+        // Do nothing.
     }
 
     void tearDown() override {
-        _queryServiceContext->getClient()->setOperationContext(_opCtx.get());
+        // Do nothing.
     }
 };
 
@@ -138,17 +143,14 @@ TEST_F(CursorManagerTest, ShouldBeAbleToKillPinnedCursor) {
 
     auto cursorPin = cursorManager->registerCursor(
         pinningOpCtx,
-        {
-            makeFakePlanExecutor(),
-            kTestNss,
-            {},
-            {},
-            repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
-            BSONObj(),
-            ClientCursorParams::LockPolicy::kLocksInternally,
-            PrivilegeVector(),
-            false  // needsMerge
-        });
+        {makeFakePlanExecutor(),
+         kTestNss,
+         {},
+         APIParameters(),
+         {},
+         repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
+         BSONObj(),
+         PrivilegeVector()});
 
     auto cursorId = cursorPin.getCursor()->cursorid();
     ASSERT_OK(cursorManager->killCursor(_opCtx.get(), cursorId, shouldAudit));
@@ -168,17 +170,14 @@ TEST_F(CursorManagerTest, ShouldBeAbleToKillPinnedCursorMultiClient) {
     // Pin the cursor from one client.
     auto cursorPin = cursorManager->registerCursor(
         pinningOpCtx,
-        {
-            makeFakePlanExecutor(),
-            kTestNss,
-            {},
-            {},
-            repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
-            BSONObj(),
-            ClientCursorParams::LockPolicy::kLocksInternally,
-            PrivilegeVector(),
-            false  // needsMerge
-        });
+        {makeFakePlanExecutor(),
+         kTestNss,
+         {},
+         APIParameters(),
+         {},
+         repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
+         BSONObj(),
+         PrivilegeVector()});
 
     auto cursorId = cursorPin.getCursor()->cursorid();
 
@@ -207,19 +206,15 @@ TEST_F(CursorManagerTest, InactiveCursorShouldTimeout) {
     CursorManager* cursorManager = useCursorManager();
     auto clock = useClock();
 
-    cursorManager->registerCursor(
-        _opCtx.get(),
-        {
-            makeFakePlanExecutor(),
-            NamespaceString{"test.collection"},
-            {},
-            {},
-            repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
-            BSONObj(),
-            ClientCursorParams::LockPolicy::kLocksInternally,
-            PrivilegeVector(),
-            false  // needsMerge
-        });
+    cursorManager->registerCursor(_opCtx.get(),
+                                  {makeFakePlanExecutor(),
+                                   NamespaceString{"test.collection"},
+                                   {},
+                                   APIParameters(),
+                                   {},
+                                   repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
+                                   BSONObj(),
+                                   PrivilegeVector()});
 
     ASSERT_EQ(0UL, cursorManager->timeoutCursors(_opCtx.get(), Date_t()));
 
@@ -227,19 +222,15 @@ TEST_F(CursorManagerTest, InactiveCursorShouldTimeout) {
     ASSERT_EQ(1UL, cursorManager->timeoutCursors(_opCtx.get(), clock->now()));
     ASSERT_EQ(0UL, cursorManager->numCursors());
 
-    cursorManager->registerCursor(
-        _opCtx.get(),
-        {
-            makeFakePlanExecutor(),
-            NamespaceString{"test.collection"},
-            {},
-            {},
-            repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
-            BSONObj(),
-            ClientCursorParams::LockPolicy::kLocksInternally,
-            PrivilegeVector(),
-            false  // needsMerge
-        });
+    cursorManager->registerCursor(_opCtx.get(),
+                                  {makeFakePlanExecutor(),
+                                   NamespaceString{"test.collection"},
+                                   {},
+                                   APIParameters(),
+                                   {},
+                                   repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
+                                   BSONObj(),
+                                   PrivilegeVector()});
     ASSERT_EQ(1UL, cursorManager->timeoutCursors(_opCtx.get(), Date_t::max()));
     ASSERT_EQ(0UL, cursorManager->numCursors());
 }
@@ -253,17 +244,14 @@ TEST_F(CursorManagerTest, InactivePinnedCursorShouldNotTimeout) {
 
     auto cursorPin = cursorManager->registerCursor(
         _opCtx.get(),
-        {
-            makeFakePlanExecutor(),
-            NamespaceString{"test.collection"},
-            {},
-            {},
-            repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
-            BSONObj(),
-            ClientCursorParams::LockPolicy::kLocksInternally,
-            PrivilegeVector(),
-            false  // needsMerge
-        });
+        {makeFakePlanExecutor(),
+         NamespaceString{"test.collection"},
+         {},
+         APIParameters(),
+         {},
+         repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
+         BSONObj(),
+         PrivilegeVector()});
 
     // The pin is still in scope, so it should not time out.
     clock->advance(getDefaultCursorTimeoutMillis());
@@ -281,17 +269,14 @@ TEST_F(CursorManagerTest, MarkedAsKilledCursorsShouldBeDeletedOnCursorPin) {
 
     auto cursorPin = cursorManager->registerCursor(
         _opCtx.get(),
-        {
-            makeFakePlanExecutor(),
-            NamespaceString{"test.collection"},
-            {},
-            {},
-            repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
-            BSONObj(),
-            ClientCursorParams::LockPolicy::kLocksInternally,
-            PrivilegeVector(),
-            false  // needsMerge
-        });
+        {makeFakePlanExecutor(),
+         NamespaceString{"test.collection"},
+         {},
+         APIParameters(),
+         {},
+         repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
+         BSONObj(),
+         PrivilegeVector()});
     auto cursorId = cursorPin->cursorid();
 
     // A cursor will stay alive, but be marked as killed, if it is interrupted with a code other
@@ -318,17 +303,14 @@ TEST_F(CursorManagerTest, InactiveKilledCursorsShouldTimeout) {
 
     auto cursorPin = cursorManager->registerCursor(
         _opCtx.get(),
-        {
-            makeFakePlanExecutor(),
-            NamespaceString{"test.collection"},
-            {},
-            {},
-            repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
-            BSONObj(),
-            ClientCursorParams::LockPolicy::kLocksInternally,
-            PrivilegeVector(),
-            false  // needsMerge
-        });
+        {makeFakePlanExecutor(),
+         NamespaceString{"test.collection"},
+         {},
+         APIParameters(),
+         {},
+         repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
+         BSONObj(),
+         PrivilegeVector()});
 
     // A cursor will stay alive, but be marked as killed, if it is interrupted with a code other
     // than ErrorCodes::Interrupted or ErrorCodes::CursorKilled and then unpinned.
@@ -354,35 +336,28 @@ TEST_F(CursorManagerTest, UsingACursorShouldUpdateTimeOfLastUse) {
     // Register a cursor which we will look at again.
     auto cursorPin = cursorManager->registerCursor(
         _opCtx.get(),
-        {
-            makeFakePlanExecutor(),
-            kTestNss,
-            {},
-            {},
-            repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
-            BSONObj(),
-            ClientCursorParams::LockPolicy::kLocksInternally,
-            PrivilegeVector(),
-            false  // needsMerge
-        });
+        {makeFakePlanExecutor(),
+         kTestNss,
+         {},
+         APIParameters(),
+         {},
+         repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
+         BSONObj(),
+         PrivilegeVector()});
     auto usedCursorId = cursorPin.getCursor()->cursorid();
     cursorPin.release();
 
     // Register a cursor to immediately forget about, to make sure it will time out on a normal
     // schedule.
-    cursorManager->registerCursor(
-        _opCtx.get(),
-        {
-            makeFakePlanExecutor(),
-            kTestNss,
-            {},
-            {},
-            repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
-            BSONObj(),
-            ClientCursorParams::LockPolicy::kLocksInternally,
-            PrivilegeVector(),
-            false  // needsMerge
-        });
+    cursorManager->registerCursor(_opCtx.get(),
+                                  {makeFakePlanExecutor(),
+                                   kTestNss,
+                                   {},
+                                   APIParameters(),
+                                   {},
+                                   repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
+                                   BSONObj(),
+                                   PrivilegeVector()});
 
     // Advance the clock to simulate time passing.
     clock->advance(Milliseconds(1));
@@ -413,17 +388,14 @@ TEST_F(CursorManagerTest, CursorShouldNotTimeOutUntilIdleForLongEnoughAfterBeing
     // Register a cursor which we will look at again.
     auto cursorPin = cursorManager->registerCursor(
         _opCtx.get(),
-        {
-            makeFakePlanExecutor(),
-            kTestNss,
-            {},
-            {},
-            repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
-            BSONObj(),
-            ClientCursorParams::LockPolicy::kLocksInternally,
-            PrivilegeVector(),
-            false  // needsMerge
-        });
+        {makeFakePlanExecutor(),
+         kTestNss,
+         {},
+         APIParameters(),
+         {},
+         repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
+         BSONObj(),
+         PrivilegeVector()});
 
     // Advance the clock to simulate time passing.
     clock->advance(getDefaultCursorTimeoutMillis() + Milliseconds(1));
@@ -444,6 +416,33 @@ TEST_F(CursorManagerTest, CursorShouldNotTimeOutUntilIdleForLongEnoughAfterBeing
     clock->advance(getDefaultCursorTimeoutMillis() + Milliseconds(1));
     ASSERT_EQ(1UL, cursorManager->timeoutCursors(_opCtx.get(), clock->now()));
     ASSERT_EQ(0UL, cursorManager->numCursors());
+}
+
+/**
+ * Test that a cursor correctly stores API parameters.
+ */
+TEST_F(CursorManagerTest, CursorStoresAPIParameters) {
+    APIParameters apiParams = APIParameters();
+    apiParams.setAPIVersion("2");
+    apiParams.setAPIStrict(true);
+    apiParams.setAPIDeprecationErrors(true);
+
+    CursorManager* cursorManager = useCursorManager();
+    auto cursorPin = cursorManager->registerCursor(
+        _opCtx.get(),
+        {makeFakePlanExecutor(),
+         kTestNss,
+         {},
+         apiParams,
+         {},
+         repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
+         BSONObj(),
+         PrivilegeVector()});
+
+    auto storedAPIParams = cursorPin->getAPIParameters();
+    ASSERT_EQ("2", *storedAPIParams.getAPIVersion());
+    ASSERT_TRUE(*storedAPIParams.getAPIStrict());
+    ASSERT_TRUE(*storedAPIParams.getAPIDeprecationErrors());
 }
 
 /**

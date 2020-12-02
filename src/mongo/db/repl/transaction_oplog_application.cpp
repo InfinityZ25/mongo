@@ -27,13 +27,12 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/transaction_oplog_application.h"
 
-#include "mongo/db/background.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -56,11 +55,14 @@ MONGO_FAIL_POINT_DEFINE(applyOpsHangBeforePreparingTransaction);
 // Failpoint that will cause reconstructPreparedTransactions to return early.
 MONGO_FAIL_POINT_DEFINE(skipReconstructPreparedTransactions);
 
+// Failpoint that causes apply prepare transaction oplog entry's ops to fail with write
+// conflict error.
+MONGO_FAIL_POINT_DEFINE(applyPrepareTxnOpsFailsWithWriteConflict);
 
 // Apply the oplog entries for a prepare or a prepared commit during recovery/initial sync.
 Status _applyOperationsForTransaction(OperationContext* opCtx,
                                       const std::vector<OplogEntry>& ops,
-                                      repl::OplogApplication::Mode oplogApplicationMode) {
+                                      repl::OplogApplication::Mode oplogApplicationMode) noexcept {
     // Apply each the operations via repl::applyOperation.
     for (const auto& op : ops) {
         try {
@@ -134,6 +136,8 @@ Status _applyTransactionFromOplogChain(OperationContext* opCtx,
 
         status = _applyOperationsForTransaction(opCtx, ops, mode);
         if (status.isOK()) {
+            // If the transaction was empty then we have no locks, ensure at least Global IX.
+            Lock::GlobalLock lk(opCtx, MODE_IX);
             opCtx->recoveryUnit()->setPrepareTimestamp(commitTimestamp);
             wunit.prepare();
 
@@ -260,8 +264,9 @@ std::pair<std::vector<OplogEntry>, bool> _readTransactionOperationsFromOplogChai
     const std::vector<OplogEntry*>& cachedOps,
     const bool checkForCommands) noexcept {
     bool isTransactionWithCommand = false;
-    // Traverse the oplog chain with its own snapshot and read timestamp.
-    ReadSourceScope readSourceScope(opCtx);
+    // Ensure future transactions read without a timestamp.
+    invariant(RecoveryUnit::ReadSource::kNoTimestamp ==
+              opCtx->recoveryUnit()->getTimestampReadSource());
 
     std::vector<OplogEntry> ops;
 
@@ -409,32 +414,58 @@ Status _applyPrepareTransaction(OperationContext* opCtx,
     opCtx->setLogicalSessionId(*entry.getSessionId());
     opCtx->setTxnNumber(*entry.getTxnNumber());
     opCtx->setInMultiDocumentTransaction();
-    // The write on transaction table may be applied concurrently, so refreshing state
-    // from disk may read that write, causing starting a new transaction on an existing
-    // txnNumber. Thus, we start a new transaction without refreshing state from disk.
-    MongoDOperationContextSessionWithoutRefresh sessionCheckout(opCtx);
 
-    auto transaction = TransactionParticipant::get(opCtx);
-    transaction.unstashTransactionResources(opCtx, "prepareTransaction");
+    return writeConflictRetry(opCtx, "applying prepare transaction", entry.getNss().ns(), [&] {
+        // The write on transaction table may be applied concurrently, so refreshing state
+        // from disk may read that write, causing starting a new transaction on an existing
+        // txnNumber. Thus, we start a new transaction without refreshing state from disk.
+        MongoDOperationContextSessionWithoutRefresh sessionCheckout(opCtx);
 
-    // Set this in case the application of any ops need to use the prepare timestamp of this
-    // transaction. It should be cleared automatically when the transaction finishes.
-    if (mode == repl::OplogApplication::Mode::kRecovering) {
-        transaction.setPrepareOpTimeForRecovery(opCtx, entry.getOpTime());
-    }
+        auto txnParticipant = TransactionParticipant::get(opCtx);
 
-    auto status = _applyOperationsForTransaction(opCtx, ops, mode);
-    fassert(31137, status);
+        // Release the WUOW, transaction lock resources and abort storage transaction so that the
+        // writeConflictRetry loop will be able to retry applying transactional ops on WCE error.
+        auto abortOnError = makeGuard([&txnParticipant, opCtx] {
+            // Abort the transaction and invalidate the session it is associated with.
+            txnParticipant.abortTransaction(opCtx);
+            txnParticipant.invalidate(opCtx);
+        });
 
-    if (MONGO_unlikely(applyOpsHangBeforePreparingTransaction.shouldFail())) {
-        LOGV2(21847, "Hit applyOpsHangBeforePreparingTransaction failpoint");
-        applyOpsHangBeforePreparingTransaction.pauseWhileSet(opCtx);
-    }
+        // Starts the WUOW.
+        txnParticipant.unstashTransactionResources(opCtx, "prepareTransaction");
 
-    transaction.prepareTransaction(opCtx, entry.getOpTime());
-    transaction.stashTransactionResources(opCtx);
+        // Set this in case the application of any ops need to use the prepare timestamp of this
+        // transaction. It should be cleared automatically when the transaction finishes.
+        if (mode == repl::OplogApplication::Mode::kRecovering ||
+            mode == repl::OplogApplication::Mode::kInitialSync) {
+            txnParticipant.setPrepareOpTimeForRecovery(opCtx, entry.getOpTime());
+        }
 
-    return Status::OK();
+        auto status = _applyOperationsForTransaction(opCtx, ops, mode);
+
+        if (MONGO_unlikely(applyPrepareTxnOpsFailsWithWriteConflict.shouldFail())) {
+            LOGV2(4947101, "Hit applyPrepareTxnOpsFailsWithWriteConflict failpoint");
+            status = Status(ErrorCodes::WriteConflict,
+                            "Prepare transaction apply ops failed due to write conflict");
+        }
+
+        if (status == ErrorCodes::WriteConflict) {
+            throw WriteConflictException();
+        }
+        fassert(31137, status);
+
+        if (MONGO_unlikely(applyOpsHangBeforePreparingTransaction.shouldFail())) {
+            LOGV2(21847, "Hit applyOpsHangBeforePreparingTransaction failpoint");
+            applyOpsHangBeforePreparingTransaction.pauseWhileSet(opCtx);
+        }
+
+        txnParticipant.prepareTransaction(opCtx, entry.getOpTime());
+        // Prepare transaction success.
+        abortOnError.dismiss();
+
+        txnParticipant.stashTransactionResources(opCtx);
+        return Status::OK();
+    });
 }
 
 /**
@@ -510,11 +541,10 @@ void reconstructPreparedTransactions(OperationContext* opCtx, repl::OplogApplica
         LOGV2(21848, "Hit skipReconstructPreparedTransactions failpoint");
         return;
     }
-    // Read the transactions table and the oplog collection without a timestamp.
-    // The below DBDirectClient read uses AutoGetCollectionForRead which could implicitly change the
-    // read source to kLastApplied. So we need to explicitly set the read source to kNoTimestamp to
-    // force reads in this scope to be untimestamped.
-    ReadSourceScope readSourceScope(opCtx, RecoveryUnit::ReadSource::kNoTimestamp);
+
+    // Ensure future transactions read without a timestamp.
+    invariant(RecoveryUnit::ReadSource::kNoTimestamp ==
+              opCtx->recoveryUnit()->getTimestampReadSource());
 
     DBDirectClient client(opCtx);
     const auto cursor = client.query(NamespaceString::kSessionTransactionsTableNamespace,

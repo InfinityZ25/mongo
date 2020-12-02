@@ -9,8 +9,8 @@
 
 load('jstests/libs/profiler.js');  // for profilerHasSingleMatchingEntryOrThrow()
 
-// Set the secondaries to priority 0 and votes 0 to prevent the primaries from stepping down.
-let rsOpts = {nodes: [{rsConfig: {votes: 1}}, {rsConfig: {priority: 0, votes: 0}}]};
+// Set the secondaries to priority 0 to prevent the primaries from stepping down.
+let rsOpts = {nodes: [{}, {rsConfig: {priority: 0}}]};
 let st =
     new ShardingTest({mongos: 2, shards: {rs0: rsOpts, rs1: rsOpts}, causallyConsistent: true});
 let dbName = 'test', collName = 'foo', ns = 'test.foo';
@@ -70,21 +70,6 @@ assert.eq(1, res.n, tojson(res));
 // prompting the stale mongos to refresh it's routing table and retarget to the recipient shard.
 profilerHasSingleMatchingEntryOrThrow({
     profileDB: donorShardSecondary.getDB(dbName),
-    filter: {
-        "ns": ns,
-        "command.count": collName,
-        "command.query": {x: 1},
-        "command.shardVersion": {"$exists": true},
-        "command.$readPreference": {"mode": "secondary"},
-        "command.readConcern.afterClusterTime": {"$exists": true},
-        "errCode": ErrorCodes.StaleConfig
-    }
-});
-
-// The recipient shard will then return a stale shard version error because it needs to refresh
-// its own routing table.
-profilerHasSingleMatchingEntryOrThrow({
-    profileDB: recipientShardSecondary.getDB(dbName),
     filter: {
         "ns": ns,
         "command.count": collName,

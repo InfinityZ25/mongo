@@ -1,6 +1,8 @@
 /**
  * Tests find with $elemMatch when supporting indexes are in place.
- * @tags: [assumes_balancer_off]
+ * @tags: [
+ *   assumes_balancer_off,
+ * ]
  */
 (function() {
 "use strict";

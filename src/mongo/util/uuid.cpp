@@ -29,25 +29,25 @@
 
 #include "mongo/platform/basic.h"
 
-#include <regex>
-
 #include "mongo/util/uuid.h"
+
+#include <fmt/format.h>
+#include <pcrecpp.h>
 
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/platform/random.h"
 #include "mongo/util/hex.h"
+#include "mongo/util/static_immortal.h"
 
 namespace mongo {
 
 namespace {
 
+using namespace fmt::literals;
+
 Mutex uuidGenMutex;
 SecureRandom uuidGen;
-
-// Regex to match valid version 4 UUIDs with variant bits set
-std::regex uuidRegex("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
-                     std::regex::optimize);
 
 }  // namespace
 
@@ -61,7 +61,7 @@ StatusWith<UUID> UUID::parse(BSONElement from) {
 
 StatusWith<UUID> UUID::parse(const std::string& s) {
     if (!isUUIDString(s)) {
-        return {ErrorCodes::InvalidUUID, "Invalid UUID string: " + s};
+        return {ErrorCodes::InvalidUUID, "Invalid UUID string: {}"_format(s)};
     }
 
     UUIDStorage uuid;
@@ -73,10 +73,8 @@ StatusWith<UUID> UUID::parse(const std::string& s) {
         if (s[j] == '-')
             j++;
 
-        char high = s[j++];
-        char low = s[j++];
-
-        uuid[i] = ((uassertStatusOK(fromHex(high)) << 4) | uassertStatusOK(fromHex(low)));
+        uuid[i] = hexblob::decodePair(StringData(s).substr(j, 2));
+        j += 2;
     }
 
     return UUID{std::move(uuid)};
@@ -89,7 +87,14 @@ UUID UUID::parse(const BSONObj& obj) {
 }
 
 bool UUID::isUUIDString(const std::string& s) {
-    return std::regex_match(s, uuidRegex);
+    // Regex to match valid version 4 UUIDs with variant bits set
+    static StaticImmortal<pcrecpp::RE> uuidRegex(
+        "[[:xdigit:]]{8}-"
+        "[[:xdigit:]]{4}-"
+        "[[:xdigit:]]{4}-"
+        "[[:xdigit:]]{4}-"
+        "[[:xdigit:]]{12}");
+    return uuidRegex->FullMatch(s);
 }
 
 bool UUID::isRFC4122v4() const {
@@ -128,20 +133,11 @@ BSONObj UUID::toBSON() const {
 }
 
 std::string UUID::toString() const {
-    StringBuilder ss;
-
-    // 4 Octets - 2 Octets - 2 Octets - 2 Octets - 6 Octets
-    ss << toHexLower(&_uuid[0], 4);
-    ss << "-";
-    ss << toHexLower(&_uuid[4], 2);
-    ss << "-";
-    ss << toHexLower(&_uuid[6], 2);
-    ss << "-";
-    ss << toHexLower(&_uuid[8], 2);
-    ss << "-";
-    ss << toHexLower(&_uuid[10], 6);
-
-    return ss.str();
+    return "{}-{}-{}-{}-{}"_format(hexblob::encodeLower(&_uuid[0], 4),
+                                   hexblob::encodeLower(&_uuid[4], 2),
+                                   hexblob::encodeLower(&_uuid[6], 2),
+                                   hexblob::encodeLower(&_uuid[8], 2),
+                                   hexblob::encodeLower(&_uuid[10], 6));
 }
 
 template <>

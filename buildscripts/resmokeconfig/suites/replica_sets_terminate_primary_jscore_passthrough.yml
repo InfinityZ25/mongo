@@ -21,7 +21,6 @@ selector:
   - jstests/core/top.js
   - jstests/core/views/views_stats.js
 
-  # TODO SERVER-31249: getLastError should not be affected by no-op retries.
   - jstests/core/bulk_legacy_enforce_gle.js
 
   # TODO SERVER-31242: findAndModify no-op retry should respect the fields option.
@@ -50,11 +49,11 @@ selector:
   - jstests/core/coveredIndex1.js
   - jstests/core/sortc.js
 
-  # Assert on the ismaster field of an isMaster response. If a primary steps down after accepting
-  # an isMaster command and returns before its connection is closed, the response can contain
-  # ismaster: false.
+  # Assert on the isWritablePrimary field of a hello response. If a primary steps down after
+  # accepting a hello command and returns before its connection is closed, the response can
+  # contain isWritablePrimary: false.
   - jstests/core/dbadmin.js
-  - jstests/core/ismaster.js
+  - jstests/core/hello_response_validation.js
 
   - jstests/core/bench_test*.js # benchRun() used for writes
   - jstests/core/benchrun_pipeline_updates.js # benchRun() used for writes
@@ -67,13 +66,6 @@ selector:
 
   # Creates new mongo connection but won't retry connecting.
   - jstests/core/shell_connection_strings.js
-
-  # Starts a parallel shell but won't restart it after shutdown.
-  # TODO SERVER-33229: Remove these exclusions
-  - jstests/core/compact_keeps_indexes.js
-  - jstests/core/crud_ops_do_not_throw_locktimeout.js
-  - jstests/core/find_and_modify_concurrent_update.js
-  - jstests/core/shellstartparallel.js
 
   exclude_with_any_tags:
   ##
@@ -114,6 +106,11 @@ selector:
   - operations_longer_than_stepdown_interval
   # Retrying a query can change whether a plan cache entry is active.
   - inspects_whether_plan_cache_entry_is_active
+  # Operations in the main test shell aren't guaranteed to be causally consistent with operations
+  # performed earlier in a parallel shell if multiple nodes are electable because the latest
+  # operation and cluster times aren't shared between shells.
+  # "Cowardly refusing to run test with network retries enabled when it uses startParallelShell()"
+  - uses_parallel_shell
 
 executor:
   archive:
@@ -123,10 +120,8 @@ executor:
       - ValidateCollections
   config:
     shell_options:
-      # TODO SERVER-33229: Remove override of startParallelShell
       eval: >-
         testingReplication = true;
-        load("jstests/libs/override_methods/causally_consistent_index_builds.js");
         load('jstests/libs/override_methods/network_error_and_txn_override.js');
         db = connect(TestData.connectionString);
         load("jstests/libs/override_methods/enable_sessions.js");

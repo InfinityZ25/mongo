@@ -27,13 +27,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 #include "mongo/platform/basic.h"
 
 #include "mongo/util/stacktrace_somap.h"
 
 #include <climits>
 #include <cstdlib>
+#include <fmt/format.h>
 #include <string>
 
 #if defined(__linux__)
@@ -120,7 +121,7 @@ void processNoteSegment(const dl_phdr_info& info, const ElfW(Phdr) & phdr, BSONO
         }
         const char* const noteDescBegin =
             noteNameBegin + roundUpToElfWordAlignment(noteHeader.n_namesz);
-        soInfo->append("buildId", toHex(noteDescBegin, noteHeader.n_descsz));
+        soInfo->append("buildId", hexblob::encode(noteDescBegin, noteHeader.n_descsz));
     }
 #endif
 }
@@ -144,53 +145,59 @@ void processLoadSegment(const dl_phdr_info& info, const ElfW(Phdr) & phdr, BSONO
     // Segment includes beginning of file and is large enough to hold the ELF header
     memcpy(&eHeader, (char*)(info.dlpi_addr + phdr.p_vaddr), sizeof(eHeader));
 
-    std::string quotedFileName = "\"" + str::escape(info.dlpi_name) + "\"";
+    const char* filename = info.dlpi_name;
 
-    if (memcmp(&eHeader.e_ident[0], ELFMAG, SELFMAG)) {
+    if (memcmp(&eHeader.e_ident[EI_MAG0], ELFMAG, SELFMAG)) {
         LOGV2_WARNING(23842,
-                      "Bad ELF magic number in image of {quotedFileName}",
-                      "quotedFileName"_attr = quotedFileName);
+                      "Bad ELF magic number",
+                      "filename"_attr = filename,
+                      "magic"_attr = hexdump((const char*)&eHeader.e_ident[EI_MAG0], SELFMAG),
+                      "magicExpected"_attr = hexdump(ELFMAG, SELFMAG));
         return;
     }
 
-    static constexpr int kArchBits = ARCH_BITS;
-    if (eHeader.e_ident[EI_CLASS] != ARCH_ELFCLASS) {
+    if (uint8_t elfClass = eHeader.e_ident[EI_CLASS]; elfClass != ARCH_ELFCLASS) {
+        auto elfClassStr = [](uint8_t c) -> std::string {
+            switch (c) {
+                case ELFCLASS32:
+                    return "ELFCLASS32";
+                case ELFCLASS64:
+                    return "ELFCLASS64";
+            }
+            return format(FMT_STRING("[elfClass unknown: {}]"), c);
+        };
         LOGV2_WARNING(23843,
-                      "Expected elf file class of {quotedFileName} to be "
-                      "{ARCH_ELFCLASS}({kArchBits}-bit), but found {int_eHeader_e_ident_4}",
-                      "quotedFileName"_attr = quotedFileName,
-                      "ARCH_ELFCLASS"_attr = ARCH_ELFCLASS,
-                      "kArchBits"_attr = kArchBits,
-                      "int_eHeader_e_ident_4"_attr = int(eHeader.e_ident[4]));
+                      "Unexpected ELF class (i.e. bit width)",
+                      "filename"_attr = filename,
+                      "elfClass"_attr = elfClassStr(elfClass),
+                      "elfClassExpected"_attr = elfClassStr(ARCH_ELFCLASS));
         return;
     }
 
-    if (eHeader.e_ident[EI_VERSION] != EV_CURRENT) {
+    if (uint32_t elfVersion = eHeader.e_ident[EI_VERSION]; elfVersion != EV_CURRENT) {
         LOGV2_WARNING(23844,
-                      "Wrong ELF version in {quotedFileName}.  Expected {EV_CURRENT} but found "
-                      "{int_eHeader_e_ident_EI_VERSION}",
-                      "quotedFileName"_attr = quotedFileName,
-                      "EV_CURRENT"_attr = EV_CURRENT,
-                      "int_eHeader_e_ident_EI_VERSION"_attr = int(eHeader.e_ident[EI_VERSION]));
+                      "Wrong ELF version",
+                      "filename"_attr = filename,
+                      "elfVersion"_attr = elfVersion,
+                      "elfVersionExpected"_attr = EV_CURRENT);
         return;
     }
 
-    soInfo->append("elfType", eHeader.e_type);
+    uint16_t elfType = eHeader.e_type;
+    soInfo->append("elfType", elfType);
 
-    switch (eHeader.e_type) {
+    switch (elfType) {
         case ET_EXEC:
             break;
         case ET_DYN:
             return;
         default:
-            LOGV2_WARNING(23845,
-                          "Surprised to find {quotedFileName} is ELF file of type {eHeader_e_type}",
-                          "quotedFileName"_attr = quotedFileName,
-                          "eHeader_e_type"_attr = eHeader.e_type);
+            LOGV2_WARNING(
+                23845, "Unexpected ELF type", "filename"_attr = filename, "elfType"_attr = elfType);
             return;
     }
 
-    soInfo->append("b", integerToHex(phdr.p_vaddr));
+    soInfo->append("b", unsignedHex(phdr.p_vaddr));
 }
 
 /**
@@ -212,7 +219,7 @@ void processLoadSegment(const dl_phdr_info& info, const ElfW(Phdr) & phdr, BSONO
 int outputSOInfo(dl_phdr_info* info, size_t sz, void* data) {
     BSONObjBuilder soInfo(reinterpret_cast<BSONArrayBuilder*>(data)->subobjStart());
     if (info->dlpi_addr)
-        soInfo.append("b", integerToHex(ElfW(Addr)(info->dlpi_addr)));
+        soInfo.append("b", unsignedHex(ElfW(Addr)(info->dlpi_addr)));
     if (info->dlpi_name && *info->dlpi_name)
         soInfo.append("path", info->dlpi_name);
 
@@ -255,7 +262,7 @@ void addOSComponentsToSoMap(BSONObjBuilder* soMap) {
         if (StringData(SEG_TEXT) != segmentCommand->segname) {
             return false;
         }
-        *soInfo << "vmaddr" << integerToHex(segmentCommand->vmaddr);
+        *soInfo << "vmaddr" << unsignedHex(segmentCommand->vmaddr);
         return true;
     };
     const uint32_t numImages = _dyld_image_count();
@@ -277,7 +284,7 @@ void addOSComponentsToSoMap(BSONObjBuilder* soMap) {
             continue;
         }
         soInfo << "machType" << static_cast<int32_t>(header->filetype);
-        soInfo << "b" << integerToHex(reinterpret_cast<intptr_t>(header));
+        soInfo << "b" << unsignedHex(reinterpret_cast<uintptr_t>(header));
         const char* const loadCommandsBegin = reinterpret_cast<const char*>(header) + headerSize;
         const char* const loadCommandsEnd = loadCommandsBegin + header->sizeofcmds;
 
@@ -293,7 +300,7 @@ void addOSComponentsToSoMap(BSONObjBuilder* soMap) {
             switch (lcType(lcCurr)) {
                 case LC_UUID: {
                     const auto uuidCmd = reinterpret_cast<const uuid_command*>(lcCurr);
-                    soInfo << "buildId" << toHex(uuidCmd->uuid, 16);
+                    soInfo << "buildId" << hexblob::encode(uuidCmd->uuid, 16);
                     break;
                 }
                 case LC_SEGMENT_64:

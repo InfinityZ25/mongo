@@ -1,4 +1,7 @@
 // Integration tests for {$caseSensitive: true} option to $text query operator.
+// @tags: [
+//   sbe_incompatible,
+// ]
 
 load('jstests/libs/fts.js');
 var coll = db.fts_casesensitive;
@@ -6,7 +9,7 @@ var coll = db.fts_casesensitive;
 coll.drop();
 
 assert.commandWorked(coll.insert({_id: 0, a: "The Quick Brown Fox Jumps Over The Lazy Dog"}));
-assert.commandWorked(coll.ensureIndex({a: "text"}));
+assert.commandWorked(coll.createIndex({a: "text"}));
 
 assert.throws(function() {
     queryIDS(coll, "hello", null, {$caseSensitive: "invalid"});

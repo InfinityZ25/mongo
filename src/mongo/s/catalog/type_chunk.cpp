@@ -38,6 +38,8 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/server_options.h"
+#include "mongo/s/sharded_collections_ddl_parameters_gen.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
@@ -49,6 +51,7 @@ const std::string ChunkType::ShardNSPrefix = "config.cache.chunks.";
 const BSONField<OID> ChunkType::name("_id");
 const BSONField<BSONObj> ChunkType::minShardID("_id");
 const BSONField<std::string> ChunkType::ns("ns");
+const BSONField<std::string> ChunkType::collectionUUID("uuid");
 const BSONField<BSONObj> ChunkType::min("min");
 const BSONField<BSONObj> ChunkType::max("max");
 const BSONField<std::string> ChunkType::shard("shard");
@@ -173,6 +176,10 @@ boost::optional<ChunkRange> ChunkRange::overlapWith(ChunkRange const& other) con
                       le(_maxKey, other._maxKey) ? _maxKey : other._maxKey);
 }
 
+bool ChunkRange::overlaps(const ChunkRange& other) const {
+    return _minKey.woCompare(other._maxKey) < 0 && _maxKey.woCompare(other._minKey) > 0;
+}
+
 ChunkRange ChunkRange::unionWith(ChunkRange const& other) const {
     auto le = [](auto const& a, auto const& b) { return a.woCompare(b) <= 0; };
     return ChunkRange(le(_minKey, other._minKey) ? _minKey : other._minKey,
@@ -201,7 +208,19 @@ StatusWith<std::vector<ChunkHistory>> ChunkHistory::fromBSON(const BSONArray& so
 ChunkType::ChunkType() = default;
 
 ChunkType::ChunkType(NamespaceString nss, ChunkRange range, ChunkVersion version, ShardId shardId)
-    : _nss(nss),
+    : _nss(std::move(nss)),
+      _min(range.getMin()),
+      _max(range.getMax()),
+      _version(version),
+      _shard(std::move(shardId)) {}
+
+ChunkType::ChunkType(NamespaceString nss,
+                     CollectionUUID collectionUUID,
+                     ChunkRange range,
+                     ChunkVersion version,
+                     ShardId shardId)
+    : _nss(std::move(nss)),
+      _collectionUUID(collectionUUID),
       _min(range.getMin()),
       _max(range.getMax()),
       _version(version),
@@ -229,6 +248,19 @@ StatusWith<ChunkType> ChunkType::parseFromConfigBSONCommand(const BSONObj& sourc
         if (!status.isOK())
             return status;
         chunk._nss = NamespaceString(chunkNS);
+    }
+
+    {
+        std::string collectionUUIDString;
+        Status status =
+            bsonExtractStringField(source, collectionUUID.name(), &collectionUUIDString);
+        if (status.isOK() && !collectionUUIDString.empty()) {
+            auto swUUID = CollectionUUID::parse(collectionUUIDString);
+            if (!swUUID.isOK()) {
+                return swUUID.getStatus();
+            }
+            chunk._collectionUUID = std::move(swUUID.getValue());
+        }
     }
 
     {
@@ -317,6 +349,8 @@ BSONObj ChunkType::toConfigBSON() const {
         builder.append(name.name(), getName());
     if (_nss)
         builder.append(ns.name(), getNS().ns());
+    if (_collectionUUID)
+        builder.append(collectionUUID.name(), getCollectionUUID().toString());
     if (_min)
         builder.append(min.name(), getMin());
     if (_max)
@@ -422,6 +456,10 @@ void ChunkType::setNS(const NamespaceString& nss) {
     _nss = nss;
 }
 
+void ChunkType::setCollectionUUID(const CollectionUUID& uuid) {
+    _collectionUUID = uuid;
+}
+
 void ChunkType::setMin(const BSONObj& min) {
     invariant(!min.isEmpty());
     _min = min;
@@ -474,13 +512,6 @@ Status ChunkType::validate() const {
                       str::stream() << "missing " << shard.name() << " field");
     }
 
-    // 'min' and 'max' must share the same fields.
-    if (_min->nFields() != _max->nFields()) {
-        return {ErrorCodes::BadValue,
-                str::stream() << "min and max don't have the same number of keys: " << *_min << ", "
-                              << *_max};
-    }
-
     BSONObjIterator minIt(getMin());
     BSONObjIterator maxIt(getMax());
     while (minIt.more() && maxIt.more()) {
@@ -492,6 +523,12 @@ Status ChunkType::validate() const {
                                   << *_max};
         }
     }
+
+    // 'min' and 'max' must share the same fields.
+    if (minIt.more() || maxIt.more())
+        return {ErrorCodes::BadValue,
+                str::stream() << "min and max don't have the same number of keys: " << *_min << ", "
+                              << *_max};
 
     // 'max' should be greater than 'min'.
     if (_min->woCompare(getMax()) >= 0) {

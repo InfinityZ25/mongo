@@ -50,12 +50,12 @@ public:
     void startSession(transport::SessionHandle session) override {
         stdx::unique_lock<Latch> lk(_mutex);
         _sessions.push_back(std::move(session));
-        LOGV2(23032, "started session");
+        LOGV2(2303201, "started session");
         _cv.notify_one();
     }
 
     void endAllSessions(transport::Session::TagMask tags) override {
-        LOGV2(23033, "end all sessions");
+        LOGV2(2303301, "end all sessions");
         std::vector<transport::SessionHandle> old_sessions;
         {
             stdx::unique_lock<Latch> lock(_mutex);
@@ -79,7 +79,8 @@ public:
         return _sessions.size();
     }
 
-    DbResponse handleRequest(OperationContext* opCtx, const Message& request) override {
+    Future<DbResponse> handleRequest(OperationContext* opCtx,
+                                     const Message& request) noexcept override {
         MONGO_UNREACHABLE;
     }
 
@@ -191,7 +192,8 @@ public:
         return 0;
     }
 
-    DbResponse handleRequest(OperationContext* opCtx, const Message& request) override {
+    Future<DbResponse> handleRequest(OperationContext* opCtx,
+                                     const Message& request) noexcept override {
         MONGO_UNREACHABLE;
     }
 
@@ -235,9 +237,7 @@ public:
     TimeoutSyncSEP(Mode mode) : _mode(mode) {}
 
     void startSession(transport::SessionHandle session) override {
-        LOGV2(23040,
-              "Accepted connection from {session_remote}",
-              "session_remote"_attr = session->remote());
+        LOGV2(23040, "Accepted connection", "remote"_attr = session->remote());
         startWorkerThread([this, session = std::move(session)]() mutable {
             LOGV2(23041, "waiting for message");
             session->setTimeout(Milliseconds{500});
@@ -333,9 +333,7 @@ TEST(TransportLayerASIO, SourceSyncTimeoutSucceeds) {
 class TimeoutSwitchModesSEP : public TimeoutSEP {
 public:
     void startSession(transport::SessionHandle session) override {
-        LOGV2(23044,
-              "Accepted connection from {session_remote}",
-              "session_remote"_attr = session->remote());
+        LOGV2(23044, "Accepted connection", "remote"_attr = session->remote());
         startWorkerThread([this, session = std::move(session)]() mutable {
             LOGV2(23045, "waiting for message");
             auto sourceMessage = [&] { return session->sourceMessage().getStatus(); };

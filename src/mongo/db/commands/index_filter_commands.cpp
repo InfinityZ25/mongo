@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -50,6 +50,7 @@
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/collection_query_info.h"
+#include "mongo/db/query/query_settings_decoration.h"
 #include "mongo/logv2/log.h"
 #include "mongo/stdx/unordered_set.h"
 
@@ -64,17 +65,17 @@ using namespace mongo;
  * Retrieves a collection's query settings and plan cache from the database.
  */
 static Status getQuerySettingsAndPlanCache(OperationContext* opCtx,
-                                           Collection* collection,
+                                           const CollectionPtr& collection,
                                            const string& ns,
                                            QuerySettings** querySettingsOut,
                                            PlanCache** planCacheOut) {
     *querySettingsOut = nullptr;
     *planCacheOut = nullptr;
-    if (nullptr == collection) {
+    if (!collection) {
         return Status(ErrorCodes::BadValue, "no such collection");
     }
 
-    QuerySettings* querySettings = CollectionQueryInfo::get(collection).getQuerySettings();
+    QuerySettings* querySettings = QuerySettingsDecoration::get(collection->getSharedDecorations());
     invariant(querySettings);
 
     *querySettingsOut = querySettings;
@@ -265,8 +266,9 @@ Status ClearFilters::clear(OperationContext* opCtx,
         planCache->remove(*cq).transitional_ignore();
 
         LOGV2(20479,
-              "Removed index filter on {cq_Short}",
-              "cq_Short"_attr = redact(cq->toStringShort()));
+              "Removed index filter on {query}",
+              "Removed index filter on query",
+              "query"_attr = redact(cq->toStringShort()));
 
         return Status::OK();
     }
@@ -322,7 +324,10 @@ Status ClearFilters::clear(OperationContext* opCtx,
         planCache->remove(*cq).transitional_ignore();
     }
 
-    LOGV2(20480, "Removed all index filters for collection: {ns}", "ns"_attr = ns);
+    LOGV2(20480,
+          "Removed all index filters for collection: {namespace}",
+          "Removed all index filters for collection",
+          "namespace"_attr = ns);
 
     return Status::OK();
 }
@@ -400,9 +405,10 @@ Status SetFilter::set(OperationContext* opCtx,
     planCache->remove(*cq).transitional_ignore();
 
     LOGV2(20481,
-          "Index filter set on {cq_Short} {indexesElt}",
-          "cq_Short"_attr = redact(cq->toStringShort()),
-          "indexesElt"_attr = indexesElt);
+          "Index filter set on {query} {indexes}",
+          "Index filter set on query",
+          "query"_attr = redact(cq->toStringShort()),
+          "indexes"_attr = indexesElt);
 
     return Status::OK();
 }

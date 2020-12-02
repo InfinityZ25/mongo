@@ -48,7 +48,7 @@
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/mock_yield_policies.h"
-#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_executor_factory.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/stage_builder.h"
 #include "mongo/dbtests/dbtests.h"
@@ -90,6 +90,7 @@ protected:
         _source.reset();
 
         dbtests::WriteContextForTests ctx(opCtx(), nss.ns());
+        _coll = ctx.getCollection();
 
         auto qr = std::make_unique<QueryRequest>(nss);
         if (hint) {
@@ -98,11 +99,11 @@ protected:
         auto cq = uassertStatusOK(CanonicalQuery::canonicalize(opCtx(), std::move(qr)));
 
         auto exec = uassertStatusOK(
-            getExecutor(opCtx(), ctx.getCollection(), std::move(cq), PlanExecutor::NO_YIELD, 0));
+            getExecutor(opCtx(), &_coll, std::move(cq), PlanYieldPolicy::YieldPolicy::NO_YIELD, 0));
 
         exec->saveState();
         _source = DocumentSourceCursor::create(
-            ctx.getCollection(), std::move(exec), _ctx, DocumentSourceCursor::CursorType::kRegular);
+            _coll, std::move(exec), _ctx, DocumentSourceCursor::CursorType::kRegular);
     }
 
     intrusive_ptr<ExpressionContextForTest> ctx() {
@@ -131,6 +132,7 @@ private:
     // It is important that these are ordered to ensure correct destruction order.
     intrusive_ptr<ExpressionContextForTest> _ctx;
     intrusive_ptr<DocumentSourceCursor> _source;
+    CollectionPtr _coll;
 };
 
 /** Create a DocumentSourceCursor. */
@@ -312,11 +314,11 @@ TEST_F(DocumentSourceCursorTest, TailableAwaitDataCursorShouldErrorAfterTimeout)
     auto canonicalQuery = unittest::assertGet(
         CanonicalQuery::canonicalize(opCtx(), std::move(queryRequest), nullptr));
     auto planExecutor =
-        uassertStatusOK(PlanExecutor::make(std::move(canonicalQuery),
-                                           std::move(workingSet),
-                                           std::move(collectionScan),
-                                           readLock.getCollection(),
-                                           PlanExecutor::YieldPolicy::ALWAYS_TIME_OUT));
+        uassertStatusOK(plan_executor_factory::make(std::move(canonicalQuery),
+                                                    std::move(workingSet),
+                                                    std::move(collectionScan),
+                                                    &readLock.getCollection(),
+                                                    PlanYieldPolicy::YieldPolicy::ALWAYS_TIME_OUT));
 
     // Make a DocumentSourceCursor.
     ctx()->tailableMode = TailableModeEnum::kTailableAndAwaitData;
@@ -353,11 +355,11 @@ TEST_F(DocumentSourceCursorTest, NonAwaitDataCursorShouldErrorAfterTimeout) {
     auto canonicalQuery = unittest::assertGet(
         CanonicalQuery::canonicalize(opCtx(), std::move(queryRequest), nullptr));
     auto planExecutor =
-        uassertStatusOK(PlanExecutor::make(std::move(canonicalQuery),
-                                           std::move(workingSet),
-                                           std::move(collectionScan),
-                                           readLock.getCollection(),
-                                           PlanExecutor::YieldPolicy::ALWAYS_TIME_OUT));
+        uassertStatusOK(plan_executor_factory::make(std::move(canonicalQuery),
+                                                    std::move(workingSet),
+                                                    std::move(collectionScan),
+                                                    &readLock.getCollection(),
+                                                    PlanYieldPolicy::YieldPolicy::ALWAYS_TIME_OUT));
 
     // Make a DocumentSourceCursor.
     ctx()->tailableMode = TailableModeEnum::kNormal;
@@ -402,12 +404,12 @@ TEST_F(DocumentSourceCursorTest, TailableAwaitDataCursorShouldErrorAfterBeingKil
     queryRequest->setTailableMode(TailableModeEnum::kTailableAndAwaitData);
     auto canonicalQuery = unittest::assertGet(
         CanonicalQuery::canonicalize(opCtx(), std::move(queryRequest), nullptr));
-    auto planExecutor =
-        uassertStatusOK(PlanExecutor::make(std::move(canonicalQuery),
-                                           std::move(workingSet),
-                                           std::move(collectionScan),
-                                           readLock.getCollection(),
-                                           PlanExecutor::YieldPolicy::ALWAYS_MARK_KILLED));
+    auto planExecutor = uassertStatusOK(
+        plan_executor_factory::make(std::move(canonicalQuery),
+                                    std::move(workingSet),
+                                    std::move(collectionScan),
+                                    &readLock.getCollection(),
+                                    PlanYieldPolicy::YieldPolicy::ALWAYS_MARK_KILLED));
 
     // Make a DocumentSourceCursor.
     ctx()->tailableMode = TailableModeEnum::kTailableAndAwaitData;
@@ -442,12 +444,12 @@ TEST_F(DocumentSourceCursorTest, NormalCursorShouldErrorAfterBeingKilled) {
     queryRequest->setFilter(filter);
     auto canonicalQuery = unittest::assertGet(
         CanonicalQuery::canonicalize(opCtx(), std::move(queryRequest), nullptr));
-    auto planExecutor =
-        uassertStatusOK(PlanExecutor::make(std::move(canonicalQuery),
-                                           std::move(workingSet),
-                                           std::move(collectionScan),
-                                           readLock.getCollection(),
-                                           PlanExecutor::YieldPolicy::ALWAYS_MARK_KILLED));
+    auto planExecutor = uassertStatusOK(
+        plan_executor_factory::make(std::move(canonicalQuery),
+                                    std::move(workingSet),
+                                    std::move(collectionScan),
+                                    &readLock.getCollection(),
+                                    PlanYieldPolicy::YieldPolicy::ALWAYS_MARK_KILLED));
 
     // Make a DocumentSourceCursor.
     ctx()->tailableMode = TailableModeEnum::kNormal;

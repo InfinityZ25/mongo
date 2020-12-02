@@ -1,7 +1,9 @@
 // Cannot implicitly shard accessed collections because queries on a sharded collection are not
 // able to be covered when they aren't on the shard key since the document needs to be fetched in
 // order to apply the SHARDING_FILTER stage.
-// @tags: [assumes_unsharded_collection]
+// @tags: [
+//   assumes_unsharded_collection,
+// ]
 
 // Compound index covered query tests
 
@@ -13,7 +15,7 @@ coll.drop();
 for (i = 0; i < 100; i++) {
     coll.insert({a: i, b: "strvar_" + (i % 13), c: NumberInt(i % 10)});
 }
-coll.ensureIndex({a: 1, b: -1, c: 1});
+coll.createIndex({a: 1, b: -1, c: 1});
 
 // Test equality - all indexed fields queried and projected
 var plan = coll.find({a: 10, b: "strvar_10", c: 0}, {a: 1, b: 1, c: 1, _id: 0})

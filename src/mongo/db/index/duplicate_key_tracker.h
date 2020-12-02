@@ -35,6 +35,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/index_catalog_entry.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/storage/key_string.h"
 #include "mongo/db/storage/temporary_record_store.h"
 
 namespace mongo {
@@ -52,20 +53,30 @@ class DuplicateKeyTracker {
 public:
     /**
      * Creates a temporary table in which to store any duplicate key constraint violations.
-     * deleteTemporaryTable() must be called before destruction.
+     * finalizeTemporaryTable() must be called before destruction.
      */
     DuplicateKeyTracker(OperationContext* opCtx, const IndexCatalogEntry* indexCatalogEntry);
 
     /**
-     * Deletes the temporary table for the duplicate key constraint violations. Must be called
-     * before object destruction.
+     * Finds the temporary table associated with storing any duplicate key constraint violations for
+     * this index build. Only used when resuming an index build and the temporary table already
+     * exists on disk. finalizeTemporaryTable() must be called before destruction.
      */
-    void deleteTemporaryTable(OperationContext* opCtx);
+    DuplicateKeyTracker(OperationContext* opCtx,
+                        const IndexCatalogEntry* indexCatalogEntry,
+                        StringData ident);
 
     /**
-     * Given a set of duplicate keys, insert them into the key constraint table.
+     * Deletes or keeps the temporary table for the duplicate key constraint violations. Must be
+     * called before object destruction.
      */
-    Status recordKeys(OperationContext* opCtx, const std::vector<BSONObj>& keys);
+    void finalizeTemporaryTable(OperationContext* opCtx,
+                                TemporaryRecordStore::FinalizationAction action);
+
+    /**
+     * Given a duplicate key, insert it into the key constraint table.
+     */
+    Status recordKey(OperationContext* opCtx, const KeyString::Value& key);
 
     /**
      * Returns Status::OK if all previously recorded duplicate key constraint violations have been
@@ -75,6 +86,10 @@ public:
      * Must not be in a WriteUnitOfWork.
      */
     Status checkConstraints(OperationContext* opCtx) const;
+
+    std::string getTableIdent() const {
+        return _keyConstraintsTable->rs()->getIdent();
+    }
 
 private:
     const IndexCatalogEntry* _indexCatalogEntry;

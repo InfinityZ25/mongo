@@ -7,7 +7,9 @@
  * the RECOVERING state. A restarted node with an ephemeral storage engine will not have an oplog
  * upon restart, so will immediately resync.
  *
- * @tags: [requires_persistence, requires_fcv_44]
+ * @tags: [
+ *   requires_persistence,
+ * ]
  *
  * Replica Set Setup:
  *
@@ -32,10 +34,6 @@
 "use strict";
 
 load('jstests/replsets/rslib.js');
-
-function getFirstOplogEntry(conn) {
-    return conn.getDB('local').oplog.rs.find().sort({$natural: 1}).limit(1)[0];
-}
 
 /**
  * Overflows the oplog of a given node.

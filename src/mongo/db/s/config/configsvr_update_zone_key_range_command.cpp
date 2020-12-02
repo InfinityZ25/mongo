@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -106,14 +106,13 @@ public:
             uassertStatusOK(UpdateZoneKeyRangeRequest::parseFromConfigCommand(cmdObj));
 
         if (parsedRequest.isRemove()) {
-            uassertStatusOK(ShardingCatalogManager::get(opCtx)->removeKeyRangeFromZone(
-                opCtx, parsedRequest.getNS(), parsedRequest.getRange()));
+            ShardingCatalogManager::get(opCtx)->removeKeyRangeFromZone(
+                opCtx, parsedRequest.getNS(), parsedRequest.getRange());
         } else {
-            uassertStatusOK(ShardingCatalogManager::get(opCtx)->assignKeyRangeToZone(
-                opCtx,
-                parsedRequest.getNS(),
-                parsedRequest.getRange(),
-                parsedRequest.getZoneName()));
+            ShardingCatalogManager::get(opCtx)->assignKeyRangeToZone(opCtx,
+                                                                     parsedRequest.getNS(),
+                                                                     parsedRequest.getRange(),
+                                                                     parsedRequest.getZoneName());
         }
 
         return true;

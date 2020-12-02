@@ -61,7 +61,7 @@ selector:
   - jstests/concurrency/fsm_workloads/findAndModify_update_grow.js
 
 
-  # cannot ensureIndex after dropDatabase without sharding first
+  # cannot createIndex after dropDatabase without sharding first
   - jstests/concurrency/fsm_workloads/plan_cache_drop_database.js
 
   # reIndex is not supported in mongos.
@@ -92,8 +92,8 @@ selector:
   - jstests/concurrency/fsm_workloads/yield_and_hashed.js
   - jstests/concurrency/fsm_workloads/yield_and_sorted.js
 
-  # TODO Unblacklist (SERVER-35538).
-  - jstests/concurrency/fsm_workloads/database_versioning.js
+  # Inserts directly into system.views using applyOps, which is not available on mongos.
+  - jstests/concurrency/fsm_workloads/view_catalog_direct_system_writes.js
 
   exclude_with_any_tags:
   - does_not_support_causal_consistency
@@ -105,6 +105,8 @@ selector:
   # secondary doesn't make much sense, since there's no guarantee *which* secondary you get results
   # from.
   - uses_curop_agg_stage
+  # mongos has no system.profile collection.
+  - requires_profiling
 
 executor:
   archive:
@@ -122,8 +124,6 @@ executor:
           usingReplicaSetShards: true
           runningWithAutoSplit: false
           runningWithBalancer: false
-      eval: >-
-        load('jstests/libs/override_methods/causally_consistent_index_builds.js');
   hooks:
   - class: CheckReplDBHashInBackground
   - class: CheckReplDBHash
@@ -143,6 +143,7 @@ executor:
     mongod_options:
       set_parameters:
         enableTestCommands: 1
+        roleGraphInvalidationIsFatal: 1
     num_rs_nodes_per_shard: 3
     num_shards: 2
     num_mongos: 2

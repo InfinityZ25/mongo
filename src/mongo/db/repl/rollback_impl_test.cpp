@@ -26,7 +26,7 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplicationRollback
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationRollback
 
 #include "mongo/platform/basic.h"
 
@@ -528,7 +528,11 @@ TEST_F(RollbackImplTest, RollbackKillsNecessaryOperations) {
 
     // Run rollback in a separate thread so the locking threads can check for interrupt.
     Status status(ErrorCodes::InternalError, "Not set");
-    stdx::thread rollbackThread([&] { status = _rollback->runRollback(_opCtx.get()); });
+    stdx::thread rollbackThread([&] {
+        ThreadClient tc(getGlobalServiceContext());
+        auto opCtx = tc.get()->makeOperationContext();
+        status = _rollback->runRollback(opCtx.get());
+    });
 
     while (!(writeOpCtx->isKillPending() && readOpCtx->isKillPending())) {
         // Do nothing.
@@ -665,7 +669,7 @@ TEST_F(RollbackImplTest, RollbackCallsRecoverToStableTimestamp) {
 
 DEATH_TEST_REGEX_F(RollbackImplTest,
                    RollbackFassertsIfRecoverToStableTimestampFails,
-                   "Fatal assertion.*45847000") {
+                   "Fatal assertion.*4584700") {
     auto op = makeOpAndRecordId(1);
     _remoteOplog->setOperations({op});
     ASSERT_OK(_insertOplogEntry(op.first));
@@ -1444,7 +1448,9 @@ RollbackImplTest::_setUpUnpreparedTransactionForCountTest(UUID collId) {
                                          boost::none,                // statementId
                                          OpTime(),                   // prevWriteOpTimeInTransaction
                                          boost::none,                // preImageOpTime
-                                         boost::none);               // postImageOpTime
+                                         boost::none,                // postImageOpTime
+                                         boost::none,   // ShardId of resharding recipient
+                                         boost::none);  // _id
     ASSERT_OK(_insertOplogEntry(partialApplyOpsOplogEntry.toBSON()));
     ops.push_back(std::make_pair(partialApplyOpsOplogEntry.toBSON(), insertOp2.second));
 
@@ -1475,7 +1481,9 @@ RollbackImplTest::_setUpUnpreparedTransactionForCountTest(UUID collId) {
                                         boost::none,                // statementId
                                         partialApplyOpsOpTime,      // prevWriteOpTimeInTransaction
                                         boost::none,                // preImageOpTime
-                                        boost::none);               // postImageOpTime
+                                        boost::none,                // postImageOpTime
+                                        boost::none,   // ShardId of resharding recipient
+                                        boost::none);  // _id
     ASSERT_OK(_insertOplogEntry(commitApplyOpsOplogEntry.toBSON()));
     ops.push_back(std::make_pair(commitApplyOpsOplogEntry.toBSON(), insertOp3.second));
 
@@ -1723,19 +1731,11 @@ TEST_F(RollbackImplObserverInfoTest, NamespacesForOpsExtractsNamespacesOfCollMod
 }
 
 TEST_F(RollbackImplObserverInfoTest, NamespacesForOpsFailsOnUnsupportedOplogEntry) {
-    // 'convertToCapped' is not supported in rollback.
-    auto convertToCappedOp =
-        makeCommandOp(Timestamp(2, 2), boost::none, "test.$cmd", BSON("convertToCapped" << 1), 2);
-
-    auto status =
-        _rollback->_namespacesForOp_forTest(OplogEntry(convertToCappedOp.first)).getStatus();
-    ASSERT_EQUALS(ErrorCodes::UnrecoverableRollbackError, status);
-
     // 'emptycapped' is not supported in rollback.
     auto emptycappedOp =
         makeCommandOp(Timestamp(2, 2), boost::none, "test.$cmd", BSON("emptycapped" << 1), 2);
 
-    status = _rollback->_namespacesForOp_forTest(OplogEntry(emptycappedOp.first)).getStatus();
+    auto status = _rollback->_namespacesForOp_forTest(OplogEntry(emptycappedOp.first)).getStatus();
     ASSERT_EQUALS(ErrorCodes::UnrecoverableRollbackError, status);
 }
 

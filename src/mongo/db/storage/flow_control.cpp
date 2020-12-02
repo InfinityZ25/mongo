@@ -27,8 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
-#define DEBUG_LOG_LEVEL 4
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -47,6 +46,8 @@
 #include "mongo/logv2/log.h"
 #include "mongo/util/background.h"
 #include "mongo/util/fail_point.h"
+
+#define DEBUG_LOG_LEVEL 4
 
 namespace mongo {
 
@@ -105,9 +106,10 @@ bool sustainerAdvanced(const std::vector<repl::MemberData>& prevMemberData,
     if (currMemberData.size() == 0 || currMemberData.size() != prevMemberData.size()) {
         LOGV2_WARNING(22223,
                       "Flow control detected a change in topology. PrevMemberSize: "
-                      "{prevMemberData_size} CurrMemberSize: {currMemberData_size}",
-                      "prevMemberData_size"_attr = prevMemberData.size(),
-                      "currMemberData_size"_attr = currMemberData.size());
+                      "{prevSize} CurrMemberSize: {currSize}",
+                      "Flow control detected a change in topology",
+                      "prevSize"_attr = prevMemberData.size(),
+                      "currSize"_attr = currMemberData.size());
         return false;
     }
 
@@ -117,9 +119,10 @@ bool sustainerAdvanced(const std::vector<repl::MemberData>& prevMemberData,
     if (currSustainerAppliedTs < prevSustainerAppliedTs) {
         LOGV2_WARNING(22224,
                       "Flow control's sustainer time decreased. PrevSustainer: "
-                      "{prevSustainerAppliedTs} CurrSustainer: {currSustainerAppliedTs}",
-                      "prevSustainerAppliedTs"_attr = prevSustainerAppliedTs,
-                      "currSustainerAppliedTs"_attr = currSustainerAppliedTs);
+                      "{prevApplied} CurrSustainer: {currApplied}",
+                      "Flow control's sustainer time decreased",
+                      "prevApplied"_attr = prevSustainerAppliedTs,
+                      "currApplied"_attr = currSustainerAppliedTs);
         return false;
     }
 
@@ -138,7 +141,7 @@ FlowControl::FlowControl(ServiceContext* service, repl::ReplicationCoordinator* 
       _lastTimeSustainerAdvanced(Date_t::now()) {
     // Initialize _lastTargetTicketsPermitted to maximum tickets to make sure flow control doesn't
     // cause a slow start on start up.
-    FlowControlTicketholder::set(service, std::make_unique<FlowControlTicketholder>(_kMaxTickets));
+    FlowControlTicketholder::set(service, std::make_unique<FlowControlTicketholder>(kMaxTickets));
 
     _jobAnchor = service->getPeriodicRunner()->makeJob(
         {"FlowControlRefresher",
@@ -164,6 +167,14 @@ FlowControl* FlowControl::get(OperationContext* ctx) {
 void FlowControl::set(ServiceContext* service, std::unique_ptr<FlowControl> flowControl) {
     auto& globalFlow = getFlowControl(service);
     globalFlow = std::move(flowControl);
+}
+
+void FlowControl::shutdown(ServiceContext* service) {
+    auto& globalFlow = getFlowControl(service);
+    if (globalFlow) {
+        globalFlow->_jobAnchor.stop();
+        globalFlow.reset();
+    }
 }
 
 /**
@@ -214,6 +225,10 @@ BSONObj FlowControl::generateSection(OperationContext* opCtx,
     return bob.obj();
 }
 
+void FlowControl::disableUntil(Date_t deadline) {
+    _disableUntil.store(deadline);
+}
+
 /**
  * Advance the `_*MemberData` fields and sort the new data by the element's last applied optime.
  */
@@ -247,7 +262,7 @@ int FlowControl::_calculateNewTicketsForLag(const std::vector<repl::MemberData>&
     const std::int64_t sustainerAppliedCount =
         _approximateOpsBetween(prevSustainerAppliedTs, currSustainerAppliedTs);
     LOGV2_DEBUG(22218,
-                logSeverityV1toV2(DEBUG_LOG_LEVEL).toInt(),
+                DEBUG_LOG_LEVEL,
                 " PrevApplied: {prevSustainerAppliedTs} CurrApplied: {currSustainerAppliedTs} "
                 "NumSustainerApplied: {sustainerAppliedCount}",
                 "prevSustainerAppliedTs"_attr = prevSustainerAppliedTs,
@@ -273,7 +288,7 @@ int FlowControl::_calculateNewTicketsForLag(const std::vector<repl::MemberData>&
     if (sustainerAppliedCount == -1) {
         // We don't know how many ops the sustainer applied. Hand out less tickets than were
         // used in the last period.
-        return std::min(static_cast<int>(locksUsedLastPeriod / 2.0), _kMaxTickets);
+        return std::min(static_cast<int>(locksUsedLastPeriod / 2.0), kMaxTickets);
     }
 
     // Given a "sustainer rate", this function wants to calculate what fraction the primary should
@@ -297,7 +312,7 @@ int FlowControl::_calculateNewTicketsForLag(const std::vector<repl::MemberData>&
     double sustainerAppliedPenalty =
         sustainerAppliedCount * reduce * gFlowControlFudgeFactor.load();
     LOGV2_DEBUG(22219,
-                logSeverityV1toV2(DEBUG_LOG_LEVEL).toInt(),
+                DEBUG_LOG_LEVEL,
                 "Sustainer: {sustainerAppliedCount} LagMillis: {lagMillis} Threshold lag: "
                 "{thresholdLagMillis} Exponent: {exponent} Reduce: {reduce} Penalty: "
                 "{sustainerAppliedPenalty}",
@@ -308,10 +323,16 @@ int FlowControl::_calculateNewTicketsForLag(const std::vector<repl::MemberData>&
                 "reduce"_attr = reduce,
                 "sustainerAppliedPenalty"_attr = sustainerAppliedPenalty);
 
-    return multiplyWithOverflowCheck(locksPerOp, sustainerAppliedPenalty, _kMaxTickets);
+    return multiplyWithOverflowCheck(locksPerOp, sustainerAppliedPenalty, kMaxTickets);
 }
 
-int FlowControl::getNumTickets() {
+int FlowControl::getNumTickets(Date_t now) {
+    // Flow control can be disabled until a certain deadline is passed.
+    const Date_t disabledUntil = _disableUntil.load();
+    if (now < disabledUntil) {
+        return kMaxTickets;
+    }
+
     // Flow Control is only enabled on nodes that can accept writes.
     const bool canAcceptWrites = _replCoord->canAcceptNonLocalWrites();
 
@@ -333,7 +354,7 @@ int FlowControl::getNumTickets() {
         gFlowControlEnabled.load() == false || canAcceptWrites == false || locksPerOp < 0.0) {
         _trimSamples(std::min(lastCommitted.opTime.getTimestamp(),
                               getMedianAppliedTimestamp(_prevMemberData)));
-        return _kMaxTickets;
+        return kMaxTickets;
     }
 
     int ret = 0;
@@ -360,7 +381,7 @@ int FlowControl::getNumTickets() {
         ret = multiplyWithOverflowCheck(_lastTargetTicketsPermitted.load() +
                                             gFlowControlTicketAdderConstant.load(),
                                         gFlowControlTicketMultiplierConstant.load(),
-                                        _kMaxTickets);
+                                        kMaxTickets);
         _lastTimeSustainerAdvanced = Date_t::now();
         if (_isLagged.load()) {
             _isLagged.store(false);
@@ -394,29 +415,20 @@ int FlowControl::getNumTickets() {
 
     ret = std::max(ret, gFlowControlMinTicketsPerSecond.load());
 
-    LOGV2_DEBUG(
-        22220,
-        logSeverityV1toV2(DEBUG_LOG_LEVEL).toInt(),
-        "Are lagged? {isLagged_load_true_false} Curr lag millis: "
-        "{getLagMillis_myLastApplied_wallTime_lastCommitted_wallTime} OpsLagged: "
-        "{approximateOpsBetween_lastCommitted_opTime_getTimestamp_myLastApplied_opTime_"
-        "getTimestamp} Granting: {ret} Last granted: {lastTargetTicketsPermitted_load} Last "
-        "sustainer applied: {lastSustainerAppliedCount_load} Acquisitions since last check: "
-        "{locksUsedLastPeriod} Locks per op: {lastLocksPerOp_load} Count of lagged periods: "
-        "{isLaggedCount_load} Total duration of lagged periods: {isLaggedTimeMicros_load}",
-        "isLagged_load_true_false"_attr = (_isLagged.load() ? "true" : "false"),
-        "getLagMillis_myLastApplied_wallTime_lastCommitted_wallTime"_attr =
-            getLagMillis(myLastApplied.wallTime, lastCommitted.wallTime),
-        "approximateOpsBetween_lastCommitted_opTime_getTimestamp_myLastApplied_opTime_getTimestamp"_attr =
-            _approximateOpsBetween(lastCommitted.opTime.getTimestamp(),
-                                   myLastApplied.opTime.getTimestamp()),
-        "ret"_attr = ret,
-        "lastTargetTicketsPermitted_load"_attr = _lastTargetTicketsPermitted.load(),
-        "lastSustainerAppliedCount_load"_attr = _lastSustainerAppliedCount.load(),
-        "locksUsedLastPeriod"_attr = locksUsedLastPeriod,
-        "lastLocksPerOp_load"_attr = _lastLocksPerOp.load(),
-        "isLaggedCount_load"_attr = _isLaggedCount.load(),
-        "isLaggedTimeMicros_load"_attr = _isLaggedTimeMicros.load());
+    LOGV2_DEBUG(22220,
+                DEBUG_LOG_LEVEL,
+                "FlowControl debug.",
+                "isLagged"_attr = (_isLagged.load() ? "true" : "false"),
+                "currlagMillis"_attr = getLagMillis(myLastApplied.wallTime, lastCommitted.wallTime),
+                "opsLagged"_attr = _approximateOpsBetween(lastCommitted.opTime.getTimestamp(),
+                                                          myLastApplied.opTime.getTimestamp()),
+                "granting"_attr = ret,
+                "lastGranted"_attr = _lastTargetTicketsPermitted.load(),
+                "lastSustainerApplied"_attr = _lastSustainerAppliedCount.load(),
+                "acquisitionsSinceLastCheck"_attr = locksUsedLastPeriod,
+                "locksPerOp"_attr = _lastLocksPerOp.load(),
+                "countOfLaggedPeriods"_attr = _isLaggedCount.load(),
+                "totalDurationOfLaggedPeriods"_attr = _isLaggedTimeMicros.load());
 
     _lastTargetTicketsPermitted.store(ret);
 
@@ -479,7 +491,7 @@ void FlowControl::sample(Timestamp timestamp, std::uint64_t opsApplied) {
 
     const auto lockAcquisitions = stats.get(resourceIdGlobal, LockMode::MODE_IX).numAcquisitions;
     LOGV2_DEBUG(22221,
-                logSeverityV1toV2(DEBUG_LOG_LEVEL).toInt(),
+                DEBUG_LOG_LEVEL,
                 "Sampling. Time: {timestamp} Applied: {numOpsSinceStartup} LockAcquisitions: "
                 "{lockAcquisitions}",
                 "timestamp"_attr = timestamp,
@@ -514,7 +526,7 @@ void FlowControl::_trimSamples(const Timestamp trimTo) {
     }
 
     LOGV2_DEBUG(22222,
-                logSeverityV1toV2(DEBUG_LOG_LEVEL).toInt(),
+                DEBUG_LOG_LEVEL,
                 "Trimmed samples. Num: {numTrimmed}",
                 "numTrimmed"_attr = numTrimmed);
 }

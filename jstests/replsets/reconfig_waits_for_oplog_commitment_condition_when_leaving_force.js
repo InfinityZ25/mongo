@@ -2,8 +2,6 @@
  * Verify that a non force replica set reconfig waits for all oplog entries committed in the
  * previous config to be committed in the current config even if we are exiting a config that was
  * installed via a 'force' reconfig.
- *
- * @tags: [requires_fcv_44]
  */
 (function() {
 "use strict";
@@ -53,7 +51,7 @@ assert.commandWorked(primary.adminCommand({replSetReconfig: twoNodeConfig, force
 
 // Wait until the config has propagated to the secondary and the primary has learned of it, so that
 // the config replication check is satisfied.
-waitForConfigReplication(primary);
+rst.waitForConfigReplication(primary);
 
 // Reconfig should succeed even if we have not committed the last committed op in the current
 // config because the current config is from a force reconfig.

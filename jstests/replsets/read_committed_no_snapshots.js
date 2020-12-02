@@ -3,9 +3,11 @@
  *  - Reads with an 'afterOpTime' snapshot >= current time should be able to see things that
  *    happened before or at that opTime.
  *  - Reads should time out if there are no snapshots available on secondary.
+ *
+ * @tags: [requires_majority_read_concern]
  */
 
-load("jstests/replsets/rslib.js");  // For reconfig and startSetIfSupportsReadMajority.
+load("jstests/replsets/rslib.js");  // For reconfig.
 
 (function() {
 "use strict";
@@ -26,11 +28,7 @@ var replTest = new ReplSetTest({
     settings: {protocolVersion: 1}
 });
 
-if (!startSetIfSupportsReadMajority(replTest)) {
-    jsTest.log("skipping test since storage engine doesn't support committed reads");
-    replTest.stopSet();
-    return;
-}
+replTest.startSet();
 
 // Cannot wait for a stable recovery timestamp due to the no-snapshot secondary.
 replTest.initiateWithAnyNodeAsPrimary(
@@ -38,10 +36,11 @@ replTest.initiateWithAnyNodeAsPrimary(
 
 // Get connections and collection.
 var primary = replTest.getPrimary();
-var healthySecondary = replTest._slaves[0];
-healthySecondary.setSlaveOk();
-var noSnapshotSecondary = replTest._slaves[1];
-noSnapshotSecondary.setSlaveOk();
+var secondaries = replTest.getSecondaries();
+var healthySecondary = secondaries[0];
+healthySecondary.setSecondaryOk();
+var noSnapshotSecondary = secondaries[1];
+noSnapshotSecondary.setSecondaryOk();
 
 // Do a write, wait for it to replicate, and ensure it is visible.
 var res = primary.getDB(name).runCommandWithMetadata(  //

@@ -32,6 +32,7 @@
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/sort.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/stats/resource_consumption_metrics.h"
 
 namespace mongo {
 
@@ -59,28 +60,13 @@ PlanStage::StageState SortStage::doWork(WorkingSetID* out) {
         if (code == PlanStage::ADVANCED) {
             // The plan must be structured such that a previous stage has attached the sort key
             // metadata.
-            try {
-                spool(id);
-            } catch (const AssertionException&) {
-                // Propagate runtime errors using the FAILED status code.
-                *out = WorkingSetCommon::allocateStatusMember(_ws, exceptionToStatus());
-                return PlanStage::FAILURE;
-            }
-
+            spool(id);
             return PlanStage::NEED_TIME;
         } else if (code == PlanStage::IS_EOF) {
             // The child has returned all of its results. Record this fact so that subsequent calls
             // to 'doWork()' will perform sorting and unspool the sorted results.
             _populated = true;
-
-            try {
-                loadingDone();
-            } catch (const AssertionException&) {
-                // Propagate runtime errors using the FAILED status code.
-                *out = WorkingSetCommon::allocateStatusMember(_ws, exceptionToStatus());
-                return PlanStage::FAILURE;
-            }
-
+            loadingDone();
             return PlanStage::NEED_TIME;
         } else {
             *out = id;
@@ -90,6 +76,20 @@ PlanStage::StageState SortStage::doWork(WorkingSetID* out) {
     }
 
     return unspool(out);
+}
+
+void SortStageDefault::loadingDone() {
+    _sortExecutor.loadingDone();
+    auto& metricsCollector = ResourceConsumption::MetricsCollector::get(expCtx()->opCtx);
+    metricsCollector.incrementKeysSorted(_sortExecutor.stats().keysSorted);
+    metricsCollector.incrementSorterSpills(_sortExecutor.stats().spills);
+}
+
+void SortStageSimple::loadingDone() {
+    _sortExecutor.loadingDone();
+    auto& metricsCollector = ResourceConsumption::MetricsCollector::get(expCtx()->opCtx);
+    metricsCollector.incrementKeysSorted(_sortExecutor.stats().keysSorted);
+    metricsCollector.incrementSorterSpills(_sortExecutor.stats().spills);
 }
 
 std::unique_ptr<PlanStageStats> SortStage::getStats() {

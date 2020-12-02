@@ -297,9 +297,10 @@ enum QueryOptions {
     */
     QueryOption_CursorTailable = 1 << 1,
 
-    /** allow query of replica slave.  normally these return an error except for namespace "local".
+    /** allow query of replica secondary.  normally these return an error except for namespace
+     * "local".
      */
-    QueryOption_SlaveOk = 1 << 2,
+    QueryOption_SecondaryOk = 1 << 2,
 
     // In previous versions of the server, clients were required to set this option in order to
     // enable an optimized oplog scan. As of 4.4, the server will apply the optimization for
@@ -341,11 +342,11 @@ enum QueryOptions {
 
     // DBClientCursor reserves flag 1 << 30 to force the use of OP_QUERY.
 
-    QueryOption_AllSupported = QueryOption_CursorTailable | QueryOption_SlaveOk |
+    QueryOption_AllSupported = QueryOption_CursorTailable | QueryOption_SecondaryOk |
         QueryOption_NoCursorTimeout | QueryOption_AwaitData | QueryOption_Exhaust |
         QueryOption_PartialResults,
 
-    QueryOption_AllSupportedForSharding = QueryOption_CursorTailable | QueryOption_SlaveOk |
+    QueryOption_AllSupportedForSharding = QueryOption_CursorTailable | QueryOption_SecondaryOk |
         QueryOption_NoCursorTimeout | QueryOption_AwaitData | QueryOption_PartialResults,
 };
 

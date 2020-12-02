@@ -1,7 +1,11 @@
 // @tags: [
 //   does_not_support_stepdowns,
+//   # Explain reports errors from $expr differently in 4.4 and older, so this test assumes that all
+//   # nodes are at least binary version 4.7.
+//   requires_fcv_47,
 //   requires_getmore,
 //   requires_non_retryable_writes,
+//   sbe_incompatible,
 // ]
 
 // Tests for $expr in the CRUD commands.
@@ -10,9 +14,9 @@
 
 const coll = db.expr;
 
-const isMaster = db.runCommand("ismaster");
-assert.commandWorked(isMaster);
-const isMongos = (isMaster.msg === "isdbgrid");
+const hello = db.runCommand("hello");
+assert.commandWorked(hello);
+const isMongos = (hello.msg === "isdbgrid");
 
 //
 // $expr in aggregate.
@@ -113,10 +117,15 @@ assert.throws(function() {
     coll.find({$expr: {$eq: ["$a", "$$unbound"]}}).explain();
 });
 
-// $expr with division by zero in find with explain with executionStats throws.
-assert.throws(function() {
-    coll.find({$expr: {$divide: [1, "$a"]}}).explain("executionStats");
-});
+// $expr which causes a runtime error should be caught be explain and reported as an error in the
+// 'executionSuccess' field.
+let explain = coll.find({$expr: {$divide: [1, "$a"]}}).explain("executionStats");
+// Accommodate format differences between explain via mongos and explain directly on a mongod.
+if (!isMongos) {
+    assert(explain.hasOwnProperty("executionStats"), explain);
+    assert.eq(explain.executionStats.executionSuccess, false, explain);
+    assert.eq(explain.executionStats.errorCode, 16609, explain);
+}
 
 // $expr is not allowed in $elemMatch projection.
 coll.drop();
@@ -181,7 +190,7 @@ if (db.getMongo().writeMode() === "commands") {
 
 coll.drop();
 assert.commandWorked(coll.insert({geo: {type: "Point", coordinates: [0, 0]}, a: 0}));
-assert.commandWorked(coll.ensureIndex({geo: "2dsphere"}));
+assert.commandWorked(coll.createIndex({geo: "2dsphere"}));
 assert.eq(1,
           coll.aggregate({
                   $geoNear: {

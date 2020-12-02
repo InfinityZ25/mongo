@@ -4,8 +4,6 @@
  *     assumes_against_mongod_not_mongos,
  *     # Sets a failpoint on one mongod, so switching primaries would break the test.
  *     does_not_support_stepdowns,
- *     # This test depends on two concurrent ops taking concurrent collection IX locks.
- *     requires_document_locking,
  * ]
  */
 (function() {
@@ -52,7 +50,7 @@ function runSuccessfulIndexBuild(dbName, collName) {
 
 // Simulate a scenario where a createCollection succeeds before createIndexes can create the same
 // collection.
-function runConflictingCollectionCreate(testDB, dbName, collName, createConflictingIndex) {
+function runConflictingCollectionCreate(testDB, dbName, collName) {
     testColl.drop();
     assert.commandWorked(testDB.adminCommand(
         {configureFailPoint: 'hangBeforeCreateIndexesCollectionCreate', mode: 'alwaysOn'}));
@@ -71,12 +69,6 @@ function runConflictingCollectionCreate(testDB, dbName, collName, createConflict
         const res = db.getSiblingDB(dbName).runCommand({create: collName});
         jsTest.log("Create collection request expected to succeed, result: " + tojson(res));
         assert.commandWorked(res);
-
-        if (createConflictingIndex) {
-            const indexRes = db.getSiblingDB(dbName).runCommand(
-                {createIndexes: collName, indexes: [{key: {b: 1}, name: "the_b_1_index"}]});
-            assert.commandWorked(indexRes);
-        }
     } finally {
         assert.commandWorked(testDB.adminCommand(
             {configureFailPoint: 'hangBeforeCreateIndexesCollectionCreate', mode: 'off'}));
@@ -90,6 +82,5 @@ function runConflictingCollectionCreate(testDB, dbName, collName, createConflict
     assert.eq(testColl.getIndexes().length, 2);
 }
 
-runConflictingCollectionCreate(testDB, dbName, collName, /*createConflictingIndex*/ false);
-runConflictingCollectionCreate(testDB, dbName, collName, /*createConflictingIndex*/ true);
+runConflictingCollectionCreate(testDB, dbName, collName);
 })();

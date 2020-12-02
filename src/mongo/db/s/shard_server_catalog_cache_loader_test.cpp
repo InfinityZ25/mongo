@@ -30,12 +30,10 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/s/shard_server_catalog_cache_loader.h"
-
-#include "mongo/db/s/catalog_cache_loader_mock.h"
+#include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
-#include "mongo/s/shard_server_test_fixture.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/s/catalog_cache_loader_mock.h"
 
 namespace mongo {
 namespace {
@@ -80,10 +78,6 @@ public:
     vector<ChunkType> setUpChunkLoaderWithFiveChunks();
 
     const KeyPattern kKeyPattern = KeyPattern(BSON(kPattern << 1));
-    const std::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)>
-        kDoNothingCallbackFn = [](
-            OperationContext * opCtx,
-            StatusWith<CatalogCacheLoader::CollectionAndChangedChunks> swCollAndChunks) noexcept {};
 
     CatalogCacheLoaderMock* _remoteLoaderMock;
     std::unique_ptr<ShardServerCatalogCacheLoader> _shardLoader;
@@ -98,7 +92,7 @@ void ShardServerCatalogCacheLoaderTest::setUp() {
 
     // Create mock remote and real shard loader, retaining a pointer to the mock remote loader so
     // that unit tests can manipulate it to return certain responses.
-    std::unique_ptr<CatalogCacheLoaderMock> mockLoader = std::make_unique<CatalogCacheLoaderMock>();
+    auto mockLoader = std::make_unique<CatalogCacheLoaderMock>();
     _remoteLoaderMock = mockLoader.get();
     _shardLoader = std::make_unique<ShardServerCatalogCacheLoader>(std::move(mockLoader));
 
@@ -192,10 +186,7 @@ ShardServerCatalogCacheLoaderTest::makeCombinedOriginalFiveChunksAndThreeNewChun
 
 CollectionType ShardServerCatalogCacheLoaderTest::makeCollectionType(
     const ChunkVersion& collVersion) {
-    CollectionType coll;
-    coll.setNs(kNss);
-    coll.setEpoch(collVersion.epoch());
-    coll.setUpdatedAt(Date_t::fromMillisSinceEpoch(collVersion.toLong()));
+    CollectionType coll(kNss, collVersion.epoch(), Date_t::now(), UUID::gen());
     coll.setKeyPattern(kKeyPattern);
     coll.setUnique(false);
     return coll;
@@ -209,25 +200,12 @@ vector<ChunkType> ShardServerCatalogCacheLoaderTest::setUpChunkLoaderWithFiveChu
     _remoteLoaderMock->setCollectionRefreshReturnValue(collectionType);
     _remoteLoaderMock->setChunkRefreshReturnValue(chunks);
 
-    StatusWith<CatalogCacheLoader::CollectionAndChangedChunks> results{
-        Status(ErrorCodes::InternalError, "")};
-    const auto refreshCallbackFn = [&results](
-        OperationContext * opCtx,
-        StatusWith<CatalogCacheLoader::CollectionAndChangedChunks> swCollAndChunks) noexcept {
-        results = std::move(swCollAndChunks);
-    };
+    auto collAndChunksRes = _shardLoader->getChunksSince(kNss, ChunkVersion::UNSHARDED()).get();
 
-    auto notification =
-        _shardLoader->getChunksSince(kNss, ChunkVersion::UNSHARDED(), refreshCallbackFn);
-    notification->get();
-
-    // Check refreshCallbackFn thread results where we can safely throw.
-    ASSERT_OK(results.getStatus());
-    auto collAndChunkRes = results.getValue();
-    ASSERT_EQUALS(collAndChunkRes.epoch, collectionType.getEpoch());
-    ASSERT_EQUALS(collAndChunkRes.changedChunks.size(), 5UL);
-    for (unsigned int i = 0; i < collAndChunkRes.changedChunks.size(); ++i) {
-        ASSERT_BSONOBJ_EQ(collAndChunkRes.changedChunks[i].toShardBSON(), chunks[i].toShardBSON());
+    ASSERT_EQUALS(collAndChunksRes.epoch, collectionType.getEpoch());
+    ASSERT_EQUALS(collAndChunksRes.changedChunks.size(), 5UL);
+    for (unsigned int i = 0; i < collAndChunksRes.changedChunks.size(); ++i) {
+        ASSERT_BSONOBJ_EQ(collAndChunksRes.changedChunks[i].toShardBSON(), chunks[i].toShardBSON());
     }
 
     return chunks;
@@ -239,19 +217,10 @@ TEST_F(ShardServerCatalogCacheLoaderTest, PrimaryLoadFromUnshardedToUnsharded) {
     Status errorStatus = Status(ErrorCodes::NamespaceNotFound, "collection not found");
     _remoteLoaderMock->setCollectionRefreshReturnValue(errorStatus);
 
-    StatusWith<CatalogCacheLoader::CollectionAndChangedChunks> results{
-        Status(ErrorCodes::InternalError, "")};
-    const auto refreshCallbackFn = [&results](
-        OperationContext * opCtx,
-        StatusWith<CatalogCacheLoader::CollectionAndChangedChunks> swCollAndChunks) noexcept {
-        results = std::move(swCollAndChunks);
-    };
-
-    auto notification =
-        _shardLoader->getChunksSince(kNss, ChunkVersion::UNSHARDED(), refreshCallbackFn);
-    notification->get();
-
-    ASSERT_EQUALS(results.getStatus(), errorStatus);
+    ASSERT_THROWS_CODE_AND_WHAT(_shardLoader->getChunksSince(kNss, ChunkVersion::UNSHARDED()).get(),
+                                DBException,
+                                errorStatus.code(),
+                                errorStatus.reason());
 }
 
 TEST_F(ShardServerCatalogCacheLoaderTest, PrimaryLoadFromShardedToUnsharded) {
@@ -265,19 +234,11 @@ TEST_F(ShardServerCatalogCacheLoaderTest, PrimaryLoadFromShardedToUnsharded) {
     Status errorStatus = Status(ErrorCodes::NamespaceNotFound, "collection not found");
     _remoteLoaderMock->setCollectionRefreshReturnValue(errorStatus);
 
-    StatusWith<CatalogCacheLoader::CollectionAndChangedChunks> results{
-        Status(ErrorCodes::InternalError, "")};
-    const auto nextRefreshCallbackFn = [&results](
-        OperationContext * opCtx,
-        StatusWith<CatalogCacheLoader::CollectionAndChangedChunks> swCollAndChunks) noexcept {
-        results = std::move(swCollAndChunks);
-    };
-
-    auto notification =
-        _shardLoader->getChunksSince(kNss, chunks.back().getVersion(), nextRefreshCallbackFn);
-    notification->get();
-
-    ASSERT_EQUALS(results.getStatus(), errorStatus);
+    ASSERT_THROWS_CODE_AND_WHAT(
+        _shardLoader->getChunksSince(kNss, chunks.back().getVersion()).get(),
+        DBException,
+        errorStatus.code(),
+        errorStatus.reason());
 }
 
 TEST_F(ShardServerCatalogCacheLoaderTest, PrimaryLoadFromShardedAndFindNoDiff) {
@@ -292,22 +253,10 @@ TEST_F(ShardServerCatalogCacheLoaderTest, PrimaryLoadFromShardedAndFindNoDiff) {
     lastChunk.push_back(chunks.back());
     _remoteLoaderMock->setChunkRefreshReturnValue(lastChunk);
 
-    StatusWith<CatalogCacheLoader::CollectionAndChangedChunks> results{
-        Status(ErrorCodes::InternalError, "")};
-    const auto refreshCallbackFn = [&results](
-        OperationContext * opCtx,
-        StatusWith<CatalogCacheLoader::CollectionAndChangedChunks> swCollAndChunks) noexcept {
-        results = std::move(swCollAndChunks);
-    };
-
-    auto notification =
-        _shardLoader->getChunksSince(kNss, chunks.back().getVersion(), refreshCallbackFn);
-    notification->get();
+    auto collAndChunksRes = _shardLoader->getChunksSince(kNss, chunks.back().getVersion()).get();
 
     // Check that refreshing from the latest version returned a single document matching that
     // version.
-    ASSERT_OK(results.getStatus());
-    auto collAndChunksRes = results.getValue();
     ASSERT_EQUALS(collAndChunksRes.epoch, chunks.back().getVersion().epoch());
     ASSERT_EQUALS(collAndChunksRes.changedChunks.size(), 1UL);
     ASSERT_BSONOBJ_EQ(collAndChunksRes.changedChunks.back().toShardBSON(),
@@ -328,21 +277,7 @@ TEST_F(ShardServerCatalogCacheLoaderTest, PrimaryLoadFromShardedAndFindNoDiffReq
     lastChunk.push_back(chunks.back());
     _remoteLoaderMock->setChunkRefreshReturnValue(lastChunk);
 
-    StatusWith<CatalogCacheLoader::CollectionAndChangedChunks> results{
-        Status(ErrorCodes::InternalError, "")};
-    const auto completeRefreshCallbackFn = [&results](
-        OperationContext * opCtx,
-        StatusWith<CatalogCacheLoader::CollectionAndChangedChunks> swCollAndChunks) noexcept {
-        results = std::move(swCollAndChunks);
-    };
-
-    auto notification =
-        _shardLoader->getChunksSince(kNss, ChunkVersion::UNSHARDED(), completeRefreshCallbackFn);
-    notification->get();
-
-    // Check that the complete routing table was returned successfully.
-    ASSERT_OK(results.getStatus());
-    auto collAndChunksRes = results.getValue();
+    auto collAndChunksRes = _shardLoader->getChunksSince(kNss, ChunkVersion::UNSHARDED()).get();
     ASSERT_EQUALS(collAndChunksRes.epoch, chunks.back().getVersion().epoch());
     ASSERT_EQUALS(collAndChunksRes.changedChunks.size(), 5UL);
     for (unsigned int i = 0; i < collAndChunksRes.changedChunks.size(); ++i) {
@@ -363,21 +298,9 @@ TEST_F(ShardServerCatalogCacheLoaderTest, PrimaryLoadFromShardedAndFindDiff) {
     vector<ChunkType> updatedChunksDiff = makeThreeUpdatedChunksDiff(collVersion);
     _remoteLoaderMock->setChunkRefreshReturnValue(updatedChunksDiff);
 
-    StatusWith<CatalogCacheLoader::CollectionAndChangedChunks> results{
-        Status(ErrorCodes::InternalError, "")};
-    const auto refreshCallbackFn = [&results](
-        OperationContext * opCtx,
-        StatusWith<CatalogCacheLoader::CollectionAndChangedChunks> swCollAndChunks) noexcept {
-        results = std::move(swCollAndChunks);
-    };
-
-    auto notification =
-        _shardLoader->getChunksSince(kNss, chunks.back().getVersion(), refreshCallbackFn);
-    notification->get();
+    auto collAndChunksRes = _shardLoader->getChunksSince(kNss, chunks.back().getVersion()).get();
 
     // Check that the diff was returned successfull.
-    ASSERT_OK(results.getStatus());
-    auto collAndChunksRes = results.getValue();
     ASSERT_EQUALS(collAndChunksRes.epoch, updatedChunksDiff.front().getVersion().epoch());
     ASSERT_EQUALS(collAndChunksRes.changedChunks.size(), 4UL);
     for (unsigned int i = 0; i < collAndChunksRes.changedChunks.size(); ++i) {
@@ -402,9 +325,7 @@ TEST_F(ShardServerCatalogCacheLoaderTest, PrimaryLoadFromShardedAndFindDiffReque
     vector<ChunkType> updatedChunksDiff = makeThreeUpdatedChunksDiff(chunks.back().getVersion());
     _remoteLoaderMock->setChunkRefreshReturnValue(updatedChunksDiff);
 
-    auto notification =
-        _shardLoader->getChunksSince(kNss, chunks.back().getVersion(), kDoNothingCallbackFn);
-    notification->get();
+    _shardLoader->getChunksSince(kNss, chunks.back().getVersion()).get();
 
     // Wait for persistence of update
     _shardLoader->waitForCollectionFlush(operationContext(), kNss);
@@ -418,21 +339,7 @@ TEST_F(ShardServerCatalogCacheLoaderTest, PrimaryLoadFromShardedAndFindDiffReque
     vector<ChunkType> completeRoutingTableWithDiffApplied =
         makeCombinedOriginalFiveChunksAndThreeNewChunksDiff(chunks, updatedChunksDiff);
 
-    StatusWith<CatalogCacheLoader::CollectionAndChangedChunks> results{
-        Status(ErrorCodes::InternalError, "")};
-    const auto refreshCallbackFn = [&results](
-        OperationContext * opCtx,
-        StatusWith<CatalogCacheLoader::CollectionAndChangedChunks> swCollAndChunks) noexcept {
-        results = std::move(swCollAndChunks);
-    };
-
-    auto nextNotification =
-        _shardLoader->getChunksSince(kNss, ChunkVersion::UNSHARDED(), refreshCallbackFn);
-    nextNotification->get();
-
-    // Check that the complete routing table, with diff applied, was returned.
-    ASSERT_OK(results.getStatus());
-    auto collAndChunksRes = results.getValue();
+    auto collAndChunksRes = _shardLoader->getChunksSince(kNss, ChunkVersion::UNSHARDED()).get();
     ASSERT_EQUALS(collAndChunksRes.epoch,
                   completeRoutingTableWithDiffApplied.front().getVersion().epoch());
     ASSERT_EQUALS(collAndChunksRes.changedChunks.size(), 5UL);
@@ -459,21 +366,7 @@ TEST_F(ShardServerCatalogCacheLoaderTest, PrimaryLoadFromShardedAndFindNewEpoch)
     _remoteLoaderMock->setCollectionRefreshReturnValue(collectionTypeWithNewEpoch);
     _remoteLoaderMock->setChunkRefreshReturnValue(chunksWithNewEpoch);
 
-    StatusWith<CatalogCacheLoader::CollectionAndChangedChunks> results{
-        Status(ErrorCodes::InternalError, "")};
-    const auto refreshCallbackFn = [&results](
-        OperationContext * opCtx,
-        StatusWith<CatalogCacheLoader::CollectionAndChangedChunks> swCollAndChunks) noexcept {
-        results = std::move(swCollAndChunks);
-    };
-
-    auto notification =
-        _shardLoader->getChunksSince(kNss, chunks.back().getVersion(), refreshCallbackFn);
-    notification->get();
-
-    // Check that the complete routing table for the new epoch was returned.
-    ASSERT_OK(results.getStatus());
-    auto collAndChunksRes = results.getValue();
+    auto collAndChunksRes = _shardLoader->getChunksSince(kNss, chunks.back().getVersion()).get();
     ASSERT_EQUALS(collAndChunksRes.epoch, collectionTypeWithNewEpoch.getEpoch());
     ASSERT_EQUALS(collAndChunksRes.changedChunks.size(), 5UL);
     for (unsigned int i = 0; i < collAndChunksRes.changedChunks.size(); ++i) {
@@ -504,19 +397,9 @@ TEST_F(ShardServerCatalogCacheLoaderTest, PrimaryLoadFromShardedAndFindMixedChun
     mixedChunks.insert(mixedChunks.end(), chunksWithNewEpoch.begin(), chunksWithNewEpoch.end());
     _remoteLoaderMock->setChunkRefreshReturnValue(mixedChunks);
 
-    StatusWith<CatalogCacheLoader::CollectionAndChangedChunks> mixedResults{
-        Status(ErrorCodes::InternalError, "")};
-    const auto mixedRefreshCallbackFn = [&mixedResults](
-        OperationContext * opCtx,
-        StatusWith<CatalogCacheLoader::CollectionAndChangedChunks> swCollAndChunks) noexcept {
-        mixedResults = std::move(swCollAndChunks);
-    };
-
-    auto mixedNotification =
-        _shardLoader->getChunksSince(kNss, chunks.back().getVersion(), mixedRefreshCallbackFn);
-    mixedNotification->get();
-
-    ASSERT_EQUALS(mixedResults.getStatus().code(), ErrorCodes::ConflictingOperationInProgress);
+    ASSERT_THROWS_CODE(_shardLoader->getChunksSince(kNss, chunks.back().getVersion()).get(),
+                       DBException,
+                       ErrorCodes::ConflictingOperationInProgress);
 
     // Now make sure the newly recreated collection is cleanly loaded. We cannot ensure a
     // non-variable response until the loader has remotely retrieved the new metadata and applied
@@ -526,9 +409,7 @@ TEST_F(ShardServerCatalogCacheLoaderTest, PrimaryLoadFromShardedAndFindMixedChun
     _remoteLoaderMock->setCollectionRefreshReturnValue(collectionTypeWithNewEpoch);
     _remoteLoaderMock->setChunkRefreshReturnValue(chunksWithNewEpoch);
 
-    auto cleanNotification =
-        _shardLoader->getChunksSince(kNss, chunks.back().getVersion(), kDoNothingCallbackFn);
-    cleanNotification->get();
+    _shardLoader->getChunksSince(kNss, chunks.back().getVersion()).get();
 
     // Wait for persistence of update.
     _shardLoader->waitForCollectionFlush(operationContext(), kNss);
@@ -537,20 +418,7 @@ TEST_F(ShardServerCatalogCacheLoaderTest, PrimaryLoadFromShardedAndFindMixedChun
     lastChunkWithNewEpoch.push_back(chunksWithNewEpoch.back());
     _remoteLoaderMock->setChunkRefreshReturnValue(lastChunkWithNewEpoch);
 
-    StatusWith<CatalogCacheLoader::CollectionAndChangedChunks> results{
-        Status(ErrorCodes::InternalError, "")};
-    const auto refreshCallbackFn = [&results](
-        OperationContext * opCtx,
-        StatusWith<CatalogCacheLoader::CollectionAndChangedChunks> swCollAndChunks) noexcept {
-        results = std::move(swCollAndChunks);
-    };
-
-    auto notification =
-        _shardLoader->getChunksSince(kNss, ChunkVersion::UNSHARDED(), refreshCallbackFn);
-    notification->get();
-
-    ASSERT_OK(results.getStatus());
-    auto collAndChunksRes = results.getValue();
+    auto collAndChunksRes = _shardLoader->getChunksSince(kNss, ChunkVersion::UNSHARDED()).get();
     ASSERT_EQUALS(collAndChunksRes.epoch, collectionTypeWithNewEpoch.getEpoch());
     ASSERT_EQUALS(collAndChunksRes.changedChunks.size(), 5UL);
     for (unsigned int i = 0; i < collAndChunksRes.changedChunks.size(); ++i) {

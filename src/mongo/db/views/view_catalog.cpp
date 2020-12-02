@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -41,7 +41,6 @@
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database.h"
-#include "mongo/db/commands/feature_compatibility_version_command_parser.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/aggregation_request.h"
@@ -61,7 +60,7 @@
 namespace mongo {
 
 namespace {
-auto getViewCatalog = Database::declareDecoration<std::unique_ptr<ViewCatalog>>();
+auto getViewCatalog = Database::declareDecoration<std::shared_ptr<ViewCatalog>>();
 
 StatusWith<std::unique_ptr<CollatorInterface>> parseCollator(OperationContext* opCtx,
                                                              BSONObj collationSpec) {
@@ -73,6 +72,10 @@ StatusWith<std::unique_ptr<CollatorInterface>> parseCollator(OperationContext* o
     return CollatorFactoryInterface::get(opCtx->getServiceContext())->makeFromBSON(collationSpec);
 }
 }  // namespace
+
+std::shared_ptr<ViewCatalog> ViewCatalog::getShared(const Database* db) {
+    return getViewCatalog(db);
+}
 
 ViewCatalog* ViewCatalog::get(const Database* db) {
     return getViewCatalog(db).get();
@@ -94,10 +97,7 @@ Status ViewCatalog::reload(OperationContext* opCtx, ViewCatalogLookupBehavior lo
 Status ViewCatalog::_reload(WithLock,
                             OperationContext* opCtx,
                             ViewCatalogLookupBehavior lookupBehavior) {
-    LOGV2_DEBUG(22546,
-                1,
-                "reloading view catalog for database {durable_getName}",
-                "durable_getName"_attr = _durable->getName());
+    LOGV2_DEBUG(22546, 1, "Reloading view catalog for database", "db"_attr = _durable->getName());
 
     _viewMap.clear();
     _valid = false;
@@ -122,11 +122,22 @@ Status ViewCatalog::_reload(WithLock,
             }
         }
 
+        boost::optional<TimeseriesOptions> timeseries;
+        if (view.hasField("timeseries")) {
+            try {
+                timeseries =
+                    TimeseriesOptions::parse({"ViewCatalog::_reload"}, view["timeseries"].Obj());
+            } catch (const DBException& ex) {
+                return ex.toStatus();
+            }
+        }
+
         _viewMap[viewName.ns()] = std::make_shared<ViewDefinition>(viewName.db(),
                                                                    viewName.coll(),
                                                                    view["viewOn"].str(),
                                                                    pipeline,
-                                                                   std::move(collator.getValue()));
+                                                                   std::move(collator.getValue()),
+                                                                   timeseries);
         return Status::OK();
     };
 
@@ -141,9 +152,9 @@ Status ViewCatalog::_reload(WithLock,
     } catch (const DBException& ex) {
         auto status = ex.toStatus();
         LOGV2(22547,
-              "could not load view catalog for database {durable_getName}: {status}",
-              "durable_getName"_attr = _durable->getName(),
-              "status"_attr = status);
+              "Could not load view catalog for database",
+              "db"_attr = _durable->getName(),
+              "error"_attr = status);
         return status;
     }
 
@@ -173,10 +184,6 @@ void ViewCatalog::_requireValidCatalog(WithLock) {
 }
 
 void ViewCatalog::iterate(OperationContext* opCtx, ViewIteratorCallback callback) {
-    Lock::CollectionLock systemViewsLock(
-        opCtx,
-        NamespaceString(_durable->getName(), NamespaceString::kSystemDotViewsCollectionName),
-        MODE_IS);
     stdx::lock_guard<Latch> lk(_mutex);
     _requireValidCatalog(lk);
     for (auto&& view : _viewMap) {
@@ -189,7 +196,8 @@ Status ViewCatalog::_createOrUpdateView(WithLock lk,
                                         const NamespaceString& viewName,
                                         const NamespaceString& viewOn,
                                         const BSONArray& pipeline,
-                                        std::unique_ptr<CollatorInterface> collator) {
+                                        std::unique_ptr<CollatorInterface> collator,
+                                        const boost::optional<TimeseriesOptions>& timeseries) {
     invariant(opCtx->lockState()->isDbLockedForMode(viewName.db(), MODE_IX));
     invariant(opCtx->lockState()->isCollectionLockedForMode(viewName, MODE_IX));
     invariant(opCtx->lockState()->isCollectionLockedForMode(
@@ -210,10 +218,17 @@ Status ViewCatalog::_createOrUpdateView(WithLock lk,
     if (collator) {
         viewDefBuilder.append("collation", collator->getSpec().toBSON());
     }
+    if (timeseries) {
+        viewDefBuilder.append("timeseries", timeseries->toBSON());
+    }
 
     BSONObj ownedPipeline = pipeline.getOwned();
-    auto view = std::make_shared<ViewDefinition>(
-        viewName.db(), viewName.coll(), viewOn.coll(), ownedPipeline, std::move(collator));
+    auto view = std::make_shared<ViewDefinition>(viewName.db(),
+                                                 viewName.coll(),
+                                                 viewOn.coll(),
+                                                 ownedPipeline,
+                                                 std::move(collator),
+                                                 timeseries);
 
     // Check that the resulting dependency graph is acyclic and within the maximum depth.
     Status graphStatus = _upsertIntoGraph(lk, opCtx, *(view.get()));
@@ -225,16 +240,22 @@ Status ViewCatalog::_createOrUpdateView(WithLock lk,
     _viewMap[viewName.ns()] = view;
 
     // Register the view in the CollectionCatalog mapping from ResourceID->namespace
-    CollectionCatalog& catalog = CollectionCatalog::get(opCtx);
     auto viewRid = ResourceId(RESOURCE_COLLECTION, viewName.ns());
-    catalog.addResource(viewRid, viewName.ns());
+    CollectionCatalog::write(
+        opCtx, [&](CollectionCatalog& catalog) { catalog.addResource(viewRid, viewName.ns()); });
 
     opCtx->recoveryUnit()->onRollback([this, viewName, opCtx, viewRid]() {
-        this->_viewMap.erase(viewName.ns());
-        this->_viewGraphNeedsRefresh = true;
-        CollectionCatalog& catalog = CollectionCatalog::get(opCtx);
-        catalog.removeResource(viewRid, viewName.ns());
+        {
+            stdx::lock_guard<Latch> lk(_mutex);
+            this->_viewMap.erase(viewName.ns());
+            this->_viewGraphNeedsRefresh = true;
+        }
+
+        CollectionCatalog::write(opCtx, [&](CollectionCatalog& catalog) {
+            catalog.removeResource(viewRid, viewName.ns());
+        });
     });
+
 
     // Reload the view catalog with the changes applied.
     return _reload(lk, opCtx, ViewCatalogLookupBehavior::kValidateDurableViews);
@@ -326,15 +347,15 @@ StatusWith<stdx::unordered_set<NamespaceString>> ViewCatalog::_validatePipeline(
                               std::move(resolvedNamespaces),
                               boost::none);
 
-    // Save this to a variable to avoid reading the atomic variable multiple times.
-    auto currentFCV = serverGlobalParams.featureCompatibility.getVersion();
-
-    // If the feature compatibility version is not 4.6, and we are validating features as master,
-    // ban the use of new agg features introduced in 4.6 to prevent them from being persisted in the
-    // catalog.
-    if (serverGlobalParams.validateFeaturesAsMaster.load() &&
-        currentFCV != ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo46) {
-        expCtx->maxFeatureCompatibilityVersion = currentFCV;
+    // If the feature compatibility version is not kLatest, and we are validating features as
+    // primary, ban the use of new agg features introduced in kLatest to prevent them from being
+    // persisted in the catalog.
+    // (Generic FCV reference): This FCV check should exist across LTS binary versions.
+    ServerGlobalParams::FeatureCompatibility::Version fcv;
+    if (serverGlobalParams.validateFeaturesAsPrimary.load() &&
+        serverGlobalParams.featureCompatibility.isLessThan(
+            ServerGlobalParams::FeatureCompatibility::kLatest, &fcv)) {
+        expCtx->maxFeatureCompatibilityVersion = fcv;
     }
 
     // The pipeline parser needs to know that we're parsing a pipeline for a view definition
@@ -401,7 +422,8 @@ Status ViewCatalog::createView(OperationContext* opCtx,
                                const NamespaceString& viewName,
                                const NamespaceString& viewOn,
                                const BSONArray& pipeline,
-                               const BSONObj& collation) {
+                               const BSONObj& collation,
+                               const boost::optional<TimeseriesOptions>& timeseries) {
     invariant(opCtx->lockState()->isDbLockedForMode(viewName.db(), MODE_IX));
     invariant(opCtx->lockState()->isCollectionLockedForMode(viewName, MODE_IX));
     invariant(opCtx->lockState()->isCollectionLockedForMode(
@@ -421,17 +443,12 @@ Status ViewCatalog::createView(OperationContext* opCtx,
         return Status(ErrorCodes::InvalidNamespace,
                       str::stream() << "invalid name for 'viewOn': " << viewOn.coll());
 
-    if (viewName.isSystem())
-        return Status(
-            ErrorCodes::InvalidNamespace,
-            "View name cannot start with 'system.', which is reserved for system namespaces");
-
     auto collator = parseCollator(opCtx, collation);
     if (!collator.isOK())
         return collator.getStatus();
 
     return _createOrUpdateView(
-        lk, opCtx, viewName, viewOn, pipeline, std::move(collator.getValue()));
+        lk, opCtx, viewName, viewOn, pipeline, std::move(collator.getValue()), timeseries);
 }
 
 Status ViewCatalog::modifyView(OperationContext* opCtx,
@@ -461,10 +478,16 @@ Status ViewCatalog::modifyView(OperationContext* opCtx,
     ViewDefinition savedDefinition = *viewPtr;
 
     opCtx->recoveryUnit()->onRollback([this, viewName, savedDefinition, opCtx]() {
-        this->_viewMap[viewName.ns()] = std::make_shared<ViewDefinition>(savedDefinition);
+        auto definition = std::make_shared<ViewDefinition>(savedDefinition);
+        {
+            stdx::lock_guard<Latch> lk(_mutex);
+            this->_viewMap[viewName.ns()] = std::move(definition);
+        }
         auto viewRid = ResourceId(RESOURCE_COLLECTION, viewName.ns());
-        CollectionCatalog& catalog = CollectionCatalog::get(opCtx);
-        catalog.addResource(viewRid, viewName.ns());
+
+        CollectionCatalog::write(opCtx, [&](CollectionCatalog& catalog) {
+            catalog.addResource(viewRid, viewName.ns());
+        });
     });
 
     return _createOrUpdateView(lk,
@@ -503,15 +526,17 @@ Status ViewCatalog::dropView(OperationContext* opCtx, const NamespaceString& vie
     _viewGraph.remove(savedDefinition.name());
     _viewMap.erase(viewName.ns());
 
-    CollectionCatalog& catalog = CollectionCatalog::get(opCtx);
     auto viewRid = ResourceId(RESOURCE_COLLECTION, viewName.ns());
-    catalog.removeResource(viewRid, viewName.ns());
+    CollectionCatalog::write(
+        opCtx, [&](CollectionCatalog& catalog) { catalog.removeResource(viewRid, viewName.ns()); });
 
     opCtx->recoveryUnit()->onRollback([this, viewName, savedDefinition, opCtx, viewRid]() {
         this->_viewGraphNeedsRefresh = true;
         this->_viewMap[viewName.ns()] = std::make_shared<ViewDefinition>(savedDefinition);
-        CollectionCatalog& catalog = CollectionCatalog::get(opCtx);
-        catalog.addResource(viewRid, viewName.ns());
+
+        CollectionCatalog::write(opCtx, [&](CollectionCatalog& catalog) {
+            catalog.addResource(viewRid, viewName.ns());
+        });
     });
 
     // Reload the view catalog with the changes applied.
@@ -530,10 +555,6 @@ std::shared_ptr<ViewDefinition> ViewCatalog::_lookup(WithLock lk,
 }
 
 std::shared_ptr<ViewDefinition> ViewCatalog::lookup(OperationContext* opCtx, StringData ns) {
-    Lock::CollectionLock systemViewsLock(
-        opCtx,
-        NamespaceString(_durable->getName(), NamespaceString::kSystemDotViewsCollectionName),
-        MODE_IS);
     stdx::lock_guard<Latch> lk(_mutex);
     if (!_valid && opCtx->getClient()->isFromUserConnection()) {
         // We want to avoid lookups on invalid collection names.
@@ -552,20 +573,12 @@ std::shared_ptr<ViewDefinition> ViewCatalog::lookup(OperationContext* opCtx, Str
 
 std::shared_ptr<ViewDefinition> ViewCatalog::lookupWithoutValidatingDurableViews(
     OperationContext* opCtx, StringData ns) {
-    Lock::CollectionLock systemViewsLock(
-        opCtx,
-        NamespaceString(_durable->getName(), NamespaceString::kSystemDotViewsCollectionName),
-        MODE_IS);
     stdx::lock_guard<Latch> lk(_mutex);
     return _lookup(lk, opCtx, ns, ViewCatalogLookupBehavior::kAllowInvalidDurableViews);
 }
 
 StatusWith<ResolvedView> ViewCatalog::resolveView(OperationContext* opCtx,
                                                   const NamespaceString& nss) {
-    Lock::CollectionLock systemViewsLock(
-        opCtx,
-        NamespaceString(_durable->getName(), NamespaceString::kSystemDotViewsCollectionName),
-        MODE_IS);
     stdx::unique_lock<Latch> lock(_mutex);
 
     _requireValidCatalog(lock);

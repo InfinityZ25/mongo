@@ -56,6 +56,16 @@
 #define MONGO_STACKTRACE_BACKEND_EXECINFO 2
 
 #if defined(MONGO_CONFIG_USE_LIBUNWIND)
+
+#if !defined(__has_feature)
+#define __has_feature(x) 0
+#endif
+
+#if __has_feature(thread_sanitizer)
+// TODO: SERVER-48622 (and see also https://github.com/google/sanitizers/issues/943)
+#error "Cannot currently use libunwind with -fsanitize=thread"
+#endif
+
 #define MONGO_STACKTRACE_BACKEND MONGO_STACKTRACE_BACKEND_LIBUNWIND
 #elif defined(MONGO_CONFIG_HAVE_EXECINFO_BACKTRACE)
 #define MONGO_STACKTRACE_BACKEND MONGO_STACKTRACE_BACKEND_EXECINFO
@@ -428,10 +438,8 @@ void printStackTraceImpl(const Options& options, StackTraceSink* sink = nullptr)
     if (!err.empty()) {
         if (sink) {
             *sink << fmt::format(FMT_STRING("Error collecting stack trace: {}"), err);
-        } else {
-            LOGV2(31430, "Error collecting stack trace", "error"_attr = err);
         }
-        return;
+        LOGV2_ERROR(31430, "Error collecting stack trace", "error"_attr = err);
     }
     stack_trace_detail::logBacktraceObject(bob.done(), sink, options.withHumanReadable);
 }

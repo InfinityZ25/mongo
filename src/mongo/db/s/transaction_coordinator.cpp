@@ -27,16 +27,16 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kTransaction
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTransaction
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/s/transaction_coordinator.h"
 
-#include "mongo/db/logical_clock.h"
+#include "mongo/db/repl/wait_for_majority_service.h"
 #include "mongo/db/s/transaction_coordinator_metrics_observer.h"
-#include "mongo/db/s/wait_for_majority_service.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/vector_clock_mutable.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/fail_point.h"
@@ -108,6 +108,11 @@ TransactionCoordinator::TransactionCoordinator(OperationContext* operationContex
         _scheduler
             ->scheduleWorkAt(deadline,
                              [this](OperationContext*) {
+                                 LOGV2_DEBUG(5047000,
+                                             1,
+                                             "TransactionCoordinator deadline reached",
+                                             "sessionId"_attr = _lsid.getId(),
+                                             "txnNumber"_attr = _txnNumber);
                                  cancelIfCommitNotYetStarted();
 
                                  // See the comments for sendPrepare about the purpose of this
@@ -132,6 +137,10 @@ TransactionCoordinator::TransactionCoordinator(OperationContext* operationContex
     // Two-phase commit phases chain. Once this chain executes, the 2PC sequence has completed
     // either with success or error and the scheduled deadline task above has been joined.
     std::move(kickOffCommitPF.future)
+        .then([this] {
+            return VectorClockMutable::get(_serviceContext)->waitForDurableTopologyTime();
+        })
+        .thenRunOn(Grid::get(_serviceContext)->getExecutorPool()->getFixedExecutor())
         .then([this] {
             // Persist the participants, unless they have been made durable already (which would
             // only be the case if this coordinator was created as part of step-up recovery).
@@ -209,12 +218,24 @@ TransactionCoordinator::TransactionCoordinator(OperationContext* operationContex
                                     "txnNumber"_attr = _txnNumber,
                                     "commitTimestamp"_attr = *_decision->getCommitTimestamp());
 
-                        uassertStatusOK(LogicalClock::get(_serviceContext)
-                                            ->advanceClusterTime(
-                                                LogicalTime(*_decision->getCommitTimestamp())));
+                        VectorClockMutable::get(_serviceContext)
+                            ->tickClusterTimeTo(LogicalTime(*_decision->getCommitTimestamp()));
                     }
                 });
         })
+        .onError<ErrorCodes::TransactionCoordinatorReachedAbortDecision>(
+            [this, lsid, txnNumber](const Status& status) {
+                // Timeout happened, propagate the decision to abort the transaction to replicas
+                // and convert the internal error code to the public one.
+                LOGV2(5047001,
+                      "Transaction coordinator made abort decision",
+                      "sessionId"_attr = lsid.getId(),
+                      "txnNumber"_attr = txnNumber,
+                      "status"_attr = redact(status));
+                stdx::lock_guard<Latch> lg(_mutex);
+                _decision = txn::PrepareVote::kAbort;
+                _decision->setAbortStatus(Status(ErrorCodes::NoSuchTransaction, status.reason()));
+            })
         .then([this] {
             // Persist the commit decision, unless this has already been done (which would only be
             // the case if this coordinator was created as part of step-up recovery and the recovery
@@ -240,6 +261,19 @@ TransactionCoordinator::TransactionCoordinator(OperationContext* operationContex
             return txn::persistDecision(*_scheduler, _lsid, _txnNumber, *_participants, *_decision);
         })
         .then([this](repl::OpTime opTime) {
+            switch (_decision->getDecision()) {
+                case CommitDecision::kCommit: {
+                    _decisionPromise.emplaceValue(CommitDecision::kCommit);
+                    break;
+                }
+                case CommitDecision::kAbort: {
+                    _decisionPromise.setError(*_decision->getAbortStatus());
+                    break;
+                }
+                default:
+                    MONGO_UNREACHABLE;
+            };
+
             return waitForMajorityWithHangFailpoint(_serviceContext,
                                                     hangBeforeWaitingForDecisionWriteConcern,
                                                     "hangBeforeWaitingForDecisionWriteConcern",
@@ -268,8 +302,6 @@ TransactionCoordinator::TransactionCoordinator(OperationContext* operationContex
 
             switch (_decision->getDecision()) {
                 case CommitDecision::kCommit: {
-                    _decisionPromise.emplaceValue(CommitDecision::kCommit);
-
                     return txn::sendCommit(_serviceContext,
                                            *_scheduler,
                                            _lsid,
@@ -278,13 +310,6 @@ TransactionCoordinator::TransactionCoordinator(OperationContext* operationContex
                                            *_decision->getCommitTimestamp());
                 }
                 case CommitDecision::kAbort: {
-                    const auto& abortStatus = *_decision->getAbortStatus();
-
-                    if (abortStatus == ErrorCodes::ReadConcernMajorityNotEnabled)
-                        _decisionPromise.setError(abortStatus);
-                    else
-                        _decisionPromise.emplaceValue(CommitDecision::kAbort);
-
                     return txn::sendAbort(
                         _serviceContext, *_scheduler, _lsid, _txnNumber, *_participants);
                 }
@@ -364,7 +389,7 @@ void TransactionCoordinator::cancelIfCommitNotYetStarted() {
     if (!_reserveKickOffCommitPromise())
         return;
 
-    _kickOffCommitPromise.setError({ErrorCodes::NoSuchTransaction,
+    _kickOffCommitPromise.setError({ErrorCodes::TransactionCoordinatorCanceled,
                                     "Transaction exceeded deadline or newer transaction started"});
 }
 
@@ -415,10 +440,17 @@ void TransactionCoordinator::_done(Status status) {
     }
 
     ul.unlock();
-    if (!_decisionDurable) {
+
+    if (!_decisionPromise.getFuture().isReady()) {
         _decisionPromise.setError(status);
     }
-    _completionPromise.setFrom(_decisionPromise.getFuture().getNoThrow());
+
+    if (!status.isOK()) {
+        _completionPromise.setError(status);
+    } else {
+        // If the status is OK, the decisionPromise must be set.
+        _completionPromise.setFrom(_decisionPromise.getFuture().getNoThrow());
+    }
 }
 
 void TransactionCoordinator::_logSlowTwoPhaseCommit(

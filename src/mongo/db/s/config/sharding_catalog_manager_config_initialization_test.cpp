@@ -39,6 +39,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/s/catalog/config_server_version.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
@@ -49,14 +50,11 @@
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/client/shard.h"
-#include "mongo/s/config_server_test_fixture.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
 namespace {
 
-using std::string;
-using std::vector;
 using unittest::assertGet;
 
 /**
@@ -246,8 +244,7 @@ TEST_F(ConfigInitializationTest, ReRunsIfDocRolledBackThenReElected) {
         repl::UnreplicatedWritesBlock uwb(opCtx);
         auto nss = VersionType::ConfigNS;
         writeConflictRetry(opCtx, "removeConfigDocuments", nss.ns(), [&] {
-            AutoGetCollection autoColl(opCtx, nss, MODE_IX);
-            auto coll = autoColl.getCollection();
+            AutoGetCollection coll(opCtx, nss, MODE_IX);
             ASSERT_TRUE(coll);
             auto cursor = coll->getCursor(opCtx);
             std::vector<RecordId> recordIds;

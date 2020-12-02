@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -101,7 +101,7 @@ const InterpolatedVersionInfo interpolatedVersionInfo;
 
 MONGO_INITIALIZER_GENERAL(EnableVersionInfo,
                           MONGO_NO_PREREQUISITES,
-                          ("BeginStartupOptionRegistration", "GlobalLogManager"))
+                          ("BeginStartupOptionRegistration"))
 (InitializerContext*) {
     VersionInfoInterface::enable(&interpolatedVersionInfo);
     return Status::OK();

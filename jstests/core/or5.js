@@ -1,12 +1,14 @@
-// @tags: [requires_getmore]
+// @tags: [
+//   requires_getmore,
+// ]
 
 t = db.jstests_or5;
 t.drop();
 
-t.ensureIndex({a: 1});
-t.ensureIndex({b: 1});
+t.createIndex({a: 1});
+t.createIndex({b: 1});
 
-t.ensureIndex({c: 1});
+t.createIndex({c: 1});
 
 t.save({a: 2});
 t.save({b: 3});
@@ -33,7 +35,7 @@ for (i = 2; i <= 7; ++i) {
     assert.eq.automsg("6", "t.find( {$or:[{a:2},{b:3},{c:6}]} ).batchSize( i ).toArray().length");
 }
 
-t.ensureIndex({z: "2d"});
+t.createIndex({z: "2d"});
 
 assert.throws.automsg(function() {
                  return t.find({$or: [{z: {$near: [50, 50]}}, {a: 2}]}).toArray();
@@ -42,9 +44,9 @@ assert.throws.automsg(function() {
 function reset() {
     t.drop();
 
-    t.ensureIndex({a: 1});
-    t.ensureIndex({b: 1});
-    t.ensureIndex({c: 1});
+    t.createIndex({a: 1});
+    t.createIndex({b: 1});
+    t.createIndex({c: 1});
 
     t.save({a: 2});
     t.save({a: 2});

@@ -27,7 +27,7 @@
 "use strict";
 
 load('jstests/libs/profiler.js');
-load('jstests/sharding/libs/last_stable_mongos_commands.js');
+load('jstests/sharding/libs/last_lts_mongos_commands.js');
 
 let db = "test";
 let coll = "foo";
@@ -64,9 +64,11 @@ let testCases = {
     _configsvrMoveChunk: {skip: "primary only"},
     _configsvrMovePrimary: {skip: "primary only"},
     _configsvrRemoveShardFromZone: {skip: "primary only"},
+    _configsvrReshardCollection: {skip: "primary only"},
     _configsvrShardCollection: {skip: "primary only"},
     _configsvrUpdateZoneKeyRange: {skip: "primary only"},
     _flushRoutingTableCacheUpdates: {skip: "does not return user data"},
+    _flushRoutingTableCacheUpdatesWithWriteConcern: {skip: "does not return user data"},
     _getUserCacheGeneration: {skip: "does not return user data"},
     _hashBSONElement: {skip: "does not return user data"},
     _isSelf: {skip: "does not return user data"},
@@ -207,7 +209,6 @@ let testCases = {
     forceerror: {skip: "does not return user data"},
     fsync: {skip: "does not return user data"},
     fsyncUnlock: {skip: "does not return user data"},
-    geoSearch: {skip: "not supported in mongos"},
     getCmdLineOpts: {skip: "does not return user data"},
     getDefaultRWConcern: {skip: "does not return user data"},
     getDiagnosticData: {skip: "does not return user data"},
@@ -223,6 +224,7 @@ let testCases = {
     grantRolesToRole: {skip: "primary only"},
     grantRolesToUser: {skip: "primary only"},
     handshake: {skip: "does not return user data"},
+    hello: {skip: "does not return user data"},
     hostInfo: {skip: "does not return user data"},
     insert: {skip: "primary only"},
     invalidateUserCache: {skip: "does not return user data"},
@@ -240,6 +242,7 @@ let testCases = {
     listShards: {skip: "does not return user data"},
     lockInfo: {skip: "primary only"},
     logApplicationMessage: {skip: "primary only"},
+    logMessage: {skip: "does not return user data"},
     logRotate: {skip: "does not return user data"},
     logout: {skip: "does not return user data"},
     makeSnapshot: {skip: "does not return user data"},
@@ -338,13 +341,16 @@ let testCases = {
     replSetUpdatePosition: {skip: "does not return user data"},
     replSetResizeOplog: {skip: "does not return user data"},
     resetError: {skip: "does not return user data"},
+    reshardCollection: {skip: "primary only"},
     resync: {skip: "primary only"},
     revokePrivilegesFromRole: {skip: "primary only"},
     revokeRolesFromRole: {skip: "primary only"},
     revokeRolesFromUser: {skip: "primary only"},
     rolesInfo: {skip: "primary only"},
+    rotateCertificates: {skip: "does not return user data"},
     saslContinue: {skip: "primary only"},
     saslStart: {skip: "primary only"},
+    sbe: {skip: "internal command"},
     serverStatus: {skip: "does not return user data"},
     setCommittedSnapshot: {skip: "does not return user data"},
     setDefaultRWConcern: {skip: "primary only"},
@@ -365,6 +371,11 @@ let testCases = {
     startRecordingTraffic: {skip: "does not return user data"},
     startSession: {skip: "does not return user data"},
     stopRecordingTraffic: {skip: "does not return user data"},
+    testDeprecation: {skip: "does not return user data"},
+    testDeprecationInVersion2: {skip: "does not return user data"},
+    testRemoval: {skip: "does not return user data"},
+    testVersions1And2: {skip: "does not return user data"},
+    testVersion2: {skip: "does not return user data"},
     top: {skip: "does not return user data"},
     unsetSharding: {skip: "does not return user data"},
     update: {skip: "primary only"},
@@ -378,12 +389,12 @@ let testCases = {
     whatsmyuri: {skip: "does not return user data"}
 };
 
-commandsRemovedFromMongosIn46.forEach(function(cmd) {
+commandsRemovedFromMongosSinceLastLTS.forEach(function(cmd) {
     testCases[cmd] = {skip: "must define test coverage for 4.4 backwards compatibility"};
 });
 
-// Set the secondaries to priority 0 and votes 0 to prevent the primaries from stepping down.
-let rsOpts = {nodes: [{rsConfig: {votes: 1}}, {rsConfig: {priority: 0, votes: 0}}]};
+// Set the secondaries to priority 0 to prevent the primaries from stepping down.
+let rsOpts = {nodes: [{}, {rsConfig: {priority: 0}}]};
 let st = new ShardingTest({mongos: 2, shards: {rs0: rsOpts, rs1: rsOpts}});
 
 let donorShardPrimary = st.rs0.getPrimary();
@@ -533,20 +544,6 @@ for (let command of commands) {
         // with local read concern.
         profilerHasSingleMatchingEntryOrThrow({
             profileDB: donorShardSecondary.getDB(db),
-            filter: Object.extend({
-                "command.shardVersion": {"$exists": true},
-                "command.$readPreference": {"mode": "secondary"},
-                "command.readConcern": {"level": "local"},
-                "errCode": ErrorCodes.StaleConfig
-            },
-                                  commandProfile)
-        });
-
-        // Check that the recipient shard secondary received the request with local read concern
-        // and also returned stale shardVersion once, even though the mongos is fresh, because
-        // the secondary was stale.
-        profilerHasSingleMatchingEntryOrThrow({
-            profileDB: recipientShardSecondary.getDB(db),
             filter: Object.extend({
                 "command.shardVersion": {"$exists": true},
                 "command.$readPreference": {"mode": "secondary"},

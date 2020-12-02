@@ -50,20 +50,18 @@ class OperationContext;
  * a cursor ID of 0.
  */
 bool shouldSaveCursor(OperationContext* opCtx,
-                      const Collection* collection,
+                      const CollectionPtr& collection,
                       PlanExecutor::ExecState finalState,
                       PlanExecutor* exec);
 
 /**
- * Similar to shouldSaveCursor(), but used in getMore to determine whether we should keep
- * the cursor around for additional getMores().
+ * Similar to shouldSaveCursor(), but used in getMore to determine whether we should keep the cursor
+ * around for additional getMores().
  *
- * If false, the caller should close the cursor and indicate this to the client by sending back
- * a cursor ID of 0.
+ * If false, the caller should close the cursor and indicate this to the client by sending back a
+ * cursor ID of 0.
  */
-bool shouldSaveCursorGetMore(PlanExecutor::ExecState finalState,
-                             PlanExecutor* exec,
-                             bool isTailable);
+bool shouldSaveCursorGetMore(PlanExecutor* exec, bool isTailable);
 
 /**
  * Fills out the CurOp for "opCtx" with information about this query.
@@ -81,7 +79,7 @@ void beginQueryOp(OperationContext* opCtx,
  * Uses explain functionality to extract stats from 'exec'.
  */
 void endQueryOp(OperationContext* opCtx,
-                Collection* collection,
+                const CollectionPtr& collection,
                 const PlanExecutor& exec,
                 long long numResults,
                 CursorId cursorId);

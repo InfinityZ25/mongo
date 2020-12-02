@@ -97,9 +97,6 @@ using MongoDBCAPIClientPtr = std::unique_ptr<mongo_embedded_v1_client, ClientDes
 class MongodbCAPITest : public mongo::unittest::Test {
 protected:
     void setUp() {
-        status = mongo_embedded_v1_status_create();
-        ASSERT(status != nullptr);
-
         if (!globalTempDir) {
             globalTempDir = std::make_unique<mongo::unittest::TempDir>("embedded_mongo");
         }
@@ -122,18 +119,27 @@ protected:
 
         params.yaml_config = yaml.c_str();
 
+        auto* status = mongo_embedded_v1_status_create();
+        ASSERT(status);
+
         lib = mongo_embedded_v1_lib_init(&params, status);
         ASSERT(lib != nullptr) << mongo_embedded_v1_status_get_explanation(status);
 
         db = mongo_embedded_v1_instance_create(lib, yaml.c_str(), status);
         ASSERT(db != nullptr) << mongo_embedded_v1_status_get_explanation(status);
+
+        mongo_embedded_v1_status_destroy(status);
     }
 
     void tearDown() {
+        auto* status = mongo_embedded_v1_status_create();
+        ASSERT(status);
+
         ASSERT_EQUALS(mongo_embedded_v1_instance_destroy(db, status), MONGO_EMBEDDED_V1_SUCCESS)
             << mongo_embedded_v1_status_get_explanation(status);
         ASSERT_EQUALS(mongo_embedded_v1_lib_fini(lib, status), MONGO_EMBEDDED_V1_SUCCESS)
             << mongo_embedded_v1_status_get_explanation(status);
+
         mongo_embedded_v1_status_destroy(status);
     }
 
@@ -142,8 +148,13 @@ protected:
     }
 
     MongoDBCAPIClientPtr createClient() const {
+        auto* status = mongo_embedded_v1_status_create();
+        ASSERT(status);
+
         MongoDBCAPIClientPtr client(mongo_embedded_v1_client_create(db, status));
         ASSERT(client.get() != nullptr) << mongo_embedded_v1_status_get_explanation(status);
+
+        mongo_embedded_v1_status_destroy(status);
         return client;
     }
 
@@ -161,10 +172,15 @@ protected:
         void* output;
         size_t outputSize;
 
+        auto* status = mongo_embedded_v1_status_create();
+        ASSERT(status);
+
         // call the wire protocol
         int err = mongo_embedded_v1_client_invoke(
             client.get(), inputMessage.buf(), inputMessage.size(), &output, &outputSize, status);
         ASSERT_EQUALS(err, MONGO_EMBEDDED_V1_SUCCESS);
+
+        mongo_embedded_v1_status_destroy(status);
 
         // convert the shared buffer to a mongo::message and ensure that it is valid
         auto outputMessage = messageFromBuffer(output, outputSize);
@@ -173,7 +189,7 @@ protected:
 
         // convert the message into an OpMessage to examine its BSON
         auto outputOpMsg = mongo::OpMsg::parseOwned(outputMessage);
-        ASSERT(outputOpMsg.body.valid(mongo::BSONVersion::kLatest));
+        ASSERT(outputOpMsg.body.valid());
         return outputOpMsg.body;
     }
 
@@ -181,7 +197,6 @@ protected:
 protected:
     mongo_embedded_v1_lib* lib;
     mongo_embedded_v1_instance* db;
-    mongo_embedded_v1_status* status;
 };
 
 TEST_F(MongodbCAPITest, CreateAndDestroyDB) {
@@ -385,7 +400,7 @@ TEST_F(MongodbCAPITest, ReadDB) {
     auto outputBSON = performRpc(client, findMsg);
 
 
-    ASSERT(outputBSON.valid(mongo::BSONVersion::kLatest));
+    ASSERT(outputBSON.valid());
     ASSERT(outputBSON.hasField("cursor"));
     ASSERT(outputBSON.getField("cursor").embeddedObject().hasField("firstBatch"));
     mongo::BSONObj arrObj =
@@ -410,7 +425,7 @@ TEST_F(MongodbCAPITest, InsertAndRead) {
         "{insert: 'collection_name', documents: [{firstName: 'Mongo', lastName: 'DB', age: 10}]}");
     auto insertOpMsg = mongo::OpMsgRequest::fromDBAndBody("db_name", insertObj);
     auto outputBSON1 = performRpc(client, insertOpMsg);
-    ASSERT(outputBSON1.valid(mongo::BSONVersion::kLatest));
+    ASSERT(outputBSON1.valid());
     ASSERT(outputBSON1.hasField("n"));
     ASSERT(outputBSON1.getIntField("n") == 1);
     ASSERT(outputBSON1.hasField("ok"));
@@ -419,7 +434,7 @@ TEST_F(MongodbCAPITest, InsertAndRead) {
     mongo::BSONObj findObj = mongo::fromjson("{find: 'collection_name', limit: 1}");
     auto findMsg = mongo::OpMsgRequest::fromDBAndBody("db_name", findObj);
     auto outputBSON2 = performRpc(client, findMsg);
-    ASSERT(outputBSON2.valid(mongo::BSONVersion::kLatest));
+    ASSERT(outputBSON2.valid());
     ASSERT(outputBSON2.hasField("cursor"));
     ASSERT(outputBSON2.getField("cursor").embeddedObject().hasField("firstBatch"));
     mongo::BSONObj arrObj =
@@ -445,7 +460,7 @@ TEST_F(MongodbCAPITest, InsertAndReadDifferentClients) {
         "{insert: 'collection_name', documents: [{firstName: 'Mongo', lastName: 'DB', age: 10}]}");
     auto insertOpMsg = mongo::OpMsgRequest::fromDBAndBody("db_name", insertObj);
     auto outputBSON1 = performRpc(client1, insertOpMsg);
-    ASSERT(outputBSON1.valid(mongo::BSONVersion::kLatest));
+    ASSERT(outputBSON1.valid());
     ASSERT(outputBSON1.hasField("n"));
     ASSERT(outputBSON1.getIntField("n") == 1);
     ASSERT(outputBSON1.hasField("ok"));
@@ -454,7 +469,7 @@ TEST_F(MongodbCAPITest, InsertAndReadDifferentClients) {
     mongo::BSONObj findObj = mongo::fromjson("{find: 'collection_name', limit: 1}");
     auto findMsg = mongo::OpMsgRequest::fromDBAndBody("db_name", findObj);
     auto outputBSON2 = performRpc(client2, findMsg);
-    ASSERT(outputBSON2.valid(mongo::BSONVersion::kLatest));
+    ASSERT(outputBSON2.valid());
     ASSERT(outputBSON2.hasField("cursor"));
     ASSERT(outputBSON2.getField("cursor").embeddedObject().hasField("firstBatch"));
     mongo::BSONObj arrObj =
@@ -479,7 +494,7 @@ TEST_F(MongodbCAPITest, InsertAndDelete) {
         "age: 10}]}");
     auto insertOpMsg = mongo::OpMsgRequest::fromDBAndBody("db_name", insertObj);
     auto outputBSON1 = performRpc(client, insertOpMsg);
-    ASSERT(outputBSON1.valid(mongo::BSONVersion::kLatest));
+    ASSERT(outputBSON1.valid());
     ASSERT(outputBSON1.hasField("n"));
     ASSERT(outputBSON1.getIntField("n") == 1);
     ASSERT(outputBSON1.hasField("ok"));
@@ -492,7 +507,7 @@ TEST_F(MongodbCAPITest, InsertAndDelete) {
         "1}]}");
     auto deleteOpMsg = mongo::OpMsgRequest::fromDBAndBody("db_name", deleteObj);
     auto outputBSON2 = performRpc(client, deleteOpMsg);
-    ASSERT(outputBSON2.valid(mongo::BSONVersion::kLatest));
+    ASSERT(outputBSON2.valid());
     ASSERT(outputBSON2.hasField("n"));
     ASSERT(outputBSON2.getIntField("n") == 1);
     ASSERT(outputBSON2.hasField("ok"));
@@ -508,7 +523,7 @@ TEST_F(MongodbCAPITest, InsertAndUpdate) {
         "age: 10}]}");
     auto insertOpMsg = mongo::OpMsgRequest::fromDBAndBody("db_name", insertObj);
     auto outputBSON1 = performRpc(client, insertOpMsg);
-    ASSERT(outputBSON1.valid(mongo::BSONVersion::kLatest));
+    ASSERT(outputBSON1.valid());
     ASSERT(outputBSON1.hasField("n"));
     ASSERT(outputBSON1.getIntField("n") == 1);
     ASSERT(outputBSON1.hasField("ok"));
@@ -521,7 +536,7 @@ TEST_F(MongodbCAPITest, InsertAndUpdate) {
         "{age: 5}}}]}");
     auto updateOpMsg = mongo::OpMsgRequest::fromDBAndBody("db_name", updateObj);
     auto outputBSON2 = performRpc(client, updateOpMsg);
-    ASSERT(outputBSON2.valid(mongo::BSONVersion::kLatest));
+    ASSERT(outputBSON2.valid());
     ASSERT(outputBSON2.hasField("ok"));
     ASSERT(outputBSON2.getField("ok").numberDouble() == 1.0);
     ASSERT(outputBSON2.hasField("nModified"));
@@ -570,6 +585,7 @@ TEST_F(MongodbCAPITest, RunListCommands) {
                                           "listDatabases",
                                           "listIndexes",
                                           "lockInfo",
+                                          "logMessage",
                                           "ping",
                                           "planCacheClear",
                                           "planCacheClearFilters",
@@ -658,9 +674,8 @@ int main(const int argc, const char* const* const argv) {
         return EXIT_FAILURE;
     }
 
-    std::map<std::string, std::string> env;
     ret = moe::OptionsParser().run(
-        options, std::vector<std::string>(argv, argv + argc), env, &environment);
+        options, std::vector<std::string>(argv, argv + argc), &environment);
     if (!ret.isOK()) {
         std::cerr << options.helpString();
         return EXIT_FAILURE;
@@ -683,8 +698,7 @@ int main(const int argc, const char* const* const argv) {
     // The reason this works is that the unittest system relies on other systems being initialized
     // through global init and deinitialize just deinitializes systems that explicitly supports
     // deinit leaving the systems unittest needs initialized.
-    const char* null_argv[1] = {nullptr};
-    ret = mongo::runGlobalInitializers(0, null_argv, nullptr);
+    ret = mongo::runGlobalInitializers(std::vector<std::string>{argv, argv + argc});
     if (!ret.isOK()) {
         std::cerr << "Global initilization failed";
         return EXIT_FAILURE;

@@ -83,6 +83,10 @@ public:
                             const NamespaceString& nss,
                             const CollectionOptions& options) override;
 
+    Status createIndexesOnEmptyCollection(OperationContext* opCtx,
+                                          const NamespaceString& nss,
+                                          const std::vector<BSONObj>& secondaryIndexSpecs) override;
+
     Status dropCollection(OperationContext* opCtx, const NamespaceString& nss) override;
 
     Status truncateCollection(OperationContext* opCtx, const NamespaceString& nss) override;
@@ -95,6 +99,7 @@ public:
     Status setIndexIsMultikey(OperationContext* opCtx,
                               const NamespaceString& nss,
                               const std::string& indexName,
+                              const KeyStringSet& multikeyMetadataKeys,
                               const MultikeyPaths& paths,
                               Timestamp ts) override;
 
@@ -143,7 +148,10 @@ public:
                           const BSONObj& filter) override;
 
     boost::optional<BSONObj> findOplogEntryLessThanOrEqualToTimestamp(
-        OperationContext* opCtx, Collection* oplog, const Timestamp& timestamp) override;
+        OperationContext* opCtx, const CollectionPtr& oplog, const Timestamp& timestamp) override;
+
+    boost::optional<BSONObj> findOplogEntryLessThanOrEqualToTimestampRetryOnWCE(
+        OperationContext* opCtx, const CollectionPtr& oplog, const Timestamp& timestamp) override;
 
     Timestamp getLatestOplogTimestamp(OperationContext* opCtx) override;
 
@@ -160,7 +168,9 @@ public:
     StatusWith<OptionalCollectionUUID> getCollectionUUID(OperationContext* opCtx,
                                                          const NamespaceString& nss) override;
 
-    void setStableTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) override;
+    void setStableTimestamp(ServiceContext* serviceCtx,
+                            Timestamp snapshotName,
+                            bool force = false) override;
 
     void setInitialDataTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) override;
 
@@ -174,11 +184,7 @@ public:
 
     boost::optional<Timestamp> getRecoveryTimestamp(ServiceContext* serviceCtx) const override;
 
-    bool supportsDocLocking(ServiceContext* serviceCtx) const override;
-
     Timestamp getAllDurableTimestamp(ServiceContext* serviceCtx) const override;
-
-    Timestamp getOldestOpenReadTimestamp(ServiceContext* serviceCtx) const override;
 
     /**
      * Checks that the "admin" database contains a supported version of the auth data schema.

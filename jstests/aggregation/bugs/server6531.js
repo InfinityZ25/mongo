@@ -1,4 +1,7 @@
 // SERVER-6531 support $within in $match aggregation operations
+// @tags: [
+//   sbe_incompatible,
+// ]
 
 c = db.s6531;
 c.drop();
@@ -20,9 +23,9 @@ function test(variant) {
 
 test("no index");
 
-c.ensureIndex({loc: "2d"});
+c.createIndex({loc: "2d"});
 test("2d index");
 
 c.dropIndex({loc: "2d"});
-c.ensureIndex({loc: "2dsphere"});
+c.createIndex({loc: "2dsphere"});
 test("2dsphere index");

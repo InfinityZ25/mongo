@@ -46,8 +46,10 @@ class SkippedRecordTracker {
     SkippedRecordTracker(const SkippedRecordTracker&) = delete;
 
 public:
-    SkippedRecordTracker(IndexCatalogEntry* indexCatalogEntry)
-        : _indexCatalogEntry(indexCatalogEntry) {}
+    explicit SkippedRecordTracker(IndexCatalogEntry* indexCatalogEntry);
+    SkippedRecordTracker(OperationContext* opCtx,
+                         IndexCatalogEntry* indexCatalogEntry,
+                         boost::optional<StringData> ident);
 
     /**
      * Records a RecordId that was unable to be indexed due to a key generation error. At the
@@ -57,10 +59,11 @@ public:
     void record(OperationContext* opCtx, const RecordId& recordId);
 
     /**
-     * Deletes the temporary table managed by this tracker. This call is required, and is a no-op
-     * when the table is empty or has not yet been initialized.
+     * Deletes or keeps the temporary table managed by this tracker. This call is required, and is
+     * a no-op when the table is empty or has not yet been initialized.
      */
-    void deleteTemporaryTable(OperationContext* opCtx);
+    void finalizeTemporaryTable(OperationContext* opCtx,
+                                TemporaryRecordStore::FinalizationAction action);
 
     /**
      * Returns true if the temporary table is empty.
@@ -71,13 +74,18 @@ public:
      * Attempts to generates keys for each skipped record and insert into the index. Returns OK if
      * all records were either indexed or no longer exist.
      */
-    Status retrySkippedRecords(OperationContext* opCtx, const Collection* collection);
+    Status retrySkippedRecords(OperationContext* opCtx, const CollectionPtr& collection);
+
+    boost::optional<std::string> getTableIdent() const {
+        return _skippedRecordsTable ? boost::make_optional(_skippedRecordsTable->rs()->getIdent())
+                                    : boost::none;
+    }
 
 private:
     IndexCatalogEntry* _indexCatalogEntry;
 
-    // This temporary record store is owned by the duplicate key tracker and should be dropped along
-    // with it with a call to deleteTemporaryTable().
+    // This temporary record store is owned by the duplicate key tracker and should be dropped or
+    // kept along with it with a call to finalizeTemporaryTable().
     std::unique_ptr<TemporaryRecordStore> _skippedRecordsTable;
 
     AtomicWord<std::uint32_t> _skippedRecordCounter{0};

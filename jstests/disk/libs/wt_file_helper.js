@@ -55,7 +55,7 @@ let assertRepairSucceeds = function(dbpath, port, opts) {
             args.push("--" + a);
 
         if (opts[a].length > 0) {
-            args.push(a);
+            args.push(opts[a]);
         }
     }
     jsTestLog("Repairing the node");
@@ -70,6 +70,15 @@ let assertRepairFailsWithFailpoint = function(dbpath, port, failpoint) {
         MongoRunner.EXIT_ABRUPT,
         runMongoProgram(
             "mongod", "--repair", "--port", port, "--dbpath", dbpath, "--setParameter", param));
+};
+
+/**
+ * Asserts that running MongoDB with --repair on the provided dbpath fails.
+ */
+let assertRepairFails = function(dbpath, port) {
+    jsTestLog("The node should complete repairing the node but fails.");
+
+    assert.neq(0, runMongoProgram("mongod", "--repair", "--port", port, "--dbpath", dbpath));
 };
 
 /**
@@ -212,8 +221,8 @@ let runWiredTigerTool = function(...args) {
  * Stops the given mongod, runs the truncate command on the given uri using the WiredTiger tool, and
  * starts mongod again on the same path.
  */
-let truncateUriAndRestartMongod = function(uri, conn) {
+let truncateUriAndRestartMongod = function(uri, conn, mongodOptions) {
     MongoRunner.stopMongod(conn, null, {skipValidation: true});
     runWiredTigerTool("-h", conn.dbpath, "truncate", uri);
-    return startMongodOnExistingPath(conn.dbpath, {});
+    return startMongodOnExistingPath(conn.dbpath, mongodOptions);
 };

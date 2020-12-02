@@ -2,7 +2,7 @@
 // skip this test on 32-bit platforms
 // @tags: [requires_profiling]
 
-// TODO SERVER-35447: Multiple users cannot be authenticated on one connection within a session.
+// Multiple users cannot be authenticated on one connection within a session.
 TestData.disableImplicitSessions = true;
 
 function setupTest() {
@@ -20,8 +20,8 @@ function runTest(m) {
     dbRO = mro.getDB("test");
     tRO = dbRO[baseName];
 
-    db.getSisterDB("admin").createUser({user: "root", pwd: "root", roles: ["root"]});
-    db.getSisterDB("admin").auth("root", "root");
+    db.getSiblingDB("admin").createUser({user: "root", pwd: "root", roles: ["root"]});
+    db.getSiblingDB("admin").auth("root", "root");
 
     t = db[baseName];
     t.drop();
@@ -29,11 +29,11 @@ function runTest(m) {
     db.dropAllUsers();
     db.logout();
 
-    db.getSisterDB("admin").createUser({user: "super", pwd: "super", roles: ["__system"]});
-    db.getSisterDB("admin").auth("super", "super");
+    db.getSiblingDB("admin").createUser({user: "super", pwd: "super", roles: ["__system"]});
+    db.getSiblingDB("admin").auth("super", "super");
     db.createUser({user: "eliot", pwd: "eliot", roles: jsTest.basicUserRoles});
     db.createUser({user: "guest", pwd: "guest", roles: jsTest.readOnlyUserRoles});
-    db.getSisterDB("admin").logout();
+    db.getSiblingDB("admin").logout();
 
     assert.throws(function() {
         t.findOne();
@@ -66,7 +66,7 @@ function runTest(m) {
 
     assert.eq(1000, tRO.count(), "B1");
     assert.eq(1000, tRO.find().toArray().length, "B2");  // make sure we have a getMore in play
-    assert.commandWorked(dbRO.runCommand({ismaster: 1}), "B3");
+    assert.commandWorked(dbRO.runCommand({hello: 1}), "B3");
 
     assert.writeError(tRO.save({}));
 

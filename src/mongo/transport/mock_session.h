@@ -29,7 +29,11 @@
 
 #pragma once
 
+#include <list>
+
 #include "mongo/base/checked_cast.h"
+#include "mongo/config.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer_mock.h"
 #include "mongo/util/net/hostandport.h"
@@ -99,6 +103,22 @@ public:
         return Future<Message>::makeReady(sourceMessage());
     }
 
+    Future<void> waitForData() override {
+        auto fp = makePromiseFuture<void>();
+        stdx::lock_guard<Latch> lk(_waitForDataMutex);
+        _waitForDataQueue.emplace_back(std::move(fp.promise));
+        return std::move(fp.future);
+    }
+
+    void signalAvailableData() {
+        stdx::lock_guard<Latch> lk(_waitForDataMutex);
+        if (_waitForDataQueue.size() == 0)
+            return;
+        Promise<void> promise = std::move(_waitForDataQueue.front());
+        _waitForDataQueue.pop_front();
+        promise.emplaceValue();
+    }
+
     Status sinkMessage(Message message) override {
         if (!_tl || _tl->inShutdown()) {
             return TransportLayer::ShutdownStatus;
@@ -123,6 +143,16 @@ public:
         return true;
     }
 
+#ifdef MONGO_CONFIG_SSL
+    const SSLConfiguration* getSSLConfiguration() const override {
+        return nullptr;
+    }
+
+    const std::shared_ptr<SSLManagerInterface> getSSLManager() const override {
+        return nullptr;
+    }
+#endif
+
     explicit MockSession(TransportLayer* tl)
         : _tl(checked_cast<TransportLayerMock*>(tl)), _remote(), _local() {}
     explicit MockSession(HostAndPort remote,
@@ -143,6 +173,9 @@ protected:
     HostAndPort _local;
     SockAddr _remoteAddr;
     SockAddr _localAddr;
+
+    mutable Mutex _waitForDataMutex = MONGO_MAKE_LATCH("MockSession::_waitForDataMutex");
+    std::list<Promise<void>> _waitForDataQueue;
 };
 
 }  // namespace transport

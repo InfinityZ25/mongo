@@ -1,4 +1,4 @@
-/*
+/**
  * Basic test of a succesful replica set rollback for DDL operations.
  *
  * This tests sets up a 3 node set, data-bearing nodes A and B and an arbiter.
@@ -10,8 +10,6 @@
  * 5. A receives many new operations, which B will replicate after rollback.
  * 6. B rejoins the set and goes through the rollback process.
  * 7. The contents of A and B are compare to ensure the rollback results in consistent nodes.
- *
- * @tags: [requires_fcv_44]
  */
 load("jstests/replsets/rslib.js");
 
@@ -35,13 +33,10 @@ var checkFinalResults = function(db) {
 };
 
 var name = "rollback_ddl_op_sequences";
-// This test create indexes with majority of nodes not avialable for replication. So, disabling
-// index build commit quorum.
 var replTest = new ReplSetTest({
     name: name,
     nodes: 3,
     useBridge: true,
-    nodeOptions: {setParameter: "enableIndexBuildCommitQuorum=false"}
 });
 var nodes = replTest.nodeList();
 
@@ -55,28 +50,30 @@ replTest.initiate({
     ]
 });
 
-// Make sure we have a master and that that master is node A
+// Make sure we have a primary and that that primary is node A
 replTest.waitForState(replTest.nodes[0], ReplSetTest.State.PRIMARY);
-var master = replTest.getPrimary();
+var primary = replTest.getPrimary();
 var a_conn = conns[0];
-a_conn.setSlaveOk();
+a_conn.setSecondaryOk();
 var A = a_conn.getDB("admin");
 var b_conn = conns[1];
-b_conn.setSlaveOk();
+b_conn.setSecondaryOk();
 var B = b_conn.getDB("admin");
-assert.eq(master, conns[0], "conns[0] assumed to be master");
-assert.eq(a_conn, master);
+assert.eq(primary, conns[0], "conns[0] assumed to be primary");
+assert.eq(a_conn, primary);
 
 // Wait for initial replication
 var a = a_conn.getDB("foo");
 var b = b_conn.getDB("foo");
 
+// This test create indexes with fail point enabled on secondary which prevents secondary from
+// voting. So, disabling index build commit quorum.
 // initial data for both nodes
 assert.commandWorked(a.b.insert({x: 1}));
-a.b.ensureIndex({x: 1});
+assert.commandWorked(a.b.createIndex({x: 1}, {}, 0));
 assert.commandWorked(a.oldname.insert({y: 1}));
 assert.commandWorked(a.oldname.insert({y: 2}));
-a.oldname.ensureIndex({y: 1}, true);
+assert.commandWorked(a.oldname.createIndex({y: 1}, {unique: true}, 0));
 assert.commandWorked(a.bar.insert({q: 0}));
 assert.commandWorked(a.bar.insert({q: 1, a: "foo"}));
 assert.commandWorked(a.bar.insert({q: 2, a: "foo", x: 1}));
@@ -91,12 +88,12 @@ a.createCollection("kap", {capped: true, size: 5000});
 assert.commandWorked(a.kap.insert({foo: 1}));
 replTest.awaitReplication();
 
-// isolate A and wait for B to become master
+// isolate A and wait for B to become primary
 conns[0].disconnect(conns[1]);
 conns[0].disconnect(conns[2]);
 assert.soon(function() {
     try {
-        return B.isMaster().ismaster;
+        return B.hello().isWritablePrimary;
     } catch (e) {
         return false;
     }
@@ -125,18 +122,18 @@ b.oldname.renameCollection("newname");
 b.newname.renameCollection("fooname");
 assert(b.fooname.find().itcount() > 0, "count rename");
 // create an index - verify that it is removed
-b.fooname.ensureIndex({q: 1});
+assert.commandWorked(b.fooname.createIndex({q: 1}, {}, 0));
 // test roll back (drop) a whole database
-var abc = b.getSisterDB("abc");
+var abc = b.getSiblingDB("abc");
 assert.commandWorked(abc.foo.insert({x: 1}));
 assert.commandWorked(abc.bar.insert({y: 999}));
 
-// isolate B, bring A back into contact with the arbiter, then wait for A to become master
+// isolate B, bring A back into contact with the arbiter, then wait for A to become primary
 // insert new data into A so that B will need to rollback when it reconnects to A
 conns[1].disconnect(conns[2]);
 assert.soon(function() {
     try {
-        return !B.isMaster().ismaster;
+        return !B.hello().isWritablePrimary;
     } catch (e) {
         return false;
     }
@@ -145,7 +142,7 @@ assert.soon(function() {
 conns[0].reconnect(conns[2]);
 assert.soon(function() {
     try {
-        return A.isMaster().ismaster;
+        return A.hello().isWritablePrimary;
     } catch (e) {
         return false;
     }

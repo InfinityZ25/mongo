@@ -86,6 +86,7 @@ public:
         repl::ReplicationCoordinator::set(serviceContext(),
                                           std::make_unique<repl::ReplicationCoordinatorMock>(
                                               serviceContext(), repl::ReplSettings()));
+        _engine.notifyStartupComplete();
     }
 
     ~WiredTigerHarnessHelper() {}
@@ -123,6 +124,7 @@ public:
         params.cappedMaxDocs = -1;
         params.cappedCallback = nullptr;
         params.sizeStorer = nullptr;
+        params.isReadOnly = false;
         params.tracksSizeAdjustments = true;
 
         auto ret = std::make_unique<StandardWiredTigerRecordStore>(&_engine, &opCtx, params);
@@ -179,10 +181,6 @@ public:
 
     virtual std::unique_ptr<RecoveryUnit> newRecoveryUnit() final {
         return std::unique_ptr<RecoveryUnit>(_engine.newRecoveryUnit());
-    }
-
-    virtual bool supportsDocLocking() final {
-        return true;
     }
 
     virtual WT_CONNECTION* conn() {
@@ -263,6 +261,7 @@ TEST(WiredTigerRecordStoreTest, SizeStorer1) {
         params.cappedMaxDocs = -1;
         params.cappedCallback = nullptr;
         params.sizeStorer = &ss;
+        params.isReadOnly = false;
         params.tracksSizeAdjustments = true;
 
         auto ret = new StandardWiredTigerRecordStore(nullptr, opCtx.get(), params);

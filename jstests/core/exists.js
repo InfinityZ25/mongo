@@ -1,4 +1,6 @@
-// @tags: [requires_fastcount]
+// @tags: [
+//   requires_fastcount,
+// ]
 
 t = db.jstests_exists;
 t.drop();
@@ -34,10 +36,10 @@ function dotest(n) {
 }
 
 dotest("before index");
-t.ensureIndex({"a": 1});
-t.ensureIndex({"a.b": 1});
-t.ensureIndex({"a.b.c": 1});
-t.ensureIndex({"a.b.c.d": 1});
+t.createIndex({"a": 1});
+t.createIndex({"a.b": 1});
+t.createIndex({"a.b.c": 1});
+t.createIndex({"a.b.c.d": 1});
 dotest("after index");
 assert.eq(1, t.find({a: {$exists: false}}).hint({a: 1}).itcount());
 

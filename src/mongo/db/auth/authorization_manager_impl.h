@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/privilege.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
@@ -72,17 +73,22 @@ public:
                               const UserName& userName,
                               BSONObj* result) override;
 
-    Status getRoleDescription(OperationContext* opCtx,
-                              const RoleName& roleName,
-                              PrivilegeFormat privilegeFormat,
-                              AuthenticationRestrictionsFormat,
-                              BSONObj* result) override;
+    Status rolesExist(OperationContext* opCtx, const std::vector<RoleName>& roleNames) override;
+
+    StatusWith<ResolvedRoleData> resolveRoles(OperationContext* opCtx,
+                                              const std::vector<RoleName>& roleNames,
+                                              ResolveRoleOption option) override;
 
     Status getRolesDescription(OperationContext* opCtx,
                                const std::vector<RoleName>& roleName,
                                PrivilegeFormat privilegeFormat,
                                AuthenticationRestrictionsFormat,
-                               BSONObj* result) override;
+                               std::vector<BSONObj>* result) override;
+
+    Status getRolesAsUserFragment(OperationContext* opCtx,
+                                  const std::vector<RoleName>& roleName,
+                                  AuthenticationRestrictionsFormat,
+                                  BSONObj* result) override;
 
     Status getRoleDescriptionsForDB(OperationContext* opCtx,
                                     StringData dbname,
@@ -113,7 +119,7 @@ public:
     void updatePinnedUsersList(std::vector<UserName> names) override;
 
     void logOp(OperationContext* opCtx,
-               const char* opstr,
+               StringData opstr,
                const NamespaceString& nss,
                const BSONObj& obj,
                const BSONObj* patt) override;
@@ -154,12 +160,14 @@ private:
                                ThreadPoolInterface& threadPool,
                                AuthzManagerExternalState* externalState);
 
+    private:
         // Even though the dist cache permits for lookup to return boost::none for non-existent
         // values, the contract of the authorization manager is that it should throw an exception if
         // the value can not be loaded, so if it returns, the value will always be set.
-        boost::optional<int> lookup(OperationContext* opCtx, const int& unusedKey) override;
+        LookupResult _lookup(OperationContext* opCtx,
+                             int unusedKey,
+                             const ValueHandle& unusedCachedValue);
 
-    private:
         Mutex _mutex =
             MONGO_MAKE_LATCH("AuthorizationManagerImpl::AuthSchemaVersionDistCache::_mutex");
 
@@ -177,12 +185,14 @@ private:
                       AuthSchemaVersionCache* authSchemaVersionCache,
                       AuthzManagerExternalState* externalState);
 
+    private:
         // Even though the dist cache permits for lookup to return boost::none for non-existent
         // values, the contract of the authorization manager is that it should throw an exception if
         // the value can not be loaded, so if it returns, the value will always be set.
-        boost::optional<User> lookup(OperationContext* opCtx, const UserRequest& user) override;
+        LookupResult _lookup(OperationContext* opCtx,
+                             const UserRequest& user,
+                             const UserHandle& unusedCachedUser);
 
-    private:
         Mutex _mutex = MONGO_MAKE_LATCH("AuthorizationManagerImpl::UserDistCacheImpl::_mutex");
 
         AuthSchemaVersionCache* const _authSchemaVersionCache;

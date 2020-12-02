@@ -1,8 +1,7 @@
 /**
  * Tests that initial sync will abort an attempt if the sync source enters initial sync during
  * cloning. This test will timeout if the attempt is not aborted.
- *
- * @tags: [requires_fcv_44]
+ * @tags: [live_record_incompatible]
  */
 (function() {
 "use strict";
@@ -10,8 +9,7 @@
 load("jstests/libs/fail_point_util.js");
 
 const testName = "initial_sync_fails_when_source_resyncs";
-const rst = new ReplSetTest(
-    {name: testName, nodes: [{}, {rsConfig: {priority: 0, votes: 0}}], allowChaining: true});
+const rst = new ReplSetTest({name: testName, nodes: [{}, {rsConfig: {priority: 0, votes: 0}}]});
 const nodes = rst.startSet();
 rst.initiateWithHighElectionTimeout();
 

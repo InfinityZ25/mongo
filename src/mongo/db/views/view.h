@@ -36,6 +36,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
 
 namespace mongo {
 
@@ -52,7 +53,8 @@ public:
                    StringData viewName,
                    StringData viewOnName,
                    const BSONObj& pipeline,
-                   std::unique_ptr<CollatorInterface> collation);
+                   std::unique_ptr<CollatorInterface> collation,
+                   const boost::optional<TimeseriesOptions>& timeseries);
 
     /**
      * Copying a view 'other' clones its collator and does a simple copy of all other fields.
@@ -90,6 +92,13 @@ public:
         return _collator.get();
     }
 
+    /**
+     * Returns the time-series options for the view, or boost::none if not a time-series view.
+     */
+    const boost::optional<TimeseriesOptions>& timeseries() const {
+        return _timeseries;
+    }
+
     void setViewOn(const NamespaceString& viewOnNss);
 
     /**
@@ -102,5 +111,6 @@ private:
     NamespaceString _viewOnNss;
     std::unique_ptr<CollatorInterface> _collator;
     std::vector<BSONObj> _pipeline;
+    boost::optional<TimeseriesOptions> _timeseries;
 };
 }  // namespace mongo

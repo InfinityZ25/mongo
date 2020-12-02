@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
-
 #include "mongo/db/auth/sasl_options.h"
 #include "mongo/db/auth/sasl_options_gen.h"
 

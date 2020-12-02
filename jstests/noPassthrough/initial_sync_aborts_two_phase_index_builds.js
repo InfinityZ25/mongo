@@ -21,6 +21,12 @@ const rst = new ReplSetTest({
                 priority: 0,
             },
         },
+        {
+            // Disallow elections on secondary.
+            rsConfig: {
+                priority: 0,
+            },
+        }
     ]
 });
 
@@ -28,14 +34,6 @@ rst.startSet();
 rst.initiate();
 
 const primary = rst.getPrimary();
-
-if (!(IndexBuildTest.supportsTwoPhaseIndexBuild(primary) &&
-      IndexBuildTest.indexBuildCommitQuorumEnabled(primary))) {
-    jsTestLog(
-        'Skipping test because two phase index build and index build commit quorum are not supported.');
-    rst.stopSet();
-    return;
-}
 
 const db = primary.getDB(dbName);
 const coll = db.getCollection(collName);

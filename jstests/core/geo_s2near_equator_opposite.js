@@ -1,6 +1,9 @@
 // Tests geo near with 2 points diametrically opposite to each other
 // on the equator
 // First reported in SERVER-11830 as a regression in 2.5
+// @tags: [
+//   sbe_incompatible,
+// ]
 (function() {
 var t = db.geos2nearequatoropposite;
 
@@ -9,7 +12,7 @@ t.drop();
 t.insert({loc: {type: 'Point', coordinates: [0, 0]}});
 t.insert({loc: {type: 'Point', coordinates: [-1, 0]}});
 
-t.ensureIndex({loc: '2dsphere'});
+t.createIndex({loc: '2dsphere'});
 
 // upper bound for half of earth's circumference in meters
 var dist = 40075000 / 2 + 1;

@@ -40,6 +40,8 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/util/future.h"
@@ -99,6 +101,11 @@ enum class IndexBuildAction {
 };
 
 /**
+ * Returns string representation of IndexBuildAction.
+ */
+std::string indexBuildActionToString(IndexBuildAction action);
+
+/**
  * Represents the index build state.
  * Valid State transition for primary:
  * ===================================
@@ -139,37 +146,16 @@ public:
         kAborted = 1 << 4,
     };
 
-    using StateSet = int;
-    bool isSet(StateSet stateSet) const {
-        return _state & stateSet;
-    }
-
-    bool checkIfValidTransition(StateFlag newState) {
-        if ((_state == kSetup && newState == kInProgress) ||
-            (_state == kInProgress && newState != kSetup) ||
-            (_state == kPrepareCommit && newState == kCommitted)) {
-            return true;
-        }
-        return false;
-    }
-
+    /**
+     * Transitions this index build to new 'state'.
+     * Invariants if the requested transition is not valid and 'skipCheck' is true.
+     * 'timestamp' and 'abortReason' may be provided for certain states such as 'commit' and
+     * 'abort'.
+     */
     void setState(StateFlag state,
                   bool skipCheck,
                   boost::optional<Timestamp> timestamp = boost::none,
-                  boost::optional<std::string> abortReason = boost::none) {
-        if (!skipCheck) {
-            invariant(checkIfValidTransition(state),
-                      str::stream() << "current state :" << toString(_state)
-                                    << ", new state: " << toString(state));
-        }
-        _state = state;
-        if (timestamp)
-            _timestamp = timestamp;
-        if (abortReason) {
-            invariant(_state == kAborted);
-            _abortReason = abortReason;
-        }
-    }
+                  boost::optional<std::string> abortReason = boost::none);
 
     bool isCommitPrepared() const {
         return _state == kPrepareCommit;
@@ -233,22 +219,144 @@ private:
  *
  * TODO: pass in commit quorum setting.
  */
-struct ReplIndexBuildState {
+class ReplIndexBuildState {
+    ReplIndexBuildState(const ReplIndexBuildState&) = delete;
+    ReplIndexBuildState& operator=(const ReplIndexBuildState&) = delete;
+
+public:
     ReplIndexBuildState(const UUID& indexBuildUUID,
                         const UUID& collUUID,
                         const std::string& dbName,
                         const std::vector<BSONObj>& specs,
-                        IndexBuildProtocol protocol)
-        : buildUUID(indexBuildUUID),
-          collectionUUID(collUUID),
-          dbName(dbName),
-          indexNames(extractIndexNames(specs)),
-          indexSpecs(specs),
-          protocol(protocol) {
-        waitForNextAction = std::make_unique<SharedPromise<IndexBuildAction>>();
-        if (protocol == IndexBuildProtocol::kTwoPhase)
-            commitQuorumLock.emplace(indexBuildUUID.toString());
-    }
+                        IndexBuildProtocol protocol);
+
+    /**
+     * The index build is now past the setup stage and in progress. This makes it eligible to be
+     * aborted. Use the current OperationContext's opId as the means for interrupting the index
+     * build.
+     */
+    void start(OperationContext* opCtx);
+
+    /**
+     * This index build has completed successfully and there is no further work to be done.
+     */
+    void commit(OperationContext* opCtx);
+
+    /**
+     * Returns timestamp for committing this index build.
+     * Returns null timestamp if not set.
+     */
+    Timestamp getCommitTimestamp() const;
+
+    /**
+     * Called when handling a commitIndexIndexBuild oplog entry.
+     * This signal can be received during primary (drain phase), secondary,
+     * startup (startup recovery) and startup2 (initial sync).
+     */
+    void onOplogCommit(bool isPrimary) const;
+
+    /**
+     * This index build has failed while running in the builder thread due to a non-shutdown reason.
+     */
+    void abortSelf(OperationContext* opCtx);
+
+    /**
+     * This index build was interrupted because the server is shutting down.
+     */
+    void abortForShutdown(OperationContext* opCtx);
+
+    /**
+     * Called when handling an abortIndexIndexBuild oplog entry.
+     * This signal can be received during primary (drain phase), secondary,
+     * startup (startup recovery) and startup2 (initial sync).
+     */
+    void onOplogAbort(OperationContext* opCtx, const NamespaceString& nss) const;
+
+    /**
+     * Returns true if this index build has been aborted.
+     */
+    bool isAborted() const;
+
+    /**
+     * Returns abort reason. Invariants if not in aborted state.
+     */
+    std::string getAbortReason() const;
+
+    /**
+     * Called when commit quorum is satisfied.
+     * Invokes 'onCommitQuorumSatisfied' if state is successfully transitioned to commit quorum
+     * satisfied.
+     */
+    void setCommitQuorumSatisfied(OperationContext* opCtx);
+
+    /**
+     * Called when we are about to complete a single-phased index build.
+     * Single-phase builds don't support commit quorum, but they must go through the process of
+     * updating their state to synchronize with concurrent abort operations
+     */
+    void setSinglePhaseCommit(OperationContext* opCtx);
+
+    /**
+     * Attempt to signal the index build to commit and advance the index build to the kPrepareCommit
+     * state.
+     * Returns true if successful and false if the attempt was unnecessful and the caller should
+     * retry.
+     */
+    bool tryCommit(OperationContext* opCtx);
+
+    /**
+     * Attempt to abort an index build. Returns a flag indicating how the caller should proceed.
+     */
+    enum class TryAbortResult { kRetry, kAlreadyAborted, kNotAborted, kContinueAbort };
+    TryAbortResult tryAbort(OperationContext* opCtx,
+                            IndexBuildAction signalAction,
+                            std::string reason);
+
+    /**
+     * Called when the vote request command is scheduled by the task executor.
+     * Skips voting if we have already received commit or abort signal.
+     */
+    void onVoteRequestScheduled(OperationContext* opCtx,
+                                executor::TaskExecutor::CallbackHandle handle);
+
+    /**
+     * Clears vote request callback handle set in onVoteRequestScheduled().
+     */
+    void clearVoteRequestCbk();
+
+    /**
+     * (Re-)initializes promise for next action.
+     */
+    void resetNextActionPromise();
+
+
+    /**
+     * Returns a future that can be used to wait on 'waitForNextAction' for the next action to be
+     * available.
+     */
+    SharedSemiFuture<IndexBuildAction> getNextActionFuture() const;
+
+    /**
+     * Gets next action from future if available.
+     * Returns boost::none if future is not ready.
+     */
+    boost::optional<IndexBuildAction> getNextActionNoWait() const;
+
+    /**
+     * Called when we are trying to add a new index build 'other' that conflicts with this one.
+     * Returns a status that reflects whether this index build has been aborted or still active.
+     */
+    Status onConflictWithNewIndexBuild(const ReplIndexBuildState& otherIndexBuild,
+                                       const std::string& otherIndexName) const;
+
+    /**
+     * Accessor and mutator for last optime in the oplog before the interceptors were installed.
+     * This supports resumable index builds.
+     */
+    bool isResumable() const;
+    repl::OpTime getLastOpTimeBeforeInterceptors() const;
+    void setLastOpTimeBeforeInterceptors(repl::OpTime opTime);
+    void clearLastOpTimeBeforeInterceptors();
 
     // Uniquely identifies this index build across replica set members.
     const UUID buildUUID;
@@ -272,13 +380,6 @@ struct ReplIndexBuildState {
     // at the start of the index build will determine this setting.
     const IndexBuildProtocol protocol;
 
-    // Protects the state below.
-    mutable Mutex mutex = MONGO_MAKE_LATCH("ReplIndexBuildState::mutex");
-
-    // The OperationId of the index build. This allows external callers to interrupt the index build
-    // thread.
-    OperationId opId;
-
     /*
      * Readers who read the commit quorum value from "config.system.indexBuilds" collection
      * to decide if the commit quorum got satisfied for an index build, should take this lock in
@@ -293,40 +394,56 @@ struct ReplIndexBuildState {
      */
     boost::optional<Lock::ResourceMutex> commitQuorumLock;
 
-    using IndexCatalogStats = struct {
+    struct IndexCatalogStats {
         int numIndexesBefore = 0;
         int numIndexesAfter = 0;
     };
 
     // Tracks the index build stats that are returned to the caller upon success.
+    // Used only by the thread pool task for the index build. No synchronization necessary.
     IndexCatalogStats stats;
 
     // Communicates the final outcome of the index build to any callers waiting upon the associated
     // SharedSemiFuture(s).
     SharedPromise<IndexCatalogStats> sharedPromise;
 
+private:
+    /*
+     * Determines whether to skip the index build state transition check.
+     * Index builder not using ReplIndexBuildState::waitForNextAction to signal primary and
+     * secondaries to commit or abort signal will violate index build state transition. So, we
+     * should skip state transition verification. Otherwise, we would invariant.
+     */
+    bool _shouldSkipIndexBuildStateTransitionCheck(OperationContext* opCtx) const;
+
+    /**
+     * Updates the next action signal and cancels the vote request under lock.
+     * Used by IndexBuildsCoordinatorMongod only.
+     */
+    void _setSignalAndCancelVoteRequestCbkIfActive(WithLock lk,
+                                                   OperationContext* opCtx,
+                                                   IndexBuildAction signal);
+
+    // Protects the state below.
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("ReplIndexBuildState::_mutex");
+
     // Primary and secondaries gets their commit or abort signal via this promise future pair.
-    std::unique_ptr<SharedPromise<IndexBuildAction>> waitForNextAction;
+    std::unique_ptr<SharedPromise<IndexBuildAction>> _waitForNextAction;
 
     // Maintains the state of the index build.
-    IndexBuildState indexBuildState;
+    IndexBuildState _indexBuildState;
 
     // Represents the callback handle for scheduled remote command "voteCommitIndexBuild".
-    executor::TaskExecutor::CallbackHandle voteCmdCbkHandle;
+    executor::TaskExecutor::CallbackHandle _voteCmdCbkHandle;
 
-private:
-    std::vector<std::string> extractIndexNames(const std::vector<BSONObj>& specs) {
-        std::vector<std::string> indexNames;
-        for (const auto& spec : specs) {
-            std::string name = spec.getStringField(IndexDescriptor::kIndexNameFieldName);
-            invariant(!name.empty(),
-                      str::stream()
-                          << "Bad spec passed into ReplIndexBuildState constructor, missing '"
-                          << IndexDescriptor::kIndexNameFieldName << "' field: " << spec);
-            indexNames.push_back(name);
-        }
-        return indexNames;
-    }
+    // The OperationId of the index build. This allows external callers to interrupt the index build
+    // thread. Initialized in start() as we transition from setup to in-progress.
+    boost::optional<OperationId> _opId;
+
+    // The last optime in the oplog before the interceptors were installed. If this is a single
+    // phase index build, isn't running a hybrid index build, or isn't running during oplog
+    // application, this will be null.
+    repl::OpTime _lastOpTimeBeforeInterceptors;
 };
 
 }  // namespace mongo

@@ -16,7 +16,7 @@ testDB.runCommand({drop: collName, writeConcern: {w: "majority"}});
 const session = db.getMongo().startSession({causalConsistency: false});
 const sessionDB = session.getDatabase(dbName);
 
-const isMongos = assert.commandWorked(db.runCommand("ismaster")).msg === "isdbgrid";
+const isMongos = assert.commandWorked(db.runCommand("hello")).msg === "isdbgrid";
 if (isMongos) {
     // Access the collection before creating indexes so it can be implicitly sharded.
     assert.eq(sessionDB[collName].find().itcount(), 0);
@@ -24,7 +24,8 @@ if (isMongos) {
 
 const createIndexesCommand = {
     createIndexes: collName,
-    indexes: [{key: {a: 1}, name: "a_1"}]
+    indexes: [{key: {a: 1}, name: "a_1"}],
+    writeConcern: {w: 'majority'},
 };
 assert.commandWorked(sessionDB.runCommand(createIndexesCommand));
 

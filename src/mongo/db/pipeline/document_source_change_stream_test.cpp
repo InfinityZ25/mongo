@@ -386,7 +386,35 @@ public:
                                 boost::none,                        // statement id
                                 prevOpTime,      // optime of previous write within same transaction
                                 preImageOpTime,  // pre-image optime
-                                boost::none);    // post-image optime
+                                boost::none,     // post-image optime
+                                boost::none,     // ShardId of resharding recipient
+                                boost::none);    // _id
+    }
+
+    /**
+     * Helper function to do a $v:2 delta oplog test.
+     */
+    void runUpdateV2OplogTest(BSONObj diff, Document updateModificationEntry) {
+        BSONObj o2 = BSON("_id" << 1);
+        auto deltaOplog = makeOplogEntry(OpTypeEnum::kUpdate,                // op type
+                                         nss,                                // namespace
+                                         BSON("diff" << diff << "$v" << 2),  // o
+                                         testUuid(),                         // uuid
+                                         boost::none,                        // fromMigrate
+                                         o2);                                // o2
+        // Update fields
+        Document expectedUpdateField{
+            {DSChangeStream::kIdField, makeResumeToken(kDefaultTs, testUuid(), o2)},
+            {DSChangeStream::kOperationTypeField, DSChangeStream::kUpdateOpType},
+            {DSChangeStream::kClusterTimeField, kDefaultTs},
+            {DSChangeStream::kNamespaceField, D{{"db", nss.db()}, {"coll", nss.coll()}}},
+            {DSChangeStream::kDocumentKeyField, D{{"_id", 1}}},
+            {
+                "updateDescription",
+                updateModificationEntry,
+            },
+        };
+        checkTransformation(deltaOplog, expectedUpdateField);
     }
 };
 
@@ -450,8 +478,10 @@ TEST_F(ChangeStreamStageTest, ShouldRejectBothStartAtOperationTimeAndResumeAfter
     auto expCtx = getExpCtx();
 
     // Need to put the collection in the collection catalog so the resume token is valid.
-    std::unique_ptr<Collection> collection = std::make_unique<CollectionMock>(nss);
-    CollectionCatalog::get(expCtx->opCtx).registerCollection(testUuid(), &collection);
+    std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(nss);
+    CollectionCatalog::write(expCtx->opCtx, [&](CollectionCatalog& catalog) {
+        catalog.registerCollection(testUuid(), std::move(collection));
+    });
 
     ASSERT_THROWS_CODE(
         DSChangeStream::createFromBson(
@@ -470,9 +500,10 @@ TEST_F(ChangeStreamStageTest, ShouldRejectBothStartAfterAndResumeAfterOptions) {
     auto opCtx = expCtx->opCtx;
 
     // Need to put the collection in the collection catalog so the resume token is validcollection
-    std::unique_ptr<Collection> collection = std::make_unique<CollectionMock>(nss);
-    auto& catalog = CollectionCatalog::get(opCtx);
-    catalog.registerCollection(testUuid(), &collection);
+    std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(nss);
+    CollectionCatalog::write(opCtx, [&](CollectionCatalog& catalog) {
+        catalog.registerCollection(testUuid(), std::move(collection));
+    });
 
     ASSERT_THROWS_CODE(
         DSChangeStream::createFromBson(
@@ -492,9 +523,10 @@ TEST_F(ChangeStreamStageTest, ShouldRejectBothStartAtOperationTimeAndStartAfterO
     auto opCtx = expCtx->opCtx;
 
     // Need to put the collection in the collection catalog so the resume token is valid.
-    std::unique_ptr<Collection> collection = std::make_unique<CollectionMock>(nss);
-    auto& catalog = CollectionCatalog::get(opCtx);
-    catalog.registerCollection(testUuid(), &collection);
+    std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(nss);
+    CollectionCatalog::write(opCtx, [&](CollectionCatalog& catalog) {
+        catalog.registerCollection(testUuid(), std::move(collection));
+    });
 
     ASSERT_THROWS_CODE(
         DSChangeStream::createFromBson(
@@ -513,9 +545,10 @@ TEST_F(ChangeStreamStageTest, ShouldRejectResumeAfterWithResumeTokenMissingUUID)
     auto opCtx = expCtx->opCtx;
 
     // Need to put the collection in the collection catalog so the resume token is valid.
-    std::unique_ptr<Collection> collection = std::make_unique<CollectionMock>(nss);
-    auto& catalog = CollectionCatalog::get(opCtx);
-    catalog.registerCollection(testUuid(), &collection);
+    std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(nss);
+    CollectionCatalog::write(opCtx, [&](CollectionCatalog& catalog) {
+        catalog.registerCollection(testUuid(), std::move(collection));
+    });
 
     ASSERT_THROWS_CODE(
         DSChangeStream::createFromBson(
@@ -669,6 +702,132 @@ TEST_F(ChangeStreamStageTest, TransformUpdateFields) {
     checkTransformation(updateField, expectedUpdateField);
 }
 
+TEST_F(ChangeStreamStageTest, TransformSimpleDeltaOplogUpdatedFields) {
+    BSONObj diff = BSON("u" << BSON("a" << 1 << "b"
+                                        << "updated"));
+
+    runUpdateV2OplogTest(diff,
+                         D{{"updatedFields", D{{"a", 1}, {"b", "updated"_sd}}},
+                           {"removedFields", vector<V>{}},
+                           {"truncatedArrays", vector<V>{}}});
+}
+
+TEST_F(ChangeStreamStageTest, TransformSimpleDeltaOplogInsertFields) {
+    BSONObj diff = BSON("i" << BSON("a" << 1 << "b"
+                                        << "updated"));
+
+    runUpdateV2OplogTest(diff,
+                         D{{"updatedFields", D{{"a", 1}, {"b", "updated"_sd}}},
+                           {"removedFields", vector<V>{}},
+                           {"truncatedArrays", vector<V>{}}});
+}
+
+TEST_F(ChangeStreamStageTest, TransformSimpleDeltaOplogRemovedFields) {
+    BSONObj diff = BSON("d" << BSON("a" << false << "b" << false));
+
+    runUpdateV2OplogTest(diff,
+                         D{{"updatedFields", D{}},
+                           {"removedFields", vector<V>{V("a"_sd), V("b"_sd)}},
+                           {"truncatedArrays", vector<V>{}}});
+}
+
+TEST_F(ChangeStreamStageTest, TransformComplexDeltaOplog) {
+    BSONObj diff = fromjson(
+        "{"
+        "   d: { a: false, b: false },"
+        "   u: { c: 1, d: \"updated\" },"
+        "   i: { e: 2, f: 3 }"
+        "}");
+
+    runUpdateV2OplogTest(diff,
+                         D{{"updatedFields", D{{"c", 1}, {"d", "updated"_sd}, {"e", 2}, {"f", 3}}},
+                           {"removedFields", vector<V>{V("a"_sd), V("b"_sd)}},
+                           {"truncatedArrays", vector<V>{}}});
+}
+
+TEST_F(ChangeStreamStageTest, TransformDeltaOplogSubObjectDiff) {
+    BSONObj diff = fromjson(
+        "{"
+        "   u: { c: 1, d: \"updated\" },"
+        "   ssubObj: {"
+        "           d: { a: false, b: false },"
+        "           u: { c: 1, d: \"updated\" }"
+        "   }"
+        "}");
+
+    runUpdateV2OplogTest(
+        diff,
+        D{{"updatedFields",
+           D{{"c", 1}, {"d", "updated"_sd}, {"subObj.c", 1}, {"subObj.d", "updated"_sd}}},
+          {"removedFields", vector<V>{V("subObj.a"_sd), V("subObj.b"_sd)}},
+          {"truncatedArrays", vector<V>{}}});
+}
+
+TEST_F(ChangeStreamStageTest, TransformDeltaOplogSubArrayDiff) {
+    BSONObj diff = fromjson(
+        "{"
+        "   sarrField: {a: true, l: 10,"
+        "           u0: 1,"
+        "           u1: {a: 1}},"
+        "   sarrField2: {a: true, l: 20}"
+        "   }"
+        "}");
+
+    runUpdateV2OplogTest(diff,
+                         D{{"updatedFields", D{{"arrField.0", 1}, {"arrField.1", D{{"a", 1}}}}},
+                           {"removedFields", vector<V>{}},
+                           {"truncatedArrays",
+                            vector<V>{V{D{{"field", "arrField"_sd}, {"newSize", 10}}},
+                                      V{D{{"field", "arrField2"_sd}, {"newSize", 20}}}}}});
+}
+
+TEST_F(ChangeStreamStageTest, TransformDeltaOplogSubArrayDiffWithEmptyStringField) {
+    BSONObj diff = fromjson(
+        "{"
+        "   s: {a: true, l: 10,"
+        "           u0: 1,"
+        "           u1: {a: 1}}"
+        "}");
+
+    runUpdateV2OplogTest(
+        diff,
+        D{{"updatedFields", D{{".0", 1}, {".1", D{{"a", 1}}}}},
+          {"removedFields", vector<V>{}},
+          {"truncatedArrays", vector<V>{V{D{{"field", ""_sd}, {"newSize", 10}}}}}});
+}
+
+TEST_F(ChangeStreamStageTest, TransformDeltaOplogNestedComplexSubDiffs) {
+    BSONObj diff = fromjson(
+        "{"
+        "   u: { a: 1, b: 2},"
+        "   sarrField: {a: true, l: 10,"
+        "           u0: 1,"
+        "           u1: {a: 1},"
+        "           s2: { u: {a: 1}},"  // "arrField.2.a" should be updated.
+        "           u4: 1,"             // Test updating non-contiguous fields.
+        "           u6: 2},"
+        "   ssubObj: {"
+        "           d: {b: false},"  // "subObj.b" should be removed.
+        "           u: {a: 1}}"      // "subObj.a" should be updated.
+        "}");
+
+    runUpdateV2OplogTest(
+        diff,
+        D{{"updatedFields",
+           D{
+               {"a", 1},
+               {"b", 2},
+               {"arrField.0", 1},
+               {"arrField.1", D{{"a", 1}}},
+               {"arrField.2.a", 1},
+               {"arrField.4", 1},
+               {"arrField.6", 2},
+               {"subObj.a", 1},
+           }},
+          {"removedFields", vector<V>{V("subObj.b"_sd)}},
+          {"truncatedArrays", vector<V>{V{D{{"field", "arrField"_sd}, {"newSize", 10}}}}}});
+}
+
 // Legacy documents might not have an _id field; then the document key is the full (post-update)
 // document.
 TEST_F(ChangeStreamStageTest, TransformUpdateFieldsLegacyNoId) {
@@ -712,13 +871,13 @@ TEST_F(ChangeStreamStageTest, TransformRemoveFields) {
         {DSChangeStream::kOperationTypeField, DSChangeStream::kUpdateOpType},
         {DSChangeStream::kClusterTimeField, kDefaultTs},
         {DSChangeStream::kNamespaceField, D{{"db", nss.db()}, {"coll", nss.coll()}}},
-        {DSChangeStream::kDocumentKeyField, D{{{"_id", 1}, {"x", 2}}}},
+        {DSChangeStream::kDocumentKeyField, Document{{"_id", 1}, {"x", 2}}},
         {
             "updateDescription",
-            D{{"updatedFields", D{}}, {"removedFields", vector<V>{V("y"_sd)}}},
+            D{{"updatedFields", D{}}, {"removedFields", {"y"_sd}}},
         }};
     checkTransformation(removeField, expectedRemoveField);
-}
+}  // namespace
 
 TEST_F(ChangeStreamStageTest, TransformReplace) {
     BSONObj o = BSON("_id" << 1 << "x" << 2 << "y" << 1);
@@ -1069,7 +1228,9 @@ TEST_F(ChangeStreamStageTest, CommitCommandReturnsOperationsFromPreparedTransact
                          boost::none,                      // statement id
                          applyOpsOpTime,  // optime of previous write within same transaction
                          boost::none,     // pre-image optime
-                         boost::none);    // post-image optime
+                         boost::none,     // post-image optime
+                         boost::none,     // ShardId of resharding recipient
+                         boost::none);    // _id
 
     // When the DocumentSourceChangeStreamTransform sees the "commitTransaction" oplog entry, we
     // expect it to return the insert op within our 'preparedApplyOps' oplog entry.
@@ -1266,7 +1427,9 @@ TEST_F(ChangeStreamStageTest, PreparedTransactionWithMultipleOplogEntries) {
                          boost::none,                      // statement id
                          applyOpsOpTime2,  // optime of previous write within same transaction
                          boost::none,      // pre-image optime
-                         boost::none);     // post-image optime
+                         boost::none,      // post-image optime
+                         boost::none,      // ShardId of resharding recipient
+                         boost::none);     // _id
 
     // We do not use the checkTransformation() pattern that other tests use since we expect multiple
     // documents to be returned from one applyOps.
@@ -1545,8 +1708,11 @@ TEST_F(ChangeStreamStageTest, DocumentKeyShouldIncludeShardKeyFromResumeToken) {
     const auto opTime = repl::OpTime(ts, term);
     const auto uuid = testUuid();
 
-    std::unique_ptr<Collection> collection = std::make_unique<CollectionMock>(nss);
-    CollectionCatalog::get(getExpCtx()->opCtx).registerCollection(uuid, &collection);
+    std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(nss);
+    CollectionCatalog::write(getExpCtx()->opCtx, [&](CollectionCatalog& catalog) {
+        catalog.registerCollection(uuid, std::move(collection));
+    });
+
 
     BSONObj o2 = BSON("_id" << 1 << "shardKey" << 2);
     auto resumeToken = makeResumeToken(ts, uuid, o2);
@@ -1590,8 +1756,10 @@ TEST_F(ChangeStreamStageTest, DocumentKeyShouldNotIncludeShardKeyFieldsIfNotPres
     const auto opTime = repl::OpTime(ts, term);
     const auto uuid = testUuid();
 
-    std::unique_ptr<Collection> collection = std::make_unique<CollectionMock>(nss);
-    CollectionCatalog::get(getExpCtx()->opCtx).registerCollection(uuid, &collection);
+    std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(nss);
+    CollectionCatalog::write(getExpCtx()->opCtx, [&](CollectionCatalog& catalog) {
+        catalog.registerCollection(uuid, std::move(collection));
+    });
 
     BSONObj o2 = BSON("_id" << 1 << "shardKey" << 2);
     auto resumeToken = makeResumeToken(ts, uuid, o2);
@@ -1632,8 +1800,10 @@ TEST_F(ChangeStreamStageTest, ResumeAfterFailsIfResumeTokenDoesNotContainUUID) {
     const Timestamp ts(3, 45);
     const auto uuid = testUuid();
 
-    std::unique_ptr<Collection> collection = std::make_unique<CollectionMock>(nss);
-    CollectionCatalog::get(getExpCtx()->opCtx).registerCollection(uuid, &collection);
+    std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(nss);
+    CollectionCatalog::write(getExpCtx()->opCtx, [&](CollectionCatalog& catalog) {
+        catalog.registerCollection(uuid, std::move(collection));
+    });
 
     // Create a resume token from only the timestamp.
     auto resumeToken = makeResumeToken(ts);
@@ -1685,8 +1855,10 @@ TEST_F(ChangeStreamStageTest, ResumeAfterWithTokenFromInvalidateShouldFail) {
     auto expCtx = getExpCtx();
 
     // Need to put the collection in the collection catalog so the resume token is valid.
-    std::unique_ptr<Collection> collection = std::make_unique<CollectionMock>(nss);
-    CollectionCatalog::get(expCtx->opCtx).registerCollection(testUuid(), &collection);
+    std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(nss);
+    CollectionCatalog::write(expCtx->opCtx, [&](CollectionCatalog& catalog) {
+        catalog.registerCollection(testUuid(), std::move(collection));
+    });
 
     const auto resumeTokenInvalidate =
         makeResumeToken(kDefaultTs,
@@ -1859,10 +2031,10 @@ TEST_F(ChangeStreamStageDBTest, TransformRemoveFields) {
         {DSChangeStream::kOperationTypeField, DSChangeStream::kUpdateOpType},
         {DSChangeStream::kClusterTimeField, kDefaultTs},
         {DSChangeStream::kNamespaceField, D{{"db", nss.db()}, {"coll", nss.coll()}}},
-        {DSChangeStream::kDocumentKeyField, D{{{"_id", 1}, {"x", 2}}}},
+        {DSChangeStream::kDocumentKeyField, D{{"_id", 1}, {"x", 2}}},
         {
             "updateDescription",
-            D{{"updatedFields", D{}}, {"removedFields", vector<V>{V("y"_sd)}}},
+            D{{"updatedFields", D{}}, {"removedFields", {"y"_sd}}},
         }};
     checkTransformation(removeField, expectedRemoveField);
 }
@@ -2345,8 +2517,10 @@ TEST_F(ChangeStreamStageDBTest, DocumentKeyShouldIncludeShardKeyFromResumeToken)
     const auto opTime = repl::OpTime(ts, term);
     const auto uuid = testUuid();
 
-    std::unique_ptr<Collection> collection = std::make_unique<CollectionMock>(nss);
-    CollectionCatalog::get(getExpCtx()->opCtx).registerCollection(uuid, &collection);
+    std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(nss);
+    CollectionCatalog::write(getExpCtx()->opCtx, [&](CollectionCatalog& catalog) {
+        catalog.registerCollection(uuid, std::move(collection));
+    });
 
     BSONObj o2 = BSON("_id" << 1 << "shardKey" << 2);
     auto resumeToken = makeResumeToken(ts, uuid, o2);
@@ -2381,8 +2555,10 @@ TEST_F(ChangeStreamStageDBTest, DocumentKeyShouldNotIncludeShardKeyFieldsIfNotPr
     const auto opTime = repl::OpTime(ts, term);
     const auto uuid = testUuid();
 
-    std::unique_ptr<Collection> collection = std::make_unique<CollectionMock>(nss);
-    CollectionCatalog::get(getExpCtx()->opCtx).registerCollection(uuid, &collection);
+    std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(nss);
+    CollectionCatalog::write(getExpCtx()->opCtx, [&](CollectionCatalog& catalog) {
+        catalog.registerCollection(uuid, std::move(collection));
+    });
 
     BSONObj o2 = BSON("_id" << 1 << "shardKey" << 2);
     auto resumeToken = makeResumeToken(ts, uuid, o2);
@@ -2418,8 +2594,10 @@ TEST_F(ChangeStreamStageDBTest, DocumentKeyShouldNotIncludeShardKeyIfResumeToken
     const auto opTime = repl::OpTime(ts, term);
     const auto uuid = testUuid();
 
-    std::unique_ptr<Collection> collection = std::make_unique<CollectionMock>(nss);
-    CollectionCatalog::get(getExpCtx()->opCtx).registerCollection(uuid, &collection);
+    std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(nss);
+    CollectionCatalog::write(getExpCtx()->opCtx, [&](CollectionCatalog& catalog) {
+        catalog.registerCollection(uuid, std::move(collection));
+    });
 
     // Create a resume token from only the timestamp.
     auto resumeToken = makeResumeToken(ts);
@@ -2454,8 +2632,10 @@ TEST_F(ChangeStreamStageDBTest, ResumeAfterWithTokenFromInvalidateShouldFail) {
     auto expCtx = getExpCtx();
 
     // Need to put the collection in the collection catalog so the resume token is valid.
-    std::unique_ptr<Collection> collection = std::make_unique<CollectionMock>(nss);
-    CollectionCatalog::get(expCtx->opCtx).registerCollection(testUuid(), &collection);
+    std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(nss);
+    CollectionCatalog::write(expCtx->opCtx, [&](CollectionCatalog& catalog) {
+        catalog.registerCollection(testUuid(), std::move(collection));
+    });
 
     const auto resumeTokenInvalidate =
         makeResumeToken(kDefaultTs,
@@ -2475,8 +2655,10 @@ TEST_F(ChangeStreamStageDBTest, ResumeAfterWithTokenFromInvalidateShouldFail) {
 TEST_F(ChangeStreamStageDBTest, ResumeAfterWithTokenFromDropDatabase) {
     const auto uuid = testUuid();
 
-    std::unique_ptr<Collection> collection = std::make_unique<CollectionMock>(nss);
-    CollectionCatalog::get(getExpCtx()->opCtx).registerCollection(uuid, &collection);
+    std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(nss);
+    CollectionCatalog::write(getExpCtx()->opCtx, [&](CollectionCatalog& catalog) {
+        catalog.registerCollection(uuid, std::move(collection));
+    });
 
     // Create a resume token from only the timestamp, similar to a 'dropDatabase' entry.
     auto resumeToken = makeResumeToken(
@@ -2504,8 +2686,10 @@ TEST_F(ChangeStreamStageDBTest, ResumeAfterWithTokenFromDropDatabase) {
 TEST_F(ChangeStreamStageDBTest, StartAfterSucceedsEvenIfResumeTokenDoesNotContainUUID) {
     const auto uuid = testUuid();
 
-    std::unique_ptr<Collection> collection = std::make_unique<CollectionMock>(nss);
-    CollectionCatalog::get(getExpCtx()->opCtx).registerCollection(uuid, &collection);
+    std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(nss);
+    CollectionCatalog::write(getExpCtx()->opCtx, [&](CollectionCatalog& catalog) {
+        catalog.registerCollection(uuid, std::move(collection));
+    });
 
     // Create a resume token from only the timestamp, similar to a 'dropDatabase' entry.
     auto resumeToken = makeResumeToken(kDefaultTs);

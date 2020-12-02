@@ -29,11 +29,11 @@ function arrayIsSubset(smallArray, largeArray) {
 }
 
 // Test startup_log
-var stats = db.getSisterDB("local").startup_log.stats();
+var stats = db.getSiblingDB("local").startup_log.stats();
 assert(stats.capped);
 
 var latestStartUpLog =
-    db.getSisterDB("local").startup_log.find().sort({$natural: -1}).limit(1).next();
+    db.getSiblingDB("local").startup_log.find().sort({$natural: -1}).limit(1).next();
 var serverStatus = db._adminCommand("serverStatus");
 var cmdLine = db._adminCommand("getCmdLineOpts").parsed;
 
@@ -68,7 +68,7 @@ var buildinfo = db.runCommand("buildinfo");
 delete buildinfo.ok;             // Delete extra meta info not in startup_log
 delete buildinfo.operationTime;  // Delete extra meta info not in startup_log
 delete buildinfo.$clusterTime;   // Delete extra meta info not in startup_log
-var isMaster = db._adminCommand("ismaster");
+var hello = db._adminCommand("hello");
 
 // Test buildinfo has the expected keys
 var expectedKeys = [
@@ -107,7 +107,7 @@ assert.eq(
     version, versionArrayCleaned.join('.'), "version doesn't match that from the versionArray");
 var jsEngine = latestStartUpLog.buildinfo.javascriptEngine;
 assert((jsEngine == "none") || jsEngine.startsWith("mozjs"));
-assert.eq(isMaster.maxBsonObjectSize,
+assert.eq(hello.maxBsonObjectSize,
           latestStartUpLog.buildinfo.maxBsonObjectSize,
-          "maxBsonObjectSize doesn't match one from ismaster");
+          "maxBsonObjectSize doesn't match one from hello");
 })();

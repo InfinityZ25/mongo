@@ -39,13 +39,13 @@
 
 #include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
+#include "mongo/base/status.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/catalog/multi_index_block.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
@@ -59,6 +59,7 @@
 #include "mongo/util/clock_source_mock.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/signal_handlers_synchronous.h"
+#include "mongo/util/testing_proctor.h"
 #include "mongo/util/text.h"
 
 namespace mongo {
@@ -67,20 +68,24 @@ namespace {
 const auto kIndexVersion = IndexDescriptor::IndexVersion::kV2;
 }  // namespace
 
-void initWireSpec() {
-    WireSpec& spec = WireSpec::instance();
-
-    // Accept from internal clients of the same version, as in upgrade featureCompatibilityVersion.
-    spec.incomingInternalClient.minWireVersion = LATEST_WIRE_VERSION;
-    spec.incomingInternalClient.maxWireVersion = LATEST_WIRE_VERSION;
+MONGO_INITIALIZER_WITH_PREREQUISITES(WireSpec, ("EndStartupOptionHandling"))(InitializerContext*) {
+    WireSpec::Specification spec;
 
     // Accept from any version external client.
     spec.incomingExternalClient.minWireVersion = RELEASE_2_4_AND_BEFORE;
     spec.incomingExternalClient.maxWireVersion = LATEST_WIRE_VERSION;
 
+    // Accept from internal clients of the same version, as in upgrade
+    // featureCompatibilityVersion.
+    spec.incomingInternalClient.minWireVersion = LATEST_WIRE_VERSION;
+    spec.incomingInternalClient.maxWireVersion = LATEST_WIRE_VERSION;
+
     // Connect to servers of the same version, as in upgrade featureCompatibilityVersion.
     spec.outgoing.minWireVersion = LATEST_WIRE_VERSION;
     spec.outgoing.maxWireVersion = LATEST_WIRE_VERSION;
+
+    WireSpec::instance().initialize(std::move(spec));
+    return Status::OK();
 }
 
 Status createIndex(OperationContext* opCtx, StringData ns, const BSONObj& keys, bool unique) {
@@ -99,8 +104,8 @@ Status createIndexFromSpec(OperationContext* opCtx, StringData ns, const BSONObj
     Collection* coll;
     {
         WriteUnitOfWork wunit(opCtx);
-        coll =
-            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, NamespaceString(ns));
+        coll = CollectionCatalog::get(opCtx)->lookupCollectionByNamespaceForMetadataWrite(
+            opCtx, CollectionCatalog::LifetimeMode::kInplace, NamespaceString(ns));
         if (!coll) {
             coll = autoDb.getDb()->createCollection(opCtx, NamespaceString(ns));
         }
@@ -108,11 +113,12 @@ Status createIndexFromSpec(OperationContext* opCtx, StringData ns, const BSONObj
         wunit.commit();
     }
     MultiIndexBlock indexer;
-    auto abortOnExit =
-        makeGuard([&] { indexer.abortIndexBuild(opCtx, coll, MultiIndexBlock::kNoopOnCleanUpFn); });
+    CollectionWriter collection(coll);
+    auto abortOnExit = makeGuard(
+        [&] { indexer.abortIndexBuild(opCtx, collection, MultiIndexBlock::kNoopOnCleanUpFn); });
     Status status = indexer
                         .init(opCtx,
-                              coll,
+                              collection,
                               spec,
                               [opCtx](const std::vector<BSONObj>& specs) -> Status {
                                   if (opCtx->recoveryUnit()->getCommitTimestamp().isNull()) {
@@ -135,7 +141,7 @@ Status createIndexFromSpec(OperationContext* opCtx, StringData ns, const BSONObj
     if (!status.isOK()) {
         return status;
     }
-    status = indexer.checkConstraints(opCtx);
+    status = indexer.checkConstraints(opCtx, coll);
     if (!status.isOK()) {
         return status;
     }
@@ -171,23 +177,21 @@ WriteContextForTests::WriteContextForTests(OperationContext* opCtx, StringData n
 }  // namespace mongo
 
 
-int dbtestsMain(int argc, char** argv, char** envp) {
+int dbtestsMain(int argc, char** argv) {
     ::mongo::setTestCommandsEnabled(true);
+    ::mongo::TestingProctor::instance().setEnabled(true);
     ::mongo::setupSynchronousSignalHandlers();
-    mongo::dbtests::initWireSpec();
 
-    mongo::runGlobalInitializersOrDie(argc, argv, envp);
-    serverGlobalParams.featureCompatibility.setVersion(
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo46);
+    mongo::runGlobalInitializersOrDie(std::vector<std::string>(argv, argv + argc));
+    // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
+    serverGlobalParams.mutableFeatureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::kLatest);
     repl::ReplSettings replSettings;
     replSettings.setOplogSizeBytes(10 * 1024 * 1024);
     setGlobalServiceContext(ServiceContext::make());
 
     const auto service = getGlobalServiceContext();
     service->setServiceEntryPoint(std::make_unique<ServiceEntryPointMongod>(service));
-
-    auto logicalClock = std::make_unique<LogicalClock>(service);
-    LogicalClock::set(service, std::move(logicalClock));
 
     auto fastClock = std::make_unique<ClockSourceMock>();
     // Timestamps are split into two 32-bit integers, seconds and "increments". Currently (but
@@ -229,14 +233,11 @@ int dbtestsMain(int argc, char** argv, char** envp) {
 // WindowsCommandLine object converts these wide character strings to a UTF-8 coded equivalent
 // and makes them available through the argv() and envp() members.  This enables dbtestsMain()
 // to process UTF-8 encoded arguments and environment variables without regard to platform.
-int wmain(int argc, wchar_t* argvW[], wchar_t* envpW[]) {
-    WindowsCommandLine wcl(argc, argvW, envpW);
-    int exitCode = dbtestsMain(argc, wcl.argv(), wcl.envp());
-    quickExit(exitCode);
+int wmain(int argc, wchar_t* argvW[]) {
+    quickExit(dbtestsMain(argc, WindowsCommandLine(argc, argvW).argv()));
 }
 #else
-int main(int argc, char* argv[], char** envp) {
-    int exitCode = dbtestsMain(argc, argv, envp);
-    quickExit(exitCode);
+int main(int argc, char* argv[]) {
+    quickExit(dbtestsMain(argc, argv));
 }
 #endif

@@ -34,6 +34,7 @@
 #include "mongo/db/storage/devnull/devnull_kv_engine.h"
 #include "mongo/db/storage/storage_engine_impl.h"
 #include "mongo/db/storage/storage_engine_init.h"
+#include "mongo/db/storage/storage_engine_lock_file.h"
 #include "mongo/db/storage/storage_options.h"
 
 namespace mongo {
@@ -41,12 +42,15 @@ namespace mongo {
 namespace {
 class DevNullStorageEngineFactory : public StorageEngine::Factory {
 public:
-    virtual StorageEngine* create(const StorageGlobalParams& params,
-                                  const StorageEngineLockFile* lockFile) const {
+    virtual std::unique_ptr<StorageEngine> create(OperationContext* opCtx,
+                                                  const StorageGlobalParams& params,
+                                                  const StorageEngineLockFile* lockFile) const {
         StorageEngineOptions options;
         options.directoryPerDB = params.directoryperdb;
         options.forRepair = params.repair;
-        return new StorageEngineImpl(new DevNullKVEngine(), options);
+        options.lockFileCreatedByUncleanShutdown = lockFile && lockFile->createdByUncleanShutdown();
+        return std::make_unique<StorageEngineImpl>(
+            opCtx, std::make_unique<DevNullKVEngine>(), options);
     }
 
     virtual StringData getCanonicalName() const {

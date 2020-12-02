@@ -77,7 +77,7 @@ selector:
   # can cause OOM kills on test hosts
   - jstests/concurrency/fsm_workloads/findAndModify_update_grow.js
 
-  # cannot ensureIndex after dropDatabase without sharding first
+  # cannot createIndex after dropDatabase without sharding first
   - jstests/concurrency/fsm_workloads/plan_cache_drop_database.js
 
   # reIndex is not supported in mongos.
@@ -108,9 +108,6 @@ selector:
   # stagedebug can only be run against a standalone mongod
   - jstests/concurrency/fsm_workloads/yield_and_hashed.js
   - jstests/concurrency/fsm_workloads/yield_and_sorted.js
-
-  # TODO Unblacklist (SERVER-35538).
-  - jstests/concurrency/fsm_workloads/database_versioning.js
 
   # TODO Unblacklist (SERVER-38852).
   - jstests/concurrency/fsm_workloads/agg_out_interrupt_cleanup.js
@@ -198,9 +195,6 @@ selector:
   - jstests/concurrency/fsm_workloads/agg_merge_when_not_matched_insert.js
   - jstests/concurrency/fsm_workloads/agg_merge_when_matched_replace_with_new.js
 
-  # Uses the collMod command, which isn't considered to be retryable.
-  - jstests/concurrency/fsm_workloads/random_moveChunk_index_operations.js
-
   # JS engine interruptions on mongos return ErrorCodes::Interrupted, which isn't
   # considered a retryable or transient transaction error.
   - jstests/concurrency/fsm_workloads/indexed_insert_where.js
@@ -209,6 +203,8 @@ selector:
 
   exclude_with_any_tags:
   - requires_replication
+  # Snapshot reads in transactions are banned on capped collections.
+  - requires_capped
   # Sharing cursors between state functions will fail in this suite because it will attempt to use
   # the same cursor in multiple transactions.
   - state_functions_share_cursor
@@ -221,6 +217,8 @@ selector:
   # This tag corresponds to operations which are run long enough to exceed the stepdown interval
   # when grouped into transactions.
   - operations_longer_than_stepdown_interval_in_txns
+  # mongos has no system.profile collection.
+  - requires_profiling
 
   # Note that "requires_non_retryable_writes" does not need to be blacklisted because some writes
   # that are not individually retryable can be retried if they are part of a transaction.
@@ -284,6 +282,7 @@ executor:
       set_parameters:
         enableTestCommands: 1
         enableElectionHandoff: 0
+        roleGraphInvalidationIsFatal: 1
     num_rs_nodes_per_shard: 3
     num_shards: 2
     num_mongos: 2

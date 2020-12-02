@@ -52,16 +52,7 @@ namespace mongo {
  */
 class ReplicaSetMonitor : public ReplicaSetMonitorInterface {
 public:
-    virtual ~ReplicaSetMonitor() = default;
-
-    /**
-     * Defaults to false, meaning that if multiple hosts meet a criteria we pick one at random.
-     * This is required by the replica set driver spec. Set this to true in tests that need host
-     * selection to be deterministic.
-     *
-     * NOTE: Used by unit-tests only.
-     */
-    static bool useDeterministicHostSelection;
+    ~ReplicaSetMonitor() override = default;
 
     /**
      * Creates a new ReplicaSetMonitor, if it doesn't already exist.
@@ -101,10 +92,6 @@ public:
      * Permanently stops all monitoring on replica sets.
      */
     static void shutdown();
-
-    static void disableRefreshRetries_forTest();
-
-    static bool areRefreshRetriesDisabledForTest();
 };
 
 }  // namespace mongo

@@ -81,9 +81,8 @@ StatusWith<ChunkVersion> ChunkVersion::fromBSON(const BSONObj& obj) {
     }
 
     if (it.more()) {
-        // Expect _canThrowSSVOnIgnored
+        // Expect the canThrowSSVOnIgnored field
         BSONElement canThrowSSVOnIgnoredPart = it.next();
-
         version._canThrowSSVOnIgnored = canThrowSSVOnIgnoredPart && canThrowSSVOnIgnoredPart.Bool();
     }
 

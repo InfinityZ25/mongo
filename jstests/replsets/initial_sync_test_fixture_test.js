@@ -1,15 +1,18 @@
-/*
+/**
  * Test to check that the Initial Sync Test Fixture properly pauses initial sync.
  *
  * The test checks that both the collection cloning and oplog application stages of initial sync
- * pause after exactly one commad is run when the test fixture's step function is called. The test
+ * pause after exactly one command is run when the test fixture's step function is called. The test
  * issues the same listDatabases and listCollections commands that collection cloning does so we
  * know all the commands that will be run on the sync source and can verify that only one is run per
  * call to step(). Similarly for oplog application, we can check the log messages to make sure that
  * the batches being applied are of the expected size and that only one batch was applied per step()
  * call.
  *
- * @tags: [uses_transactions, uses_prepare_transaction, requires_fcv_44]
+ * @tags: [
+ *   uses_prepare_transaction,
+ *   uses_transactions,
+ * ]
  */
 
 (function() {
@@ -38,7 +41,7 @@ function checkLogForMsg(node, msg, contains) {
  * specified timestamp.
  */
 function checkLogForGetTimestampMsg(node, timestampName, timestamp, contains) {
-    let msg = "Initial Syncer got the " + timestampName + ": { ts: " + timestamp;
+    let msg = "Initial Syncer got the " + timestampName + ": { ts: " + tojson(timestamp);
 
     checkLogForMsg(node, msg, contains);
 }
@@ -81,7 +84,24 @@ function checkLogForOplogApplicationMsg(node, size) {
 }
 
 // Set up Initial Sync Test.
-const initialSyncTest = new InitialSyncTest();
+const rst = new ReplSetTest({
+    name: "InitialSyncTest",
+    nodes: [
+        {
+            // Each PrimaryOnlyService rebuilds its instances on stepup, and that may involve
+            // doing writes. So we need to disable PrimaryOnlyService rebuild to make the number
+            // of oplog batches check below work reliably.
+            setParameter: {
+                "failpoint.PrimaryOnlyServiceSkipRebuildingInstances": tojson({mode: "alwaysOn"}),
+            }
+        },
+        {rsConfig: {priority: 0, votes: 0}}
+    ]
+});
+rst.startSet();
+rst.initiate();
+
+const initialSyncTest = new InitialSyncTest("InitialSyncTest", rst);
 const primary = initialSyncTest.getPrimary();
 let secondary = initialSyncTest.getSecondary();
 const db = primary.getDB("test");
@@ -105,11 +125,11 @@ let prepareTimestamp = PrepareHelpers.prepareTransaction(session);
 assert(!initialSyncTest.step());
 
 secondary = initialSyncTest.getSecondary();
-secondary.setSlaveOk();
+secondary.setSecondaryOk();
 
 // Make sure that we cannot read from this node yet.
 assert.commandFailedWithCode(secondary.getDB("test").runCommand({count: "foo"}),
-                             ErrorCodes.NotMasterOrSecondary);
+                             ErrorCodes.NotPrimaryOrSecondary);
 
 // Make sure that we see that the node got the defaultBeginFetchingTimestamp, but hasn't gotten the
 // beginFetchingTimestamp yet.
@@ -123,7 +143,7 @@ assert(!initialSyncTest.step());
 
 // Make sure that we cannot read from this node yet.
 assert.commandFailedWithCode(secondary.getDB("test").runCommand({count: "foo"}),
-                             ErrorCodes.NotMasterOrSecondary);
+                             ErrorCodes.NotPrimaryOrSecondary);
 
 // Make sure that we see that the node got the beginFetchingTimestamp, but hasn't gotten the
 // beginApplyingTimestamp yet.
@@ -137,7 +157,7 @@ assert(!initialSyncTest.step());
 
 // Make sure that we cannot read from this node yet.
 assert.commandFailedWithCode(secondary.getDB("test").runCommand({count: "foo"}),
-                             ErrorCodes.NotMasterOrSecondary);
+                             ErrorCodes.NotPrimaryOrSecondary);
 
 // Make sure that we see that the node got the beginApplyingTimestamp, but that we don't see the
 // listDatabases call yet.
@@ -152,7 +172,7 @@ assert(!initialSyncTest.step());
 
 // Make sure that we cannot read from this node yet.
 assert.commandFailedWithCode(secondary.getDB("test").runCommand({count: "foo"}),
-                             ErrorCodes.NotMasterOrSecondary);
+                             ErrorCodes.NotPrimaryOrSecondary);
 
 // Make sure that we saw the listDatabases call in the log messages, but didn't see any
 // listCollections or listIndexes call.
@@ -190,7 +210,7 @@ for (let dbObj of databases) {
 
     // Make sure that we cannot read from this node yet.
     assert.commandFailedWithCode(secondary.getDB("test").runCommand({count: "foo"}),
-                                 ErrorCodes.NotMasterOrSecondary);
+                                 ErrorCodes.NotPrimaryOrSecondary);
 
     // Make sure that we saw the listCollections call in the log messages, but didn't see a
     // listIndexes call.
@@ -206,7 +226,7 @@ for (let dbObj of databases) {
 
         // Make sure that we cannot read from this node yet.
         assert.commandFailedWithCode(secondary.getDB("test").runCommand({count: "foo"}),
-                                     ErrorCodes.NotMasterOrSecondary);
+                                     ErrorCodes.NotPrimaryOrSecondary);
 
         // Make sure that we saw the listIndexes call in the log messages, but didn't
         // see a listCollections call.

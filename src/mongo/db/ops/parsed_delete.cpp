@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kWrite
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kWrite
 
 #include "mongo/platform/basic.h"
 
@@ -70,8 +70,11 @@ Status ParsedDelete::parseRequest() {
         }
         collator = uassertStatusOK(std::move(statusWithCollator));
     }
-    _expCtx = make_intrusive<ExpressionContext>(
-        _opCtx, std::move(collator), _request->getNsString(), _request->getRuntimeConstants());
+    _expCtx = make_intrusive<ExpressionContext>(_opCtx,
+                                                std::move(collator),
+                                                _request->getNsString(),
+                                                _request->getLegacyRuntimeConstants(),
+                                                _request->getLet());
 
     if (CanonicalQuery::isSimpleIdQuery(_request->getQuery())) {
         return Status::OK();
@@ -104,10 +107,12 @@ Status ParsedDelete::parseQueryToCQ() {
         qr->setLimit(1);
     }
 
-    // If the delete request has runtime constants attached to it, pass them to the QueryRequest.
-    if (auto& runtimeConstants = _request->getRuntimeConstants()) {
-        qr->setRuntimeConstants(*runtimeConstants);
-    }
+    // If the delete request has runtime constants or let parameters attached to it, pass them to
+    // the QueryRequest.
+    if (auto& runtimeConstants = _request->getLegacyRuntimeConstants())
+        qr->setLegacyRuntimeConstants(*runtimeConstants);
+    if (auto& letParams = _request->getLet())
+        qr->setLetParameters(*letParams);
 
     auto statusWithCQ =
         CanonicalQuery::canonicalize(_opCtx,
@@ -127,8 +132,8 @@ const DeleteRequest* ParsedDelete::getRequest() const {
     return _request;
 }
 
-PlanExecutor::YieldPolicy ParsedDelete::yieldPolicy() const {
-    return _request->getGod() ? PlanExecutor::NO_YIELD : _request->getYieldPolicy();
+PlanYieldPolicy::YieldPolicy ParsedDelete::yieldPolicy() const {
+    return _request->getGod() ? PlanYieldPolicy::YieldPolicy::NO_YIELD : _request->getYieldPolicy();
 }
 
 bool ParsedDelete::hasParsedQuery() const {

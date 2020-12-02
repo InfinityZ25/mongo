@@ -8,6 +8,7 @@
 
 load("jstests/sharding/libs/shard_versioning_util.js");
 load('jstests/sharding/libs/sharded_transactions_helpers.js');
+load("jstests/libs/fail_point_util.js");
 
 const st = new ShardingTest({mongos: 2, shards: 2});
 const dbName = jsTestName();
@@ -24,7 +25,7 @@ assert.commandWorked(st.s.adminCommand({split: ns, middle: {x: 0}}));
 assert.commandWorked(st.s.adminCommand({moveChunk: ns, find: {x: 100}, to: st.shard1.shardName}));
 flushRoutersAndRefreshShardMetadata(st, {ns});
 
-assert.commandWorked(mongos0Coll.ensureIndex({x: 1}));
+assert.commandWorked(mongos0Coll.createIndex({x: 1}));
 
 // Move chunk without refreshing the recipient so that the recipient shard throws a
 // StaleShardVersion error upon receiving the drop index command.

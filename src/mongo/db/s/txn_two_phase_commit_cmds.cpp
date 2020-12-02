@@ -27,12 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kTransaction
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTransaction
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/commands/txn_two_phase_commit_cmds_gen.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/sharding_state.h"
@@ -260,8 +261,8 @@ public:
 
             if (coordinatorDecisionFuture) {
                 auto swCommitDecision = coordinatorDecisionFuture->getNoThrow(opCtx);
-                // The coordinator can only throw NoSuchTransaction (as opposed to propagating an
-                // Abort decision due to NoSuchTransaction reported by a shard) if
+
+                // The coordinator can throw TransactionCoordinatorCanceled if
                 // cancelIfCommitNotYetStarted was called, which can happen in one of 3 cases:
                 //
                 //  1) The deadline to receive coordinateCommit passed
@@ -273,14 +274,17 @@ public:
                 // Even though only (3) requires recovering the commit decision from the local
                 // participant, since these cases cannot be differentiated currently, we always
                 // recover from the local participant.
-                if (swCommitDecision != ErrorCodes::NoSuchTransaction) {
-                    auto commitDecision = uassertStatusOK(std::move(swCommitDecision));
-                    switch (commitDecision) {
-                        case txn::CommitDecision::kCommit:
-                            return;
-                        case txn::CommitDecision::kAbort:
-                            uasserted(ErrorCodes::NoSuchTransaction, "Transaction was aborted");
+                if (swCommitDecision != ErrorCodes::TransactionCoordinatorCanceled) {
+                    if (swCommitDecision.isOK()) {
+                        invariant(swCommitDecision.getValue() == txn::CommitDecision::kCommit);
+                        return;
                     }
+
+                    invariant(swCommitDecision != ErrorCodes::TransactionCoordinatorSteppingDown);
+                    invariant(swCommitDecision !=
+                              ErrorCodes::TransactionCoordinatorReachedAbortDecision);
+
+                    uassertStatusOKWithContext(swCommitDecision, "Transaction was aborted");
                 }
             }
 

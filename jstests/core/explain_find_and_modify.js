@@ -1,6 +1,6 @@
 // Cannot implicitly shard accessed collections because of collection existing when none
 // expected.
-// @tags: [assumes_no_implicit_collection_creation_after_drop]
+// @tags: [assumes_no_implicit_collection_creation_after_drop,requires_fcv_47]
 
 /**
  * Test correctness of explaining findAndModify. Asserts the following:
@@ -51,7 +51,10 @@ assertCollDoesNotExist(cName, "explaining a remove should not create a new colle
 assert.commandWorked(db.runCommand(explainUpsert));
 assertCollDoesNotExist(cName, "explaining an upsert should not create a new collection.");
 
-assert.commandWorked(db.runCommand(Object.merge(explainUpsert, {fields: {x: 1}})));
+explainUpsert.explain.fields = {
+    x: 1
+};
+assert.commandWorked(db.runCommand(explainUpsert));
 assertCollDoesNotExist(cName, "explaining an upsert should not create a new collection.");
 
 // 3. Explaining findAndModify should not work with an invalid findAndModify command object.
@@ -118,7 +121,7 @@ var testCases = [
             executionStats: {
                 nReturned: 0,
                 executionSuccess: true,
-                executionStages: {stage: "UPDATE", nWouldModify: 0, wouldInsert: false}
+                executionStages: {stage: "UPDATE", nWouldModify: 0, nWouldUpsert: 0}
             }
         }
     },
@@ -129,7 +132,7 @@ var testCases = [
             executionStats: {
                 nReturned: 0,
                 executionSuccess: true,
-                executionStages: {stage: "UPDATE", nWouldModify: 0, wouldInsert: false}
+                executionStages: {stage: "UPDATE", nWouldModify: 0, nWouldUpsert: 0}
             }
         }
     },
@@ -140,7 +143,7 @@ var testCases = [
             executionStats: {
                 nReturned: 1,
                 executionSuccess: true,
-                executionStages: {stage: "UPDATE", nWouldModify: 1, wouldInsert: false}
+                executionStages: {stage: "UPDATE", nWouldModify: 1, nWouldUpsert: 0}
             }
         }
     },
@@ -151,7 +154,7 @@ var testCases = [
             executionStats: {
                 nReturned: 1,
                 executionSuccess: true,
-                executionStages: {stage: "UPDATE", nWouldModify: 1, wouldInsert: false}
+                executionStages: {stage: "UPDATE", nWouldModify: 1, nWouldUpsert: 0}
             }
         }
     },
@@ -163,7 +166,7 @@ var testCases = [
             executionStats: {
                 nReturned: 0,
                 executionSuccess: true,
-                executionStages: {stage: "UPDATE", nWouldModify: 0, wouldInsert: true}
+                executionStages: {stage: "UPDATE", nWouldModify: 0, nWouldUpsert: 1}
             }
         }
     },
@@ -174,7 +177,7 @@ var testCases = [
             executionStats: {
                 nReturned: 1,
                 executionSuccess: true,
-                executionStages: {stage: "UPDATE", nWouldModify: 0, wouldInsert: true}
+                executionStages: {stage: "UPDATE", nWouldModify: 0, nWouldUpsert: 1}
             }
         }
     },
@@ -185,7 +188,7 @@ var testCases = [
             executionStats: {
                 nReturned: 1,
                 executionSuccess: true,
-                executionStages: {stage: "UPDATE", nWouldModify: 1, wouldInsert: false}
+                executionStages: {stage: "UPDATE", nWouldModify: 1, nWouldUpsert: 0}
             }
         }
     }

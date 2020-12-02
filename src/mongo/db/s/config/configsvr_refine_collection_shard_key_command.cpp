@@ -27,14 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/pipeline/sharded_agg_helpers.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/shard_key_util.h"
@@ -42,6 +41,7 @@
 #include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/refine_collection_shard_key_gen.h"
+#include "mongo/s/stale_shard_version_helpers.h"
 
 namespace mongo {
 namespace {
@@ -87,15 +87,16 @@ public:
             // Validate the given namespace is (i) sharded, (ii) doesn't already have the proposed
             // key, and (iii) has the same epoch as the router that received
             // refineCollectionShardKey had in its routing table cache.
-            const auto collStatus =
-                catalogClient->getCollection(opCtx, nss, repl::ReadConcernLevel::kLocalReadConcern);
+            CollectionType collType;
+            try {
+                collType = catalogClient->getCollection(
+                    opCtx, nss, repl::ReadConcernLevel::kLocalReadConcern);
+            } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+                uasserted(ErrorCodes::NamespaceNotSharded,
+                          str::stream()
+                              << "refineCollectionShardKey namespace " << nss << " is not sharded");
+            }
 
-            uassert(ErrorCodes::NamespaceNotSharded,
-                    str::stream() << "refineCollectionShardKey namespace " << nss.toString()
-                                  << " is not sharded",
-                    collStatus != ErrorCodes::NamespaceNotFound);
-
-            const auto collType = uassertStatusOK(collStatus).value;
             const auto oldShardKeyPattern = ShardKeyPattern(collType.getKeyPattern());
             const auto proposedKey = request().getKey().getOwned();
 
@@ -125,23 +126,22 @@ public:
             // Indexes are loaded using shard versions, so validating the shard key may need to be
             // retried on StaleConfig errors.
             auto catalogCache = Grid::get(opCtx)->catalogCache();
-            sharded_agg_helpers::shardVersionRetry(
-                opCtx,
-                catalogCache,
-                nss,
-                "validating indexes for refineCollectionShardKey"_sd,
-                [&] {
-                    // Note a shard key index will never be created automatically for refining a
-                    // shard key, so no default collation is needed.
-                    shardkeyutil::validateShardKeyIndexExistsOrCreateIfPossible(
-                        opCtx,
-                        nss,
-                        proposedKey,
-                        newShardKeyPattern,
-                        boost::none,
-                        collType.getUnique(),
-                        shardkeyutil::ValidationBehaviorsRefineShardKey(opCtx, nss));
-                });
+            shardVersionRetry(opCtx,
+                              catalogCache,
+                              nss,
+                              "validating indexes for refineCollectionShardKey"_sd,
+                              [&] {
+                                  // Note a shard key index will never be created automatically for
+                                  // refining a shard key, so no default collation is needed.
+                                  shardkeyutil::validateShardKeyIndexExistsOrCreateIfPossible(
+                                      opCtx,
+                                      nss,
+                                      proposedKey,
+                                      newShardKeyPattern,
+                                      boost::none,
+                                      collType.getUnique(),
+                                      shardkeyutil::ValidationBehaviorsRefineShardKey(opCtx, nss));
+                              });
 
             LOGV2(21922,
                   "CMD: refineCollectionShardKey: {request}",

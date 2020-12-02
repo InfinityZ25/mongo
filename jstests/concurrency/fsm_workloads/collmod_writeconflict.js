@@ -4,8 +4,6 @@
  * collmod_writeconflict.js
  *
  * Ensures collMod successfully handles WriteConflictExceptions.
- *
- * @tags: [requires_fcv_44]
  */
 load('jstests/concurrency/fsm_libs/extend_workload.js');  // for extendWorkload
 load('jstests/concurrency/fsm_workloads/collmod.js');     // for $config
@@ -16,8 +14,11 @@ var $config = extendWorkload($config, function($config, $super) {
         $super.setup.apply(this, arguments);
         // Log traces for each WriteConflictException encountered in case they are not handled
         // properly.
+        /*
+          So long as there are no BFs, leave WCE tracing disabled.
         assertAlways.commandWorked(
             db.adminCommand({setParameter: 1, traceWriteConflictExceptions: true}));
+        */
 
         // Set up failpoint to trigger WriteConflictException during write operations.
         assertAlways.commandWorked(db.adminCommand(

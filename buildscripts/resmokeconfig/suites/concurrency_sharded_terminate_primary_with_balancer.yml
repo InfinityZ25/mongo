@@ -71,7 +71,7 @@ selector:
   - jstests/concurrency/fsm_workloads/findAndModify_update_grow.js
 
 
-  # cannot ensureIndex after dropDatabase without sharding first
+  # cannot createIndex after dropDatabase without sharding first
   - jstests/concurrency/fsm_workloads/plan_cache_drop_database.js
 
   # The WTWriteConflictException failpoint is not supported on mongos.
@@ -171,10 +171,6 @@ selector:
   # much value in running it.
   - jstests/concurrency/fsm_workloads/drop_collection.js
 
-  # It fails with PooledConnectionsDropped when setFCV is run concurrently with movePrimary, which
-  # seems like it's due to a race condition in the NetworkInterfaceTL.
-  - jstests/concurrency/fsm_workloads/database_versioning.js
-
   # serverStatus does not include transaction metrics on mongos.
   - jstests/concurrency/fsm_workloads/multi_statement_transaction_atomicity_isolation_metrics_test.js
 
@@ -190,6 +186,8 @@ selector:
   - assumes_balancer_off
   - requires_replication
   - requires_non_retryable_writes
+  # mongos has no system.profile collection.
+  - requires_profiling
 
 executor:
   archive:
@@ -239,6 +237,7 @@ executor:
       set_parameters:
         enableTestCommands: 1
         enableElectionHandoff: 0
+        roleGraphInvalidationIsFatal: 1
     num_rs_nodes_per_shard: 3
     num_shards: 2
     num_mongos: 2

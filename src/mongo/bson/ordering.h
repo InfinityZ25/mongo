@@ -33,19 +33,22 @@
 
 namespace mongo {
 
-// todo: ideally move to db/ instead of bson/, but elim any dependencies first
-
 /** A precomputation of a BSON index or sort key pattern.  That is something like:
-       { a : 1, b : -1 }
-    The constructor is private to make conversion more explicit so we notice where we call make().
-    Over time we should push this up higher and higher.
-*/
+ *     { a : 1, b : -1 }
+ *   The constructor is private to make conversion more explicit so we notice where we call make().
+ *   Over time we should push this up higher and higher.
+ */
 class Ordering {
-    unsigned bits;
-    Ordering(unsigned b) : bits(b) {}
+    uint32_t bits;
+    Ordering(uint32_t b) : bits(b) {}
 
 public:
     static constexpr size_t kMaxCompoundIndexKeys = size_t{32};
+    static_assert(kMaxCompoundIndexKeys == 8 * sizeof(bits));
+
+    static Ordering allAscending() {
+        return {0};
+    }
 
     Ordering(const Ordering& r) : bits(r.bits) {}
     void operator=(const Ordering& r) {
@@ -53,39 +56,31 @@ public:
     }
 
     /** so, for key pattern { a : 1, b : -1 }
-        get(0) == 1
-        get(1) == -1
-    */
+     *   get(0) == 1
+     *   get(1) == -1
+     */
     int get(int i) const {
         uassert(ErrorCodes::Overflow,
                 str::stream() << "Ordering offset is out of bounds: " << i,
                 i >= 0 && static_cast<size_t>(i) < kMaxCompoundIndexKeys);
-        return ((1 << i) & bits) ? -1 : 1;
+        return ((1u << i) & bits) ? -1 : 1;
     }
 
-    // for woCompare...
-    unsigned descending(unsigned mask) const {
+    uint32_t descending(uint32_t mask) const {
         return bits & mask;
     }
 
-    /*operator std::string() const {
-        StringBuilder buf;
-        for ( unsigned i=0; i<nkeys; i++)
-            buf.append( get(i) > 0 ? "+" : "-" );
-        return buf.str();
-    }*/
-
     static Ordering make(const BSONObj& obj) {
-        unsigned b = 0;
+        uint32_t b = 0;
         BSONObjIterator k(obj);
-        unsigned n = 0;
+        uint32_t n = 0;
         while (1) {
             BSONElement e = k.next();
             if (e.eoo())
                 break;
             uassert(13103, "too many compound keys", n < kMaxCompoundIndexKeys);
             if (e.number() < 0)
-                b |= (1 << n);
+                b |= (1u << n);
             n++;
         }
         return Ordering(b);

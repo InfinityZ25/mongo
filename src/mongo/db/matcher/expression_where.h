@@ -29,8 +29,8 @@
 
 #pragma once
 
+#include "mongo/db/exec/js_function.h"
 #include "mongo/db/matcher/expression_where_base.h"
-#include "mongo/scripting/engine.h"
 
 namespace mongo {
 
@@ -44,13 +44,24 @@ public:
 
     std::unique_ptr<MatchExpression> shallowClone() const final;
 
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    const JsFunction& getPredicate() const {
+        return _jsFunction;
+    }
+
 private:
     std::string _dbName;
 
-    std::unique_ptr<Scope> _scope;
-    ScriptingFunction _func;
-
     OperationContext* const _opCtx;
+
+    JsFunction _jsFunction;
 };
 
 }  // namespace mongo

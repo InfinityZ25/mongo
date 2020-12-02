@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -137,7 +137,8 @@ Status storeMongosOptions(const moe::Environment& params) {
         return configdbConnectionString.getStatus();
     }
 
-    if (configdbConnectionString.getValue().type() != ConnectionString::SET) {
+    if (configdbConnectionString.getValue().type() !=
+        ConnectionString::ConnectionType::kReplicaSet) {
         return Status(ErrorCodes::BadValue,
                       str::stream() << "configdb supports only replica set connection string");
     }

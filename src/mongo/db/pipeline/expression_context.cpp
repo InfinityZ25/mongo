@@ -36,7 +36,6 @@
 #include "mongo/db/query/collation/collation_spec.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/util/intrusive_counter.h"
-#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
@@ -61,12 +60,14 @@ ExpressionContext::ExpressionContext(OperationContext* opCtx,
                         request.shouldBypassDocumentValidation(),
                         request.getIsMapReduceCommand(),
                         request.getNamespaceString(),
-                        request.getRuntimeConstants(),
+                        request.getLegacyRuntimeConstants(),
                         std::move(collator),
                         std::move(processInterface),
                         std::move(resolvedNamespaces),
                         std::move(collUUID),
+                        request.getLetParameters(),
                         mayDbProfile) {
+
     if (request.getIsMapReduceCommand()) {
         // mapReduce command JavaScript invocation is only subject to the server global
         // 'jsHeapLimitMB' limit.
@@ -83,13 +84,13 @@ ExpressionContext::ExpressionContext(
     bool bypassDocumentValidation,
     bool isMapReduce,
     const NamespaceString& ns,
-    const boost::optional<RuntimeConstants>& runtimeConstants,
+    const boost::optional<LegacyRuntimeConstants>& runtimeConstants,
     std::unique_ptr<CollatorInterface> collator,
     const std::shared_ptr<MongoProcessInterface>& mongoProcessInterface,
     StringMap<ExpressionContext::ResolvedNamespace> resolvedNamespaces,
     boost::optional<UUID> collUUID,
-    bool mayDbProfile,
-    const boost::optional<BSONObj>& letParameters)
+    const boost::optional<BSONObj>& letParameters,
+    bool mayDbProfile)
     : explain(explain),
       fromMongos(fromMongos),
       needsMerge(needsMerge),
@@ -99,9 +100,7 @@ ExpressionContext::ExpressionContext(
       uuid(std::move(collUUID)),
       opCtx(opCtx),
       mongoProcessInterface(mongoProcessInterface),
-      timeZoneDatabase(opCtx && opCtx->getServiceContext()
-                           ? TimeZoneDatabase::get(opCtx->getServiceContext())
-                           : nullptr),
+      timeZoneDatabase(getTimeZoneDatabase(opCtx)),
       variablesParseState(variables.useIdGenerator()),
       mayDbProfile(mayDbProfile),
       _collator(std::move(collator)),
@@ -114,9 +113,9 @@ ExpressionContext::ExpressionContext(
         auto genConsts = variables.generateRuntimeConstants(opCtx);
         genConsts.setJsScope(runtimeConstants->getJsScope());
         genConsts.setIsMapReduce(runtimeConstants->getIsMapReduce());
-        variables.setRuntimeConstants(genConsts);
+        variables.setLegacyRuntimeConstants(genConsts);
     } else if (runtimeConstants) {
-        variables.setRuntimeConstants(*runtimeConstants);
+        variables.setLegacyRuntimeConstants(*runtimeConstants);
     } else {
         variables.setDefaultRuntimeConstants(opCtx);
     }
@@ -124,24 +123,20 @@ ExpressionContext::ExpressionContext(
     if (!isMapReduce) {
         jsHeapLimitMB = internalQueryJavaScriptHeapSizeLimitMB.load();
     }
-    if (letParameters) {
-        // TODO SERVER-47713: One possible fix is to change the interface of everything that needs
-        // an expression context intrusive_ptr to take a raw ptr.
-        auto intrusiveThis = boost::intrusive_ptr{this};
-        ON_BLOCK_EXIT([&] {
-            intrusiveThis.detach();
-            unsafeRefDecRefCountTo(0u);
-        });
-        variables.seedVariablesWithLetParameters(intrusiveThis, *letParameters);
-    }
+    if (letParameters)
+        variables.seedVariablesWithLetParameters(this, *letParameters);
 }
 
-ExpressionContext::ExpressionContext(OperationContext* opCtx,
-                                     std::unique_ptr<CollatorInterface> collator,
-                                     const NamespaceString& nss,
-                                     const boost::optional<RuntimeConstants>& runtimeConstants,
-                                     bool mayDbProfile)
-    : ns(nss),
+ExpressionContext::ExpressionContext(
+    OperationContext* opCtx,
+    std::unique_ptr<CollatorInterface> collator,
+    const NamespaceString& nss,
+    const boost::optional<LegacyRuntimeConstants>& runtimeConstants,
+    const boost::optional<BSONObj>& letParameters,
+    bool mayDbProfile,
+    boost::optional<ExplainOptions::Verbosity> explain)
+    : explain(explain),
+      ns(nss),
       opCtx(opCtx),
       mongoProcessInterface(std::make_shared<StubMongoProcessInterface>()),
       timeZoneDatabase(opCtx && opCtx->getServiceContext()
@@ -153,10 +148,12 @@ ExpressionContext::ExpressionContext(OperationContext* opCtx,
       _documentComparator(_collator.get()),
       _valueComparator(_collator.get()) {
     if (runtimeConstants) {
-        variables.setRuntimeConstants(*runtimeConstants);
+        variables.setLegacyRuntimeConstants(*runtimeConstants);
     }
 
     jsHeapLimitMB = internalQueryJavaScriptHeapSizeLimitMB.load();
+    if (letParameters)
+        variables.seedVariablesWithLetParameters(this, *letParameters);
 }
 
 void ExpressionContext::checkForInterrupt() {
@@ -168,9 +165,8 @@ void ExpressionContext::checkForInterrupt() {
     }
 }
 
-ExpressionContext::CollatorStash::CollatorStash(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    std::unique_ptr<CollatorInterface> newCollator)
+ExpressionContext::CollatorStash::CollatorStash(ExpressionContext* const expCtx,
+                                                std::unique_ptr<CollatorInterface> newCollator)
     : _expCtx(expCtx), _originalCollator(std::move(_expCtx->_collator)) {
     _expCtx->setCollator(std::move(newCollator));
 }
@@ -206,8 +202,7 @@ intrusive_ptr<ExpressionContext> ExpressionContext::copyWith(
                                                     std::move(collator),
                                                     mongoProcessInterface,
                                                     _resolvedNamespaces,
-                                                    uuid,
-                                                    mayDbProfile);
+                                                    uuid);
 
     expCtx->inMongos = inMongos;
     expCtx->maxFeatureCompatibilityVersion = maxFeatureCompatibilityVersion;

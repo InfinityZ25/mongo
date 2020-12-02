@@ -31,7 +31,7 @@
  * Connect to a Mongo database as a database, from C++.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -60,7 +60,7 @@
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/json.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/query/killcursors_request.h"
+#include "mongo/db/query/kill_cursors_gen.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/remote_command_request.h"
@@ -77,6 +77,7 @@
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/net/ssl_options.h"
+#include "mongo/util/net/ssl_peer_info.h"
 #include "mongo/util/password_digest.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/version.h"
@@ -187,6 +188,12 @@ executor::RemoteCommandResponse initWireVersion(
     BSONObjBuilder bob;
     bob.append("isMaster", 1);
 
+    if (uri.isHelloOk()) {
+        // Attach "helloOk: true" to the initial handshake to indicate that the client supports the
+        // hello command.
+        bob.append("helloOk", true);
+    }
+
     *speculativeAuthType = auth::speculateAuth(&bob, uri, saslClientSession);
     if (!uri.getUser().empty()) {
         UserName user(uri.getUser(), uri.getAuthenticationDatabase());
@@ -212,8 +219,8 @@ executor::RemoteCommandResponse initWireVersion(
 
     conn->getCompressorManager().clientBegin(&bob);
 
-    if (WireSpec::instance().isInternalClient) {
-        WireSpec::appendInternalClientWireVersion(WireSpec::instance().outgoing, &bob);
+    if (auto wireSpec = WireSpec::instance().get(); wireSpec->isInternalClient) {
+        WireSpec::appendInternalClientWireVersion(wireSpec->outgoing, &bob);
     }
 
     Date_t start{Date_t::now()};
@@ -257,12 +264,13 @@ void DBClientConnection::_auth(const BSONObj& params) {
     DBClientBase::_auth(params);
 }
 
-Status DBClientConnection::authenticateInternalUser() {
+Status DBClientConnection::authenticateInternalUser(auth::StepDownBehavior stepDownBehavior) {
     if (autoReconnect) {
         _internalAuthOnReconnect = true;
+        _internalAuthStepDownBehavior = stepDownBehavior;
     }
 
-    return DBClientBase::authenticateInternalUser();
+    return DBClientBase::authenticateInternalUser(stepDownBehavior);
 }
 
 bool DBClientConnection::connect(const HostAndPort& server,
@@ -338,8 +346,9 @@ Status DBClientConnection::connect(const HostAndPort& serverAddress, StringData 
         }
     }
 
+    auto wireSpec = WireSpec::instance().get();
     auto validateStatus =
-        rpc::validateWireVersion(WireSpec::instance().outgoing, swProtocolSet.getValue().version);
+        rpc::validateWireVersion(wireSpec->outgoing, swProtocolSet.getValue().version);
     if (!validateStatus.isOK()) {
         LOGV2_WARNING(20126,
                       "Remote host has incompatible wire version: {error}",
@@ -351,8 +360,8 @@ Status DBClientConnection::connect(const HostAndPort& serverAddress, StringData 
 
     _setServerRPCProtocols(swProtocolSet.getValue().protocolSet);
 
-    auto negotiatedProtocol = rpc::negotiate(
-        getServerRPCProtocols(), rpc::computeProtocolSet(WireSpec::instance().outgoing));
+    auto negotiatedProtocol =
+        rpc::negotiate(getServerRPCProtocols(), rpc::computeProtocolSet(wireSpec->outgoing));
 
     if (!negotiatedProtocol.isOK()) {
         return negotiatedProtocol.getStatus();
@@ -447,7 +456,7 @@ std::pair<rpc::UniqueReply, DBClientBase*> DBClientConnection::runCommandWithTar
     if (!_parentReplSetName.empty()) {
         const auto replyBody = out.first->getCommandReply();
         if (!isOk(replyBody)) {
-            handleNotMasterResponse(replyBody, "errmsg");
+            handleNotPrimaryResponse(replyBody, "errmsg");
         }
     }
 
@@ -460,7 +469,7 @@ std::pair<rpc::UniqueReply, std::shared_ptr<DBClientBase>> DBClientConnection::r
     if (!_parentReplSetName.empty()) {
         const auto replyBody = out.first->getCommandReply();
         if (!isOk(replyBody)) {
-            handleNotMasterResponse(replyBody, "errmsg");
+            handleNotPrimaryResponse(replyBody, "errmsg");
         }
     }
 
@@ -559,16 +568,16 @@ void DBClientConnection::_checkConnection() {
     sleepFor(_autoReconnectBackoff.nextSleep());
 
     LOGV2_DEBUG(20120,
-                logSeverityV1toV2(_logLevel).toInt(),
+                _logLevel.toInt(),
                 "Trying to reconnect to {connString}",
-                "Trying to reconnnect",
+                "Trying to reconnect",
                 "connString"_attr = toString());
     string errmsg;
     auto connectStatus = connect(_serverAddress, _applicationName);
     if (!connectStatus.isOK()) {
         _markFailed(kSetFlag);
         LOGV2_DEBUG(20121,
-                    logSeverityV1toV2(_logLevel).toInt(),
+                    _logLevel.toInt(),
                     "Reconnect attempt to {connString} failed: {reason}",
                     "Reconnect attempt failed",
                     "connString"_attr = toString(),
@@ -581,19 +590,19 @@ void DBClientConnection::_checkConnection() {
     }
 
     LOGV2_DEBUG(20122,
-                logSeverityV1toV2(_logLevel).toInt(),
+                _logLevel.toInt(),
                 "Reconnected to {connString}",
                 "Reconnected",
                 "connString"_attr = toString());
     if (_internalAuthOnReconnect) {
-        uassertStatusOK(authenticateInternalUser());
+        uassertStatusOK(authenticateInternalUser(_internalAuthStepDownBehavior));
     } else {
         for (const auto& kv : authCache) {
             try {
                 DBClientConnection::_auth(kv.second);
             } catch (ExceptionFor<ErrorCodes::AuthenticationFailed>& ex) {
                 LOGV2_DEBUG(20123,
-                            logSeverityV1toV2(_logLevel).toInt(),
+                            _logLevel.toInt(),
                             "Reconnect: auth failed for on {db} using {user}: {reason}",
                             "Reconnect: auth failed",
                             "db"_attr = kv.second[auth::getSaslCommandUserDBFieldName()],
@@ -640,7 +649,8 @@ unsigned long long DBClientConnection::query(std::function<void(DBClientCursorBa
     }
 
     // mask options
-    queryOptions &= (int)(QueryOption_NoCursorTimeout | QueryOption_SlaveOk | QueryOption_Exhaust);
+    queryOptions &=
+        (int)(QueryOption_NoCursorTimeout | QueryOption_SecondaryOk | QueryOption_Exhaust);
 
     unique_ptr<DBClientCursor> c(this->query(
         nsOrUuid, query, 0, 0, fieldsToReturn, queryOptions, batchSize, readConcernObj));
@@ -675,8 +685,10 @@ unsigned long long DBClientConnection::query(std::function<void(DBClientCursorBa
 DBClientConnection::DBClientConnection(bool _autoReconnect,
                                        double so_timeout,
                                        MongoURI uri,
-                                       const HandshakeValidationHook& hook)
-    : autoReconnect(_autoReconnect),
+                                       const HandshakeValidationHook& hook,
+                                       const ClientAPIVersionParameters* apiParameters)
+    : DBClientBase(apiParameters),
+      autoReconnect(_autoReconnect),
       _autoReconnectBackoff(Seconds(1), Seconds(2)),
       _hook(hook),
       _uri(std::move(uri)) {
@@ -793,7 +805,7 @@ void DBClientConnection::checkResponse(const std::vector<BSONObj>& batch,
     *host = _serverAddress.toString();
 
     if (!_parentReplSetName.empty() && !batch.empty()) {
-        handleNotMasterResponse(batch[0], "$err");
+        handleNotPrimaryResponse(batch[0], "$err");
     }
 }
 
@@ -801,26 +813,32 @@ void DBClientConnection::setParentReplSetName(const string& replSetName) {
     _parentReplSetName = replSetName;
 }
 
-void DBClientConnection::handleNotMasterResponse(const BSONObj& replyBody,
-                                                 StringData errorMsgFieldName) {
+void DBClientConnection::handleNotPrimaryResponse(const BSONObj& replyBody,
+                                                  StringData errorMsgFieldName) {
     const BSONElement errorMsgElem = replyBody[errorMsgFieldName];
     const BSONElement codeElem = replyBody["code"];
 
-    if (!isNotMasterErrorString(errorMsgElem) &&
-        !ErrorCodes::isNotMasterError(ErrorCodes::Error(codeElem.numberInt()))) {
+    if (!isNotPrimaryErrorString(errorMsgElem) &&
+        !ErrorCodes::isNotPrimaryError(ErrorCodes::Error(codeElem.numberInt()))) {
         return;
     }
 
     auto monitor = ReplicaSetMonitor::get(_parentReplSetName);
     if (monitor) {
         monitor->failedHost(_serverAddress,
-                            {ErrorCodes::NotMaster,
-                             str::stream() << "got not master from: " << _serverAddress
+                            {ErrorCodes::NotWritablePrimary,
+                             str::stream() << "got not primary from: " << _serverAddress
                                            << " of repl set: " << _parentReplSetName});
     }
 
     _markFailed(kSetFlag);
 }
+
+#ifdef MONGO_CONFIG_SSL
+const SSLConfiguration* DBClientConnection::getSSLConfiguration() {
+    return _session->getSSLConfiguration();
+}
+#endif
 
 AtomicWord<int> DBClientConnection::_numConnections;
 

@@ -34,15 +34,9 @@
 
 #include "mongo/db/namespace_string.h"
 #include "mongo/s/catalog/type_shard.h"
-#include "mongo/s/catalog_cache.h"
 #include "mongo/s/sharding_router_test_fixture.h"
 
 namespace mongo {
-
-class BSONObj;
-class ChunkManager;
-class CollatorInterface;
-class ShardKeyPattern;
 
 class CatalogCacheTestFixture : public ShardingTestFixture {
 protected:
@@ -53,12 +47,12 @@ protected:
      * points. Each individual chunk is placed on a separate shard with shard id being a single
      * number ranging from "0" to the number of chunks.
      */
-    std::shared_ptr<ChunkManager> makeChunkManager(
-        const NamespaceString& nss,
-        const ShardKeyPattern& shardKeyPattern,
-        std::unique_ptr<CollatorInterface> defaultCollator,
-        bool unique,
-        const std::vector<BSONObj>& splitPoints);
+    ChunkManager makeChunkManager(const NamespaceString& nss,
+                                  const ShardKeyPattern& shardKeyPattern,
+                                  std::unique_ptr<CollatorInterface> defaultCollator,
+                                  bool unique,
+                                  const std::vector<BSONObj>& splitPoints,
+                                  boost::optional<ReshardingFields> reshardingFields = boost::none);
 
     /**
      * Invalidates the catalog cache for 'kNss' and schedules a thread to invoke the blocking 'get'
@@ -71,7 +65,7 @@ protected:
      * std::future with the MSVC STL library, which requires the templated type to be default
      * constructible.
      */
-    executor::NetworkTestEnv::FutureHandle<boost::optional<CachedCollectionRoutingInfo>>
+    executor::NetworkTestEnv::FutureHandle<boost::optional<ChunkManager>>
     scheduleRoutingInfoForcedRefresh(const NamespaceString& nss);
 
     /**
@@ -85,8 +79,19 @@ protected:
      * std::future with the MSVC STL library, which requires the templated type to be default
      * constructible.
      */
-    executor::NetworkTestEnv::FutureHandle<boost::optional<CachedCollectionRoutingInfo>>
+    executor::NetworkTestEnv::FutureHandle<boost::optional<ChunkManager>>
     scheduleRoutingInfoUnforcedRefresh(const NamespaceString& nss);
+
+    /**
+     * Advance the time in the cache for 'kNss' and schedules a thread to make an incremental
+     * refresh.
+     *
+     * NOTE: The returned value is always set. The reason to use optional is a deficiency of
+     * std::future with the MSVC STL library, which requires the templated type to be default
+     * constructible.
+     */
+    executor::NetworkTestEnv::FutureHandle<boost::optional<ChunkManager>>
+    scheduleRoutingInfoIncrementalRefresh(const NamespaceString& nss);
 
     /**
      * Ensures that there are 'numShards' available in the shard registry. The shard ids are
@@ -100,18 +105,21 @@ protected:
      * Triggers a refresh for the given namespace and mocks network calls to simulate loading
      * metadata with two chunks: [minKey, 0) and [0, maxKey) on two shards with ids: "0" and "1".
      */
-    CachedCollectionRoutingInfo loadRoutingTableWithTwoChunksAndTwoShards(NamespaceString nss);
+    ChunkManager loadRoutingTableWithTwoChunksAndTwoShards(NamespaceString nss);
 
     /**
      * Same as the above method but the sharding key is hashed.
      */
-    CachedCollectionRoutingInfo loadRoutingTableWithTwoChunksAndTwoShardsHash(NamespaceString nss);
+    ChunkManager loadRoutingTableWithTwoChunksAndTwoShardsHash(NamespaceString nss);
 
     /**
      * The common implementation for any shard key.
      */
-    CachedCollectionRoutingInfo loadRoutingTableWithTwoChunksAndTwoShardsImpl(
-        NamespaceString nss, const BSONObj& shardKey);
+    ChunkManager loadRoutingTableWithTwoChunksAndTwoShardsImpl(
+        NamespaceString nss,
+        const BSONObj& shardKey,
+        boost::optional<std::string> primaryShardId = boost::none,
+        UUID uuid = UUID::gen());
 
     /**
      * Mocks network responses for loading a sharded database and collection from the config server.
@@ -119,6 +127,7 @@ protected:
     void expectGetDatabase(NamespaceString nss, std::string primaryShard = "0");
     void expectGetCollection(NamespaceString nss,
                              OID epoch,
+                             UUID uuid,
                              const ShardKeyPattern& shardKeyPattern);
 
     const HostAndPort kConfigHostAndPort{"DummyConfig", 1234};

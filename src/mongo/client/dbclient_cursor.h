@@ -35,6 +35,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/aggregation_request.h"
 #include "mongo/rpc/message.h"
 
 namespace mongo {
@@ -162,6 +163,9 @@ public:
                    int options,
                    std::vector<BSONObj> initialBatch = {});
 
+    static StatusWith<std::unique_ptr<DBClientCursor>> fromAggregationRequest(
+        DBClientBase* client, AggregationRequest aggRequest, bool secondaryOk, bool useExhaust);
+
     virtual ~DBClientCursor();
 
     long long getCursorId() const {
@@ -252,6 +256,13 @@ public:
         return _postBatchResumeToken;
     }
 
+    /**
+     * Returns the operation time for the latest batch, if set.
+     */
+    virtual boost::optional<Timestamp> getOperationTime() const {
+        return _operationTime;
+    }
+
 protected:
     struct Batch {
         // TODO remove constructors after c++17 toolchain upgrade
@@ -301,7 +312,6 @@ private:
     std::string _scopedHost;
     std::string _lazyHost;
     bool wasError;
-    BSONVersion _enabledBSONVersion;
     bool _useFindCommand = true;
     bool _connectionHasPendingReplies = false;
     int _lastRequestId = 0;
@@ -310,6 +320,7 @@ private:
     boost::optional<repl::OpTime> _lastKnownCommittedOpTime;
     boost::optional<BSONObj> _postBatchResumeToken;
     boost::optional<BSONObj> _readConcernObj;
+    boost::optional<Timestamp> _operationTime;
 
     void dataReceived(const Message& reply) {
         bool retry;

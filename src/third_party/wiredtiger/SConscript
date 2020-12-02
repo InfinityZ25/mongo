@@ -199,12 +199,11 @@ cslib = env.Library(
 wtlib = env.Library(
     target="wiredtiger",
     source=wtsources,
-    LIBDEPS=[
-        'wiredtiger_checksum',
-        '$BUILD_DIR/third_party/shim_allocator',
+    LIBDEPS_PRIVATE=[
         '$BUILD_DIR/third_party/shim_snappy',
         '$BUILD_DIR/third_party/shim_zlib',
         '$BUILD_DIR/third_party/shim_zstd',
+        'wiredtiger_checksum',
     ],
     LIBDEPS_TAGS=[
         'init-no-global-side-effects',
@@ -220,18 +219,17 @@ if wtbinEnv.TargetOSIs("windows"):
     # conformant name: _strdup. See online help for details.
     wtbinEnv.Append(CFLAGS=["/wd4996"])
 
+# SCons's smart_link() decides to try and link as C because all of the
+# file extensions are .c; however, we must link with snappy, etc. as
+# C++ if we are not in dynamic mode. The smart_link() function isn't
+# used by default on Windows, so we leave the value unchanged on other
+# platforms. See # https://github.com/SCons/scons/issues/3673.
+if wtbinEnv["LINK"] == "$SMARTLINK" and get_option("link-model") != "dynamic":
+    wtbinEnv["LINK"] = "$CXX"
+
 wtbin = wtbinEnv.Program(
     target="wt",
     source=Glob("src/utilities/*.c"),
     LIBDEPS=["wiredtiger"],
-    # SCons's smart_link() decides to try and link as C because all of the file extensions are .c;
-    # however, we must link with snappy, etc. as C++. The smart_link() function isn't used by
-    # default on Windows, so we leave the value unchanged on other platforms.
-    LINK="$CXX" if wtbinEnv["LINK"] == "$SMARTLINK" else wtbinEnv["LINK"],
     AIB_COMPONENT="dist-test",
 )
-
-hygienic = get_option('install-mode') == 'hygienic'
-if not hygienic:
-    wtbin_install = wtbinEnv.Install("#/", wtbin)
-    wtbinEnv.Alias("tools", wtbin_install)

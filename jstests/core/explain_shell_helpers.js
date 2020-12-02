@@ -2,13 +2,13 @@
  * Cannot implicitly shard accessed collections because the explain output from a mongod when run
  * against a sharded collection is wrapped in a "shards" object with keys for each shard.
  *
- * @tags: [assumes_unsharded_collection,
- *         does_not_support_stepdowns,
- *         requires_fastcount,
- *         # Projection push down works differently between 4.2 and 4.4. explain() provides a
- *         # different output between the two versions. This test expects only the 4.4 version
- *         # output.
- *         requires_fcv_44]
+ * @tags: [
+ *   assumes_unsharded_collection,
+ *   does_not_support_stepdowns,
+ *   requires_fastcount,
+ *   sbe_incompatible,
+ *   requires_fcv_47,
+ * ]
  */
 
 // Tests for the .explain() shell helper, which provides syntactic sugar for the explain command.
@@ -22,7 +22,7 @@ load("jstests/libs/analyze_plan.js");
 var explain;
 var stage;
 
-t.ensureIndex({a: 1});
+t.createIndex({a: 1});
 for (var i = 0; i < 10; i++) {
     t.insert({_id: i, a: i, b: 1});
 }
@@ -267,7 +267,7 @@ assert(planHasStage(db, explain.queryPlanner.winningPlan, "COUNT"));
 assert(planHasStage(db, explain.queryPlanner.winningPlan, "COUNT_SCAN"));
 
 // Explainable count with hint.
-assert.commandWorked(t.ensureIndex({c: 1}, {sparse: true}));
+assert.commandWorked(t.createIndex({c: 1}, {sparse: true}));
 explain = t.explain().count({c: {$exists: false}}, {hint: "c_1"});
 assert.commandWorked(explain);
 assert(planHasStage(db, explain.queryPlanner.winningPlan, "IXSCAN"));
@@ -343,7 +343,7 @@ if ("SHARD_WRITE" === stage.stage) {
     stage = stage.shards[0].executionStages;
 }
 assert.eq(stage.stage, "UPDATE");
-assert(stage.wouldInsert);
+assert(stage.nWouldUpsert == 1);
 
 // Make sure that the insert didn't actually happen.
 assert.eq(10, t.count());
@@ -356,7 +356,7 @@ if ("SHARD_WRITE" === stage.stage) {
     stage = stage.shards[0].executionStages;
 }
 assert.eq(stage.stage, "UPDATE");
-assert(stage.wouldInsert);
+assert(stage.nWouldUpsert == 1);
 assert.eq(0, stage.nMatched);
 
 // Make sure that the insert didn't actually happen.
@@ -370,7 +370,7 @@ if ("SHARD_WRITE" === stage.stage) {
     stage = stage.shards[0].executionStages;
 }
 assert.eq(stage.stage, "UPDATE");
-assert(!stage.wouldInsert);
+assert(stage.nWouldUpsert == 0);
 assert.eq(3, stage.nMatched);
 assert.eq(3, stage.nWouldModify);
 
@@ -382,7 +382,7 @@ if ("SHARD_WRITE" === stage.stage) {
     stage = stage.shards[0].executionStages;
 }
 assert.eq(stage.stage, "UPDATE");
-assert(!stage.wouldInsert);
+assert(stage.nWouldUpsert == 0);
 assert.eq(3, stage.nMatched);
 assert.eq(3, stage.nWouldModify);
 
@@ -415,7 +415,7 @@ if ("SINGLE_SHARD" === stage.stage) {
     stage = stage.shards[0].executionStages;
 }
 assert.eq(stage.stage, "UPDATE");
-assert(stage.wouldInsert);
+assert(stage.nWouldUpsert == 1);
 
 // Make sure that the insert didn't actually happen.
 assert.eq(10, t.count());
@@ -423,14 +423,6 @@ assert.eq(10, t.count());
 //
 // Error cases.
 //
-
-// Invalid verbosity string.
-assert.throws(function() {
-    t.explain("foobar").find().finish();
-});
-assert.throws(function() {
-    t.find().explain("foobar");
-});
 
 // Can't explain an update without a query.
 assert.throws(function() {

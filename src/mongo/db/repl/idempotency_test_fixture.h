@@ -49,6 +49,7 @@
 namespace mongo {
 
 class Collection;
+class CollectionPtr;
 
 namespace repl {
 
@@ -151,10 +152,11 @@ protected:
         return obj;
     };
 
-    std::string computeDataHash(Collection* collection);
+    std::string computeDataHash(const CollectionPtr& collection);
     virtual std::string getStatesString(const std::vector<CollectionState>& state1,
                                         const std::vector<CollectionState>& state2,
-                                        const std::vector<OplogEntry>& ops);
+                                        const std::vector<OplogEntry>& state1Ops,
+                                        const std::vector<OplogEntry>& state2Ops);
     /**
      * Validate data and indexes. Return the MD5 hash of the documents ordered by _id.
      */
@@ -164,58 +166,5 @@ protected:
     NamespaceString nss{"test.foo"};
 };
 
-OplogEntry makeCreateCollectionOplogEntry(OpTime opTime,
-                                          const NamespaceString& nss = NamespaceString("test.t"),
-                                          const BSONObj& options = BSONObj());
-
-OplogEntry makeInsertDocumentOplogEntry(OpTime opTime,
-                                        const NamespaceString& nss,
-                                        const BSONObj& documentToInsert);
-
-OplogEntry makeDeleteDocumentOplogEntry(OpTime opTime,
-                                        const NamespaceString& nss,
-                                        const BSONObj& documentToDelete);
-
-OplogEntry makeUpdateDocumentOplogEntry(OpTime opTime,
-                                        const NamespaceString& nss,
-                                        const BSONObj& documentToUpdate,
-                                        const BSONObj& updatedDocument);
-
-OplogEntry makeCreateIndexOplogEntry(OpTime opTime,
-                                     const NamespaceString& nss,
-                                     const std::string& indexName,
-                                     const BSONObj& keyPattern,
-                                     const UUID& uuid);
-
-OplogEntry makeCommandOplogEntry(OpTime opTime,
-                                 const NamespaceString& nss,
-                                 const BSONObj& command,
-                                 boost::optional<UUID> uuid = boost::none);
-
-OplogEntry makeCommandOplogEntryWithSessionInfoAndStmtId(
-    OpTime opTime,
-    const NamespaceString& nss,
-    const BSONObj& command,
-    LogicalSessionId lsid,
-    TxnNumber txnNum,
-    StmtId stmtId,
-    boost::optional<OpTime> prevOpTime = boost::none);
-
-OplogEntry makeInsertDocumentOplogEntryWithSessionInfo(OpTime opTime,
-                                                       const NamespaceString& nss,
-                                                       const BSONObj& documentToInsert,
-                                                       OperationSessionInfo info);
-
-OplogEntry makeInsertDocumentOplogEntryWithSessionInfoAndStmtId(
-    OpTime opTime,
-    const NamespaceString& nss,
-    boost::optional<UUID> uuid,
-    const BSONObj& documentToInsert,
-    LogicalSessionId lsid,
-    TxnNumber txnNum,
-    StmtId stmtId,
-    boost::optional<OpTime> prevOpTime = boost::none);
-
-BSONObj makeInsertApplyOpsEntry(const NamespaceString& nss, const UUID& uuid, const BSONObj& doc);
 }  // namespace repl
 }  // namespace mongo

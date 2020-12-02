@@ -2,11 +2,11 @@
  * Tests which commands support causal consistency in the Mongo shell, that for each supported
  * command, the shell properly forwards its operation and cluster time and updates them based on the
  * response, and that the server rejects commands with afterClusterTime ahead of cluster time.
+ *
+ * @tags: [requires_majority_read_concern]
  */
 (function() {
 "use strict";
-
-load("jstests/replsets/rslib.js");  // For startSetIfSupportsReadMajority.
 
 // Verifies the command works and properly updates operation or cluster time.
 function runCommandAndCheckLogicalTimes(cmdObj, db, shouldAdvance) {
@@ -43,7 +43,7 @@ function commandWorksAndUpdatesOperationTime(cmdObj, db) {
 
     // Verify the response contents and that new operation time is >= passed in time.
     assert(bsonWoCompare(session.getOperationTime(), clusterTimeObj.clusterTime) >= 0,
-           "expected the shell's operationTime to be >= to:" + clusterTimeObj.clusterTime +
+           "expected the shell's operationTime to be >= to:" + tojson(clusterTimeObj.clusterTime) +
                " after running command: " + tojson(cmdObj));
 }
 
@@ -59,11 +59,7 @@ const rst = new ReplSetTest({
     }
 });
 
-if (!startSetIfSupportsReadMajority(rst)) {
-    jsTest.log("skipping test since storage engine doesn't support committed reads");
-    rst.stopSet();
-    return;
-}
+rst.startSet();
 rst.initiate();
 
 // Start the sharding test and add the majority readConcern enabled replica set.
@@ -164,8 +160,6 @@ runCommandAndCheckLogicalTimes(
 runCommandAndCheckLogicalTimes(geoNearCmd, testDB, false);
 commandWorksAndUpdatesOperationTime(geoNearCmd, testDB);
 
-// GeoSearch is not supported for sharded clusters.
-
 // MapReduce doesn't currently support read concern majority.
 
 // Verify that the server rejects commands when operation time is invalid by running a command
@@ -175,12 +169,13 @@ const invalidCmd = {
     find: "foo",
     readConcern: {level: "majority", afterClusterTime: invalidTime}
 };
-assert.commandFailedWithCode(
-    testDB.runCommand(invalidCmd),
-    ErrorCodes.InvalidOptions,
-    "expected command, " + tojson(invalidCmd) + ", to fail with code, " +
-        ErrorCodes.InvalidOptions + ", because the afterClusterTime value, " + invalidTime +
-        ", should not be ahead of the clusterTime, " + session.getClusterTime().clusterTime);
+assert.commandFailedWithCode(testDB.runCommand(invalidCmd),
+                             ErrorCodes.InvalidOptions,
+                             "expected command, " + tojson(invalidCmd) + ", to fail with code, " +
+                                 ErrorCodes.InvalidOptions +
+                                 ", because the afterClusterTime value, " + tojson(invalidTime) +
+                                 ", should not be ahead of the clusterTime, " +
+                                 tojson(session.getClusterTime().clusterTime));
 
 rst.stopSet();
 st.stop();

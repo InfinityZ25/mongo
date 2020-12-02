@@ -35,6 +35,7 @@
 #include "mongo/db/exec/requires_collection_stage.h"
 #include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/record_id.h"
+#include "mongo/s/resharding/resume_token_gen.h"
 
 namespace mongo {
 
@@ -54,7 +55,7 @@ public:
     static const char* kStageType;
 
     CollectionScan(ExpressionContext* expCtx,
-                   const Collection* collection,
+                   const CollectionPtr& collection,
                    const CollectionScanParams& params,
                    WorkingSet* workingSet,
                    const MatchExpression* filter);
@@ -74,7 +75,16 @@ public:
     }
 
     BSONObj getPostBatchResumeToken() const {
-        return _params.requestResumeToken ? BSON("$recordId" << _lastSeenId.repr()) : BSONObj();
+        // Return a resume token compatible with resumable initial sync.
+        if (_params.requestResumeToken) {
+            return BSON("$recordId" << _lastSeenId.repr());
+        }
+        // Return a resume token compatible with resharding oplog sync.
+        if (_params.shouldTrackLatestOplogTimestamp) {
+            return ResumeTokenOplogTimestamp{_latestOplogEntryTimestamp}.toBSON();
+        }
+
+        return {};
     }
 
     std::unique_ptr<PlanStageStats> getStats() final;
@@ -95,10 +105,15 @@ private:
 
     /**
      * Extracts the timestamp from the 'ts' field of 'record', and sets '_latestOplogEntryTimestamp'
-     * to that time if it isn't already greater.  Returns an error if the 'ts' field cannot be
+     * to that time if it isn't already greater. Throws an exception if the 'ts' field cannot be
      * extracted.
      */
-    Status setLatestOplogEntryTimestamp(const Record& record);
+    void setLatestOplogEntryTimestamp(const Record& record);
+
+    /**
+     * Asserts that the 'minTs' specified in the query filter has not already fallen off the oplog.
+     */
+    void assertMinTsHasNotFallenOffOplog(const Record& record);
 
     // WorkingSet is not owned by us.
     WorkingSet* _workingSet;

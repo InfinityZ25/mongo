@@ -5,8 +5,9 @@
 (function() {
 'use strict';
 
-load("jstests/replsets/rslib.js");
+load("jstests/libs/fail_point_util.js");
 load("jstests/libs/write_concern_util.js");
+load("jstests/replsets/rslib.js");
 
 var name = "writeConcernStepDownAndBackUp";
 var dbName = "wMajorityCheck";
@@ -26,7 +27,7 @@ rst.initiate();
 
 function waitForPrimary(node) {
     assert.soon(function() {
-        return node.adminCommand('ismaster').ismaster;
+        return node.adminCommand('hello').isWritablePrimary;
     });
 }
 
@@ -42,25 +43,32 @@ assert.commandWorked(nodes[0].getDB(dbName).getCollection(collName).insert(
 
 // Stop the secondaries from replicating.
 stopServerReplication(secondaries);
+// Stop the primary from calling into awaitReplication().
+const hangBeforeWaitingForWriteConcern =
+    configureFailPoint(nodes[0], "hangBeforeWaitingForWriteConcern");
 // Stop the primary from being able to complete stepping down.
 assert.commandWorked(
     nodes[0].adminCommand({configureFailPoint: 'blockHeartbeatStepdown', mode: 'alwaysOn'}));
 
 jsTestLog("Do w:majority write that will block waiting for replication.");
 var doMajorityWrite = function() {
-    // Run ismaster command with 'hangUpOnStepDown' set to false to mark this connection as
+    // Run hello command with 'hangUpOnStepDown' set to false to mark this connection as
     // one that shouldn't be closed when the node steps down.  This makes it easier to detect
     // the error returned by the write concern failure.
-    assert.commandWorked(db.adminCommand({ismaster: 1, hangUpOnStepDown: false}));
+    assert.commandWorked(db.adminCommand({hello: 1, hangUpOnStepDown: false}));
 
+    jsTestLog("Begin waiting for w:majority write");
     var res = db.getSiblingDB('wMajorityCheck').stepdownAndBackUp.insert({a: 2}, {
         writeConcern: {w: 'majority', wtimeout: 600000}
     });
+    jsTestLog(`w:majority write replied: ${tojson(res)}`);
     assert.writeErrorWithCode(
         res, [ErrorCodes.PrimarySteppedDown, ErrorCodes.InterruptedDueToReplStateChange]);
 };
 
 var joinMajorityWriter = startParallelShell(doMajorityWrite, nodes[0].port);
+// Ensure the parallel shell hangs on the majority write before stepping the primary down.
+hangBeforeWaitingForWriteConcern.wait();
 
 jsTest.log("Disconnect primary from all secondaries");
 nodes[0].disconnect(nodes[1]);
@@ -90,6 +98,10 @@ nodes[2].acceptConnectionsFrom(nodes[0]);
 // Allow the old primary to finish stepping down so that shutdown can finish.
 assert.commandWorked(
     nodes[0].adminCommand({configureFailPoint: 'blockHeartbeatStepdown', mode: 'off'}));
+
+jsTestLog("Unblock the thread waiting for replication of the now rolled-back write, ensure " +
+          "that the write concern failed");
+hangBeforeWaitingForWriteConcern.off();
 
 joinMajorityWriter();
 

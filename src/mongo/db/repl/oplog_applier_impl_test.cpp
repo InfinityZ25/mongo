@@ -56,6 +56,7 @@
 #include "mongo/db/repl/idempotency_test_fixture.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_applier.h"
+#include "mongo/db/repl/oplog_entry_test_helpers.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_process.h"
@@ -76,105 +77,6 @@
 namespace mongo {
 namespace repl {
 namespace {
-
-/**
- * Creates an OplogEntry with given parameters and preset defaults for this test suite.
- */
-OplogEntry makeOplogEntry(OpTypeEnum opType,
-                          NamespaceString nss,
-                          OptionalCollectionUUID uuid,
-                          BSONObj o,
-                          boost::optional<BSONObj> o2) {
-    return OplogEntry(OpTime(Timestamp(1, 1), 1),  // optime
-                      boost::none,                 // hash
-                      opType,                      // opType
-                      nss,                         // namespace
-                      uuid,                        // uuid
-                      boost::none,                 // fromMigrate
-                      OplogEntry::kOplogVersion,   // version
-                      o,                           // o
-                      o2,                          // o2
-                      {},                          // sessionInfo
-                      boost::none,                 // upsert
-                      Date_t(),                    // wall clock time
-                      boost::none,                 // statement id
-                      boost::none,   // optime of previous write within same transaction
-                      boost::none,   // pre-image optime
-                      boost::none);  // post-image optime
-}
-
-OplogEntry makeOplogEntry(OpTypeEnum opType, NamespaceString nss, OptionalCollectionUUID uuid) {
-    return makeOplogEntry(opType, nss, uuid, BSON("_id" << 0), boost::none);
-}
-/**
- * Creates collection options suitable for oplog.
- */
-CollectionOptions createOplogCollectionOptions() {
-    CollectionOptions options;
-    options.capped = true;
-    options.cappedSize = 64 * 1024 * 1024LL;
-    options.autoIndexId = CollectionOptions::NO;
-    return options;
-}
-
-/*
- * Creates collection options for recording pre-images for testing deletes
- */
-CollectionOptions createRecordPreImageCollectionOptions() {
-    CollectionOptions options;
-    options.recordPreImages = true;
-    return options;
-}
-
-/**
- * Create test collection.
- * Returns collection.
- */
-void createCollection(OperationContext* opCtx,
-                      const NamespaceString& nss,
-                      const CollectionOptions& options) {
-    writeConflictRetry(opCtx, "createCollection", nss.ns(), [&] {
-        Lock::DBLock dblk(opCtx, nss.db(), MODE_IX);
-        Lock::CollectionLock collLk(opCtx, nss, MODE_X);
-        OldClientContext ctx(opCtx, nss.ns());
-        auto db = ctx.db();
-        ASSERT_TRUE(db);
-        mongo::WriteUnitOfWork wuow(opCtx);
-        auto coll = db->createCollection(opCtx, nss, options);
-        ASSERT_TRUE(coll);
-        wuow.commit();
-    });
-}
-
-
-/**
- * Create test collection with UUID.
- */
-auto createCollectionWithUuid(OperationContext* opCtx, const NamespaceString& nss) {
-    CollectionOptions options;
-    options.uuid = UUID::gen();
-    createCollection(opCtx, nss, options);
-    return options.uuid.get();
-}
-
-/**
- * Create test database.
- */
-void createDatabase(OperationContext* opCtx, StringData dbName) {
-    Lock::GlobalWrite globalLock(opCtx);
-    bool justCreated;
-    auto databaseHolder = DatabaseHolder::get(opCtx);
-    auto db = databaseHolder->openDb(opCtx, dbName, &justCreated);
-    ASSERT_TRUE(db);
-    ASSERT_TRUE(justCreated);
-}
-
-/**
- * Returns true if collection exists.
- */
-bool collectionExists(OperationContext* opCtx, const NamespaceString& nss) {
-    return AutoGetCollectionForRead(opCtx, nss).getCollection() != nullptr;
-}
 
 auto parseFromOplogEntryArray(const BSONObj& obj, int elem) {
     BSONElement tsArray;
@@ -447,7 +349,7 @@ TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsCommand) {
              << BSON("create" << nss.coll()) << "ts" << Timestamp(1, 1) << "ui" << UUID::gen());
     bool applyCmdCalled = false;
     _opObserver->onCreateCollectionFn = [&](OperationContext* opCtx,
-                                            Collection*,
+                                            const CollectionPtr&,
                                             const NamespaceString& collNss,
                                             const CollectionOptions&,
                                             const BSONObj&) {
@@ -625,9 +527,14 @@ protected:
         _opObserver->onInsertsFn =
             [&](OperationContext*, const NamespaceString& nss, const std::vector<BSONObj>& docs) {
                 stdx::lock_guard<Latch> lock(_insertMutex);
-                if (nss.isOplog() || nss == _nss1 || nss == _nss2 ||
-                    nss == NamespaceString::kSessionTransactionsTableNamespace) {
-                    _insertedDocs[nss].insert(_insertedDocs[nss].end(), docs.begin(), docs.end());
+                if (nss.isOplog()) {
+                    _insertedOplogDocs.insert(_insertedOplogDocs.end(), docs.begin(), docs.end());
+                } else if (nss == _nss1 || nss == _nss2 ||
+                           nss == NamespaceString::kSessionTransactionsTableNamespace) {
+                    // Storing the inserted documents in a sorted data structure to make checking
+                    // for valid results easier. The inserts will be performed by different threads
+                    // and there's no guarantee of the order.
+                    _insertedDocs[nss].insert(docs.begin(), docs.end());
                 } else
                     FAIL("Unexpected insert") << " into " << nss << " first doc: " << docs.front();
             };
@@ -655,7 +562,7 @@ protected:
     }
 
     std::vector<BSONObj>& oplogDocs() {
-        return _insertedDocs[NamespaceString::kRsOplogNamespace];
+        return _insertedOplogDocs;
     }
 
 protected:
@@ -667,7 +574,8 @@ protected:
     TxnNumber _txnNum;
     boost::optional<OplogEntry> _insertOp1, _insertOp2;
     boost::optional<OplogEntry> _commitOp;
-    std::map<NamespaceString, std::vector<BSONObj>> _insertedDocs;
+    std::map<NamespaceString, SimpleBSONObjSet> _insertedDocs;
+    std::vector<BSONObj> _insertedOplogDocs;
     std::unique_ptr<ThreadPool> _writerPool;
 
 private:
@@ -833,12 +741,12 @@ TEST_F(MultiOplogEntryOplogApplierImplTest, MultiApplyUnpreparedTransactionTwoBa
                   boost::none,
                   DurableTxnStateEnum::kCommitted);
 
-    // Check docs and ordering of docs in nss1.
-    // The insert into nss2 is unordered with respect to those.
-    ASSERT_BSONOBJ_EQ(insertDocs[0], _insertedDocs[_nss1][0]);
-    ASSERT_BSONOBJ_EQ(insertDocs[1], _insertedDocs[_nss2].front());
-    ASSERT_BSONOBJ_EQ(insertDocs[2], _insertedDocs[_nss1][1]);
-    ASSERT_BSONOBJ_EQ(insertDocs[3], _insertedDocs[_nss1][2]);
+    // Check that we inserted the expected documents
+    auto nss1It = _insertedDocs[_nss1].begin();
+    ASSERT_BSONOBJ_EQ(insertDocs[0], *(nss1It++));
+    ASSERT_BSONOBJ_EQ(insertDocs[1], *_insertedDocs[_nss2].begin());
+    ASSERT_BSONOBJ_EQ(insertDocs[2], *(nss1It++));
+    ASSERT_BSONOBJ_EQ(insertDocs[3], *(nss1It++));
 }
 
 TEST_F(MultiOplogEntryOplogApplierImplTest, MultiApplyTwoTransactionsOneBatch) {
@@ -944,11 +852,12 @@ TEST_F(MultiOplogEntryOplogApplierImplTest, MultiApplyTwoTransactionsOneBatch) {
                   boost::none,
                   DurableTxnStateEnum::kCommitted);
 
-    // Check docs and ordering of docs in nss1.
-    ASSERT_BSONOBJ_EQ(BSON("_id" << 1), _insertedDocs[_nss1][0]);
-    ASSERT_BSONOBJ_EQ(BSON("_id" << 2), _insertedDocs[_nss1][1]);
-    ASSERT_BSONOBJ_EQ(BSON("_id" << 3), _insertedDocs[_nss1][2]);
-    ASSERT_BSONOBJ_EQ(BSON("_id" << 4), _insertedDocs[_nss1][3]);
+    // Check docs in nss1.
+    auto nss1It = _insertedDocs[_nss1].begin();
+    ASSERT_BSONOBJ_EQ(BSON("_id" << 1), *(nss1It++));
+    ASSERT_BSONOBJ_EQ(BSON("_id" << 2), *(nss1It++));
+    ASSERT_BSONOBJ_EQ(BSON("_id" << 3), *(nss1It++));
+    ASSERT_BSONOBJ_EQ(BSON("_id" << 4), *(nss1It++));
 }
 
 
@@ -956,6 +865,17 @@ class MultiOplogEntryPreparedTransactionTest : public MultiOplogEntryOplogApplie
 protected:
     void setUp() override {
         MultiOplogEntryOplogApplierImplTest::setUp();
+
+        // Replaying prepared transactions requires 'enableMajorityReadConcern' to be set to true.
+        // This test uses ephemeralForTest under the hood and is ran in standalone mode. Given that,
+        // to satisfy the tests requirements, we forcefully set 'enableMajorityReadConcern' to true
+        // for these tests.
+        //
+        // Switching the storage engine to use WiredTiger comes with its own complications.
+        // 1. Transaction prepare is not supported with logged tables in debug builds.
+        // 2. Transactions cannot be assigned a log record if WT_CONN_LOG_DEBUG mode is not enabled.
+        _stashedEnableMajorityReadConcern =
+            std::exchange(serverGlobalParams.enableMajorityReadConcern, true);
 
         _prepareWithPrevOp = makeCommandOplogEntryWithSessionInfoAndStmtId(
             {Timestamp(Seconds(1), 3), 1LL},
@@ -1015,12 +935,19 @@ protected:
                                                           _singlePrepareApplyOp->getOpTime());
     }
 
+    void tearDown() override {
+        MultiOplogEntryOplogApplierImplTest::tearDown();
+
+        serverGlobalParams.enableMajorityReadConcern = _stashedEnableMajorityReadConcern;
+    }
+
 protected:
     boost::optional<OplogEntry> _commitPrepareWithPrevOp, _abortPrepareWithPrevOp,
         _singlePrepareApplyOp, _prepareWithPrevOp, _commitSinglePrepareApplyOp,
         _abortSinglePrepareApplyOp;
 
 private:
+    bool _stashedEnableMajorityReadConcern;
     Mutex _insertMutex = MONGO_MAKE_LATCH("MultiOplogEntryPreparedTransactionTest::_insertMutex");
 };
 
@@ -1605,7 +1532,7 @@ TEST_F(OplogApplierImplTest,
             onInsertsCalled = true;
             ASSERT_FALSE(opCtx->writesAreReplicated());
             ASSERT_FALSE(opCtx->lockState()->shouldConflictWithSecondaryBatchApplication());
-            ASSERT_TRUE(documentValidationDisabled(opCtx));
+            ASSERT_TRUE(DocumentValidationSettings::get(opCtx).isSchemaValidationDisabled());
             return Status::OK();
         };
     createCollectionWithUuid(_opCtx.get(), nss);
@@ -2516,7 +2443,9 @@ public:
                                 boost::none,    // statement id
                                 boost::none,    // optime of previous write within same transaction
                                 boost::none,    // pre-image optime
-                                boost::none);   // post-image optime
+                                boost::none,    // post-image optime
+                                boost::none,    // ShardId of resharding recipient
+                                boost::none);   // _id
     }
 
     /**
@@ -2544,7 +2473,9 @@ public:
                                 boost::none,    // statement id
                                 boost::none,    // optime of previous write within same transaction
                                 boost::none,    // pre-image optime
-                                boost::none);   // post-image optime
+                                boost::none,    // post-image optime
+                                boost::none,    // ShardId of resharding recipient
+                                boost::none);   // _id
     }
 
     void checkTxnTable(const OperationSessionInfo& sessionInfo,
@@ -3116,41 +3047,19 @@ TEST_F(IdempotencyTest, EmptyCappedNamespaceNotFound) {
     ASSERT_FALSE(autoColl.getDb());
 }
 
-TEST_F(IdempotencyTest, ConvertToCappedNamespaceNotFound) {
-    // Create a BSON "convertToCapped" command.
-    auto convertToCappedCmd = BSON("convertToCapped" << nss.coll());
-
-    // Create a "convertToCapped" oplog entry.
-    auto convertToCappedOp = makeCommandOplogEntry(nextOpTime(), nss, convertToCappedCmd);
-
-    // Ensure that NamespaceNotFound is acceptable.
-    ASSERT_OK(runOpInitialSync(convertToCappedOp));
-
-    AutoGetCollectionForReadCommand autoColl(_opCtx.get(), nss);
-
-    // Ensure that autoColl.getCollection() and autoColl.getDb() are both null.
-    ASSERT_FALSE(autoColl.getCollection());
-    ASSERT_FALSE(autoColl.getDb());
-}
-
-TEST_F(IdempotencyTest, IgnoreMultipleTextIndexErrorFromSystemConnection) {
+TEST_F(IdempotencyTest, UpdateTwoFields) {
     ASSERT_OK(
         ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
+
     ASSERT_OK(runOpInitialSync(createCollection(kUuid)));
-    ASSERT_OK(runOpInitialSync(insert(fromjson("{_id: 1, a: '1', b: '2'}"))));
-    // Building multiple non-compound indexes on different field results in an IndexOptionsConflict
-    // error code, which is already explicitly ignored during oplog application. In order to test
-    // ignoring the correct multiple text index error, we use compound indexes.
-    auto addA = buildIndex(fromjson("{a: 'text', b: 1}"), BSONObj(), kUuid);
-    ASSERT_OK(runOpInitialSync(addA));
-    // Building a second text index should succeed as only users are limited to one
-    // text index per collection. Trying to build indexA a second time should fail, but the error
-    // will be ignored.
-    auto indexB = buildIndex(fromjson("{b: 'text', c: 1}"), BSONObj(), kUuid);
-    auto dropB = dropIndex("b_index", kUuid);
-    auto ops = {indexB, dropB, addA};
+    ASSERT_OK(runOpInitialSync(insert(fromjson("{_id: 1, y: [0]}"))));
+
+    auto updateOp1 = update(1, fromjson("{$set: {x: 1}}"));
+    auto updateOp2 = update(1, fromjson("{$set: {x: 2, 'y.0': 2}}"));
+    auto updateOp3 = update(1, fromjson("{$set: {y: 3}}"));
+
+    auto ops = {updateOp1, updateOp2, updateOp3};
     testOpsAreIdempotent(ops);
-    ASSERT_OK(runOpsInitialSync(ops));
 }
 
 typedef SetSteadyStateConstraints<IdempotencyTest, false>
@@ -3159,29 +3068,29 @@ typedef SetSteadyStateConstraints<IdempotencyTest, true>
     IdempotencyTestEnableSteadyStateConstraints;
 
 TEST_F(IdempotencyTestDisableSteadyStateConstraints, AcceptableErrorsRecordedInSteadyStateMode) {
-    // Create a BSON "convertToCapped" command.
-    auto convertToCappedCmd = BSON("convertToCapped" << nss.coll());
+    // Create a BSON "emptycapped" command.
+    auto emptyCappedCmd = BSON("emptycapped" << nss.coll());
 
-    // Create a "convertToCapped" oplog entry.
-    auto convertToCappedOp = makeCommandOplogEntry(nextOpTime(), nss, convertToCappedCmd);
+    // Create a "emptycapped" oplog entry.
+    auto emptyCappedOp = makeCommandOplogEntry(nextOpTime(), nss, emptyCappedCmd);
 
     // Ensure that NamespaceNotFound is "acceptable" but counted.
     int prevAcceptableError = replOpCounters.getAcceptableErrorInCommand()->load();
-    ASSERT_OK(runOpSteadyState(convertToCappedOp));
+    ASSERT_OK(runOpSteadyState(emptyCappedOp));
 
     ASSERT_EQ(1, replOpCounters.getAcceptableErrorInCommand()->load() - prevAcceptableError);
 }
 
 TEST_F(IdempotencyTestEnableSteadyStateConstraints,
        AcceptableErrorsNotAcceptableInSteadyStateMode) {
-    // Create a BSON "convertToCapped" command.
-    auto convertToCappedCmd = BSON("convertToCapped" << nss.coll());
+    // Create a BSON "emptycapped" command.
+    auto emptyCappedCmd = BSON("emptycapped" << nss.coll());
 
-    // Create a "convertToCapped" oplog entry.
-    auto convertToCappedOp = makeCommandOplogEntry(nextOpTime(), nss, convertToCappedCmd);
+    // Create a "emptyCapped" oplog entry.
+    auto emptyCappedOp = makeCommandOplogEntry(nextOpTime(), nss, emptyCappedCmd);
 
     // Ensure that NamespaceNotFound is returned.
-    ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, runOpSteadyState(convertToCappedOp));
+    ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, runOpSteadyState(emptyCappedOp));
 }
 
 class IdempotencyTestTxns : public IdempotencyTest {};

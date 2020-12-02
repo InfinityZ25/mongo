@@ -45,6 +45,7 @@ namespace mongo {
 
 class Client;
 class Collection;
+class CollectionPtr;
 
 class IndexDescriptor;
 struct InsertDeleteOptions;
@@ -177,8 +178,13 @@ public:
     IndexCatalog() = default;
     virtual ~IndexCatalog() = default;
 
-    inline IndexCatalog(IndexCatalog&&) = delete;
-    inline IndexCatalog& operator=(IndexCatalog&&) = delete;
+    IndexCatalog(const IndexCatalog&) = default;
+    IndexCatalog& operator=(const IndexCatalog&) = default;
+
+    IndexCatalog(IndexCatalog&&) = delete;
+    IndexCatalog& operator=(IndexCatalog&&) = delete;
+
+    virtual std::unique_ptr<IndexCatalog> clone() const = 0;
 
     // Must be called before used.
     virtual Status init(OperationContext* const opCtx) = 0;
@@ -215,19 +221,15 @@ public:
         const bool includeUnfinishedIndexes = false) const = 0;
 
     /**
-     * Find index by matching key pattern and collation spec.  The key pattern and collation spec
-     * uniquely identify an index.
+     * Find index by matching key pattern and options. The key pattern, collation spec, and partial
+     * filter expression together uniquely identify an index.
      *
-     * Collation is specified as a normalized collation spec as returned by
-     * CollationInterface::getSpec.  An empty object indicates the simple collation.
-     *
-     * @return null if cannot find index, otherwise the index with a matching key pattern and
-     * collation.
+     * @return null if cannot find index, otherwise the index with a matching signature.
      */
-    virtual const IndexDescriptor* findIndexByKeyPatternAndCollationSpec(
+    virtual const IndexDescriptor* findIndexByKeyPatternAndOptions(
         OperationContext* const opCtx,
         const BSONObj& key,
-        const BSONObj& collationSpec,
+        const BSONObj& indexSpec,
         const bool includeUnfinishedIndexes = false) const = 0;
 
     /**
@@ -331,8 +333,10 @@ public:
      * IndexAlreadyExists if the index already exists; IndexBuildAlreadyInProgress if the index is
      * already being built.
      */
-    virtual StatusWith<BSONObj> prepareSpecForCreate(OperationContext* const opCtx,
-                                                     const BSONObj& original) const = 0;
+    virtual StatusWith<BSONObj> prepareSpecForCreate(
+        OperationContext* const opCtx,
+        const BSONObj& original,
+        const boost::optional<ResumeIndexInfo>& resumeInfo) const = 0;
 
     /**
      * Returns a copy of 'indexSpecsToBuild' that does not contain index specifications that already
@@ -407,30 +411,15 @@ public:
     // ---- modify single index
 
     /**
-     * Returns true if the index 'idx' is multikey, and returns false otherwise.
-     */
-    virtual bool isMultikey(const IndexDescriptor* const idx) = 0;
-
-    /**
-     * Returns the path components that cause the index 'idx' to be multikey if the index supports
-     * path-level multikey tracking, and returns an empty vector if path-level multikey tracking
-     * isn't supported.
-     *
-     * If the index supports path-level multikey tracking but isn't multikey, then this function
-     * returns a vector with size equal to the number of elements in the index key pattern where
-     * each element in the vector is an empty set.
-     */
-    virtual MultikeyPaths getMultikeyPaths(OperationContext* const opCtx,
-                                           const IndexDescriptor* const idx) = 0;
-
-    /**
      * Sets the index 'desc' to be multikey with the provided 'multikeyPaths'.
      *
      * See IndexCatalogEntry::setMultikey().
      */
     virtual void setMultikeyPaths(OperationContext* const opCtx,
+                                  const CollectionPtr& coll,
                                   const IndexDescriptor* const desc,
-                                  const MultikeyPaths& multikeyPaths) = 0;
+                                  const KeyStringSet& multikeyMetadataKeys,
+                                  const MultikeyPaths& multikeyPaths) const = 0;
 
     // ----- data modifiers ------
 
@@ -441,6 +430,7 @@ public:
      * This method may throw.
      */
     virtual Status indexRecords(OperationContext* const opCtx,
+                                const CollectionPtr& collection,
                                 const std::vector<BsonRecord>& bsonRecords,
                                 int64_t* const keysInsertedOut) = 0;
 
@@ -451,6 +441,7 @@ public:
      * This method may throw.
      */
     virtual Status updateRecord(OperationContext* const opCtx,
+                                const CollectionPtr& coll,
                                 const BSONObj& oldDoc,
                                 const BSONObj& newDoc,
                                 const RecordId& recordId,
@@ -471,7 +462,7 @@ public:
      * Attempt compaction on all ready indexes to regain disk space, if the storage engine's index
      * supports compaction in-place.
      */
-    virtual Status compactIndexes(OperationContext* opCtx) = 0;
+    virtual Status compactIndexes(OperationContext* opCtx) const = 0;
 
     virtual std::string getAccessMethodName(const BSONObj& keyPattern) = 0;
 
@@ -493,9 +484,12 @@ public:
      * index constraints, as needed by replication.
      */
     virtual void prepareInsertDeleteOptions(OperationContext* opCtx,
+                                            const NamespaceString& ns,
                                             const IndexDescriptor* desc,
                                             InsertDeleteOptions* options) const = 0;
 
-    virtual void indexBuildSuccess(OperationContext* opCtx, IndexCatalogEntry* index) = 0;
+    virtual void indexBuildSuccess(OperationContext* opCtx,
+                                   const CollectionPtr& coll,
+                                   IndexCatalogEntry* index) = 0;
 };
 }  // namespace mongo

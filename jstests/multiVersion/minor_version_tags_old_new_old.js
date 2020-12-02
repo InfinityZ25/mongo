@@ -1,10 +1,9 @@
-// @tags: [fix_for_fcv_46]
 (function() {
 'use strict';
 
 load("jstests/replsets/libs/tags.js");
 
-var oldVersion = "last-stable";
+var oldVersion = "last-lts";
 var newVersion = "latest";
 let nodes = [
     {binVersion: oldVersion},

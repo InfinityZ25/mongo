@@ -3,9 +3,7 @@
 //   requires_fastcount,
 //   requires_getmore,
 //   requires_non_retryable_writes,
-//   # Map Reduce before 4.4. does not support outputting to a sharded collection whose shard key is
-//   # {_id: "hashed"}.
-//   requires_fcv_44,
+//   sbe_incompatible,
 // ]
 
 load("jstests/aggregation/extras/utils.js");  // For resultsEq
@@ -16,8 +14,8 @@ const coll = db.or4;
 coll.drop();
 db.getCollection("mrOutput").drop();
 
-coll.ensureIndex({a: 1});
-coll.ensureIndex({b: 1});
+coll.createIndex({a: 1});
+coll.createIndex({b: 1});
 
 assert.commandWorked(coll.insert({a: 2}));
 assert.commandWorked(coll.insert({b: 3}));

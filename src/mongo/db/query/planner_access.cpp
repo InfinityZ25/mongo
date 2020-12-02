@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -124,10 +124,9 @@ std::vector<bool> canProvideSortWithMergeSort(
     const auto reverseSort = QueryPlannerCommon::reverseSortObj(requestedSort);
     for (auto&& node : nodes) {
         node->computeProperties();
-        auto sorts = node->getSort();
-        if (sorts.find(requestedSort) != sorts.end()) {
+        if (node->providedSorts().contains(requestedSort)) {
             shouldReverseScan.push_back(false);
-        } else if (sorts.find(reverseSort) != sorts.end()) {
+        } else if (node->providedSorts().contains(reverseSort)) {
             shouldReverseScan.push_back(true);
         } else {
             return {};
@@ -218,6 +217,8 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::makeCollectionScan(
     csn->tailable = tailable;
     csn->shouldTrackLatestOplogTimestamp =
         params.options & QueryPlannerParams::TRACK_LATEST_OPLOG_TS;
+    csn->assertMinTsHasNotFallenOffOplog =
+        params.options & QueryPlannerParams::ASSERT_MIN_TS_HAS_NOT_FALLEN_OFF_OPLOG;
     csn->shouldWaitForOplogVisibility =
         params.options & QueryPlannerParams::OPLOG_SCAN_WAIT_FOR_VISIBLE;
 
@@ -230,8 +231,13 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::makeCollectionScan(
         }
     }
 
-    // Extract and assign the 'requestResumeToken' field.
-    csn->requestResumeToken = query.getQueryRequest().getRequestResumeToken();
+    // If the client requested a resume token and we are scanning the oplog, prepare
+    // the collection scan to return timestamp-based tokens. Otherwise, we should
+    // return generic RecordId-based tokens.
+    if (query.getQueryRequest().getRequestResumeToken()) {
+        csn->shouldTrackLatestOplogTimestamp = query.nss().isOplog();
+        csn->requestResumeToken = !query.nss().isOplog();
+    }
 
     // Extract and assign the RecordId from the 'resumeAfter' token, if present.
     const BSONObj& resumeAfterObj = query.getQueryRequest().getResumeAfter();
@@ -255,7 +261,7 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::makeCollectionScan(
         }
     }
 
-    return std::move(csn);
+    return csn;
 }
 
 std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::makeLeafNode(
@@ -289,7 +295,7 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::makeLeafNode(
             ret->addPointMeta = query.metadataDeps()[DocumentMetadataFields::kGeoNearPoint];
             ret->addDistMeta = query.metadataDeps()[DocumentMetadataFields::kGeoNearDist];
 
-            return std::move(ret);
+            return ret;
         } else {
             auto ret = std::make_unique<GeoNear2DSphereNode>(index);
             ret->nq = &nearExpr->getData();
@@ -297,7 +303,7 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::makeLeafNode(
             ret->addPointMeta = query.metadataDeps()[DocumentMetadataFields::kGeoNearPoint];
             ret->addDistMeta = query.metadataDeps()[DocumentMetadataFields::kGeoNearDist];
 
-            return std::move(ret);
+            return ret;
         }
     } else if (MatchExpression::TEXT == expr->matchType()) {
         // We must not keep the expression node around.
@@ -316,7 +322,7 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::makeLeafNode(
             ++(ret->numPrefixFields);
         }
 
-        return std::move(ret);
+        return ret;
     } else {
         // Note that indexKeyPattern.firstElement().fieldName() may not equal expr->path()
         // because expr might be inside an array operator that provides a path prefix.
@@ -337,7 +343,7 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::makeLeafNode(
 
         IndexBoundsBuilder::translate(expr, keyElt, index, &isn->bounds.fields[pos], tightnessOut);
 
-        return std::move(isn);
+        return isn;
     }
 }
 
@@ -1103,8 +1109,8 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::buildIndexedAnd(
             // that one last.
             for (size_t i = 0; i < andResult->children.size(); ++i) {
                 andResult->children[i]->computeProperties();
-                const BSONObjSet& sorts = andResult->children[i]->getSort();
-                if (sorts.end() != sorts.find(query.getQueryRequest().getSort())) {
+                if (andResult->children[i]->providedSorts().contains(
+                        query.getQueryRequest().getSort())) {
                     std::swap(andResult->children[i], andResult->children.back());
                     break;
                 }
@@ -1115,7 +1121,7 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::buildIndexedAnd(
             LOGV2_DEBUG(20947,
                         5,
                         "Can't build index intersection solution: AND_SORTED is not possible and "
-                        "AND_HASH is disabled.");
+                        "AND_HASH is disabled");
             return nullptr;
         }
     }
@@ -1136,7 +1142,7 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::buildIndexedAnd(
         fetch->filter = std::move(clonedRoot);
         // Takes ownership of 'andResult'.
         fetch->children.push_back(andResult.release());
-        return std::move(fetch);
+        return fetch;
     }
 
     // If there are any nodes still attached to the AND, we can't answer them using the
@@ -1182,7 +1188,7 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::buildIndexedOr(
     // when any of our children lack index tags.  If a node lacks an index tag it cannot
     // be answered via an index.
     if (!inArrayOperator && 0 != root->numChildren()) {
-        LOGV2_WARNING(20948, "planner OR error, non-indexed child of OR.");
+        LOGV2_WARNING(20948, "Planner OR error, non-indexed child of OR");
         // We won't enumerate an OR without indices for each child, so this isn't an issue, even
         // if we have an AND with an OR child -- we won't get here unless the OR is fully
         // indexed.
@@ -1303,7 +1309,7 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::_buildIndexedDataAccess(
                 auto fetch = std::make_unique<FetchNode>();
                 fetch->filter = std::move(ownedRoot);
                 fetch->children.push_back(soln.release());
-                return std::move(fetch);
+                return fetch;
             }
         } else if (Indexability::arrayUsesIndexOnChildren(root)) {
             std::unique_ptr<QuerySolutionNode> solution;
@@ -1327,7 +1333,7 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::_buildIndexedDataAccess(
             auto fetch = std::make_unique<FetchNode>();
             fetch->filter = std::move(ownedRoot);
             fetch->children.push_back(solution.release());
-            return std::move(fetch);
+            return fetch;
         }
     }
 

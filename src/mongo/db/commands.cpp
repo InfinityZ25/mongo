@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -47,16 +47,18 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/client.h"
-#include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/error_labels.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/read_write_concern_defaults.h"
+#include "mongo/idl/basic_types_gen.h"
+#include "mongo/idl/command_generic_argument.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/factory.h"
-#include "mongo/rpc/metadata/client_metadata_ismaster.h"
+#include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/rpc/op_msg_rpc_impls.h"
 #include "mongo/rpc/protocol.h"
 #include "mongo/rpc/write_concern_error_detail.h"
@@ -67,7 +69,9 @@
 
 namespace mongo {
 
-using logger::LogComponent;
+using logv2::LogComponent;
+const std::set<std::string> kNoApiVersions = {};
+const std::set<std::string> kApiVersions1 = {"1"};
 
 namespace {
 
@@ -121,18 +125,11 @@ const StringMap<int> txnCmdWhitelist = {{"abortTransaction", 1},
                                         {"find", 1},
                                         {"findandmodify", 1},
                                         {"findAndModify", 1},
-                                        {"geoSearch", 1},
                                         {"getMore", 1},
                                         {"insert", 1},
                                         {"killCursors", 1},
                                         {"prepareTransaction", 1},
                                         {"update", 1}};
-
-// The commands that can be run on the 'admin' database in multi-document transactions.
-const StringMap<int> txnAdminCommands = {{"abortTransaction", 1},
-                                         {"commitTransaction", 1},
-                                         {"coordinateCommitTransaction", 1},
-                                         {"prepareTransaction", 1}};
 
 auto getCommandInvocationHooksHandle =
     ServiceContext::declareDecoration<std::shared_ptr<CommandInvocationHooks>>();
@@ -188,6 +185,20 @@ void CommandHelpers::runCommandInvocation(OperationContext* opCtx,
     }
 }
 
+Future<void> CommandHelpers::runCommandInvocationAsync(
+    std::shared_ptr<RequestExecutionContext> rec,
+    std::shared_ptr<CommandInvocation> invocation) try {
+    auto hooks = getCommandInvocationHooksHandle(rec->getOpCtx()->getServiceContext());
+    if (hooks)
+        hooks->onBeforeAsyncRun(rec, invocation.get());
+    return invocation->runAsync(rec).then([rec, hooks, invocation] {
+        if (hooks)
+            hooks->onAfterAsyncRun(rec, invocation.get());
+    });
+} catch (const DBException& e) {
+    return e.toStatus();
+}
+
 void CommandHelpers::auditLogAuthEvent(OperationContext* opCtx,
                                        const CommandInvocation* invocation,
                                        const OpMsgRequest& request,
@@ -231,7 +242,16 @@ void CommandHelpers::auditLogAuthEvent(OperationContext* opCtx,
     };
 
     NamespaceString nss = invocation ? invocation->ns() : NamespaceString(request.getDatabase());
-    audit::logCommandAuthzCheck(opCtx->getClient(), request, Hook(invocation, &nss), err);
+
+    // Always audit errors other than Unauthorized.
+    //
+    // When we get Unauthorized (usually),
+    // then only audit if our Command definition wants it (default),
+    // or if we don't know our Command definition.
+    if ((err != ErrorCodes::Unauthorized) || !invocation ||
+        invocation->definition()->auditAuthorizationFailure()) {
+        audit::logCommandAuthzCheck(opCtx->getClient(), request, Hook(invocation, &nss), err);
+    }
 }
 
 void CommandHelpers::uassertNoDocumentSequences(StringData commandName,
@@ -317,6 +337,20 @@ bool CommandHelpers::appendCommandStatusNoThrow(BSONObjBuilder& result, const St
     if (auto extraInfo = status.extraInfo()) {
         extraInfo->serialize(&result);
     }
+    // If the command has errored, assert that it satisfies the IDL-defined requirements on a
+    // command error reply.
+    if (!status.isOK()) {
+        try {
+            ErrorReply::parse(IDLParserErrorContext("appendCommandStatusNoThrow"),
+                              result.asTempObj());
+        } catch (const DBException&) {
+            invariant(false,
+                      "invalid error-response to a command constructed in "
+                      "CommandHelpers::appendComandStatusNoThrow. All erroring command responses "
+                      "must comply with the format specified by the IDL-defined struct ErrorReply, "
+                      "defined in idl/basic_types.idl");
+        }
+    }
     return status.isOK();
 }
 
@@ -340,8 +374,9 @@ bool CommandHelpers::extractOrAppendOk(BSONObjBuilder& reply) {
         // If ok is present, use its truthiness.
         return okField.trueValue();
     }
+
     // Missing "ok" field is an implied success.
-    CommandHelpers::appendSimpleCommandStatus(reply, true);
+    reply.append("ok", 1.0);
     return true;
 }
 
@@ -361,16 +396,35 @@ void CommandHelpers::appendCommandWCStatus(BSONObjBuilder& result,
     }
 }
 
-BSONObj CommandHelpers::appendPassthroughFields(const BSONObj& cmdObjWithPassthroughFields,
-                                                const BSONObj& request) {
+BSONObj CommandHelpers::appendGenericCommandArgs(const BSONObj& cmdObjWithGenericArgs,
+                                                 const BSONObj& request) {
     BSONObjBuilder b;
     b.appendElements(request);
-    for (const auto& elem : filterCommandRequestForPassthrough(cmdObjWithPassthroughFields)) {
+    for (const auto& elem : filterCommandRequestForPassthrough(cmdObjWithGenericArgs)) {
         const auto name = elem.fieldNameStringData();
         if (isGenericArgument(name) && !request.hasField(name)) {
             b.append(elem);
         }
     }
+    return b.obj();
+}
+
+void CommandHelpers::appendGenericReplyFields(const BSONObj& replyObjWithGenericReplyFields,
+                                              const BSONObj& reply,
+                                              BSONObjBuilder* replyBuilder) {
+    replyBuilder->appendElements(reply);
+    for (const auto& elem : filterCommandReplyForPassthrough(replyObjWithGenericReplyFields)) {
+        const auto name = elem.fieldNameStringData();
+        if (isGenericArgument(name) && !reply.hasField(name)) {
+            replyBuilder->append(elem);
+        }
+    }
+}
+
+BSONObj CommandHelpers::appendGenericReplyFields(const BSONObj& replyObjWithGenericReplyFields,
+                                                 const BSONObj& reply) {
+    BSONObjBuilder b;
+    appendGenericReplyFields(replyObjWithGenericReplyFields, reply, &b);
     return b.obj();
 }
 
@@ -432,7 +486,7 @@ void CommandHelpers::filterCommandRequestForPassthrough(BSONObjIterator* cmdIter
             BSONObjBuilder(requestBuilder->subobjStart("$queryOptions")).append(elem);
             continue;
         }
-        if (isRequestStripArgument(name))
+        if (!shouldForwardToShards(name))
             continue;
         requestBuilder->append(elem);
     }
@@ -442,7 +496,7 @@ void CommandHelpers::filterCommandReplyForPassthrough(const BSONObj& cmdObj,
                                                       BSONObjBuilder* output) {
     for (auto elem : cmdObj) {
         const auto name = elem.fieldNameStringData();
-        if (isReplyStripArgument(name))
+        if (!shouldForwardFromShards(name))
             continue;
         output->append(elem);
     }
@@ -464,7 +518,9 @@ bool CommandHelpers::uassertShouldAttemptParse(OperationContext* opCtx,
     try {
         return checkAuthorizationImplPreParse(opCtx, command, request);
     } catch (const ExceptionFor<ErrorCodes::Unauthorized>& e) {
-        CommandHelpers::auditLogAuthEvent(opCtx, nullptr, request, e.code());
+        if (command->auditAuthorizationFailure()) {
+            CommandHelpers::auditLogAuthEvent(opCtx, nullptr, request, e.code());
+        }
         throw;
     }
 }
@@ -490,9 +546,12 @@ void CommandHelpers::canUseTransactions(const NamespaceString& nss,
     uassert(ErrorCodes::OperationNotSupportedInTransaction,
             str::stream() << "Cannot run command against the '" << dbName
                           << "' database in a transaction.",
-            dbName != NamespaceString::kLocalDb &&
-                (dbName != NamespaceString::kAdminDb ||
-                 txnAdminCommands.find(cmdName) != txnAdminCommands.cend()));
+            dbName != NamespaceString::kLocalDb);
+
+    uassert(ErrorCodes::OperationNotSupportedInTransaction,
+            str::stream() << "Cannot run command against the '" << nss
+                          << "' collection in a transaction.",
+            !nss.isSystemDotProfile());
 
     if (allowTransactionsOnConfigDatabase) {
         uassert(ErrorCodes::OperationNotSupportedInTransaction,
@@ -536,37 +595,45 @@ bool CommandHelpers::shouldActivateFailCommandFailPoint(const BSONObj& data,
     if (cmd->getName() == "configureFailPoint"_sd)  // Banned even if in failCommands.
         return false;
 
-    if (data.hasField("threadName") &&
-        (client->desc() !=
-         data.getStringField(
-             "threadName"))) {  // only activate failpoint on thread from certain client
-        return false;
-    }
-
-    if (data.hasField("appName")) {
-        const auto& clientMetadata = ClientMetadataIsMasterState::get(client).getClientMetadata();
-        if (clientMetadata &&
-            clientMetadata.get().getApplicationName() != data.getStringField("appName")) {
-            return false;  // only activate failpoint on connection with a certain appName
-        }
-    }
-
-    if (client->session() && (client->session()->getTags() & transport::Session::kInternalClient)) {
-        if (!data.hasField("failInternalCommands") || !data.getBoolField("failInternalCommands")) {
-            return false;
-        }
-    }
-
     if (!client->session()) {
         return false;
     }
 
-    if (data.hasField("namespace") && nss != NamespaceString(data.getStringField("namespace"))) {
+    auto threadName = client->desc();
+    auto appName = StringData();
+    if (auto clientMetadata = ClientMetadata::get(client)) {
+        appName = clientMetadata->getApplicationName();
+    }
+    auto isInternalClient = client->session()->getTags() & transport::Session::kInternalClient;
+
+    if (data.hasField("threadName") && (threadName != data.getStringField("threadName"))) {
+        return false;  // only activate failpoint on thread from certain client
+    }
+
+    if (data.hasField("appName") && (appName != data.getStringField("appName"))) {
+        return false;  // only activate failpoint on connection with a certain appName
+    }
+
+    if (data.hasField("namespace") && (nss != NamespaceString(data.getStringField("namespace")))) {
+        return false;
+    }
+
+    if (!(data.hasField("failInternalCommands") && data.getBoolField("failInternalCommands")) &&
+        isInternalClient) {
         return false;
     }
 
     for (auto&& failCommand : data.getObjectField("failCommands")) {
         if (failCommand.type() == String && cmd->hasAlias(failCommand.valueStringData())) {
+            LOGV2(4898500,
+                  "Activating 'failCommand' failpoint",
+                  "data"_attr = data,
+                  "threadName"_attr = threadName,
+                  "appName"_attr = appName,
+                  "namespace"_attr = nss,
+                  "isInternalClient"_attr = isInternalClient,
+                  "command"_attr = cmd->getName());
+
             return true;
         }
     }
@@ -684,8 +751,7 @@ void CommandHelpers::handleMarkKillOnClientDisconnect(OperationContext* opCtx,
     waitInCommandMarkKillOnClientDisconnect.executeIf(
         [&](const BSONObj&) { waitInCommandMarkKillOnClientDisconnect.pauseWhileSet(opCtx); },
         [&](const BSONObj& obj) {
-            const auto& md =
-                ClientMetadataIsMasterState::get(opCtx->getClient()).getClientMetadata();
+            auto md = ClientMetadata::get(opCtx->getClient());
             return md && (md->getApplicationName() == obj["appName"].str());
         });
 }
@@ -735,7 +801,7 @@ void CommandInvocation::checkAuthorization(OperationContext* opCtx,
         }
     } catch (const DBException& e) {
         LOGV2_OPTIONS(20436,
-                      {logComponentV1toV2(LogComponent::kAccessControl)},
+                      {LogComponent::kAccessControl},
                       "Checking authorization failed: {error}",
                       "Checking authorization failed",
                       "error"_attr = e.toStatus());
@@ -766,6 +832,16 @@ private:
             BSONObjBuilder bob = result->getBodyBuilder();
             CommandHelpers::appendSimpleCommandStatus(bob, ok);
         }
+    }
+
+    Future<void> runAsync(std::shared_ptr<RequestExecutionContext> rec) override {
+        return _command->runAsync(rec, _dbName).onError([rec](Status status) {
+            if (status.code() != ErrorCodes::FailedToRunWithReplyBuilder)
+                return status;
+            BSONObjBuilder bob = rec->getReplyBuilder()->getBodyBuilder();
+            CommandHelpers::appendSimpleCommandStatus(bob, false);
+            return Status::OK();
+        });
     }
 
     void explain(OperationContext* opCtx,
@@ -846,6 +922,14 @@ Command::Command(StringData name, std::vector<StringData> aliases)
       _commandsExecutedMetric("commands." + _name + ".total", &_commandsExecuted),
       _commandsFailedMetric("commands." + _name + ".failed", &_commandsFailed) {
     globalCommandRegistry()->registerCommand(this, _name, _aliases);
+}
+
+const std::set<std::string>& Command::apiVersions() const {
+    return kNoApiVersions;
+}
+
+const std::set<std::string>& Command::deprecatedApiVersions() const {
+    return kNoApiVersions;
 }
 
 bool Command::hasAlias(const StringData& alias) const {

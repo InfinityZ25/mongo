@@ -35,6 +35,7 @@ selector:
   - jstests/core/geo_allowedcomparisons.js
   - jstests/core/geo_big_polygon2.js
   - jstests/core/geonear_key.js
+  - jstests/core/get_more_cmd_refuses_api_params.js
   - jstests/core/in.js
   - jstests/core/index8.js # No explicit check for failed command.
   - jstests/core/index_decimal.js
@@ -53,6 +54,7 @@ selector:
   - jstests/core/or2.js
   - jstests/core/or3.js
   - jstests/core/orj.js
+  - jstests/core/projection_expr_mod.js
   - jstests/core/ref.js
   - jstests/core/ref4.js
   - jstests/core/regex_limit.js
@@ -201,11 +203,11 @@ selector:
   - jstests/core/kill_cursors.js
   - jstests/core/list_collections1.js
   - jstests/core/list_indexes.js
+  - jstests/core/list_namespaces_invalidation.js
   - jstests/core/oro.js
 
   # Parallel Shell - we do not signal the override to end a txn when a parallel shell closes.
   - jstests/core/awaitdata_getmore_cmd.js
-  - jstests/core/background_validation.js
   - jstests/core/compact_keeps_indexes.js
   - jstests/core/count10.js
   - jstests/core/count_plan_summary.js
@@ -247,6 +249,9 @@ selector:
   - inspects_whether_plan_cache_entry_is_active
   # $out is not supported in transactions
   - uses_$out
+  # Transaction-continuing commands cannot specify API parameters, so tests that use API parameters
+  # cannot be run with transactions.
+  - uses_api_parameters
 
 executor:
   archive:

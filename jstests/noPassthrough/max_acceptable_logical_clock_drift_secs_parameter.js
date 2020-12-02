@@ -17,10 +17,6 @@ assert.eq(null, conn, "expected server to reject zero maxAcceptableLogicalClockD
 conn = MongoRunner.runMongod({setParameter: {maxAcceptableLogicalClockDriftSecs: "value"}});
 assert.eq(null, conn, "expected server to reject non-numeric maxAcceptableLogicalClockDriftSecs");
 
-conn = MongoRunner.runMongod(
-    {setParameter: {maxAcceptableLogicalClockDriftSecs: new Timestamp(50, 0)}});
-assert.eq(null, conn, "expected server to reject non-numeric maxAcceptableLogicalClockDriftSecs");
-
 // Any positive number is valid.
 conn = MongoRunner.runMongod({setParameter: {maxAcceptableLogicalClockDriftSecs: 1}});
 assert.neq(null, conn, "failed to start mongod with valid maxAcceptableLogicalClockDriftSecs");
@@ -41,14 +37,14 @@ const st = new ShardingTest({
 let testDB = st.s.getDB("test");
 
 // Contact cluster to get initial cluster time.
-let res = assert.commandWorked(testDB.runCommand({isMaster: 1}));
+let res = assert.commandWorked(testDB.runCommand({hello: 1}));
 let lt = res.$clusterTime;
 
 // Try to advance cluster time by more than the max acceptable drift, which should fail the rate
 // limiter.
 let tooFarTime = Object.assign(
     {}, lt, {clusterTime: new Timestamp(lt.clusterTime.getTime() + (maxDriftValue * 2), 0)});
-assert.commandFailedWithCode(testDB.runCommand({isMaster: 1, $clusterTime: tooFarTime}),
+assert.commandFailedWithCode(testDB.runCommand({hello: 1, $clusterTime: tooFarTime}),
                              ErrorCodes.ClusterTimeFailsRateLimiter,
                              "expected command to not pass the rate limiter");
 

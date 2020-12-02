@@ -81,10 +81,10 @@ public:
         return nullptr;
     }
 
-    IndexDescriptor* findIndexByKeyPatternAndCollationSpec(
+    IndexDescriptor* findIndexByKeyPatternAndOptions(
         OperationContext* const opCtx,
         const BSONObj& key,
-        const BSONObj& collationSpec,
+        const BSONObj& indexSpec,
         const bool includeUnfinishedIndexes = false) const override {
         return nullptr;
     }
@@ -140,8 +140,10 @@ public:
         return spec;
     }
 
-    StatusWith<BSONObj> prepareSpecForCreate(OperationContext* const opCtx,
-                                             const BSONObj& original) const override {
+    StatusWith<BSONObj> prepareSpecForCreate(
+        OperationContext* const opCtx,
+        const BSONObj& original,
+        const boost::optional<ResumeIndexInfo>& resumeInfo) const override {
         return original;
     }
 
@@ -192,16 +194,19 @@ public:
     }
 
     void setMultikeyPaths(OperationContext* const opCtx,
+                          const CollectionPtr& coll,
                           const IndexDescriptor* const desc,
-                          const MultikeyPaths& multikeyPaths) override {}
+                          const MultikeyPaths& multikeyPaths) const override {}
 
     Status indexRecords(OperationContext* const opCtx,
+                        const CollectionPtr& coll,
                         const std::vector<BsonRecord>& bsonRecords,
                         int64_t* const keysInsertedOut) override {
         return Status::OK();
     }
 
     Status updateRecord(OperationContext* const opCtx,
+                        const CollectionPtr& coll,
                         const BSONObj& oldDoc,
                         const BSONObj& newDoc,
                         const RecordId& recordId,
@@ -233,10 +238,13 @@ public:
     }
 
     void prepareInsertDeleteOptions(OperationContext* opCtx,
+                                    const NamespaceString& ns,
                                     const IndexDescriptor* desc,
                                     InsertDeleteOptions* options) const override {}
 
-    void indexBuildSuccess(OperationContext* opCtx, IndexCatalogEntry* index) override {}
+    void indexBuildSuccess(OperationContext* opCtx,
+                           const CollectionPtr& coll,
+                           IndexCatalogEntry* index) override {}
 };
 
 }  // namespace mongo

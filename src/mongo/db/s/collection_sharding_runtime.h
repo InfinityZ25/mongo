@@ -36,12 +36,9 @@
 #include "mongo/db/s/sharding_migration_critical_section.h"
 #include "mongo/db/s/sharding_state_lock.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/util/decorable.h"
 
 namespace mongo {
-
-extern AtomicWord<int> migrationLockAcquisitionMaxWaitMS;
 
 /**
  * See the comments for CollectionShardingState for more information on how this class fits in the
@@ -49,13 +46,13 @@ extern AtomicWord<int> migrationLockAcquisitionMaxWaitMS;
  */
 class CollectionShardingRuntime final : public CollectionShardingState,
                                         public Decorable<CollectionShardingRuntime> {
-public:
-    CollectionShardingRuntime(ServiceContext* sc,
-                              NamespaceString nss,
-                              std::shared_ptr<executor::TaskExecutor> rangeDeleterExecutor);
-
     CollectionShardingRuntime(const CollectionShardingRuntime&) = delete;
     CollectionShardingRuntime& operator=(const CollectionShardingRuntime&) = delete;
+
+public:
+    CollectionShardingRuntime(ServiceContext* service,
+                              NamespaceString nss,
+                              std::shared_ptr<executor::TaskExecutor> rangeDeleterExecutor);
 
     using CSRLock = ShardingStateLock<CollectionShardingRuntime>;
 
@@ -75,20 +72,10 @@ public:
     static CollectionShardingRuntime* get_UNSAFE(ServiceContext* svcCtx,
                                                  const NamespaceString& nss);
 
-    /**
-     * Waits for all ranges deletion tasks with UUID 'collectionUuid' overlapping range
-     * 'orphanRange' to be processed, even if the collection does not exist in the storage catalog.
-     */
-    static Status waitForClean(OperationContext* opCtx,
-                               const NamespaceString& nss,
-                               const UUID& collectionUuid,
-                               ChunkRange orphanRange);
-
     ScopedCollectionFilter getOwnershipFilter(OperationContext* opCtx,
                                               OrphanCleanupPolicy orphanCleanupPolicy) override;
 
-    ScopedCollectionDescription getCollectionDescription() override;
-    ScopedCollectionDescription getCollectionDescription_DEPRECATED() override;
+    ScopedCollectionDescription getCollectionDescription(OperationContext* opCtx) override;
 
     void checkShardVersionOrThrow(OperationContext* opCtx) override;
 
@@ -125,21 +112,33 @@ public:
      * filtering metadata will interrupt all in-progress orphan cleanups in which case orphaned data
      * will remain behind on disk.
      */
-    void clearFilteringMetadata();
+    void clearFilteringMetadata(OperationContext* opCtx);
 
     /**
-     * Schedules any documents in `range` for immediate cleanup iff no running queries can depend
-     * on them, and adds the range to the list of ranges being received.
+     * Methods to control the collection's critical section. Methods listed below must be called
+     * with both the collection lock and CSRLock held in exclusive mode.
      *
-     * Returns a future that will be resolved when the deletion has completed or failed.
+     * In these methods, the CSRLock ensures concurrent access to the critical section.
      */
-    SharedSemiFuture<void> beginReceive(ChunkRange const& range);
+    void enterCriticalSectionCatchUpPhase(const CSRLock&);
+    void enterCriticalSectionCommitPhase(const CSRLock&);
 
-    /*
-     * Removes `range` from the list of ranges being received, and schedules any documents in the
-     * range for immediate cleanup. Does not block.
+    /**
+     * Method to control the collection's critical secion. Method listed below must be called with
+     * the collection lock in IX mode and the CSRLock in exclusive mode.
+     *
+     * In this method, the CSRLock ensures concurrent access to the critical section.
      */
-    void forgetReceive(const ChunkRange& range);
+    void exitCriticalSection(OperationContext* opCtx);
+
+    /**
+     * If the collection is currently in a critical section, returns the critical section signal to
+     * be waited on. Otherwise, returns nullptr.
+     *
+     * This method internally acquires the CSRLock in IS to wait for eventual ongoing operations.
+     */
+    boost::optional<SharedSemiFuture<void>> getCriticalSectionSignal(
+        OperationContext* opCtx, ShardingMigrationCriticalSection::Operation op);
 
     /**
      * Schedules documents in `range` for cleanup after any running queries that may depend on them
@@ -156,52 +155,43 @@ public:
                                         CleanWhen when);
 
     /**
-     * Returns a range _not_ owned by this shard that starts no lower than the specified
-     * startingFrom key value, if any, or boost::none if there is no such range.
+     * Waits for all ranges deletion tasks with UUID 'collectionUuid' overlapping range
+     * 'orphanRange' to be processed, even if the collection does not exist in the storage catalog.
      */
-    boost::optional<ChunkRange> getNextOrphanRange(BSONObj const& startingFrom);
-
-    /**
-     * Methods to control the collection's critical section. Methods listed below must be called
-     * with both the collection lock and CSRLock held in exclusive mode.
-     *
-     * In these methods, the CSRLock ensures concurrent access to the critical section.
-     */
-    void enterCriticalSectionCatchUpPhase(OperationContext* opCtx);
-    void enterCriticalSectionCommitPhase(OperationContext* opCtx);
-
-    /**
-     * Method to control the collection's critical secion. Method listed below must be called with
-     * the collection lock in IX mode and the CSRLock in exclusive mode.
-     *
-     * In this method, the CSRLock ensures concurrent access to the critical section.
-     */
-    void exitCriticalSection(OperationContext* opCtx);
-
-    /**
-     * If the collection is currently in a critical section, returns the critical section signal to
-     * be waited on. Otherwise, returns nullptr.
-     *
-     * In this method, the CSRLock ensures concurrent access to the critical section.
-     */
-    std::shared_ptr<Notification<void>> getCriticalSectionSignal(
-        OperationContext* opCtx, ShardingMigrationCriticalSection::Operation op);
-
-    /**
-     * Appends information about any chunks for which incoming migration has been requested, but the
-     * shard hasn't yet synchronised with the config server on whether that migration actually
-     * committed.
-     */
-    void appendPendingReceiveChunks(BSONArrayBuilder* builder);
-
-    /**
-     * Clears the list of chunks that are being received as a part of an incoming migration.
-     */
-    void clearReceivingChunks();
+    static Status waitForClean(OperationContext* opCtx,
+                               const NamespaceString& nss,
+                               const UUID& collectionUuid,
+                               ChunkRange orphanRange);
 
     std::uint64_t getNumMetadataManagerChanges_forTest() {
         return _numMetadataManagerChanges;
     }
+
+    /**
+     * Initializes the shard version recover/refresh shared semifuture for other threads to wait on
+     * it.
+     *
+     * In this method, the CSRLock ensures concurrent access to the shared semifuture.
+     *
+     * To invoke this method, the criticalSectionSignal must not be hold by a different thread.
+     */
+    void setShardVersionRecoverRefreshFuture(SharedSemiFuture<void> future, const CSRLock&);
+
+    /**
+     * If there an ongoing shard version recover/refresh, it returns the shared semifuture to be
+     * waited on. Otherwise, returns boost::none.
+     *
+     * This method internally acquires the CSRLock in IS to wait for eventual ongoing operations.
+     */
+    boost::optional<SharedSemiFuture<void>> getShardVersionRecoverRefreshFuture(
+        OperationContext* opCtx);
+
+    /**
+     * Resets the shard version recover/refresh shared semifuture to boost::none.
+     *
+     * In this method, the CSRLock ensures concurrent access to the shared semifuture.
+     */
+    void resetShardVersionRecoverRefreshFuture(const CSRLock&);
 
 private:
     friend CSRLock;
@@ -221,6 +211,9 @@ private:
     std::shared_ptr<ScopedCollectionDescription::Impl> _getMetadataWithVersionCheckAt(
         OperationContext* opCtx, const boost::optional<mongo::LogicalTime>& atClusterTime);
 
+    // The service context under which this instance runs
+    ServiceContext* const _serviceContext;
+
     // Namespace this state belongs to.
     const NamespaceString _nss;
 
@@ -236,15 +229,12 @@ private:
     // Must hold CSRLock while accessing.
     ShardingMigrationCriticalSection _critSec;
 
+    // Protects state around the metadata manager below
     mutable Mutex _metadataManagerLock =
         MONGO_MAKE_LATCH("CollectionShardingRuntime::_metadataManagerLock");
 
     // Tracks whether the filtering metadata is unknown, unsharded, or sharded
-    enum class MetadataType {
-        kUnknown,
-        kUnsharded,
-        kSharded
-    } _metadataType{MetadataType::kUnknown};
+    enum class MetadataType { kUnknown, kUnsharded, kSharded } _metadataType;
 
     // If the collection is sharded, contains all the metadata associated with this collection.
     //
@@ -255,19 +245,26 @@ private:
     // Used for testing to check the number of times a new MetadataManager has been installed.
     std::uint64_t _numMetadataManagerChanges{0};
 
-    // Used to get the shardId if no metadata is known when calling getCollectionDescription
-    ServiceContext* _serviceContext;
+    // Tracks ongoing shard version recover/refresh. Eventually set to the semifuture to wait on.
+    boost::optional<SharedSemiFuture<void>> _shardVersionInRecoverOrRefresh;
 };
 
 /**
  * RAII-style class, which obtains a reference to the critical section for the specified collection.
+ *
+ *
+ * Shard version recovery/refresh procedures always wait for the critical section to be released in
+ * order to serialise with concurrent moveChunk/shardCollection commit operations.
+ *
+ * Entering the critical section doesn't serialise with concurrent recovery/refresh, because
+ * causally such refreshes would have happened *before* the critical section was entered.
  */
 class CollectionCriticalSection {
     CollectionCriticalSection(const CollectionCriticalSection&) = delete;
     CollectionCriticalSection& operator=(const CollectionCriticalSection&) = delete;
 
 public:
-    CollectionCriticalSection(OperationContext* opCtx, NamespaceString ns);
+    CollectionCriticalSection(OperationContext* opCtx, NamespaceString nss);
     ~CollectionCriticalSection();
 
     /**
@@ -276,9 +273,9 @@ public:
     void enterCommitPhase();
 
 private:
-    NamespaceString _nss;
+    OperationContext* const _opCtx;
 
-    OperationContext* _opCtx;
+    NamespaceString _nss;
 };
 
 }  // namespace mongo

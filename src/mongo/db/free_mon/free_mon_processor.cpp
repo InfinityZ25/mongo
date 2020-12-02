@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -151,6 +151,10 @@ void FreeMonProcessor::turnCrankForTest(size_t countMessagesToIgnore) {
     _queue.turnCrankForTest(countMessagesToIgnore);
 
     _countdown.wait();
+}
+
+void FreeMonProcessor::deprioritizeFirstMessageForTest(FreeMonMessageType type) {
+    _queue.deprioritizeFirstMessageForTest(type);
 }
 
 void FreeMonProcessor::run() {
@@ -330,7 +334,7 @@ void FreeMonProcessor::doServerRegister(
     // If we are asked to register now, then kick off a registration request
     const auto regType = msg->getPayload().first;
     if (regType == RegistrationType::RegisterOnStart) {
-        enqueue(FreeMonRegisterCommandMessage::createNow(msg->getPayload().second));
+        enqueue(FreeMonRegisterCommandMessage::createNow({msg->getPayload().second, boost::none}));
     } else {
         invariant((regType == RegistrationType::RegisterAfterOnTransitionToPrimary) ||
                   (regType == RegistrationType::RegisterAfterOnTransitionToPrimaryIfEnabled));
@@ -355,7 +359,8 @@ void FreeMonProcessor::doServerRegister(
             // We are standalone or secondary, if we have a registration id, then send a
             // registration notification, else wait for the user to register us.
             if (state.get().getState() == StorageStateEnum::enabled) {
-                enqueue(FreeMonRegisterCommandMessage::createNow(msg->getPayload().second));
+                enqueue(FreeMonRegisterCommandMessage::createNow(
+                    {msg->getPayload().second, boost::none}));
             }
         }
 
@@ -418,22 +423,26 @@ void FreeMonProcessor::doCommandRegister(Client* client,
 
     FreeMonRegistrationRequest req;
 
-    auto regid = _state->getRegistrationId();
-    if (!regid.empty()) {
-        req.setId(regid);
+    if (msg->getPayload().second) {
+        req.setId(StringData(msg->getPayload().second.get()));
+    } else {
+        auto regid = _state->getRegistrationId();
+        if (!regid.empty()) {
+            req.setId(regid);
+        }
     }
 
     req.setVersion(kMaxProtocolVersion);
 
     req.setLocalTime(client->getServiceContext()->getPreciseClockSource()->now());
 
-    if (!msg->getPayload().empty()) {
+    if (!msg->getPayload().first.empty()) {
         // Cache the tags for subsequent retries
-        _tags = msg->getPayload();
+        _tags = msg->getPayload().first;
     }
 
     if (!_tags.empty()) {
-        req.setTags(transformVector(msg->getPayload()));
+        req.setTags(transformVector(msg->getPayload().first));
     }
 
     // Collect the data
@@ -603,8 +612,10 @@ void FreeMonProcessor::doAsyncRegisterComplete(
 
     Status s = validateRegistrationResponse(resp);
     if (!s.isOK()) {
-        LOGV2_WARNING(
-            20620, "Free Monitoring registration halted due to {status}", "status"_attr = s);
+        LOGV2_WARNING(20620,
+                      "Free Monitoring registration halted due to {error}",
+                      "Free Monitoring registration halted due to error",
+                      "error"_attr = s);
 
         // Disable on any error
         _state->setState(StorageStateEnum::disabled);
@@ -652,7 +663,7 @@ void FreeMonProcessor::doAsyncRegisterComplete(
 
     LOGV2(20615,
           "Free Monitoring is Enabled. Frequency: {interval} seconds",
-          "Free Moniforing is Enabled",
+          "Free Monitoring is Enabled",
           "interval"_attr = resp.getReportingInterval());
 
     // Enqueue next metrics upload immediately to deliver a good experience
@@ -677,17 +688,16 @@ void FreeMonProcessor::doAsyncRegisterFail(
         return;
     }
 
-    LOGV2_DEBUG(
-        20616,
-        1,
-        "Free Monitoring Registration Failed with status '{status}', retrying in {interval}",
-        "Free Monitoring Registration Failed",
-        "status"_attr = msg->getPayload(),
-        "interval"_attr = _registrationRetry->getNextDuration());
+    LOGV2_DEBUG(20616,
+                1,
+                "Free Monitoring Registration Failed with status '{error}', retrying in {interval}",
+                "Free Monitoring Registration Failed, will retry after interval",
+                "error"_attr = msg->getPayload(),
+                "interval"_attr = _registrationRetry->getNextDuration());
 
     // Enqueue a register retry
     enqueue(FreeMonRegisterCommandMessage::createWithDeadline(
-        _tags, _registrationRetry->getNextDeadline(client)));
+        {_tags, boost::none}, _registrationRetry->getNextDeadline(client)));
 }
 
 void FreeMonProcessor::doCommandUnregister(
@@ -786,12 +796,21 @@ void FreeMonProcessor::doAsyncMetricsComplete(
     Client* client,
     const FreeMonMessageWithPayload<FreeMonMessageType::AsyncMetricsComplete>* msg) {
 
+    // If we have disabled the store between the metrics send message and the metrcs complete
+    // message then it means that we need to stop processing metrics on this instance. We ignore the
+    // message entirely including an errors as the disabling of the store takes priority.
+    if (_lastReadState == boost::none) {
+        return;
+    }
+
     auto& resp = msg->getPayload();
 
     Status s = validateMetricsResponse(resp);
     if (!s.isOK()) {
-        LOGV2_WARNING(
-            20622, "Free Monitoring metrics uploading halted due to {status}", "status"_attr = s);
+        LOGV2_WARNING(20622,
+                      "Free Monitoring metrics uploading halted due to {error}",
+                      "Free Monitoring metrics uploading halted due to error",
+                      "error"_attr = s);
 
         // Disable free monitoring on validation errors
         _state->setState(StorageStateEnum::disabled);
@@ -851,7 +870,7 @@ void FreeMonProcessor::doAsyncMetricsComplete(
     _metricsRetry->reset();
 
     if (resp.getResendRegistration().is_initialized() && resp.getResendRegistration()) {
-        enqueue(FreeMonRegisterCommandMessage::createNow(_tags));
+        enqueue(FreeMonRegisterCommandMessage::createNow({_tags, boost::none}));
     } else {
         // Enqueue next metrics upload
         enqueue(FreeMonMessage::createWithDeadline(FreeMonMessageType::MetricsSend,
@@ -868,13 +887,12 @@ void FreeMonProcessor::doAsyncMetricsFail(
         return;
     }
 
-    LOGV2_DEBUG(
-        20618,
-        1,
-        "Free Monitoring Metrics upload failed with status {status}, retrying in {interval}",
-        "Free Monitoring Metrics upload failed",
-        "status"_attr = msg->getPayload(),
-        "interval"_attr = _metricsRetry->getNextDuration());
+    LOGV2_DEBUG(20618,
+                1,
+                "Free Monitoring Metrics upload failed with status {error}, retrying in {interval}",
+                "Free Monitoring Metrics upload failed, will retry after interval",
+                "error"_attr = msg->getPayload(),
+                "interval"_attr = _metricsRetry->getNextDuration());
 
     // Enqueue next metrics upload
     enqueue(FreeMonMessage::createWithDeadline(FreeMonMessageType::MetricsSend,
@@ -912,13 +930,15 @@ void FreeMonProcessor::getStatus(OperationContext* opCtx,
 
 void FreeMonProcessor::doOnTransitionToPrimary(Client* client) {
     if (_registerOnTransitionToPrimary == RegistrationType::RegisterAfterOnTransitionToPrimary) {
-        enqueue(FreeMonRegisterCommandMessage::createNow(std::vector<std::string>()));
+        enqueue(
+            FreeMonRegisterCommandMessage::createNow({std::vector<std::string>(), boost::none}));
 
     } else if (_registerOnTransitionToPrimary ==
                RegistrationType::RegisterAfterOnTransitionToPrimaryIfEnabled) {
         readState(client);
         if (_state->getState() == StorageStateEnum::enabled) {
-            enqueue(FreeMonRegisterCommandMessage::createNow(std::vector<std::string>()));
+            enqueue(FreeMonRegisterCommandMessage::createNow(
+                {std::vector<std::string>(), boost::none}));
         }
     }
 
@@ -934,7 +954,8 @@ void FreeMonProcessor::processInMemoryStateChange(const FreeMonStorageState& ori
             newState.getState() == StorageStateEnum::enabled) {
 
             // Secondary needs to start registration
-            enqueue(FreeMonRegisterCommandMessage::createNow(std::vector<std::string>()));
+            enqueue(FreeMonRegisterCommandMessage::createNow(
+                {std::vector<std::string>(), newState.getRegistrationId().toString()}));
         }
     }
 }

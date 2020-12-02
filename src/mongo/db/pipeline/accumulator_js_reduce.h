@@ -42,14 +42,14 @@ class AccumulatorInternalJsReduce final : public AccumulatorState {
 public:
     static constexpr auto kAccumulatorName = "$_internalJsReduce"_sd;
 
-    static boost::intrusive_ptr<AccumulatorState> create(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx, StringData funcSource);
+    static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* const expCtx,
+                                                         StringData funcSource);
 
-    static AccumulationExpression parseInternalJsReduce(
-        boost::intrusive_ptr<ExpressionContext> expCtx, BSONElement elem, VariablesParseState vps);
+    static AccumulationExpression parseInternalJsReduce(ExpressionContext* const expCtx,
+                                                        BSONElement elem,
+                                                        VariablesParseState vps);
 
-    AccumulatorInternalJsReduce(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                StringData funcSource)
+    AccumulatorInternalJsReduce(ExpressionContext* const expCtx, StringData funcSource)
         : AccumulatorState(expCtx), _funcSource(funcSource) {
         _memUsageBytes = sizeof(*this);
     }
@@ -85,20 +85,21 @@ public:
 
     // An AccumulatorState instance only owns its "static" arguments: those that don't need to be
     // evaluated per input document.
-    static boost::intrusive_ptr<AccumulatorState> create(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx,
-        std::string init,
-        std::string accumulate,
-        std::string merge,
-        boost::optional<std::string> finalize);
+    static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* const expCtx,
+                                                         std::string init,
+                                                         std::string accumulate,
+                                                         std::string merge,
+                                                         boost::optional<std::string> finalize);
 
-    static AccumulationExpression parse(boost::intrusive_ptr<ExpressionContext> expCtx,
+    static AccumulationExpression parse(ExpressionContext* const expCtx,
                                         BSONElement elem,
                                         VariablesParseState vps);
 
     Value getValue(bool toBeMerged) final;
     void reset() final;
     void processInternal(const Value& input, bool merging) final;
+    void reduceMemoryConsumptionIfAble() final;
+
 
     Document serialize(boost::intrusive_ptr<Expression> initializer,
                        boost::intrusive_ptr<Expression> argument,
@@ -106,7 +107,7 @@ public:
     void startNewGroup(Value const& input) final;
 
 private:
-    AccumulatorJs(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    AccumulatorJs(ExpressionContext* const expCtx,
                   std::string init,
                   std::string accumulate,
                   std::string merge,
@@ -139,10 +140,7 @@ private:
     // True means the elements of _pendingCalls should be interpreted as intermediate states from
     // other instances of $accumulator. False means the elements of _pendingCalls should be
     // interpreted as inputs from accumulateArgs.
-    bool _pendingCallsMerging;
-
-    // Call the user's accumulate/merge function for each element of _pendingCalls.
-    void reducePendingCalls();
+    bool _pendingCallsMerging = false;
 };
 
 }  // namespace mongo

@@ -3,9 +3,15 @@
 // present without this test failing. In particular if the rst.stop(1) doesn't execute mid-batch,
 // it isn't fully exercising the code. However, if the test fails there is definitely a bug.
 //
-// @tags: [requires_persistence, requires_majority_read_concern]
+// @tags: [
+//   requires_persistence,
+//   requires_majority_read_concern,
+//   live_record_incompatible,
+// ]
 (function() {
 "use strict";
+
+load("jstests/libs/write_concern_util.js");
 
 // Skip db hash check because secondary restarted as standalone.
 TestData.skipCheckDBHashes = true;
@@ -24,10 +30,10 @@ printjson(conf);
 rst.initiate(conf);
 
 var primary = rst.getPrimary();  // Waits for PRIMARY state.
-var slave = rst.nodes[1];
+var secondary = rst.nodes[1];
 
 // Stop replication on the secondary.
-assert.commandWorked(slave.adminCommand({configureFailPoint: 'rsSyncApplyStop', mode: 'alwaysOn'}));
+stopServerReplication(secondary);
 
 // Prime the main collection.
 primary.getCollection("test.coll").insert({_id: -1});
@@ -47,13 +53,13 @@ assert.commandWorked(op.execute());
 
 // Resume replication and wait for ops to start replicating, then do a clean shutdown on the
 // secondary.
-assert.commandWorked(slave.adminCommand({configureFailPoint: 'rsSyncApplyStop', mode: 'off'}));
+restartServerReplication(secondary);
 waitForReplStart();
 sleep(100);  // wait a bit to increase the chances of killing mid-batch.
 rst.stop(1);
 
 // Restart the secondary as a standalone node.
-var options = slave.savedOptions;
+var options = secondary.savedOptions;
 options.noCleanData = true;
 delete options.replSet;
 

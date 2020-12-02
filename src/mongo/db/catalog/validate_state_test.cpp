@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -35,8 +35,13 @@
 
 #include "mongo/db/catalog/catalog_test_fixture.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index_builds_coordinator.h"
+#include "mongo/db/op_observer_impl.h"
+#include "mongo/db/op_observer_registry.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/storage/durable_catalog.h"
+#include "mongo/db/storage/snapshot_manager.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
 #include "mongo/util/fail_point.h"
 
@@ -58,7 +63,10 @@ public:
     /**
      * Create collection 'nss' and insert some documents. It will possess a default _id index.
      */
-    Collection* createCollectionAndPopulateIt(OperationContext* opCtx, const NamespaceString& nss);
+    void createCollectionAndPopulateIt(OperationContext* opCtx, const NamespaceString& nss);
+
+private:
+    void setUp() override;
 };
 
 void ValidateStateTest::createCollection(OperationContext* opCtx, const NamespaceString& nss) {
@@ -67,13 +75,12 @@ void ValidateStateTest::createCollection(OperationContext* opCtx, const Namespac
     ASSERT_OK(storageInterface()->createCollection(opCtx, nss, defaultCollectionOptions));
 }
 
-Collection* ValidateStateTest::createCollectionAndPopulateIt(OperationContext* opCtx,
-                                                             const NamespaceString& nss) {
+void ValidateStateTest::createCollectionAndPopulateIt(OperationContext* opCtx,
+                                                      const NamespaceString& nss) {
     // Create collection.
     createCollection(opCtx, nss);
 
-    AutoGetCollection autoColl(opCtx, nss, MODE_X);
-    Collection* collection = autoColl.getCollection();
+    AutoGetCollection collection(opCtx, nss, MODE_X);
     invariant(collection);
 
     // Insert some data.
@@ -84,30 +91,60 @@ Collection* ValidateStateTest::createCollectionAndPopulateIt(OperationContext* o
             collection->insertDocument(opCtx, InsertStatement(BSON("_id" << i)), nullOpDebug));
         wuow.commit();
     }
+}
 
-    return collection;
+void ValidateStateTest::setUp() {
+    CatalogTestFixture::setUp();
+
+    auto service = getServiceContext();
+
+    // Set up OpObserver so that we will append actual oplog entries to the oplog using
+    // repl::logOp(). This supports index builds that have to look up the last oplog entry.
+    auto opObserverRegistry = dynamic_cast<OpObserverRegistry*>(service->getOpObserver());
+    opObserverRegistry->addObserver(std::make_unique<OpObserverImpl>());
+
+    // Index builds expect a non-empty oplog and a valid committed snapshot.
+    auto opCtx = operationContext();
+    Lock::GlobalLock lk(opCtx, MODE_IX);
+    WriteUnitOfWork wuow(opCtx);
+    service->getOpObserver()->onOpMessage(opCtx, BSONObj());
+    wuow.commit();
+
+    // Provide an initial committed snapshot so that index build can begin the collection scan.
+    auto snapshotManager = service->getStorageEngine()->getSnapshotManager();
+    auto lastAppliedOpTime = repl::ReplicationCoordinator::get(service)->getMyLastAppliedOpTime();
+    snapshotManager->setCommittedSnapshot(lastAppliedOpTime.getTimestamp());
 }
 
 /**
  * Builds an index on the given 'nss'. 'indexKey' specifies the index key, e.g. {'a': 1};
  */
 void createIndex(OperationContext* opCtx, const NamespaceString& nss, const BSONObj& indexKey) {
-    DBDirectClient client(opCtx);
-    client.createIndex(nss.ns(), indexKey);
+    AutoGetCollection collection(opCtx, nss, MODE_X);
+    ASSERT(collection);
+
+    ASSERT_EQ(1, indexKey.nFields()) << nss << "/" << indexKey;
+    auto spec = BSON("v" << int(IndexDescriptor::kLatestIndexVersion) << "key" << indexKey << "name"
+                         << (indexKey.firstElementFieldNameStringData() + "_1"));
+
+    auto indexBuildsCoord = IndexBuildsCoordinator::get(opCtx);
+    auto indexConstraints = IndexBuildsManager::IndexConstraints::kEnforce;
+    auto fromMigrate = false;
+    indexBuildsCoord->createIndex(opCtx, collection->uuid(), spec, indexConstraints, fromMigrate);
 }
 
 /**
  * Drops index 'indexName' in collection 'nss'.
  */
 void dropIndex(OperationContext* opCtx, const NamespaceString& nss, const std::string& indexName) {
-    AutoGetCollection autoColl(opCtx, nss, MODE_X);
+    AutoGetCollection collection(opCtx, nss, MODE_X);
 
     WriteUnitOfWork wuow(opCtx);
 
-    auto collection = autoColl.getCollection();
     auto indexDescriptor = collection->getIndexCatalog()->findIndexByName(opCtx, indexName);
     ASSERT(indexDescriptor);
-    ASSERT_OK(collection->getIndexCatalog()->dropIndex(opCtx, indexDescriptor));
+    ASSERT_OK(
+        collection.getWritableCollection()->getIndexCatalog()->dropIndex(opCtx, indexDescriptor));
 
     wuow.commit();
 }
@@ -116,21 +153,21 @@ void dropIndex(OperationContext* opCtx, const NamespaceString& nss, const std::s
 TEST_F(ValidateStateTest, NonExistentCollectionShouldThrowNamespaceNotFoundError) {
     auto opCtx = operationContext();
 
-    ASSERT_THROWS_CODE(CollectionValidation::ValidateState(
-                           opCtx,
-                           kNss,
-                           /*background*/ false,
-                           CollectionValidation::ValidateOptions::kNoFullValidation),
-                       AssertionException,
-                       ErrorCodes::NamespaceNotFound);
+    ASSERT_THROWS_CODE(
+        CollectionValidation::ValidateState(opCtx,
+                                            kNss,
+                                            CollectionValidation::ValidateMode::kForeground,
+                                            CollectionValidation::RepairMode::kNone),
+        AssertionException,
+        ErrorCodes::NamespaceNotFound);
 
-    ASSERT_THROWS_CODE(CollectionValidation::ValidateState(
-                           opCtx,
-                           kNss,
-                           /*background*/ true,
-                           CollectionValidation::ValidateOptions::kNoFullValidation),
-                       AssertionException,
-                       ErrorCodes::NamespaceNotFound);
+    ASSERT_THROWS_CODE(
+        CollectionValidation::ValidateState(opCtx,
+                                            kNss,
+                                            CollectionValidation::ValidateMode::kBackground,
+                                            CollectionValidation::RepairMode::kNone),
+        AssertionException,
+        ErrorCodes::NamespaceNotFound);
 }
 
 TEST_F(ValidateStateTest, UncheckpointedCollectionShouldBeAbleToInitializeCursors) {
@@ -144,7 +181,10 @@ TEST_F(ValidateStateTest, UncheckpointedCollectionShouldBeAbleToInitializeCursor
 
     createCollectionAndPopulateIt(opCtx, kNss);
     CollectionValidation::ValidateState validateState(
-        opCtx, kNss, /*background*/ true, CollectionValidation::ValidateOptions::kNoFullValidation);
+        opCtx,
+        kNss,
+        CollectionValidation::ValidateMode::kBackground,
+        CollectionValidation::RepairMode::kNone);
     // Assert that cursors are able to created on the new collection.
     validateState.initializeCursors(opCtx);
     // There should only be a first record id if cursors were initialized successfully.
@@ -153,17 +193,7 @@ TEST_F(ValidateStateTest, UncheckpointedCollectionShouldBeAbleToInitializeCursor
 
 // Basic test with {background:false} to open cursors against all collection indexes.
 TEST_F(ValidateStateTest, OpenCursorsOnAllIndexes) {
-    // Disable index build commit quorum as we don't have support of replication subsystem for
-    // voting.
-    ASSERT_OK(ServerParameterSet::getGlobal()
-                  ->getMap()
-                  .find("enableIndexBuildCommitQuorum")
-                  ->second->setFromString("false"));
     auto opCtx = operationContext();
-    // Create config.system.indexBuilds collection to store commit quorum value during index
-    // building.
-    createCollection(opCtx, NamespaceString::kIndexBuildEntryNamespace);
-
     createCollectionAndPopulateIt(opCtx, kNss);
 
     // Disable periodic checkpoint'ing thread so we can control when checkpoints occur.
@@ -180,8 +210,8 @@ TEST_F(ValidateStateTest, OpenCursorsOnAllIndexes) {
         CollectionValidation::ValidateState validateState(
             opCtx,
             kNss,
-            /*background*/ false,
-            CollectionValidation::ValidateOptions::kNoFullValidation);
+            CollectionValidation::ValidateMode::kForeground,
+            CollectionValidation::RepairMode::kNone);
         validateState.initializeCursors(opCtx);
 
         // Make sure all of the indexes were found and cursors opened against them. Including the
@@ -198,26 +228,15 @@ TEST_F(ValidateStateTest, OpenCursorsOnAllIndexes) {
     CollectionValidation::ValidateState validateState(
         opCtx,
         kNss,
-        /*background*/ false,
-        CollectionValidation::ValidateOptions::kNoFullValidation);
+        CollectionValidation::ValidateMode::kForeground,
+        CollectionValidation::RepairMode::kNone);
     validateState.initializeCursors(opCtx);
     ASSERT_EQ(validateState.getIndexes().size(), 5);
 }
 
 // Open cursors against all indexes with {background:true}.
 TEST_F(ValidateStateTest, OpenCursorsOnAllIndexesWithBackground) {
-    // Disable index build commit quorum as we don't have support of replication subsystem for
-    // voting.
-    ASSERT_OK(ServerParameterSet::getGlobal()
-                  ->getMap()
-                  .find("enableIndexBuildCommitQuorum")
-                  ->second->setFromString("false"));
-
     auto opCtx = operationContext();
-    // Create config.system.indexBuilds collection to store commit quorum value during index
-    // building.
-    createCollection(opCtx, NamespaceString::kIndexBuildEntryNamespace);
-
     createCollectionAndPopulateIt(opCtx, kNss);
 
     // Disable periodic checkpoint'ing thread so we can control when checkpoints occur.
@@ -234,7 +253,10 @@ TEST_F(ValidateStateTest, OpenCursorsOnAllIndexesWithBackground) {
 
     // Open the cursors.
     CollectionValidation::ValidateState validateState(
-        opCtx, kNss, /*background*/ true, CollectionValidation::ValidateOptions::kNoFullValidation);
+        opCtx,
+        kNss,
+        CollectionValidation::ValidateMode::kBackground,
+        CollectionValidation::RepairMode::kNone);
     validateState.initializeCursors(opCtx);
 
     // We should be able to open a cursor on each index.
@@ -245,18 +267,7 @@ TEST_F(ValidateStateTest, OpenCursorsOnAllIndexesWithBackground) {
 // Indexes in the checkpoint that were dropped in the present should not have cursors opened against
 // them.
 TEST_F(ValidateStateTest, CursorsAreNotOpenedAgainstCheckpointedIndexesThatWereLaterDropped) {
-    // Disable index build commit quorum as we don't have support of replication subsystem for
-    // voting.
-    ASSERT_OK(ServerParameterSet::getGlobal()
-                  ->getMap()
-                  .find("enableIndexBuildCommitQuorum")
-                  ->second->setFromString("false"));
-
     auto opCtx = operationContext();
-    // Create config.system.indexBuilds collection to store commit quorum value during index
-    // building.
-    createCollection(opCtx, NamespaceString::kIndexBuildEntryNamespace);
-
     createCollectionAndPopulateIt(opCtx, kNss);
 
     // Disable periodic checkpoint'ing thread so we can control when checkpoints occur.
@@ -281,8 +292,8 @@ TEST_F(ValidateStateTest, CursorsAreNotOpenedAgainstCheckpointedIndexesThatWereL
         CollectionValidation::ValidateState validateState(
             opCtx,
             kNss,
-            /*background*/ true,
-            CollectionValidation::ValidateOptions::kNoFullValidation);
+            CollectionValidation::ValidateMode::kBackground,
+            CollectionValidation::RepairMode::kNone);
         validateState.initializeCursors(opCtx);
         ASSERT_EQ(validateState.getIndexes().size(), 3);
     }
@@ -292,7 +303,10 @@ TEST_F(ValidateStateTest, CursorsAreNotOpenedAgainstCheckpointedIndexesThatWereL
     opCtx->recoveryUnit()->waitUntilUnjournaledWritesDurable(opCtx, /*stableCheckpoint*/ false);
 
     CollectionValidation::ValidateState validateState(
-        opCtx, kNss, /*background*/ true, CollectionValidation::ValidateOptions::kNoFullValidation);
+        opCtx,
+        kNss,
+        CollectionValidation::ValidateMode::kBackground,
+        CollectionValidation::RepairMode::kNone);
     validateState.initializeCursors(opCtx);
     ASSERT_EQ(validateState.getIndexes().size(), 3);
 }

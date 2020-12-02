@@ -18,7 +18,9 @@ st.shardColl(collA, {_id: 1}, false);
 st.shardColl(collB, {_id: 1}, false);
 
 // Split into a lot of chunks so balancing can occur
-for (var i = 0; i < 10 - 1; i++) {  // 10 chunks total
+var totalNumChunks = 10;
+var numChunksPerShard = totalNumChunks / 2;
+for (var i = 0; i < totalNumChunks - 1; i++) {  // 10 chunks total
     collA.getMongo().getDB("admin").runCommand({split: collA + "", middle: {_id: i}});
     collA.getMongo().getDB("admin").runCommand({split: collB + "", middle: {_id: i}});
 }
@@ -27,27 +29,27 @@ for (var i = 0; i < 10 - 1; i++) {  // 10 chunks total
 sh.disableBalancing(collB);
 
 jsTest.log("Balancing disabled on " + collB);
-printjson(collA.getDB().getSisterDB("config").collections.find().toArray());
+printjson(collA.getDB().getSiblingDB("config").collections.find().toArray());
 
 st.startBalancer();
 
 // Make sure collA gets balanced
 assert.soon(function() {
     var shardAChunks =
-        st.s.getDB("config").chunks.find({_id: sh._collRE(collA), shard: shardAName}).itcount();
+        st.s.getDB("config").chunks.find({ns: collA.getFullName(), shard: shardAName}).itcount();
     var shardBChunks =
-        st.s.getDB("config").chunks.find({_id: sh._collRE(collA), shard: shardBName}).itcount();
+        st.s.getDB("config").chunks.find({ns: collA.getFullName(), shard: shardBName}).itcount();
     printjson({shardA: shardAChunks, shardB: shardBChunks});
-    return shardAChunks == shardBChunks;
+    return (shardAChunks == numChunksPerShard) && (shardAChunks == shardBChunks);
 }, "" + collA + " chunks not balanced!", 5 * 60 * 1000);
 
 jsTest.log("Chunks for " + collA + " are balanced.");
 
 // Check that the collB chunks were not moved
 var shardAChunks =
-    st.s.getDB("config").chunks.find({_id: sh._collRE(collB), shard: shardAName}).itcount();
+    st.s.getDB("config").chunks.find({ns: collB.getFullName(), shard: shardAName}).itcount();
 var shardBChunks =
-    st.s.getDB("config").chunks.find({_id: sh._collRE(collB), shard: shardBName}).itcount();
+    st.s.getDB("config").chunks.find({ns: collB.getFullName(), shard: shardBName}).itcount();
 printjson({shardA: shardAChunks, shardB: shardBChunks});
 assert(shardAChunks == 0 || shardBChunks == 0);
 
@@ -57,11 +59,11 @@ sh.enableBalancing(collB);
 // Make sure that collB is now balanced
 assert.soon(function() {
     var shardAChunks =
-        st.s.getDB("config").chunks.find({_id: sh._collRE(collB), shard: shardAName}).itcount();
+        st.s.getDB("config").chunks.find({ns: collB.getFullName(), shard: shardAName}).itcount();
     var shardBChunks =
-        st.s.getDB("config").chunks.find({_id: sh._collRE(collB), shard: shardBName}).itcount();
+        st.s.getDB("config").chunks.find({ns: collB.getFullName(), shard: shardBName}).itcount();
     printjson({shardA: shardAChunks, shardB: shardBChunks});
-    return shardAChunks == shardBChunks;
+    return (shardAChunks == numChunksPerShard) && (shardAChunks == shardBChunks);
 }, "" + collB + " chunks not balanced!", 5 * 60 * 1000);
 
 jsTest.log("Chunks for " + collB + " are balanced.");
@@ -78,7 +80,9 @@ st.waitForBalancer(true, 60000);
 var lastMigration = sh._lastMigration(collB);
 
 var bulk = collB.initializeUnorderedBulkOp();
-for (var i = 0; i < 1000000; i++) {
+// Reduce the amount of data on live-record buildvariant
+var n = (TestData.undoRecorderPath ? 100000 : 1000000);
+for (var i = 0; i < n; i++) {
     bulk.insert({_id: i, hello: "world"});
 }
 assert.commandWorked(bulk.execute());

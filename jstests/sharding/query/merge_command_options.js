@@ -1,6 +1,4 @@
 // Tests that aggregations with a $merge stage respect the options set on the command.
-// Requires fcv44 for when $out against a secondary creates a temp collection.
-// @tags: [requires_fcv_44]
 (function() {
 'use strict';
 
@@ -123,11 +121,12 @@ assert.commandWorked(st.rs0.getPrimary().getDB('test').adminCommand(
         numExpectedMatches: 1
     });
 
-    // Verify that there is an additional listIndexes profiler entry on the primary shard.
+    // TODO(SERVER-47998): The listIndexes command should be sent to the primary shard,
+    // but due to SERVER-47998 it does not show up in the profiler.
     profilerHasNumMatchingEntriesOrThrow({
         profileDB: primaryDB,
         filter: {ns: target.getFullName(), "command.listIndexes": target.getName()},
-        numExpectedMatches: 3
+        numExpectedMatches: 2
     });
 
     assert.commandWorked(primaryDB.getSiblingDB("admin").runCommand(
@@ -164,7 +163,7 @@ assert.commandWorked(st.rs0.getPrimary().getDB('test').adminCommand(
     profilerHasNumMatchingEntriesOrThrow({
         profileDB: primaryDB,
         filter: {ns: target.getFullName(), "command.listIndexes": target.getName()},
-        numExpectedMatches: 3
+        numExpectedMatches: 2
     });
 
     profilerHasNumMatchingEntriesOrThrow({

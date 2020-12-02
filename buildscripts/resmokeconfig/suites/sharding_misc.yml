@@ -58,10 +58,10 @@ selector:
   - jstests/sharding/mongos_shard_failure_tolerance.js
   - jstests/sharding/index_and_collection_option_propagation.js
   - jstests/sharding/change_stream_update_lookup_read_concern.js
-  - jstests/sharding/count_slaveok.js
+  - jstests/sharding/count_secondaryok.js
   - jstests/sharding/rename.js
   - jstests/sharding/shard_identity_config_update.js
-  - jstests/sharding/recovering_slaveok.js
+  - jstests/sharding/recovering_secondaryok.js
   - jstests/sharding/all_config_servers_blackholed_from_mongos.js
   - jstests/sharding/authCommands.js
   - jstests/sharding/addshard4.js
@@ -94,7 +94,7 @@ selector:
   - jstests/sharding/migrateBig.js
   - jstests/sharding/change_stream_chunk_migration.js
   - jstests/sharding/large_chunk.js
-  - jstests/sharding/auth_slaveok_routing.js
+  - jstests/sharding/auth_secondaryok_routing.js
   - jstests/sharding/balancer_window.js
   - jstests/sharding/change_streams_primary_shard_unaware.js
   - jstests/sharding/diffservers1.js
@@ -113,7 +113,6 @@ selector:
   - jstests/sharding/query_config.js
   - jstests/sharding/hash_basic.js
   - jstests/sharding/hash_shard1.js
-  - jstests/sharding/max_time_ms_sharded.js
   - jstests/sharding/change_stream_read_preference.js
   - jstests/sharding/features1.js
   - jstests/sharding/read_committed_lookup.js
@@ -135,9 +134,7 @@ selector:
   - jstests/sharding/coll_epoch_test1.js
   - jstests/sharding/hash_shard_num_chunks.js
   - jstests/sharding/basic_sharding_params.js
-  - jstests/sharding/migration_ignore_interrupts_3.js
   - jstests/sharding/change_streams.js
-  - jstests/sharding/migration_ignore_interrupts_4.js
   - jstests/sharding/move_chunk_basic.js
   - jstests/sharding/query/collation_targeting_inherited.js
   - jstests/sharding/secondary_shard_version_protocol_with_causal_consistency.js
@@ -161,7 +158,7 @@ selector:
   - jstests/sharding/multi_mongos2.js
   - jstests/sharding/query/cursor_timeout.js
   - jstests/sharding/query/geo_near_sharded.js
-  - jstests/sharding/findandmodify2.js
+  - jstests/sharding/findandmodify_autosplit.js
   - jstests/sharding/mongos_validate_writes.js
   - jstests/sharding/coll_epoch_test2.js
   - jstests/sharding/cursor1.js
@@ -175,15 +172,11 @@ selector:
   - jstests/sharding/causal_consistency_shell_support.js
   - jstests/sharding/change_streams_establishment_finds_new_shards.js
   - jstests/sharding/retryable_writes.js
-  - jstests/sharding/cleanup_orphaned_cmd_prereload.js
   - jstests/sharding/basic_merge.js
   - jstests/sharding/migration_critical_section_concurrency.js
   - jstests/sharding/sort1.js
-  - jstests/sharding/cleanup_orphaned_cmd_during_movechunk.js
   - jstests/sharding/upsert_sharded.js
-  - jstests/sharding/cleanup_orphaned_cmd_hashed.js
   - jstests/sharding/addshard5.js
-  - jstests/sharding/cleanup_orphaned_compound.js
   - jstests/sharding/query/agg_sort.js
   - jstests/sharding/remove1.js
   - jstests/sharding/shard_targeting.js
@@ -200,8 +193,6 @@ selector:
   - jstests/sharding/count2.js
   - jstests/sharding/no_empty_reset.js
   - jstests/sharding/kill_pinned_cursor.js
-  - jstests/sharding/cleanup_orphaned.js
-  - jstests/sharding/cleanup_orphaned_cmd_during_movechunk_hashed.js
   - jstests/sharding/sharded_limit_batchsize.js
   - jstests/sharding/migration_sets_fromMigrate_flag.js
   - jstests/sharding/change_stream_metadata_notifications.js
@@ -309,7 +300,6 @@ selector:
   - jstests/sharding/hash_single_shard.js
   - jstests/sharding/version2.js
   - jstests/sharding/advance_logical_time_with_valid_signature.js
-  - jstests/sharding/cleanup_orphaned_auth.js
   - jstests/sharding/query/mrShardedOutputAuth.js
   - jstests/sharding/split_against_shard_with_invalid_split_points.js
   - jstests/sharding/version1.js
@@ -329,7 +319,7 @@ selector:
   - jstests/sharding/authmr.js
   - jstests/sharding/sessions_collection_auto_healing.js
   - jstests/sharding/read_does_not_create_namespaces.js
-  - jstests/sharding/ismaster.js
+  - jstests/sharding/hello_response_validation.js
   - jstests/sharding/balancer_shell_commands.js
   - jstests/sharding/auth_sharding_cmd_metadata.js
   - jstests/sharding/autodiscover_config_rs_from_secondary.js

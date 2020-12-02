@@ -1,10 +1,18 @@
-// Tests the behavior of a $lookup when a shard contains incorrect routing information for the
-// local and/or foreign collections.  This includes when the shard thinks the collection is sharded
-// when it's not, and likewise when it thinks the collection is unsharded but is actually sharded.
-//
-// We restart a mongod to cause it to forget that a collection was sharded. When restarted, we
-// expect it to still have all the previous data.
-// @tags: [requires_persistence]
+/**
+ * Tests the behavior of a $lookup when a shard contains incorrect routing information for the
+ * local and/or foreign collections. This includes when the shard thinks the collection is sharded
+ * when it's not, and likewise when it thinks the collection is unsharded but is actually sharded.
+ *
+ * We restart a mongod to cause it to forget that a collection was sharded. When restarted, we
+ * expect it to still have all the previous data.
+ *
+ * @tags: [
+ *  requires_fcv_47,
+ *  requires_persistence,
+ * ]
+ *
+ * TODO (SERVER-47265): Remove the requires_fcv_47 flag
+ */
 (function() {
 "use strict";
 
@@ -31,17 +39,15 @@ function restartPrimaryShard(rs, localColl, foreignColl) {
                            true);
 }
 
-const testName = "lookup_stale_mongod";
-const st = new ShardingTest({
-    shards: 2,
-    mongos: 2,
-    rs: {nodes: 1},
-});
-
 // Disable checking for index consistency to ensure that the config server doesn't trigger a
 // StaleShardVersion exception on shard0 and cause it to refresh its sharding metadata.
-st._configServers.forEach(
-    config => config.adminCommand({setParameter: 1, enableShardedIndexConsistencyCheck: false}));
+const nodeOptions = {
+    setParameter: {enableShardedIndexConsistencyCheck: false}
+};
+
+const testName = "lookup_stale_mongod";
+const st =
+    new ShardingTest({shards: 2, mongos: 2, rs: {nodes: 1}, other: {configOptions: nodeOptions}});
 
 // Set the parameter allowing sharded $lookup on all nodes.
 setParameterOnAllHosts(DiscoverTopology.findNonConfigNodes(st.s0).concat([st.s1.host]),

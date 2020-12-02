@@ -54,6 +54,13 @@ public:
         // Does not traverse arrays at the end of the path. For the path "f" and document {f: [1,
         // 2]}, the path iterator returns only the entire array [1, 2].
         kNoTraversal,
+
+        // Matches against the elements of arrays at the end of the path. The same as kTraverse, but
+        // does not match the array as a whole.
+        //
+        // For example, for the path "f" and document {f: [1, 2]}, causes the path iterator to
+        // return 1 and 2.
+        kTraverseOmitArray,
     };
 
     /**
@@ -80,9 +87,13 @@ public:
           _nonLeafArrayBehavior(nonLeafArrayBehavior),
           _fieldRef(path) {}
 
-    // TODO: replace uses of members below with regular construction.
-    ElementPath() {}
-    void init(StringData path);
+    /**
+     * Resets this ElementPath to 'newPath'. Note that this method will make a copy of 'newPath'
+     * such that there's no lifetime requirements for the string which 'newPath' points into.
+     */
+    void reset(StringData newPath) {
+        _fieldRef.parse(newPath);
+    }
 
     void setLeafArrayBehavior(LeafArrayBehavior leafArrBehavior) {
         _leafArrayBehavior = leafArrBehavior;

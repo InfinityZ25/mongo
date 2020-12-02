@@ -104,6 +104,8 @@ public:
     using CreateOplogFn = std::function<Status(OperationContext*, const NamespaceString&)>;
     using CreateCollectionFn =
         std::function<Status(OperationContext*, const NamespaceString&, const CollectionOptions&)>;
+    using CreateIndexesOnEmptyCollectionFn = std::function<Status(
+        OperationContext*, const NamespaceString&, const std::vector<BSONObj>&)>;
     using TruncateCollectionFn =
         std::function<Status(OperationContext*, const NamespaceString& nss)>;
     using DropCollectionFn = std::function<Status(OperationContext*, const NamespaceString& nss)>;
@@ -172,6 +174,13 @@ public:
         return createCollFn(opCtx, nss, options);
     }
 
+    Status createIndexesOnEmptyCollection(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        const std::vector<BSONObj>& secondaryIndexSpecs) override {
+        return createIndexesOnEmptyCollFn(opCtx, nss, secondaryIndexSpecs);
+    }
+
     Status dropCollection(OperationContext* opCtx, const NamespaceString& nss) override {
         return dropCollFn(opCtx, nss);
     };
@@ -191,6 +200,7 @@ public:
     Status setIndexIsMultikey(OperationContext* opCtx,
                               const NamespaceString& nss,
                               const std::string& indexName,
+                              const KeyStringSet& multikeyMetadataKeys,
                               const MultikeyPaths& paths,
                               Timestamp ts) override {
 
@@ -263,7 +273,12 @@ public:
     }
 
     boost::optional<BSONObj> findOplogEntryLessThanOrEqualToTimestamp(
-        OperationContext* opCtx, Collection* oplog, const Timestamp& timestamp) override {
+        OperationContext* opCtx, const CollectionPtr& oplog, const Timestamp& timestamp) override {
+        return boost::none;
+    }
+
+    boost::optional<BSONObj> findOplogEntryLessThanOrEqualToTimestampRetryOnWCE(
+        OperationContext* opCtx, const CollectionPtr& oplog, const Timestamp& timestamp) override {
         return boost::none;
     }
 
@@ -292,7 +307,9 @@ public:
         return getCollectionUUIDFn(opCtx, nss);
     }
 
-    void setStableTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) override;
+    void setStableTimestamp(ServiceContext* serviceCtx,
+                            Timestamp snapshotName,
+                            bool force = false) override;
 
     void setInitialDataTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) override;
 
@@ -319,10 +336,6 @@ public:
     }
 
     Timestamp getAllDurableTimestamp(ServiceContext* serviceCtx) const override;
-
-    Timestamp getOldestOpenReadTimestamp(ServiceContext* serviceCtx) const override;
-
-    bool supportsDocLocking(ServiceContext* serviceCtx) const override;
 
     Status isAdminDbValid(OperationContext* opCtx) override {
         return isAdminDbValidFn(opCtx);
@@ -378,6 +391,12 @@ public:
         [](OperationContext* opCtx, const NamespaceString& nss, const CollectionOptions& options) {
             return Status{ErrorCodes::IllegalOperation, "CreateCollectionFn not implemented."};
         };
+    CreateIndexesOnEmptyCollectionFn createIndexesOnEmptyCollFn = [](OperationContext* opCtx,
+                                                                     const NamespaceString& nss,
+                                                                     const std::vector<BSONObj>&
+                                                                         secondaryIndexSpecs) {
+        return Status{ErrorCodes::IllegalOperation, "createIndexesOnEmptyCollFn not implemented."};
+    };
     TruncateCollectionFn truncateCollFn = [](OperationContext* opCtx, const NamespaceString& nss) {
         return Status{ErrorCodes::IllegalOperation, "TruncateCollectionFn not implemented."};
     };
@@ -411,7 +430,6 @@ public:
         return Status{ErrorCodes::IllegalOperation, "GetCollectionUUIDFn not implemented."};
     };
 
-    bool supportsDocLockingBool = false;
     Timestamp allDurableTimestamp = Timestamp::min();
     Timestamp oldestOpenReadTimestamp = Timestamp::min();
 

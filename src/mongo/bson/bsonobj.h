@@ -296,9 +296,6 @@ public:
                                 fmt::memory_buffer& buffer,
                                 size_t writeLimit = 0) const;
 
-    /** note: addFields always adds _id even if not specified */
-    int addFields(BSONObj& from, std::set<std::string>& fields); /* returns n added */
-
     /**
      * Add specific field to the end of the object if it did not exist, otherwise replace it
      * preserving original field order. Returns newly built object. Returns copy of this for empty
@@ -306,10 +303,26 @@ public:
      */
     BSONObj addField(const BSONElement& field) const;
 
+    /**
+     * Merges the specified 'fields' from the 'from' object into the current BSON and returns the
+     * merged object. If the 'fields' is not specified, all the fields from the 'from' object are
+     * merged.
+     *
+     * Note that if the original object already has a particular field, then the field will be
+     * replaced.
+     */
+    BSONObj addFields(const BSONObj& from,
+                      const boost::optional<std::set<std::string>>& fields = boost::none) const;
+
     /** remove specified field and return a new object with the remaining fields.
         slowish as builds a full new object
      */
     BSONObj removeField(StringData name) const;
+
+    /**
+     * Remove specified fields and return a new object with the remaining fields.
+     */
+    BSONObj removeFields(const std::set<std::string>& fields) const;
 
     /** returns # of top level fields in the object
        note: iterates to count the fields
@@ -563,10 +576,9 @@ public:
     bool hasFieldNames() const;
 
     /**
-     * Returns true if this object is valid according to the specified BSON version, and returns
-     * false otherwise.
+     * Returns true if this object is valid and returns false otherwise.
      */
-    bool valid(BSONVersion version) const;
+    bool valid() const;
 
     /** add all elements of the object to the specified vector */
     void elems(std::vector<BSONElement>&) const;
@@ -749,6 +761,25 @@ public:
     BSONObjIterator(const char* start, const char* end) {
         _pos = start + 4;
         _theend = end - 1;
+    }
+
+    /*
+     * Advance '_pos' by currentElement.size(). The element passed in must be equivalent to the
+     * current element '_pos' is at.
+     */
+    void advance(const BSONElement& currentElement) {
+        dassert(BSONElement(_pos).size() == currentElement.size());
+        _pos += currentElement.size();
+    }
+
+    /**
+     * Return true if the current element is equal to 'otherElement'.
+     * Do *not* use with moreWithEOO() as the function will return false if the current element and
+     * 'otherElement' are EOO.
+     */
+    bool currentElementBinaryEqual(const BSONElement& otherElement) {
+        auto sz = otherElement.size();
+        return sz <= (_theend - _pos) && memcmp(otherElement.rawdata(), _pos, sz) == 0;
     }
 
     /** @return true if more elements exist to be enumerated. */

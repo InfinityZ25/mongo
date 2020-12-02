@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "mongo/base/status.h"
+#include "mongo/config.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer.h"
@@ -55,17 +56,22 @@ class TransportLayerManager final : public TransportLayer {
     TransportLayerManager& operator=(const TransportLayerManager&) = delete;
 
 public:
-    TransportLayerManager(std::vector<std::unique_ptr<TransportLayer>> tls)
-        : _tls(std::move(tls)) {}
-    TransportLayerManager();
+    explicit TransportLayerManager(std::vector<std::unique_ptr<TransportLayer>> tls,
+                                   const WireSpec& wireSpec = WireSpec::instance())
+        : TransportLayer(wireSpec), _tls(std::move(tls)) {}
+
+    explicit TransportLayerManager(const WireSpec& wireSpec = WireSpec::instance())
+        : TransportLayer(wireSpec) {}
 
     StatusWith<SessionHandle> connect(HostAndPort peer,
                                       ConnectSSLMode sslMode,
                                       Milliseconds timeout) override;
-    Future<SessionHandle> asyncConnect(HostAndPort peer,
-                                       ConnectSSLMode sslMode,
-                                       const ReactorHandle& reactor,
-                                       Milliseconds timeout) override;
+    Future<SessionHandle> asyncConnect(
+        HostAndPort peer,
+        ConnectSSLMode sslMode,
+        const ReactorHandle& reactor,
+        Milliseconds timeout,
+        std::shared_ptr<const SSLConnectionContext> transientSSLContext = nullptr) override;
 
     Status start() override;
     void shutdown() override;
@@ -98,6 +104,14 @@ public:
         return _tls[0]->makeBaton(opCtx);
     }
 
+#ifdef MONGO_CONFIG_SSL
+    Status rotateCertificates(std::shared_ptr<SSLManagerInterface> manager,
+                              bool asyncOCSPStaple) override;
+
+    StatusWith<std::shared_ptr<const transport::SSLConnectionContext>> createTransientSSLContext(
+        const TransientSSLParams& transientSSLParams,
+        const SSLManagerInterface* optionalManager) override;
+#endif
 private:
     template <typename Callable>
     void _foreach(Callable&& cb) const;

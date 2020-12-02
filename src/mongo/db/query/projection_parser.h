@@ -53,5 +53,13 @@ Projection parse(boost::intrusive_ptr<ExpressionContext> expCtx,
 Projection parse(boost::intrusive_ptr<ExpressionContext> expCtx,
                  const BSONObj& obj,
                  ProjectionPolicies policies);
+
+/**
+ * Adds a node to the projection AST rooted at 'root' to the path specified by 'path'.
+ */
+void addNodeAtPath(ProjectionPathASTNode* root,
+                   const FieldPath& path,
+                   std::unique_ptr<ASTNode> newChild);
+
 }  // namespace projection_ast
 }  // namespace mongo

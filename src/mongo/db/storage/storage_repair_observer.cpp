@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/db/storage/storage_repair_observer.h"
 
@@ -47,6 +47,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/control/journal_flusher.h"
 #include "mongo/db/storage/storage_file_util.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/logv2/log.h"
@@ -123,11 +124,11 @@ void StorageRepairObserver::_touchRepairIncompleteFile() {
     boost::filesystem::ofstream fileStream(_repairIncompleteFilePath);
     fileStream << "This file indicates that a repair operation is in progress or incomplete.";
     if (fileStream.fail()) {
-        LOGV2_FATAL_NOTRACE(
-            50920,
-            "Failed to write to file {repairIncompleteFilePath_string}: {errnoWithDescription}",
-            "repairIncompleteFilePath_string"_attr = _repairIncompleteFilePath.string(),
-            "errnoWithDescription"_attr = errnoWithDescription());
+        LOGV2_FATAL_NOTRACE(50920,
+                            "Failed to write to file {file}: {error}",
+                            "Failed to write to file",
+                            "file"_attr = _repairIncompleteFilePath.generic_string(),
+                            "error"_attr = errnoWithDescription());
     }
     fileStream.close();
 
@@ -141,10 +142,10 @@ void StorageRepairObserver::_removeRepairIncompleteFile() {
 
     if (ec) {
         LOGV2_FATAL_NOTRACE(50921,
-                            "Failed to remove file {repairIncompleteFilePath_string}: {ec_message}",
-                            "repairIncompleteFilePath_string"_attr =
-                                _repairIncompleteFilePath.string(),
-                            "ec_message"_attr = ec.message());
+                            "Failed to remove file {file}: {error}",
+                            "Failed to remove file",
+                            "file"_attr = _repairIncompleteFilePath.generic_string(),
+                            "error"_attr = ec.message());
     }
     fassertNoTrace(50927, fsyncParentDirectory(_repairIncompleteFilePath));
 }
@@ -165,7 +166,7 @@ void StorageRepairObserver::_invalidateReplConfigIfNeeded(OperationContext* opCt
     configBuilder.append(repl::ReplSetConfig::kRepairedFieldName, true);
     Helpers::putSingleton(opCtx, kConfigNss.ns().c_str(), configBuilder.obj());
 
-    opCtx->recoveryUnit()->waitUntilDurable(opCtx);
+    JournalFlusher::get(opCtx)->waitForJournalFlush();
 }
 
 }  // namespace mongo

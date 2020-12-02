@@ -35,6 +35,7 @@
 
 #include "mongo/bson/json.h"
 #include "mongo/unittest/death_test.h"
+#include "mongo/util/exit_code.h"
 
 #ifndef _WIN32
 #include <cstdio>
@@ -45,6 +46,10 @@
 
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
+#endif
+
+#if defined(__has_feature) && __has_feature(thread_sanitizer)
+#include <sanitizer/common_interface_defs.h>
 #endif
 
 #include <sstream>
@@ -81,8 +86,20 @@ void logAndThrowWithErrnoAt(const StringData expr,
         "{} failed: {} @{}:{}"_format(expr, errnoWithDescription(err), file, line));
 }
 
+#if defined(__has_feature) && __has_feature(thread_sanitizer)
+// Our callback handler exits with the default TSAN exit code so we can check in the death test
+// framework Without this, the use could override the exit code and get a false positive that the
+// test passes in TSAN builds.
+void sanitizerDieCallback() {
+    _exit(EXIT_THREAD_SANITIZER);
+}
+#endif
+
 void DeathTestBase::_doTest() {
-#if defined(_WIN32)
+#if defined(__has_feature) && (__has_feature(address_sanitizer) || __has_feature(memory_sanitizer))
+    LOGV2(5306900, "Skipping death test in sanitizer build");
+    return;
+#elif defined(_WIN32)
     LOGV2(24133, "Skipping death test on Windows");
     return;
 #elif defined(__APPLE__) && (TARGET_OS_TV || TARGET_OS_WATCH)
@@ -106,6 +123,9 @@ void DeathTestBase::_doTest() {
             if (fclose(pf) != 0)
                 logAndThrowWithErrno("fclose(pf)");
         });
+        LOGV2(5042601, "Death test starting");
+        auto alwaysLogExit = makeGuard([] { LOGV2(5042602, "Death test finishing"); });
+
         char* lineBuf = nullptr;
         size_t lineBufSize = 0;
         auto lineBufGuard = makeGuard([&] { free(lineBuf); });
@@ -118,8 +138,14 @@ void DeathTestBase::_doTest() {
                 line = line.substr(0, line.size() - 1);
             if (line.empty())
                 continue;
-            int parsedLen;
-            auto parsedChildLog = fromjson(lineBuf, &parsedLen);
+            int parsedLen = 0;
+            BSONObj parsedChildLog;
+            try {
+                parsedChildLog = fromjson(lineBuf, &parsedLen);
+            } catch (DBException&) {
+                // ignore json parsing errors and dump the whole log line as text
+                parsedLen = 0;
+            }
             if (static_cast<size_t>(parsedLen) == line.size()) {
                 LOGV2(20165, "child", "json"_attr = parsedChildLog);
             } else {
@@ -144,7 +170,14 @@ void DeathTestBase::_doTest() {
             }
         }
         if (WIFSIGNALED(stat) || (WIFEXITED(stat) && WEXITSTATUS(stat) != 0)) {
-            // Exited with a signal or non-zero code. Validate the expected message.
+// Exited with a signal or non-zero code. Validate the expected message.
+#if defined(__has_feature) && __has_feature(thread_sanitizer)
+            if (WEXITSTATUS(stat) == EXIT_THREAD_SANITIZER) {
+                FAIL(
+                    "Death test exited with Thread Sanitizer exit code, search test output for "
+                    "'ThreadSanitizer' for more information");
+            }
+#endif
             if (_isRegex()) {
                 ASSERT_STRING_SEARCH_REGEX(os.str(), _doGetPattern())
                     << " @" << _getFile() << ":" << _getLine();
@@ -152,6 +185,7 @@ void DeathTestBase::_doTest() {
                 ASSERT_STRING_CONTAINS(os.str(), _doGetPattern())
                     << " @" << _getFile() << ":" << _getLine();
             }
+            LOGV2(5042603, "Death test test died as expected");
             return;
         } else {
             invariant(!WIFSTOPPED(stat));
@@ -173,6 +207,10 @@ void DeathTestBase::_doTest() {
     const struct rlimit kNoCoreDump { 0U, 0U };
     if (setrlimit(RLIMIT_CORE, &kNoCoreDump) == -1)
         logAndThrowWithErrno("setrlimit(RLIMIT_CORE, &kNoCoreDump)");
+
+#if defined(__has_feature) && __has_feature(thread_sanitizer)
+    __sanitizer_set_death_callback(sanitizerDieCallback);
+#endif
 
     try {
         auto test = _doMakeTest();

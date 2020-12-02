@@ -105,16 +105,18 @@ vector<BSONObj> getFilters(const QuerySettings& querySettings) {
 /**
  * Utility function to create a PlanRankingDecision
  */
-std::unique_ptr<PlanRankingDecision> createDecision(size_t numPlans) {
-    unique_ptr<PlanRankingDecision> why(new PlanRankingDecision());
+std::unique_ptr<plan_ranker::PlanRankingDecision> createDecision(size_t numPlans) {
+    auto why = std::make_unique<plan_ranker::PlanRankingDecision>();
+    std::vector<std::unique_ptr<PlanStageStats>> stats;
     for (size_t i = 0; i < numPlans; ++i) {
         CommonStats common("COLLSCAN");
-        auto stats = std::make_unique<PlanStageStats>(common, STAGE_COLLSCAN);
-        stats->specific.reset(new CollectionScanStats());
-        why->stats.push_back(std::move(stats));
+        auto stat = std::make_unique<PlanStageStats>(common, STAGE_COLLSCAN);
+        stat->specific.reset(new CollectionScanStats());
+        stats.push_back(std::move(stat));
         why->scores.push_back(0U);
         why->candidateOrder.push_back(i);
     }
+    why->getStats<PlanStageStats>() = std::move(stats);
     return why;
 }
 
@@ -174,14 +176,16 @@ bool planCacheContains(OperationContext* opCtx,
     // Search keys.
     bool found = false;
     for (auto&& entry : entries) {
-        // Canonicalizing query shape in cache entry to get cache key.
-        // Alternatively, we could add key to PlanCacheEntry but that would be used in one place
-        // only.
+        ASSERT(entry->debugInfo);
+        const auto& createdFromQuery = entry->debugInfo->createdFromQuery;
+
+        // Canonicalize the query shape stored in the cache entry in order to get the plan cache
+        // key.
         auto qr = std::make_unique<QueryRequest>(nss);
-        qr->setFilter(entry->query);
-        qr->setSort(entry->sort);
-        qr->setProj(entry->projection);
-        qr->setCollation(entry->collation);
+        qr->setFilter(createdFromQuery.filter);
+        qr->setSort(createdFromQuery.sort);
+        qr->setProj(createdFromQuery.projection);
+        qr->setCollation(createdFromQuery.collation);
         auto statusWithCurrentQuery = CanonicalQuery::canonicalize(opCtx, std::move(qr));
         ASSERT_OK(statusWithCurrentQuery.getStatus());
         unique_ptr<CanonicalQuery> currentQuery = std::move(statusWithCurrentQuery.getValue());

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -92,12 +92,12 @@ public:
             "configServer",
             Grid::get(opCtx)->shardRegistry()->getConfigServerConnectionString().toString());
 
-        // Legacy boolean related to sharded connections. To remove in 4.8.
+        // TODO SERVER-50017: Legacy boolean related to sharded connections. To remove when 5.0
+        // becomes last-lts.
         result.appendBool("inShardedMode", false);
         result.appendTimestamp("mine", 0);
 
-        AutoGetCollection autoColl(
-            opCtx, nss, MODE_IS, AutoGetCollection::ViewMode::kViewsPermitted);
+        AutoGetCollection autoColl(opCtx, nss, MODE_IS, AutoGetCollectionViewMode::kViewsPermitted);
         auto* const csr = CollectionShardingRuntime::get(opCtx, nss);
 
         const auto optMetadata = csr->getCurrentMetadataIfKnown();
@@ -119,10 +119,6 @@ public:
                     BSONArrayBuilder chunksArr(metadataBuilder.subarrayStart("chunks"));
                     metadata.toBSONChunks(&chunksArr);
                     chunksArr.doneFast();
-
-                    BSONArrayBuilder pendingArr(metadataBuilder.subarrayStart("pending"));
-                    csr->appendPendingReceiveChunks(&pendingArr);
-                    pendingArr.doneFast();
                 }
                 metadataBuilder.doneFast();
             }

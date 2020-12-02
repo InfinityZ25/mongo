@@ -27,10 +27,11 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/bson/json.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <fmt/format.h>
 
@@ -40,6 +41,7 @@
 #include "mongo/platform/decimal128.h"
 #include "mongo/platform/strtoll.h"
 #include "mongo/util/base64.h"
+#include "mongo/util/ctype.h"
 #include "mongo/util/decimal_counter.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/str.h"
@@ -477,13 +479,7 @@ Status JParse::binaryObject(StringData fieldName, BSONObjBuilder& builder) {
             "single byte");
     }
 
-    // The fromHex function returns a signed char, but the highest
-    // BinDataType value is 128, which can only be represented as an
-    // unsigned char. If we don't coerce it to an unsigned char before
-    // wrapping it in a BinDataType (currently implicitly a signed
-    // integer), we get undefined behavior.
-    const auto binDataTypeNumeric =
-        static_cast<unsigned char>(uassertStatusOK(fromHex(binDataType)));
+    const auto binDataTypeNumeric = hexblob::decodePair(binDataType);
 
     builder.appendBinData(
         fieldName, binData.length(), BinDataType(binDataTypeNumeric), binData.data());
@@ -1205,10 +1201,7 @@ Status JParse::field(std::string* result) {
         return quotedString(result);
     } else {
         // Unquoted key
-        // 'isspace()' takes an 'int' (signed), so (default signed) 'char's get sign-extended
-        // and therefore 'corrupted' unless we force them to be unsigned ... 0x80 becomes
-        // 0xffffff80 as seen by isspace when sign-extended ... we want it to be 0x00000080
-        while (_input < _input_end && isspace(*reinterpret_cast<const unsigned char*>(_input))) {
+        while (_input < _input_end && ctype::isSpace(*_input)) {
             ++_input;
         }
         if (_input >= _input_end) {
@@ -1305,8 +1298,8 @@ Status JParse::chars(std::string* result, const char* terminalSet, const char* a
                     if (!isHexString(StringData(q, 4))) {
                         return parseError("Expecting 4 hex digits");
                     }
-                    unsigned char first = uassertStatusOK(fromHex(q));
-                    unsigned char second = uassertStatusOK(fromHex(q += 2));
+                    unsigned char first = hexblob::decodePair(StringData(q, 2));
+                    unsigned char second = hexblob::decodePair(StringData(q += 2, 2));
                     const std::string& utf8str = encodeUTF8(first, second);
                     for (unsigned int i = 0; i < utf8str.size(); i++) {
                         result->push_back(utf8str[i]);
@@ -1378,10 +1371,7 @@ bool JParse::readTokenImpl(const char* token, bool advance) {
     if (token == nullptr) {
         return false;
     }
-    // 'isspace()' takes an 'int' (signed), so (default signed) 'char's get sign-extended
-    // and therefore 'corrupted' unless we force them to be unsigned ... 0x80 becomes
-    // 0xffffff80 as seen by isspace when sign-extended ... we want it to be 0x00000080
-    while (check < _input_end && isspace(*reinterpret_cast<const unsigned char*>(check))) {
+    while (check < _input_end && ctype::isSpace(*check)) {
         ++check;
     }
     while (*token != '\0') {
@@ -1424,13 +1414,7 @@ inline bool JParse::match(char matchChar, const char* matchSet) const {
 
 bool JParse::isHexString(StringData str) const {
     MONGO_JSON_DEBUG("str: " << str);
-    std::size_t i;
-    for (i = 0; i < str.size(); i++) {
-        if (!isxdigit(str[i])) {
-            return false;
-        }
-    }
-    return true;
+    return std::all_of(str.begin(), str.end(), [](char c) { return ctype::isXdigit(c); });
 }
 
 bool JParse::isBase64String(StringData str) const {

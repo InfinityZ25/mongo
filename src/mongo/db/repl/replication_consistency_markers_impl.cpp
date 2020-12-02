@@ -26,7 +26,7 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -40,6 +40,7 @@
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/storage/control/journal_flusher.h"
 #include "mongo/logv2/log.h"
 
 namespace mongo {
@@ -150,7 +151,7 @@ void ReplicationConsistencyMarkersImpl::setInitialSyncFlag(OperationContext* opC
     update.timestamp = Timestamp();
 
     _updateMinValidDocument(opCtx, update);
-    opCtx->recoveryUnit()->waitUntilDurable(opCtx);
+    JournalFlusher::get(opCtx)->waitForJournalFlush();
 }
 
 void ReplicationConsistencyMarkersImpl::clearInitialSyncFlag(OperationContext* opCtx) {
@@ -186,7 +187,7 @@ void ReplicationConsistencyMarkersImpl::clearInitialSyncFlag(OperationContext* o
     setOplogTruncateAfterPoint(opCtx, Timestamp());
 
     if (getGlobalServiceContext()->getStorageEngine()->isDurable()) {
-        opCtx->recoveryUnit()->waitUntilDurable(opCtx);
+        JournalFlusher::get(opCtx)->waitForJournalFlush();
         replCoord->setMyLastDurableOpTimeAndWallTime(opTimeAndWallTime);
     }
 }
@@ -370,24 +371,30 @@ void ReplicationConsistencyMarkersImpl::ensureFastCountOnOplogTruncateAfterPoint
     invariant(_storageInterface->setCollectionCount(opCtx, _oplogTruncateAfterPointNss, 1).isOK());
 }
 
-void ReplicationConsistencyMarkersImpl::_upsertOplogTruncateAfterPointDocument(
+Status ReplicationConsistencyMarkersImpl::_upsertOplogTruncateAfterPointDocument(
     OperationContext* opCtx, const BSONObj& updateSpec) {
-    fassert(40512,
-            _storageInterface->upsertById(
-                opCtx, _oplogTruncateAfterPointNss, kOplogTruncateAfterPointId["_id"], updateSpec));
+    return _storageInterface->upsertById(
+        opCtx, _oplogTruncateAfterPointNss, kOplogTruncateAfterPointId["_id"], updateSpec);
 }
 
-void ReplicationConsistencyMarkersImpl::setOplogTruncateAfterPoint(OperationContext* opCtx,
-                                                                   const Timestamp& timestamp) {
+Status ReplicationConsistencyMarkersImpl::_setOplogTruncateAfterPoint(OperationContext* opCtx,
+                                                                      const Timestamp& timestamp) {
     LOGV2_DEBUG(21296,
                 3,
                 "setting oplog truncate after point to: {oplogTruncateAfterPoint}",
                 "Setting oplog truncate after point",
                 "oplogTruncateAfterPoint"_attr = timestamp.toBSON());
-    _upsertOplogTruncateAfterPointDocument(
+
+    return _upsertOplogTruncateAfterPointDocument(
         opCtx,
         BSON("$set" << BSON(OplogTruncateAfterPointDocument::kOplogTruncateAfterPointFieldName
                             << timestamp)));
+}
+
+void ReplicationConsistencyMarkersImpl::setOplogTruncateAfterPoint(OperationContext* opCtx,
+                                                                   const Timestamp& timestamp) {
+
+    fassert(40512, _setOplogTruncateAfterPoint(opCtx, timestamp));
 }
 
 boost::optional<OplogTruncateAfterPointDocument>
@@ -488,7 +495,9 @@ ReplicationConsistencyMarkersImpl::refreshOplogTruncateAfterPointIfPrimary(
     auto truncateTimestamp = _storageInterface->getAllDurableTimestamp(opCtx->getServiceContext());
 
     if (truncateTimestamp != Timestamp(StorageEngine::kMinimumTimestamp)) {
-        setOplogTruncateAfterPoint(opCtx, truncateTimestamp);
+        // Throw write interruption errors up to the caller so that durability attempts can be
+        // retried.
+        uassertStatusOK(_setOplogTruncateAfterPoint(opCtx, truncateTimestamp));
     } else {
         // The all_durable timestamp has not yet been set: there have been no oplog writes since
         // this server instance started up. In this case, we will return the current
@@ -506,15 +515,16 @@ ReplicationConsistencyMarkersImpl::refreshOplogTruncateAfterPointIfPrimary(
     // Fetch the oplog entry <= timestamp. all_durable may be set to a value between oplog entries.
     // We need an oplog entry in order to return term and wallclock time for an OpTimeAndWallTime
     // result.
-    auto truncateOplogEntryBSON = _storageInterface->findOplogEntryLessThanOrEqualToTimestamp(
-        opCtx, oplogRead.getCollection(), truncateTimestamp);
+    auto truncateOplogEntryBSON =
+        _storageInterface->findOplogEntryLessThanOrEqualToTimestampRetryOnWCE(
+            opCtx, oplogRead.getCollection(), truncateTimestamp);
 
     // The truncate point moves the Durable timestamp forward, so it should always exist in the
     // oplog.
     invariant(truncateOplogEntryBSON, "Found no oplog entry lte " + truncateTimestamp.toString());
 
     return fassert(
-        44555001,
+        4455501,
         OpTimeAndWallTime::parseOpTimeAndWallTimeFromOplogEntry(truncateOplogEntryBSON.get()));
 }
 

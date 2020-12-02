@@ -27,13 +27,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kTransaction
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTransaction
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/s/transaction_coordinator_service.h"
 
 #include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/s/sharding_runtime_d_params_gen.h"
 #include "mongo/db/s/transaction_coordinator_document_gen.h"
 #include "mongo/db/storage/flow_control.h"
 #include "mongo/db/transaction_participant_gen.h"
@@ -92,8 +93,8 @@ void TransactionCoordinatorService::reportCoordinators(OperationContext* opCtx,
     std::shared_ptr<CatalogAndScheduler> cas;
     try {
         cas = _getCatalogAndScheduler(opCtx);
-    } catch (ExceptionFor<ErrorCodes::NotMaster>&) {
-        // If we are not master, don't include any output for transaction coordinators in
+    } catch (ExceptionFor<ErrorCodes::NotWritablePrimary>&) {
+        // If we are not primary, don't include any output for transaction coordinators in
         // the curOp command.
         return;
     }
@@ -138,12 +139,9 @@ TransactionCoordinatorService::coordinateCommit(OperationContext* opCtx,
     coordinator->runCommit(opCtx,
                            std::vector<ShardId>{participantList.begin(), participantList.end()});
 
-    return coordinator->onCompletion();
-
-    // TODO (SERVER-37364): Re-enable the coordinator returning the decision as soon as the decision
-    // is made durable. Currently the coordinator waits to hear acks because participants in prepare
-    // reject requests with a higher transaction number, causing tests to fail.
-    // return coordinator->getDecision();
+    return coordinateCommitReturnImmediatelyAfterPersistingDecision.load()
+        ? coordinator->getDecision()
+        : coordinator->onCompletion();
 }
 
 boost::optional<SharedSemiFuture<txn::CommitDecision>> TransactionCoordinatorService::recoverCommit(
@@ -160,12 +158,9 @@ boost::optional<SharedSemiFuture<txn::CommitDecision>> TransactionCoordinatorSer
     // the coordinator.
     coordinator->cancelIfCommitNotYetStarted();
 
-    return coordinator->onCompletion();
-
-    // TODO (SERVER-37364): Re-enable the coordinator returning the decision as soon as the decision
-    // is made durable. Currently the coordinator waits to hear acks because participants in prepare
-    // reject requests with a higher transaction number, causing tests to fail.
-    // return coordinator->getDecision();
+    return coordinateCommitReturnImmediatelyAfterPersistingDecision.load()
+        ? coordinator->getDecision()
+        : coordinator->onCompletion();
 }
 
 void TransactionCoordinatorService::onStepUp(OperationContext* opCtx,
@@ -275,8 +270,9 @@ void TransactionCoordinatorService::onShardingInitialization(OperationContext* o
 std::shared_ptr<TransactionCoordinatorService::CatalogAndScheduler>
 TransactionCoordinatorService::_getCatalogAndScheduler(OperationContext* opCtx) {
     stdx::unique_lock<Latch> ul(_mutex);
-    uassert(
-        ErrorCodes::NotMaster, "Transaction coordinator is not a primary", _catalogAndScheduler);
+    uassert(ErrorCodes::NotWritablePrimary,
+            "Transaction coordinator is not a primary",
+            _catalogAndScheduler);
 
     return _catalogAndScheduler;
 }

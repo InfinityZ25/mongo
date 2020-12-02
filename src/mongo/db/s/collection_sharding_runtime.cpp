@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -73,11 +73,9 @@ const auto kUnshardedCollection = std::make_shared<UnshardedCollection>();
 
 boost::optional<ChunkVersion> getOperationReceivedVersion(OperationContext* opCtx,
                                                           const NamespaceString& nss) {
-    auto& oss = OperationShardingState::get(opCtx);
-
     // If there is a version attached to the OperationContext, use it as the received version.
-    if (oss.hasShardVersion()) {
-        return oss.getShardVersion(nss);
+    if (OperationShardingState::isOperationVersioned(opCtx)) {
+        return OperationShardingState::get(opCtx).getShardVersion(nss);
     }
 
     // There is no shard version information on the 'opCtx'. This means that the operation
@@ -89,17 +87,15 @@ boost::optional<ChunkVersion> getOperationReceivedVersion(OperationContext* opCt
 }  // namespace
 
 CollectionShardingRuntime::CollectionShardingRuntime(
-    ServiceContext* sc,
+    ServiceContext* service,
     NamespaceString nss,
     std::shared_ptr<executor::TaskExecutor> rangeDeleterExecutor)
-    : _nss(std::move(nss)),
-      _rangeDeleterExecutor(rangeDeleterExecutor),
-      _stateChangeMutex(nss.toString()),
-      _serviceContext(sc) {
-    if (isNamespaceAlwaysUnsharded(_nss)) {
-        _metadataType = MetadataType::kUnsharded;
-    }
-}
+    : _serviceContext(service),
+      _nss(std::move(nss)),
+      _rangeDeleterExecutor(std::move(rangeDeleterExecutor)),
+      _stateChangeMutex(_nss.toString()),
+      _metadataType(isNamespaceAlwaysUnsharded(_nss) ? MetadataType::kUnsharded
+                                                     : MetadataType::kUnknown) {}
 
 CollectionShardingRuntime* CollectionShardingRuntime::get(OperationContext* opCtx,
                                                           const NamespaceString& nss) {
@@ -116,17 +112,32 @@ CollectionShardingRuntime* CollectionShardingRuntime::get_UNSAFE(ServiceContext*
 ScopedCollectionFilter CollectionShardingRuntime::getOwnershipFilter(
     OperationContext* opCtx, OrphanCleanupPolicy orphanCleanupPolicy) {
     const auto optReceivedShardVersion = getOperationReceivedVersion(opCtx, _nss);
-    invariant(!optReceivedShardVersion || !ChunkVersion::isIgnoredVersion(*optReceivedShardVersion),
-              "getOwnershipFilter called by operation that doesn't have a valid shard version");
+    // TODO (SERVER-52764): No operations should be calling getOwnershipFilter without a shard
+    // version
+    //
+    // invariant(optReceivedShardVersion,
+    //          "getOwnershipFilter called by operation that doesn't specify shard version");
+    if (!optReceivedShardVersion)
+        return {kUnshardedCollection};
 
-    return _getMetadataWithVersionCheckAt(opCtx,
-                                          repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime());
+    auto metadata = _getMetadataWithVersionCheckAt(
+        opCtx, repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime());
+    invariant(!ChunkVersion::isIgnoredVersion(*optReceivedShardVersion) ||
+                  !metadata->get().allowMigrations() || !metadata->get().isSharded(),
+              "For sharded collections getOwnershipFilter cannot be relied on without a valid "
+              "shard version");
+
+    return {std::move(metadata)};
 }
 
-ScopedCollectionDescription CollectionShardingRuntime::getCollectionDescription() {
+ScopedCollectionDescription CollectionShardingRuntime::getCollectionDescription(
+    OperationContext* opCtx) {
+    auto& oss = OperationShardingState::get(opCtx);
     // If the server has been started with --shardsvr, but hasn't been added to a cluster we should
-    // consider all collections as unsharded.
-    if (!ShardingState::get(_serviceContext)->enabled()) {
+    // consider all collections as unsharded. Also, return unsharded if no shard version or db
+    // version is present on the context.
+    if (!ShardingState::get(_serviceContext)->enabled() ||
+        (!OperationShardingState::isOperationVersioned(opCtx) && !oss.hasDbVersion())) {
         return {kUnshardedCollection};
     }
 
@@ -144,15 +155,6 @@ ScopedCollectionDescription CollectionShardingRuntime::getCollectionDescription(
     return {std::move(optMetadata)};
 }
 
-ScopedCollectionDescription CollectionShardingRuntime::getCollectionDescription_DEPRECATED() {
-    auto optMetadata = _getCurrentMetadataIfKnown(boost::none);
-
-    if (!optMetadata)
-        return {kUnshardedCollection};
-
-    return {std::move(optMetadata)};
-}
-
 boost::optional<CollectionMetadata> CollectionShardingRuntime::getCurrentMetadataIfKnown() {
     auto optMetadata = _getCurrentMetadataIfKnown(boost::none);
     if (!optMetadata)
@@ -164,15 +166,13 @@ void CollectionShardingRuntime::checkShardVersionOrThrow(OperationContext* opCtx
     (void)_getMetadataWithVersionCheckAt(opCtx, boost::none);
 }
 
-void CollectionShardingRuntime::enterCriticalSectionCatchUpPhase(OperationContext* opCtx) {
-    invariant(opCtx->lockState()->isCollectionLockedForMode(_nss, MODE_X));
-    auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(opCtx, this);
+void CollectionShardingRuntime::enterCriticalSectionCatchUpPhase(const CSRLock&) {
+    invariant(_metadataType != MetadataType::kUnknown);
     _critSec.enterCriticalSectionCatchUpPhase();
 }
 
-void CollectionShardingRuntime::enterCriticalSectionCommitPhase(OperationContext* opCtx) {
-    invariant(opCtx->lockState()->isCollectionLockedForMode(_nss, MODE_X));
-    auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(opCtx, this);
+void CollectionShardingRuntime::enterCriticalSectionCommitPhase(const CSRLock&) {
+    invariant(_metadataType != MetadataType::kUnknown);
     _critSec.enterCriticalSectionCommitPhase();
 }
 
@@ -182,7 +182,7 @@ void CollectionShardingRuntime::exitCriticalSection(OperationContext* opCtx) {
     _critSec.exitCriticalSection();
 }
 
-std::shared_ptr<Notification<void>> CollectionShardingRuntime::getCriticalSectionSignal(
+boost::optional<SharedSemiFuture<void>> CollectionShardingRuntime::getCriticalSectionSignal(
     OperationContext* opCtx, ShardingMigrationCriticalSection::Operation op) {
     auto csrLock = CSRLock::lockShared(opCtx, this);
     return _critSec.getSignal(op);
@@ -215,25 +215,20 @@ void CollectionShardingRuntime::setFilteringMetadata(OperationContext* opCtx,
     }
 }
 
-void CollectionShardingRuntime::clearFilteringMetadata() {
+void CollectionShardingRuntime::clearFilteringMetadata(OperationContext* opCtx) {
+    const auto csrLock = CSRLock::lockExclusive(opCtx, this);
     stdx::lock_guard lk(_metadataManagerLock);
     if (!isNamespaceAlwaysUnsharded(_nss)) {
+        LOGV2_DEBUG(4798530,
+                    1,
+                    "Clearing metadata for collection {namespace}",
+                    "Clearing collection metadata",
+                    "namespace"_attr = _nss);
         _metadataType = MetadataType::kUnknown;
         _metadataManager.reset();
     }
 }
 
-SharedSemiFuture<void> CollectionShardingRuntime::beginReceive(ChunkRange const& range) {
-    stdx::lock_guard lk(_metadataManagerLock);
-    invariant(_metadataType == MetadataType::kSharded);
-    return _metadataManager->beginReceive(range);
-}
-
-void CollectionShardingRuntime::forgetReceive(const ChunkRange& range) {
-    stdx::lock_guard lk(_metadataManagerLock);
-    invariant(_metadataType == MetadataType::kSharded);
-    _metadataManager->forgetReceive(range);
-}
 SharedSemiFuture<void> CollectionShardingRuntime::cleanUpRange(ChunkRange const& range,
                                                                boost::optional<UUID> migrationId,
                                                                CleanWhen when) {
@@ -297,12 +292,6 @@ Status CollectionShardingRuntime::waitForClean(OperationContext* opCtx,
     MONGO_UNREACHABLE;
 }
 
-boost::optional<ChunkRange> CollectionShardingRuntime::getNextOrphanRange(BSONObj const& from) {
-    stdx::lock_guard lk(_metadataManagerLock);
-    invariant(_metadataType == MetadataType::kSharded);
-    return _metadataManager->getNextOrphanRange(from);
-}
-
 std::shared_ptr<ScopedCollectionDescription::Impl>
 CollectionShardingRuntime::_getCurrentMetadataIfKnown(
     const boost::optional<LogicalTime>& atClusterTime) {
@@ -357,10 +346,8 @@ CollectionShardingRuntime::_getMetadataWithVersionCheckAt(
                 !criticalSectionSignal);
     }
 
-    if (ChunkVersion::isIgnoredVersion(receivedShardVersion))
-        return kUnshardedCollection;
-
-    if (receivedShardVersion.isWriteCompatibleWith(wantedShardVersion))
+    if (wantedShardVersion.isWriteCompatibleWith(receivedShardVersion) ||
+        ChunkVersion::isIgnoredVersion(receivedShardVersion))
         return optCurrentMetadata;
 
     StaleConfigInfo sci(
@@ -399,16 +386,6 @@ void CollectionShardingRuntime::appendShardVersion(BSONObjBuilder* builder) {
     }
 }
 
-void CollectionShardingRuntime::appendPendingReceiveChunks(BSONArrayBuilder* builder) {
-    _metadataManager->toBSONPending(*builder);
-}
-
-void CollectionShardingRuntime::clearReceivingChunks() {
-    stdx::lock_guard lk(_metadataManagerLock);
-    invariant(_metadataType == MetadataType::kSharded);
-    _metadataManager->clearReceivingChunks();
-}
-
 size_t CollectionShardingRuntime::numberOfRangesScheduledForDeletion() const {
     stdx::lock_guard lk(_metadataManagerLock);
     if (_metadataManager) {
@@ -417,16 +394,38 @@ size_t CollectionShardingRuntime::numberOfRangesScheduledForDeletion() const {
     return 0;
 }
 
-CollectionCriticalSection::CollectionCriticalSection(OperationContext* opCtx, NamespaceString ns)
-    : _nss(std::move(ns)), _opCtx(opCtx) {
+
+void CollectionShardingRuntime::setShardVersionRecoverRefreshFuture(SharedSemiFuture<void> future,
+                                                                    const CSRLock&) {
+    invariant(!_shardVersionInRecoverOrRefresh);
+    _shardVersionInRecoverOrRefresh.emplace(std::move(future));
+}
+
+boost::optional<SharedSemiFuture<void>>
+CollectionShardingRuntime::getShardVersionRecoverRefreshFuture(OperationContext* opCtx) {
+    auto csrLock = CSRLock::lockShared(opCtx, this);
+    return _shardVersionInRecoverOrRefresh;
+}
+
+void CollectionShardingRuntime::resetShardVersionRecoverRefreshFuture(const CSRLock&) {
+    invariant(_shardVersionInRecoverOrRefresh);
+    _shardVersionInRecoverOrRefresh = boost::none;
+}
+
+CollectionCriticalSection::CollectionCriticalSection(OperationContext* opCtx, NamespaceString nss)
+    : _opCtx(opCtx), _nss(std::move(nss)) {
+    // This acquisition is performed with collection lock MODE_S in order to ensure that any ongoing
+    // writes have completed and become visible
     AutoGetCollection autoColl(_opCtx,
                                _nss,
-                               MODE_X,
-                               AutoGetCollection::ViewMode::kViewsForbidden,
-                               opCtx->getServiceContext()->getPreciseClockSource()->now() +
+                               MODE_S,
+                               AutoGetCollectionViewMode::kViewsForbidden,
+                               _opCtx->getServiceContext()->getPreciseClockSource()->now() +
                                    Milliseconds(migrationLockAcquisitionMaxWaitMS.load()));
     auto* const csr = CollectionShardingRuntime::get(_opCtx, _nss);
-    csr->enterCriticalSectionCatchUpPhase(_opCtx);
+    auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(opCtx, csr);
+    invariant(csr->getCurrentMetadataIfKnown());
+    csr->enterCriticalSectionCatchUpPhase(csrLock);
 }
 
 CollectionCriticalSection::~CollectionCriticalSection() {
@@ -440,11 +439,13 @@ void CollectionCriticalSection::enterCommitPhase() {
     AutoGetCollection autoColl(_opCtx,
                                _nss,
                                MODE_X,
-                               AutoGetCollection::ViewMode::kViewsForbidden,
+                               AutoGetCollectionViewMode::kViewsForbidden,
                                _opCtx->getServiceContext()->getPreciseClockSource()->now() +
                                    Milliseconds(migrationLockAcquisitionMaxWaitMS.load()));
     auto* const csr = CollectionShardingRuntime::get(_opCtx, _nss);
-    csr->enterCriticalSectionCommitPhase(_opCtx);
+    auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(_opCtx, csr);
+    invariant(csr->getCurrentMetadataIfKnown());
+    csr->enterCriticalSectionCommitPhase(csrLock);
 }
 
 }  // namespace mongo

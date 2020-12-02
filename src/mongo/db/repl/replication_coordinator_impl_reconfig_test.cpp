@@ -42,6 +42,7 @@
 #include "mongo/db/repl/replication_coordinator_test_fixture.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/logv2/log.h"
+#include "mongo/stdx/future.h"
 #include "mongo/unittest/log_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/fail_point.h"
@@ -69,7 +70,7 @@ TEST_F(ReplCoordTest, NodeReturnsNotYetInitializedWhenReconfigReceivedPriorToIni
     ASSERT_TRUE(result.obj().isEmpty());
 }
 
-TEST_F(ReplCoordTest, NodeReturnsNotMasterWhenReconfigReceivedWhileSecondary) {
+TEST_F(ReplCoordTest, NodeReturnsNotWritablePrimaryWhenReconfigReceivedWhileSecondary) {
     // start up, become secondary, receive reconfig
     init();
     assertStartSuccess(BSON("_id"
@@ -89,12 +90,12 @@ TEST_F(ReplCoordTest, NodeReturnsNotMasterWhenReconfigReceivedWhileSecondary) {
     ReplSetReconfigArgs args;
     args.force = false;
     const auto opCtx = makeOperationContext();
-    ASSERT_EQUALS(ErrorCodes::NotMaster,
+    ASSERT_EQUALS(ErrorCodes::NotWritablePrimary,
                   getReplCoord()->processReplSetReconfig(opCtx.get(), args, &result));
     ASSERT_TRUE(result.obj().isEmpty());
 }
 
-TEST_F(ReplCoordTest, NodeReturnsNotMasterWhenRunningSafeReconfigWhileInDrainMode) {
+TEST_F(ReplCoordTest, NodeReturnsNotWritablePrimaryWhenRunningSafeReconfigWhileInDrainMode) {
     init();
 
     assertStartSuccess(BSON("_id"
@@ -122,12 +123,12 @@ TEST_F(ReplCoordTest, NodeReturnsNotMasterWhenRunningSafeReconfigWhileInDrainMod
     ReplSetReconfigArgs args;
     args.force = false;
     auto status = getReplCoord()->processReplSetReconfig(opCtx.get(), args, &result);
-    ASSERT_EQUALS(ErrorCodes::NotMaster, status);
+    ASSERT_EQUALS(ErrorCodes::NotWritablePrimary, status);
     ASSERT_STRING_CONTAINS(status.reason(), "Safe reconfig is only allowed on a writable PRIMARY.");
     ASSERT_TRUE(result.obj().isEmpty());
 }
 
-TEST_F(ReplCoordTest, NodeReturnsNotMasterWhenReconfigCmdReceivedWhileInDrainMode) {
+TEST_F(ReplCoordTest, NodeReturnsNotPrimaryErrorWhenReconfigCmdReceivedWhileInDrainMode) {
     init();
 
     assertStartSuccess(BSON("_id"
@@ -278,13 +279,14 @@ TEST_F(ReplCoordTest,
     BSONObjBuilder result;
     ReplSetReconfigArgs args;
     args.force = false;
+    // new config fails to validate because one node is localhost and another is not.
     args.newConfigObj = BSON("_id"
                              << "mySet"
-                             << "version" << -3 << "protocolVersion" << 1 << "members"
+                             << "version" << 3 << "protocolVersion" << 1 << "members"
                              << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                       << "node1:12345")
                                            << BSON("_id" << 2 << "host"
-                                                         << "node2:12345")));
+                                                         << "localhost:12345")));
 
     const auto opCtx = makeOperationContext();
     ASSERT_EQUALS(ErrorCodes::NewReplicaSetConfigurationIncompatible,
@@ -329,48 +331,88 @@ void doReplSetReconfig(ReplicationCoordinatorImpl* replCoord,
     *status = replCoord->processReplSetReconfig(opCtx, args, &garbage);
 }
 
-TEST_F(ReplCoordTest,
-       NodeReturnsNewReplicaSetConfigurationIncompatibleWhenQuorumCheckFailsDuringReconfig) {
-    // start up, become primary, fail during quorum check due to a heartbeat
-    // containing a higher config version
-    assertStartSuccess(BSON("_id"
-                            << "mySet"
-                            << "version" << 2 << "members"
-                            << BSON_ARRAY(BSON("_id" << 1 << "host"
-                                                     << "node1:12345")
-                                          << BSON("_id" << 2 << "host"
-                                                        << "node2:12345"))),
-                       HostAndPort("node1", 12345));
+TEST_F(ReplCoordTest, QuorumCheckSucceedsWhenOtherNodesHaveHigherTerm) {
+    // Initiate a config without a term to avoid stepup auto-reconfig.
+    auto configObj =
+        configWithMembers(2, -1, BSON_ARRAY(member(1, "node1:12345") << member(2, "node2:12345")));
+
+    OpTime opTime{Timestamp(100, 1), 1};
+    assertStartSuccess(configObj, HostAndPort("node1", 12345));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastAppliedAndDurableOpTime(opTime, getNet()->now());
     simulateSuccessfulV1Election();
 
     Status status(ErrorCodes::InternalError, "Not Set");
     const auto opCtx = makeOperationContext();
-    stdx::thread reconfigThread([&] { doReplSetReconfig(getReplCoord(), &status, opCtx.get()); });
+    // Reconfig with version 3.
+    stdx::thread reconfigThread([&] {
+        doReplSetReconfig(getReplCoord(), &status, opCtx.get(), getReplCoord()->getTerm());
+    });
 
     NetworkInterfaceMock* net = getNet();
-    getNet()->enterNetwork();
-    const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
-    const RemoteCommandRequest& request = noi->getRequest();
+    net->enterNetwork();
+    auto noi = net->getNextReadyRequest();
+    auto& request = noi->getRequest();
     repl::ReplSetHeartbeatArgsV1 hbArgs;
     ASSERT_OK(hbArgs.initialize(request.cmdObj));
     repl::ReplSetHeartbeatResponse hbResp;
     hbResp.setSetName("mySet");
     hbResp.setState(MemberState::RS_SECONDARY);
-    hbResp.setConfigVersion(5);
-    BSONObjBuilder respObj;
-    hbResp.setAppliedOpTimeAndWallTime({OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100)});
-    hbResp.setDurableOpTimeAndWallTime({OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100)});
-    respObj << "ok" << 1;
-    hbResp.addToBSON(&respObj);
-    net->scheduleResponse(noi, net->now(), makeResponseStatus(respObj.obj()));
+    // The config version from the remote is lower, but its term is higher. The quorum checker
+    // does not compare config versions or terms of remotes nodes, so this should always
+    // succeed.
+    hbResp.setConfigVersion(2);
+    hbResp.setConfigTerm(getReplCoord()->getTerm() + 1);
+    hbResp.setAppliedOpTimeAndWallTime({opTime, net->now()});
+    hbResp.setDurableOpTimeAndWallTime({opTime, net->now()});
+    net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON()));
     net->runReadyNetworkOperations();
-    getNet()->exitNetwork();
+    net->exitNetwork();
     reconfigThread.join();
-    ASSERT_EQUALS(ErrorCodes::NewReplicaSetConfigurationIncompatible, status);
+    ASSERT_OK(status);
 }
+
+TEST_F(ReplCoordTest, QuorumCheckSucceedsWhenOtherNodesHaveLowerTerm) {
+    // Initiate a config without a term to avoid stepup auto-reconfig.
+    auto configObj =
+        configWithMembers(2, -1, BSON_ARRAY(member(1, "node1:12345") << member(2, "node2:12345")));
+
+    OpTime opTime{Timestamp(100, 1), 1};
+    assertStartSuccess(configObj, HostAndPort("node1", 12345));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    replCoordSetMyLastAppliedAndDurableOpTime(opTime, getNet()->now());
+    simulateSuccessfulV1Election();
+
+    Status status(ErrorCodes::InternalError, "Not Set");
+    const auto opCtx = makeOperationContext();
+    // Reconfig with version 3.
+    stdx::thread reconfigThread([&] {
+        doReplSetReconfig(getReplCoord(), &status, opCtx.get(), getReplCoord()->getTerm());
+    });
+
+    NetworkInterfaceMock* net = getNet();
+    net->enterNetwork();
+    auto noi = net->getNextReadyRequest();
+    auto& request = noi->getRequest();
+    repl::ReplSetHeartbeatArgsV1 hbArgs;
+    ASSERT_OK(hbArgs.initialize(request.cmdObj));
+    repl::ReplSetHeartbeatResponse hbResp;
+    hbResp.setSetName("mySet");
+    hbResp.setState(MemberState::RS_SECONDARY);
+    // The config version from the remote is higher, but its term is lower. The quorum checker
+    // does not compare config versions or terms of remotes nodes, so this should always
+    // succeed.
+    hbResp.setConfigVersion(4);
+    hbResp.setConfigTerm(getReplCoord()->getTerm() - 1);
+    hbResp.setAppliedOpTimeAndWallTime({opTime, net->now()});
+    hbResp.setDurableOpTimeAndWallTime({opTime, net->now()});
+    net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON()));
+    net->runReadyNetworkOperations();
+    net->exitNetwork();
+    reconfigThread.join();
+    ASSERT_OK(status);
+}
+
 
 TEST_F(ReplCoordTest, NodeReturnsOutOfDiskSpaceWhenSavingANewConfigFailsDuringReconfig) {
     // start up, become primary, saving the config fails
@@ -628,16 +670,13 @@ TEST_F(
     NetworkInterfaceMock* net = getNet();
     net->enterNetwork();
     ReplSetHeartbeatResponse hbResp2;
-    ReplSetConfig config;
-    config
-        .initialize(BSON("_id"
-                         << "mySet"
-                         << "version" << 3 << "protocolVersion" << 1 << "members"
-                         << BSON_ARRAY(BSON("_id" << 1 << "host"
-                                                  << "node1:12345")
-                                       << BSON("_id" << 2 << "host"
-                                                     << "node2:12345"))))
-        .transitional_ignore();
+    auto config = ReplSetConfig::parse(BSON("_id"
+                                            << "mySet"
+                                            << "version" << 3 << "protocolVersion" << 1 << "members"
+                                            << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                                     << "node1:12345")
+                                                          << BSON("_id" << 2 << "host"
+                                                                        << "node2:12345"))));
     hbResp2.setConfig(config);
     hbResp2.setConfigVersion(3);
     hbResp2.setSetName("mySet");
@@ -696,16 +735,13 @@ TEST_F(ReplCoordTest, NodeDoesNotAcceptHeartbeatReconfigWhileInTheMidstOfReconfi
     net->runUntil(net->now() + Seconds(10));  // run until we've sent a heartbeat request
     const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
     ReplSetHeartbeatResponse hbResp;
-    ReplSetConfig config;
-    config
-        .initialize(BSON("_id"
-                         << "mySet"
-                         << "version" << 4 << "members"
-                         << BSON_ARRAY(BSON("_id" << 1 << "host"
-                                                  << "node1:12345")
-                                       << BSON("_id" << 2 << "host"
-                                                     << "node2:12345"))))
-        .transitional_ignore();
+    auto config = ReplSetConfig::parse(BSON("_id"
+                                            << "mySet"
+                                            << "version" << 4 << "members"
+                                            << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                                     << "node1:12345")
+                                                          << BSON("_id" << 2 << "host"
+                                                                        << "node2:12345"))));
     hbResp.setConfig(config);
     hbResp.setConfigVersion(4);
     hbResp.setSetName("mySet");
@@ -760,7 +796,7 @@ TEST_F(ReplCoordTest, NodeAcceptsConfigFromAReconfigWithForceTrueWhileNotPrimary
                                            << BSON("_id" << 2 << "host"
                                                          << "node2:12345")));
     const auto opCtx = makeOperationContext();
-    ASSERT_EQUALS(ErrorCodes::NotMaster,
+    ASSERT_EQUALS(ErrorCodes::NotWritablePrimary,
                   getReplCoord()->processReplSetReconfig(opCtx.get(), args, &result));
 
     // forced should succeed
@@ -778,17 +814,6 @@ public:
     std::vector<HostAndPort> initialSyncNodes;
     unittest::MinimumLoggedSeverityGuard severityGuard{logv2::LogComponent::kDefault,
                                                        logv2::LogSeverity::Debug(3)};
-
-    BSONObj member(int id, std::string host) {
-        return BSON("_id" << id << "host" << host);
-    }
-
-    BSONObj configWithMembers(int version, long long term, BSONArray members) {
-        return BSON("_id"
-                    << "mySet"
-                    << "protocolVersion" << 1 << "version" << version << "term" << term << "members"
-                    << members);
-    }
 
     void respondToHeartbeat() {
         counter++;
@@ -909,13 +934,78 @@ public:
     }
 };
 
+TEST_F(ReplCoordReconfigTest, MustFindSelfAndBeElectableInNewConfig) {
+    // Start up as a secondary and then get elected.
+    init();
+
+    // We only check for ourselves if the config contents actually change.
+    auto oldConfigObj = BSON("_id"
+                             << "mySet"
+                             << "version" << 1 << "protocolVersion" << 1 << "members"
+                             << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                      << "h1:1")
+                                           << BSON("_id" << 2 << "host"
+                                                         << "h2:1")
+                                           << BSON("_id" << 3 << "host"
+                                                         << "h3:1"))
+                             << "settings" << BSON("heartbeatIntervalMillis" << 1000));
+    auto newConfigObj = BSON("_id"
+                             << "mySet"
+                             << "version" << 2 << "protocolVersion" << 1 << "members"
+                             << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                      << "h1:1")
+                                           << BSON("_id" << 2 << "host"
+                                                         << "h2:1")
+                                           << BSON("_id" << 3 << "host"
+                                                         << "h3:1"
+                                                         << "priority" << 0))
+                             << "settings" << BSON("heartbeatIntervalMillis" << 2000));
+
+    assertStartSuccess(oldConfigObj, HostAndPort("h1", 1));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    replCoordSetMyLastAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
+    simulateSuccessfulV1Election();
+    ASSERT_EQ(getReplCoord()->getMemberState(), MemberState::RS_PRIMARY);
+
+    BSONObjBuilder result;
+    const auto opCtx = makeOperationContext();
+    ReplSetReconfigArgs args;
+    args.newConfigObj = newConfigObj;
+
+    // We must be present in the new config. Must hold for both safe and force reconfig.
+    getExternalState()->clearSelfHosts();
+    getExternalState()->addSelf(HostAndPort("nonself:1"));
+
+    args.force = false;
+    Status status = getReplCoord()->processReplSetReconfig(opCtx.get(), args, &result);
+    ASSERT_EQUALS(status.code(), ErrorCodes::NodeNotFound);
+
+    args.force = true;
+    status = getReplCoord()->processReplSetReconfig(opCtx.get(), args, &result);
+    ASSERT_EQUALS(status.code(), ErrorCodes::NodeNotFound);
+
+    // We must be electable in the new config. Only required for safe reconfig.
+    getExternalState()->clearSelfHosts();
+    getExternalState()->addSelf(HostAndPort("h3:1"));  // h3 has priority 0 (unelectable).
+
+    args.force = false;
+    status = getReplCoord()->processReplSetReconfig(opCtx.get(), args, &result);
+    ASSERT_EQUALS(status.code(), ErrorCodes::NodeNotElectable);
+
+    args.force = true;
+    status = getReplCoord()->processReplSetReconfig(opCtx.get(), args, &result);
+    ASSERT_OK(status.code());
+}
+
 TEST_F(ReplCoordReconfigTest,
        InitialReconfigAlwaysSucceedsOnlyRegardlessOfLastCommittedOpInPrevConfig) {
     // Start up as a secondary.
     init();
     assertStartSuccess(
-        configWithMembers(
-            1, 0, BSON_ARRAY(member(1, "n1:1") << member(2, "n2:1") << member(3, "n3:1"))),
+        configWithMembers(1,
+                          0,
+                          BSON_ARRAY(member(1, "n1:1") << member(2, "n2:1") << member(3, "n3:1")
+                                                       << member(4, "n4:1", 0))),
         HostAndPort("n1", 1));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
 
@@ -1052,14 +1142,14 @@ TEST_F(ReplCoordReconfigTest, WaitForConfigCommitmentTimesOutIfConfigIsNotCommit
     // Start out in a non-initial config version.
     init();
     auto configVersion = 2;
-    auto Ca_members = BSON_ARRAY(member(1, "n1:1"));
+    auto Ca_members = BSON_ARRAY(member(1, "n1:1") << member(2, "n2:1", 0));
     auto Cb_members = BSON_ARRAY(member(1, "n1:1") << member(2, "n2:1"));
 
     // Startup, simulate application of one oplog entry and get elected.
     assertStartSuccess(configWithMembers(configVersion, 0, Ca_members), HostAndPort("n1", 1));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
     replCoordSetMyLastAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
-    const auto opCtx = makeOperationContext();
-    runSingleNodeElection(opCtx.get());
+    simulateSuccessfulV1Election();
     ASSERT_EQ(getReplCoord()->getMemberState(), MemberState::RS_PRIMARY);
     ASSERT_EQ(getReplCoord()->getTerm(), 1);
 
@@ -1070,6 +1160,7 @@ TEST_F(ReplCoordReconfigTest, WaitForConfigCommitmentTimesOutIfConfigIsNotCommit
     respondToAllHeartbeats();
 
     // Do a first reconfig that should succeed since the current config is committed.
+    const auto opCtx = makeOperationContext();
     Status status(ErrorCodes::InternalError, "Not Set");
     configVersion = 3;
     ASSERT_OK(doSafeReconfig(opCtx.get(), configVersion, Cb_members, 1 /* quorumHbs */));
@@ -1091,14 +1182,14 @@ TEST_F(ReplCoordReconfigTest, WaitForConfigCommitmentReturnsOKIfConfigIsCommitte
     // Start out in a non-initial config version.
     init();
     auto configVersion = 2;
-    auto Ca_members = BSON_ARRAY(member(1, "n1:1"));
+    auto Ca_members = BSON_ARRAY(member(1, "n1:1") << member(2, "n2:1", 0));
     auto Cb_members = BSON_ARRAY(member(1, "n1:1") << member(2, "n2:1"));
 
     // Startup, simulate application of one oplog entry and get elected.
     assertStartSuccess(configWithMembers(configVersion, 0, Ca_members), HostAndPort("n1", 1));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
     replCoordSetMyLastAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
-    const auto opCtx = makeOperationContext();
-    runSingleNodeElection(opCtx.get());
+    simulateSuccessfulV1Election();
     ASSERT_EQ(getReplCoord()->getMemberState(), MemberState::RS_PRIMARY);
     ASSERT_EQ(getReplCoord()->getTerm(), 1);
 
@@ -1109,6 +1200,7 @@ TEST_F(ReplCoordReconfigTest, WaitForConfigCommitmentReturnsOKIfConfigIsCommitte
     respondToAllHeartbeats();
 
     // Do a first reconfig that should succeed since the current config is committed.
+    const auto opCtx = makeOperationContext();
     configVersion = 3;
     ASSERT_OK(doSafeReconfig(opCtx.get(), configVersion, Cb_members, 1 /* quorumHbs */));
 
@@ -1122,18 +1214,19 @@ TEST_F(ReplCoordReconfigTest,
     // Start out in a non-initial config version.
     init();
     auto configVersion = 2;
-    auto Ca_members = BSON_ARRAY(member(1, "n1:1"));
+    auto Ca_members = BSON_ARRAY(member(1, "n1:1") << member(2, "n2:1", 0));
     auto Cb_members = BSON_ARRAY(member(1, "n1:1") << member(2, "n2:1"));
 
     // Startup, simulate application of one oplog entry and get elected.
     assertStartSuccess(configWithMembers(configVersion, 0, Ca_members), HostAndPort("n1", 1));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
     replCoordSetMyLastAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
-    const auto opCtx = makeOperationContext();
-    runSingleNodeElection(opCtx.get());
+    simulateSuccessfulV1Election();
     ASSERT_EQ(getReplCoord()->getMemberState(), MemberState::RS_PRIMARY);
     ASSERT_EQ(getReplCoord()->getTerm(), 1);
 
     // Write and commit one new oplog entry, and consume any heartbeats.
+    const auto opCtx = makeOperationContext();
     auto commitPoint = OpTime(Timestamp(2, 1), 1);
     replCoordSetMyLastAppliedAndDurableOpTime(commitPoint);
     ASSERT_EQ(getReplCoord()->getLastCommittedOpTime(), commitPoint);
@@ -1158,7 +1251,8 @@ TEST_F(ReplCoordReconfigTest,
     // Start out in a non-initial config version.
     init();
     auto configVersion = 2;
-    auto Ca_members = BSON_ARRAY(member(1, "n1:1") << member(2, "n2:1") << member(3, "n3:1"));
+    auto Ca_members = BSON_ARRAY(member(1, "n1:1")
+                                 << member(2, "n2:1") << member(3, "n3:1") << member(4, "n4:1", 0));
     auto Cb_members = BSON_ARRAY(member(1, "n1:1")
                                  << member(2, "n2:1") << member(3, "n3:1") << member(4, "n4:1"));
 
@@ -1180,7 +1274,7 @@ TEST_F(ReplCoordReconfigTest,
 
     // Do a first reconfig that should succeed since the current config is committed.
     configVersion = 3;
-    ASSERT_OK(doSafeReconfig(opCtx.get(), configVersion, Cb_members, 2 /* quorumHbs */));
+    ASSERT_OK(doSafeReconfig(opCtx.get(), configVersion, Cb_members, 3 /* quorumHbs */));
 
     // Try to reconfig out of Cb which should fail.
     configVersion = 4;
@@ -1318,9 +1412,11 @@ TEST_F(ReplCoordReconfigTest, StepdownShouldInterruptConfigWrite) {
     // Start out in a non-initial config version.
     init();
     auto configVersion = 2;
-    assertStartSuccess(
-        configWithMembers(configVersion, 0, BSON_ARRAY(member(1, "n1:1") << member(2, "n2:1"))),
-        HostAndPort("n1", 1));
+    assertStartSuccess(configWithMembers(configVersion,
+                                         0,
+                                         BSON_ARRAY(member(1, "n1:1")
+                                                    << member(2, "n2:1") << member(3, "n3:1", 0))),
+                       HostAndPort("n1", 1));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
 
     // Simulate application of one oplog entry.
@@ -1345,18 +1441,27 @@ TEST_F(ReplCoordReconfigTest, StepdownShouldInterruptConfigWrite) {
     args.newConfigObj = configWithMembers(
         configVersion, 1, BSON_ARRAY(member(1, "n1:1") << member(2, "n2:1") << member(3, "n3:1")));
 
+    // Turn on a reconfig hang to ensure that the reconfig thread will be scheduled before the node
+    // is stepped down. If the node is stepped down before reconfig is initiated, the reconfig will
+    // fail with a different reason than expected.
+    auto hangReconfig = globalFailPointRegistry().find("ReconfigHangBeforeConfigValidationCheck");
+    auto timesEnteredFailPoint = hangReconfig->setMode(FailPoint::alwaysOn);
+
     BSONObjBuilder result;
     Status status(ErrorCodes::InternalError, "Not Set");
     const auto opCtx = makeOperationContext();
-    stdx::thread reconfigThread;
-    reconfigThread = stdx::thread(
-        [&] { status = getReplCoord()->processReplSetReconfig(opCtx.get(), args, &result); });
+    auto reconfigResult = stdx::async(stdx::launch::async, [&] {
+        status = getReplCoord()->processReplSetReconfig(opCtx.get(), args, &result);
+    });
 
+    // Ensure the reconfig thread has started before stepping down as primary.
+    hangReconfig->waitForTimesEntered(timesEnteredFailPoint + 1);
+    hangReconfig->setMode(FailPoint::off);
+
+    // The failpoint should be released now. We run the clock forward so that the reconfig can
+    // continue.
     getNet()->enterNetwork();
-    // Wait for the next heartbeat of quorum check and blackhole it.
-    // The reconfig is hung during the quorum check.
-    auto request = getNet()->getNextReadyRequest();
-    getNet()->blackHole(request);
+    getNet()->runUntil(getNet()->now() + Milliseconds(200));
     getNet()->exitNetwork();
 
     // Step down due to a higher term.
@@ -1366,20 +1471,46 @@ TEST_F(ReplCoordReconfigTest, StepdownShouldInterruptConfigWrite) {
     ASSERT(updateTermEvh.isValid());
     getReplExec()->waitForEvent(updateTermEvh);
 
-    // Respond to quorum check to resume the reconfig.
-    respondToAllHeartbeats();
+    // Respond to quorum check to resume the reconfig. We keep responding until the reconfig thread
+    // finishes.
+    while (stdx::future_status::ready !=
+           reconfigResult.wait_for(Milliseconds::zero().toSystemDuration())) {
+        respondToAllHeartbeats();
+    }
 
-    reconfigThread.join();
-    ASSERT_EQ(status.code(), ErrorCodes::NotMaster);
+    ASSERT_EQ(status.code(), ErrorCodes::NotWritablePrimary);
     ASSERT_EQ(status.reason(), "Stepped down when persisting new config");
 }
 
-TEST_F(ReplCoordReconfigTest, NewlyAddedFieldIsTrueForNewMembersInReconfig) {
-    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
-    enableAutomaticReconfig = true;
-    // Set the flag back to false after this test exits.
-    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
+TEST_F(ReplCoordReconfigTest, StartElectionOnReconfigToSingleNode) {
+    // Start up as a secondary.
+    init();
+    assertStartSuccess(
+        configWithMembers(
+            1, 0, BSON_ARRAY(member(1, "n1:1") << member(2, "n2:1") << member(3, "n3:1"))),
+        HostAndPort("n1", 1));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
 
+    // Simulate application of one oplog entry.
+    replCoordSetMyLastAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
+
+    // Construct the new config of single node replset.
+    auto configVersion = 2;
+    ReplSetReconfigArgs args;
+    args.force = true;
+    args.newConfigObj = configWithMembers(configVersion, 1, BSON_ARRAY(member(1, "n1:1")));
+
+    BSONObjBuilder result;
+    const auto opCtx = makeOperationContext();
+    ASSERT_OK(getReplCoord()->processReplSetReconfig(opCtx.get(), args, &result));
+    getNet()->enterNetwork();
+    getNet()->runReadyNetworkOperations();
+    getNet()->exitNetwork();
+
+    ASSERT_EQUALS(MemberState::RS_PRIMARY, getReplCoord()->getMemberState().s);
+}
+
+TEST_F(ReplCoordReconfigTest, NewlyAddedFieldIsTrueForNewMembersInReconfig) {
     setUpNewlyAddedFieldTest();
 
     auto opCtx = makeOperationContext();
@@ -1387,7 +1518,7 @@ TEST_F(ReplCoordReconfigTest, NewlyAddedFieldIsTrueForNewMembersInReconfig) {
     const auto members = BSON_ARRAY(member(1, "n1:1") << member(2, "n2:1") << member(3, "n3:1"));
 
     startCapturingLogMessages();
-    Status status = doSafeReconfig(opCtx.get(), 2, members, 1 /* quorumHbs */);
+    Status status = doSafeReconfig(opCtx.get(), 2, members, 2 /* quorumHbs */);
     ASSERT_OK(status);
     stopCapturingLogMessages();
 
@@ -1405,11 +1536,6 @@ TEST_F(ReplCoordReconfigTest, NewlyAddedFieldIsTrueForNewMembersInReconfig) {
 }
 
 TEST_F(ReplCoordReconfigTest, NewlyAddedFieldIsNotPresentForNodesWithVotesZero) {
-    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
-    enableAutomaticReconfig = true;
-    // Set the flag back to false after this test exits.
-    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
-
     setUpNewlyAddedFieldTest();
 
     auto opCtx = makeOperationContext();
@@ -1421,7 +1547,7 @@ TEST_F(ReplCoordReconfigTest, NewlyAddedFieldIsNotPresentForNodesWithVotesZero) 
                                                    << "votes" << 0 << "priority" << 0));
 
     startCapturingLogMessages();
-    ASSERT_OK(doSafeReconfig(opCtx.get(), 2, members, 1 /* quorumHbs */));
+    ASSERT_OK(doSafeReconfig(opCtx.get(), 2, members, 2 /* quorumHbs */));
     stopCapturingLogMessages();
 
     const auto rsConfig = getReplCoord()->getReplicaSetConfig_forTest();
@@ -1439,11 +1565,6 @@ TEST_F(ReplCoordReconfigTest, NewlyAddedFieldIsNotPresentForNodesWithVotesZero) 
 }
 
 TEST_F(ReplCoordReconfigTest, NewlyAddedFieldIsNotPresentForNodesWithModifiedHostName) {
-    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
-    enableAutomaticReconfig = true;
-    // Set the flag back to false after this test exits.
-    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
-
     setUpNewlyAddedFieldTest();
 
     auto opCtx = makeOperationContext();
@@ -1468,11 +1589,6 @@ TEST_F(ReplCoordReconfigTest, NewlyAddedFieldIsNotPresentForNodesWithModifiedHos
 }
 
 TEST_F(ReplCoordReconfigTest, NewlyAddedFieldIsNotPresentForNodesWithDifferentIndexButSameID) {
-    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
-    enableAutomaticReconfig = true;
-    // Set the flag back to false after this test exits.
-    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
-
     setUpNewlyAddedFieldTest();
 
     auto opCtx = makeOperationContext();
@@ -1496,11 +1612,6 @@ TEST_F(ReplCoordReconfigTest, NewlyAddedFieldIsNotPresentForNodesWithDifferentIn
 }
 
 TEST_F(ReplCoordReconfigTest, ForceReconfigDoesNotPersistNewlyAddedFieldFromOldNodes) {
-    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
-    enableAutomaticReconfig = true;
-    // Set the flag back to false after this test exits.
-    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
-
     setUpNewlyAddedFieldTest();
 
     auto opCtx = makeOperationContext();
@@ -1508,7 +1619,7 @@ TEST_F(ReplCoordReconfigTest, ForceReconfigDoesNotPersistNewlyAddedFieldFromOldN
     auto members = BSON_ARRAY(member(1, "n1:1") << member(2, "n2:1") << member(3, "n3:1"));
 
     startCapturingLogMessages();
-    ASSERT_OK(doSafeReconfig(opCtx.get(), 2, members, 1 /* quorumHbs */));
+    ASSERT_OK(doSafeReconfig(opCtx.get(), 2, members, 2 /* quorumHbs */));
     stopCapturingLogMessages();
 
     auto rsConfig = getReplCoord()->getReplicaSetConfig_forTest();
@@ -1559,11 +1670,6 @@ TEST_F(ReplCoordReconfigTest, ForceReconfigDoesNotPersistNewlyAddedFieldFromOldN
 }
 
 TEST_F(ReplCoordReconfigTest, ForceReconfigDoesNotAppendNewlyAddedFieldToNewNodes) {
-    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
-    enableAutomaticReconfig = true;
-    // Set the flag back to false after this test exits.
-    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
-
     setUpNewlyAddedFieldTest();
 
     auto opCtx = makeOperationContext();
@@ -1589,12 +1695,7 @@ TEST_F(ReplCoordReconfigTest, ForceReconfigDoesNotAppendNewlyAddedFieldToNewNode
                       "Appended the 'newlyAdded' field to a node in the new config."));
 }
 
-TEST_F(ReplCoordReconfigTest, ForceReconfigSucceedsWhenNewlyAddedFieldIsSetToTrue) {
-    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
-    enableAutomaticReconfig = true;
-    // Set the flag back to false after this test exits.
-    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
-
+TEST_F(ReplCoordReconfigTest, ForceReconfigFailsWhenNewlyAddedFieldIsSetToTrue) {
     setUpNewlyAddedFieldTest();
 
     auto opCtx = makeOperationContext();
@@ -1610,31 +1711,11 @@ TEST_F(ReplCoordReconfigTest, ForceReconfigSucceedsWhenNewlyAddedFieldIsSetToTru
                                                                      << "n3:1"
                                                                      << "newlyAdded" << true)));
 
-    startCapturingLogMessages();
-    ASSERT_OK(getReplCoord()->processReplSetReconfig(opCtx.get(), args, &result));
-    stopCapturingLogMessages();
-
-    const auto rsConfig = getReplCoord()->getReplicaSetConfig_forTest();
-    const auto newMember = rsConfig.findMemberByID(3);
-
-    // Verify that the 'newlyAdded' field is set and that the member is considered a non-voting
-    // node.
-    ASSERT_TRUE(newMember->isNewlyAdded());
-    ASSERT_FALSE(newMember->isVoter());
-
-    // Verify that a log message was not created for adding the 'newlyAdded' field, since a force
-    // reconfig should not attempt to append the field.
-    ASSERT_EQUALS(0,
-                  countTextFormatLogLinesContaining(
-                      "Appended the 'newlyAdded' field to a node in the new config."));
+    ASSERT_EQUALS(ErrorCodes::InvalidReplicaSetConfig,
+                  getReplCoord()->processReplSetReconfig(opCtx.get(), args, &result));
 }
 
 TEST_F(ReplCoordReconfigTest, ForceReconfigFailsWhenNewlyAddedFieldSetToFalse) {
-    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
-    enableAutomaticReconfig = true;
-    // Set the flag back to false after this test exits.
-    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
-
     setUpNewlyAddedFieldTest();
 
     auto opCtx = makeOperationContext();
@@ -1655,11 +1736,6 @@ TEST_F(ReplCoordReconfigTest, ForceReconfigFailsWhenNewlyAddedFieldSetToFalse) {
 }
 
 TEST_F(ReplCoordReconfigTest, ParseFailedIfUserProvidesNewlyAddedFieldDuringSafeReconfig) {
-    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
-    enableAutomaticReconfig = true;
-    // Set the flag back to false after this test exits.
-    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
-
     setUpNewlyAddedFieldTest();
 
     auto opCtx = makeOperationContext();
@@ -1689,11 +1765,6 @@ TEST_F(ReplCoordReconfigTest, ParseFailedIfUserProvidesNewlyAddedFieldDuringSafe
 }
 
 TEST_F(ReplCoordReconfigTest, ReconfigNeverModifiesExistingNewlyAddedFieldForMember) {
-    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
-    enableAutomaticReconfig = true;
-    // Set the flag back to false after this test exits.
-    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
-
     setUpNewlyAddedFieldTest();
 
     auto opCtx = makeOperationContext();
@@ -1702,7 +1773,7 @@ TEST_F(ReplCoordReconfigTest, ReconfigNeverModifiesExistingNewlyAddedFieldForMem
     initialSyncNodes.emplace_back(HostAndPort("n3:1"));
 
     startCapturingLogMessages();
-    ASSERT_OK(doSafeReconfig(opCtx.get(), 2, members, 1 /* quorumHbs */));
+    ASSERT_OK(doSafeReconfig(opCtx.get(), 2, members, 2 /* quorumHbs */));
     stopCapturingLogMessages();
 
     auto rsConfig = getReplCoord()->getReplicaSetConfig_forTest();
@@ -1725,7 +1796,7 @@ TEST_F(ReplCoordReconfigTest, ReconfigNeverModifiesExistingNewlyAddedFieldForMem
     members = BSON_ARRAY(member(2, "n2:1") << member(1, "n1:1") << member(3, "n3:1"));
 
     startCapturingLogMessages();
-    ASSERT_OK(doSafeReconfig(opCtx.get(), 3, members, 1 /* quorumHbs */));
+    ASSERT_OK(doSafeReconfig(opCtx.get(), 3, members, 2 /* quorumHbs */));
     stopCapturingLogMessages();
 
     rsConfig = getReplCoord()->getReplicaSetConfig_forTest();
@@ -1740,11 +1811,6 @@ TEST_F(ReplCoordReconfigTest, ReconfigNeverModifiesExistingNewlyAddedFieldForMem
 }
 
 TEST_F(ReplCoordReconfigTest, ReconfigNeverModifiesExistingNewlyAddedFieldForPreviouslyAddedNodes) {
-    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
-    enableAutomaticReconfig = true;
-    // Set the flag back to false after this test exits.
-    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
-
     setUpNewlyAddedFieldTest();
 
     auto opCtx = makeOperationContext();
@@ -1753,7 +1819,7 @@ TEST_F(ReplCoordReconfigTest, ReconfigNeverModifiesExistingNewlyAddedFieldForPre
     initialSyncNodes.emplace_back(HostAndPort("n3:1"));
 
     startCapturingLogMessages();
-    ASSERT_OK(doSafeReconfig(opCtx.get(), 2, members, 1 /* quorumHbs */));
+    ASSERT_OK(doSafeReconfig(opCtx.get(), 2, members, 2 /* quorumHbs */));
     stopCapturingLogMessages();
 
     auto rsConfig = getReplCoord()->getReplicaSetConfig_forTest();
@@ -1778,7 +1844,7 @@ TEST_F(ReplCoordReconfigTest, ReconfigNeverModifiesExistingNewlyAddedFieldForPre
     initialSyncNodes.emplace_back(HostAndPort("n4:1"));
 
     startCapturingLogMessages();
-    ASSERT_OK(doSafeReconfig(opCtx.get(), 3, members, 2 /* quorumHbs */));
+    ASSERT_OK(doSafeReconfig(opCtx.get(), 3, members, 3 /* quorumHbs */));
     stopCapturingLogMessages();
 
     rsConfig = getReplCoord()->getReplicaSetConfig_forTest();
@@ -1795,11 +1861,6 @@ TEST_F(ReplCoordReconfigTest, ReconfigNeverModifiesExistingNewlyAddedFieldForPre
 }
 
 TEST_F(ReplCoordReconfigTest, NodesWithNewlyAddedFieldSetAreTreatedAsVotesZero) {
-    // Set the flag to add the `newlyAdded` field to MemberConfigs.
-    enableAutomaticReconfig = true;
-    // Set the flag back to false after this test exits.
-    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
-
     setUpNewlyAddedFieldTest();
 
     auto opCtx = makeOperationContext();
@@ -1807,7 +1868,7 @@ TEST_F(ReplCoordReconfigTest, NodesWithNewlyAddedFieldSetAreTreatedAsVotesZero) 
     auto members = BSON_ARRAY(member(1, "n1:1") << member(2, "n2:1") << member(3, "n3:1"));
 
     startCapturingLogMessages();
-    ASSERT_OK(doSafeReconfig(opCtx.get(), 2, members, 1 /* quorumHbs */));
+    ASSERT_OK(doSafeReconfig(opCtx.get(), 2, members, 2 /* quorumHbs */));
     stopCapturingLogMessages();
 
     const auto rsConfig = getReplCoord()->getReplicaSetConfig_forTest();
@@ -1828,11 +1889,6 @@ TEST_F(ReplCoordReconfigTest, NodesWithNewlyAddedFieldSetAreTreatedAsVotesZero) 
 }
 
 TEST_F(ReplCoordReconfigTest, NodesWithNewlyAddedFieldSetHavePriorityZero) {
-    // Set the flag to add the `newlyAdded` field to MemberConfigs.
-    enableAutomaticReconfig = true;
-    // Set the flag back to false after this test exits.
-    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
-
     setUpNewlyAddedFieldTest();
 
     auto opCtx = makeOperationContext();
@@ -1844,7 +1900,7 @@ TEST_F(ReplCoordReconfigTest, NodesWithNewlyAddedFieldSetHavePriorityZero) {
     initialSyncNodes.emplace_back(HostAndPort("n3:1"));
 
     startCapturingLogMessages();
-    ASSERT_OK(doSafeReconfig(opCtx.get(), 2, members, 1 /* quorumHbs */));
+    ASSERT_OK(doSafeReconfig(opCtx.get(), 2, members, 2 /* quorumHbs */));
     stopCapturingLogMessages();
 
     ASSERT_EQUALS(1,
@@ -1876,7 +1932,7 @@ TEST_F(ReplCoordReconfigTest, NodesWithNewlyAddedFieldSetHavePriorityZero) {
     initialSyncNodes.emplace_back(HostAndPort("n4:1"));
 
     startCapturingLogMessages();
-    ASSERT_OK(doSafeReconfig(opCtx.get(), 3, members, 2 /* quorumHbs */));
+    ASSERT_OK(doSafeReconfig(opCtx.get(), 3, members, 3 /* quorumHbs */));
     stopCapturingLogMessages();
 
     ASSERT_EQUALS(1,
@@ -1897,11 +1953,6 @@ TEST_F(ReplCoordReconfigTest, NodesWithNewlyAddedFieldSetHavePriorityZero) {
 }
 
 TEST_F(ReplCoordReconfigTest, ArbiterNodesShouldNeverHaveNewlyAddedField) {
-    // Set the flag to add the `newlyAdded` field to MemberConfigs.
-    enableAutomaticReconfig = true;
-    // Set the flag back to false after this test exits.
-    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
-
     setUpNewlyAddedFieldTest();
 
     auto opCtx = makeOperationContext();
@@ -1912,7 +1963,7 @@ TEST_F(ReplCoordReconfigTest, ArbiterNodesShouldNeverHaveNewlyAddedField) {
                                                               << "arbiterOnly" << true));
 
     startCapturingLogMessages();
-    ASSERT_OK(doSafeReconfig(opCtx.get(), 3, members, 1 /* quorumHbs */));
+    ASSERT_OK(doSafeReconfig(opCtx.get(), 3, members, 2 /* quorumHbs */));
     stopCapturingLogMessages();
 
     const auto rsConfig = getReplCoord()->getReplicaSetConfig_forTest();
@@ -1931,11 +1982,6 @@ TEST_F(ReplCoordReconfigTest, ArbiterNodesShouldNeverHaveNewlyAddedField) {
 }
 
 TEST_F(ReplCoordReconfigTest, ForceReconfigShouldThrowIfArbiterNodesHaveNewlyAddedField) {
-    // Set the flag to add the `newlyAdded` field to MemberConfigs.
-    enableAutomaticReconfig = true;
-    // Set the flag back to false after this test exits.
-    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
-
     setUpNewlyAddedFieldTest();
 
     auto opCtx = makeOperationContext();
@@ -1954,6 +2000,204 @@ TEST_F(ReplCoordReconfigTest, ForceReconfigShouldThrowIfArbiterNodesHaveNewlyAdd
 
     ASSERT_EQUALS(ErrorCodes::InvalidReplicaSetConfig,
                   getReplCoord()->processReplSetReconfig(opCtx.get(), args, &result));
+}
+
+TEST_F(ReplCoordTest, StepUpReconfigConcurrentWithHeartbeatReconfig) {
+    auto severityGuard = unittest::MinimumLoggedSeverityGuard{logv2::LogComponent::kReplication,
+                                                              logv2::LogSeverity::Debug(2)};
+    assertStartSuccess(BSON("_id"
+                            << "mySet"
+                            << "version" << 2 << "term" << 0 << "members"
+                            << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                     << "node1:12345")
+                                          << BSON("_id" << 2 << "host"
+                                                        << "node2:12345"))),
+                       HostAndPort("node1", 12345));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    ASSERT_EQUALS(getReplCoord()->getTerm(), 0);
+    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+
+    // Win election but don't exit drain mode.
+    auto electionTimeoutWhen = getReplCoord()->getElectionTimeout_forTest();
+    const auto opCtx = makeOperationContext();
+    simulateSuccessfulV1ElectionWithoutExitingDrainMode(electionTimeoutWhen, opCtx.get());
+
+    // Receive a heartbeat that should NOT schedule a new heartbeat to fetch a newer config.
+    ReplSetHeartbeatArgsV1 hbArgs;
+    auto rsConfig = getReplCoord()->getConfig();
+    hbArgs.setConfigVersion(3);  // simulate a newer config version.
+    hbArgs.setConfigTerm(rsConfig.getConfigTerm());
+    hbArgs.setSetName(rsConfig.getReplSetName());
+    hbArgs.setSenderHost(HostAndPort("node2", 12345));
+    hbArgs.setSenderId(2);
+    hbArgs.setTerm(0);
+    ASSERT(hbArgs.isInitialized());
+
+    ReplSetHeartbeatResponse response;
+    ASSERT_OK(getReplCoord()->processHeartbeatV1(hbArgs, &response));
+
+    // No requests should have been scheduled.
+    getNet()->enterNetwork();
+    ASSERT_FALSE(getNet()->hasReadyRequests());
+    getNet()->exitNetwork();
+
+    // Receive a heartbeat that schedules a new heartbeat to fetch a newer config. We simulate a
+    // newer config version and an uninitialized term, so that a heartbeat will be scheduled to
+    // fetch a new config. When we mock the heartbeat response below, we will respond with a
+    // non-force config, which is to test the case where the sending node installed a non force
+    // config after we scheduled a heartbeat to it to fetch a force config. For safety, the
+    // important aspect is that we don't accept/install configs during drain mode, even if we try to
+    // fetch them.
+    hbArgs.setConfigVersion(3);
+    hbArgs.setConfigTerm(OpTime::kUninitializedTerm);
+    hbArgs.setSetName(rsConfig.getReplSetName());
+    hbArgs.setSenderHost(HostAndPort("node2", 12345));
+    hbArgs.setSenderId(2);
+    hbArgs.setTerm(0);
+    ASSERT(hbArgs.isInitialized());
+
+    ASSERT_OK(getReplCoord()->processHeartbeatV1(hbArgs, &response));
+
+    // Schedule a response with a newer config.
+    auto newerConfigVersion = 3;
+    auto newerConfig = BSON("_id"
+                            << "mySet"
+                            << "version" << newerConfigVersion << "term" << 0 << "members"
+                            << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                     << "node1:12345")
+                                          << BSON("_id" << 2 << "host"
+                                                        << "node2:12345")));
+    auto net = getNet();
+    net->enterNetwork();
+    auto noi = net->getNextReadyRequest();
+    auto& request = noi->getRequest();
+
+    ReplSetHeartbeatArgsV1 args;
+    ASSERT_OK(args.initialize(request.cmdObj));
+
+    startCapturingLogMessages();
+    OpTime lastApplied(Timestamp(100, 1), 0);
+    ReplSetHeartbeatResponse hbResp;
+    rsConfig = ReplSetConfig::parse(newerConfig);
+    hbResp.setConfig(rsConfig);
+    hbResp.setSetName(rsConfig.getReplSetName());
+    hbResp.setState(MemberState::RS_SECONDARY);
+    hbResp.setConfigVersion(rsConfig.getConfigVersion());
+    hbResp.setConfigTerm(rsConfig.getConfigTerm());
+    hbResp.setAppliedOpTimeAndWallTime({lastApplied, Date_t() + Seconds(lastApplied.getSecs())});
+    hbResp.setDurableOpTimeAndWallTime({lastApplied, Date_t() + Seconds(lastApplied.getSecs())});
+    net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON()));
+    net->runReadyNetworkOperations();
+    net->exitNetwork();
+    stopCapturingLogMessages();
+
+    // Make sure the heartbeat reconfig has not been scheduled.
+    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("Not scheduling a heartbeat reconfig"));
+
+    // Let drain mode complete.
+    signalDrainComplete(opCtx.get());
+
+    // We should have moved to a new term in the election, and our config should have the same term.
+    ASSERT_EQUALS(getReplCoord()->getTerm(), 1);
+    ASSERT_EQUALS(getReplCoord()->getConfig().getConfigTerm(), 1);
+}
+
+TEST_F(ReplCoordTest, StepUpReconfigConcurrentWithForceHeartbeatReconfig) {
+    auto severityGuard = unittest::MinimumLoggedSeverityGuard{logv2::LogComponent::kReplication,
+                                                              logv2::LogSeverity::Debug(2)};
+    assertStartSuccess(BSON("_id"
+                            << "mySet"
+                            << "version" << 2 << "term" << 0 << "members"
+                            << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                     << "node1:12345")
+                                          << BSON("_id" << 2 << "host"
+                                                        << "node2:12345"))),
+                       HostAndPort("node1", 12345));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    ASSERT_EQUALS(getReplCoord()->getTerm(), 0);
+    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+
+    // Win election but don't exit drain mode.
+    auto electionTimeoutWhen = getReplCoord()->getElectionTimeout_forTest();
+    const auto opCtx = makeOperationContext();
+    simulateSuccessfulV1ElectionWithoutExitingDrainMode(electionTimeoutWhen, opCtx.get());
+
+    // Receive a heartbeat that schedules a new heartbeat to fetch a newer config.
+    ReplSetHeartbeatArgsV1 hbArgs;
+    auto rsConfig = getReplCoord()->getConfig();
+    hbArgs.setConfigVersion(3);                        // simulate a newer config version.
+    hbArgs.setConfigTerm(OpTime::kUninitializedTerm);  // force config.
+    hbArgs.setSetName(rsConfig.getReplSetName());
+    hbArgs.setSenderHost(HostAndPort("node2", 12345));
+    hbArgs.setSenderId(2);
+    hbArgs.setTerm(0);
+    ASSERT(hbArgs.isInitialized());
+
+    ReplSetHeartbeatResponse response;
+    ASSERT_OK(getReplCoord()->processHeartbeatV1(hbArgs, &response));
+
+    // Schedule a response with a newer config.
+    auto newerConfigVersion = 3;
+    auto newerConfig =
+        BSON("_id"
+             << "mySet"
+             << "version" << newerConfigVersion << "term" << OpTime::kUninitializedTerm << "members"
+             << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                      << "node1:12345")
+                           << BSON("_id" << 2 << "host"
+                                         << "node2:12345")));
+    auto net = getNet();
+    net->enterNetwork();
+    auto noi = net->getNextReadyRequest();
+    auto& request = noi->getRequest();
+
+    ReplSetHeartbeatArgsV1 args;
+    ASSERT_OK(args.initialize(request.cmdObj));
+
+    OpTime lastApplied(Timestamp(100, 1), 0);
+    ReplSetHeartbeatResponse hbResp;
+    rsConfig = ReplSetConfig::parse(newerConfig);
+    hbResp.setConfig(rsConfig);
+    hbResp.setSetName(rsConfig.getReplSetName());
+    hbResp.setState(MemberState::RS_SECONDARY);
+    hbResp.setConfigVersion(rsConfig.getConfigVersion());
+    hbResp.setConfigTerm(rsConfig.getConfigTerm());
+    hbResp.setAppliedOpTimeAndWallTime({lastApplied, Date_t() + Seconds(lastApplied.getSecs())});
+    hbResp.setDurableOpTimeAndWallTime({lastApplied, Date_t() + Seconds(lastApplied.getSecs())});
+    net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON()));
+    net->exitNetwork();
+
+    {
+        // Prevent the heartbeat reconfig from completing.
+        FailPointEnableBlock fpb("blockHeartbeatReconfigFinish");
+
+        // Let the heartbeat reconfig begin.
+        net->enterNetwork();
+        net->runReadyNetworkOperations();
+        net->exitNetwork();
+
+        // For force reconfigs, we do allow them to proceed even if we are in drain mode, so make
+        // sure it is in progress, stuck at the failpoint before completion.
+        fpb->waitForTimesEntered(1);
+
+        // At this point the heartbeat reconfig should be in progress but blocked from completion by
+        // the failpoint. We now let drain mode complete. The step up reconfig should be interrupted
+        // by the in progress heartbeat reconfig.
+        signalDrainComplete(opCtx.get());
+    }
+
+    // The failpoint should be released now, allowing the heartbeat reconfig to complete. We run the
+    // clock forward so the re-scheduled heartbeat reconfig will complete.
+    net->enterNetwork();
+    net->runUntil(net->now() + Milliseconds(100));
+    net->exitNetwork();
+
+    // We should have moved to a new term in the election, but our config should have the term from
+    // the force config.
+    ASSERT_EQUALS(getReplCoord()->getTerm(), 1);
+    ASSERT_EQUALS(getReplCoord()->getConfig().getConfigTerm(), OpTime::kUninitializedTerm);
 }
 
 }  // anonymous namespace

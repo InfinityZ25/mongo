@@ -1,4 +1,8 @@
-// @tags: [requires_non_retryable_writes, requires_fastcount]
+// @tags: [
+//   requires_fastcount,
+//   requires_non_retryable_writes,
+//   sbe_incompatible,
+// ]
 
 //
 //  Big Polygon related tests
@@ -6,17 +10,30 @@
 //    $geoWithin & $geoIntersects
 //  - Big polygon objects cannot be stored
 //    Try all different shapes queries against various stored geo points, line & polygons
+(function() {
 
-var crs84CRS = {type: "name", properties: {name: "urn:ogc:def:crs:OGC:1.3:CRS84"}};
-var epsg4326CRS = {type: "name", properties: {name: "EPSG:4326"}};
-var strictCRS = {type: "name", properties: {name: "urn:x-mongodb:crs:strictwinding:EPSG:4326"}};
+const crs84CRS = {
+    type: "name",
+    properties: {name: "urn:ogc:def:crs:OGC:1.3:CRS84"}
+};
+const epsg4326CRS = {
+    type: "name",
+    properties: {name: "EPSG:4326"}
+};
+const strictCRS = {
+    type: "name",
+    properties: {name: "urn:x-mongodb:crs:strictwinding:EPSG:4326"}
+};
 // invalid CRS name
-var badCRS = {type: "name", properties: {name: "urn:x-mongodb:crs:invalid:EPSG:4326"}};
+const badCRS = {
+    type: "name",
+    properties: {name: "urn:x-mongodb:crs:invalid:EPSG:4326"}
+};
 
 // helper to generate a line along a longitudinal
 function genLonLine(lon, startLat, endLat, latStep) {
-    var line = [];
-    for (var lat = startLat; lat <= endLat; lat += latStep) {
+    let line = [];
+    for (let lat = startLat; lat <= endLat; lat += latStep) {
         line.push([lon, lat]);
     }
     return line;
@@ -24,13 +41,13 @@ function genLonLine(lon, startLat, endLat, latStep) {
 
 // Main program
 // Clear out collection
-var coll = db.geo_bigpoly;
+const coll = db.geo_bigpoly;
 coll.drop();
 
 // GeoJson Objects to be inserted into collection
 // coordinates are longitude, latitude
 // strictCRS (big polygon) cannot be stored in the collection
-var objects = [
+const objects = [
     {name: "boat ramp", geo: {type: "Point", coordinates: [-97.927117, 30.327376]}},
     {name: "on equator", geo: {type: "Point", coordinates: [-97.9, 0]}},
     {name: "just north of equator", geo: {type: "Point", coordinates: [-97.9, 0.1]}},
@@ -269,7 +286,7 @@ var objects = [
 ];
 
 // Test various polygons which are not queryable
-var badPolys = [
+const badPolys = [
     {
         name: "Polygon with bad CRS",
         type: "Polygon",
@@ -339,7 +356,7 @@ var badPolys = [
 ];
 
 // Closed polygons used in query (3, 4, 5, 6-sided)
-var polys = [
+const polys = [
     {
         name: "3 sided closed polygon",
         type: "Polygon",  // triangle
@@ -431,11 +448,11 @@ function nGonGenerator(N, D, clockwise, LON, LAT) {
     // N must be even!
     // edge lengths will be uneven with this quick & dirty approach
     N = (N % 2 == 1) ? N + 1 : N;
-    var eps = 2 * D / N;
-    var lat = 0;
-    var lon = 0;
-    var pts = [];
-    var i = 0;
+    let eps = 2 * D / N;
+    let lat = 0;
+    let lon = 0;
+    let pts = [];
+    let i = 0;
     // produce longitude values in pairs
     // traverse with left foot outside the circle (clockwise) to define the big polygon
     for (i = 0, lat = D / 2; i <= N / 2; ++i, lat -= eps) {
@@ -461,7 +478,7 @@ function nGonGenerator(N, D, clockwise, LON, LAT) {
 
 // helper function to return number of valid objects
 function getNumberOfValidObjects(objects) {
-    var i = 0;
+    let i = 0;
     objects.forEach(function(o) {
         // strictCRS cannot be stored
         if (!o.geo.crs || o.geo.crs != strictCRS) {
@@ -471,11 +488,11 @@ function getNumberOfValidObjects(objects) {
     return i;
 }
 
-var totalObjects = getNumberOfValidObjects(objects);
+let totalObjects = getNumberOfValidObjects(objects);
 
 // test various n-sided polygons in query, (n: <number of sides>, d: <diameter>)
 // Try them in both clockwise & counterclockwise order
-var nsidedPolys = [
+const nsidedPolys = [
     // Big Polygon centered on 0, 0
     {
         name: "4 sided polygon centered on 0, 0",
@@ -543,7 +560,7 @@ var nsidedPolys = [
 ];
 
 // Populate with 2dsphere index
-assert.commandWorked(coll.ensureIndex({geo: "2dsphere"}), "create 2dsphere index");
+assert.commandWorked(coll.createIndex({geo: "2dsphere"}), "create 2dsphere index");
 
 // Insert objects into collection
 objects.forEach(function(o) {
@@ -556,16 +573,15 @@ objects.forEach(function(o) {
 });
 
 // Try creating other index types
-assert.commandWorked(coll.ensureIndex({geo: "2dsphere", a: 1}), "compound index, geo");
+assert.commandWorked(coll.createIndex({geo: "2dsphere", a: 1}), "compound index, geo");
 // These other index types will fail because of the GeoJSON documents
-assert.commandFailed(coll.ensureIndex({geo: "2dsphere", a: "text"}), "compound index, geo & text");
-assert.commandFailed(coll.ensureIndex({geo: "geoHaystack"}, {bucketSize: 1}), "geoHaystack index");
-assert.commandFailed(coll.ensureIndex({geo: "2d"}), "2d index");
+assert.commandFailed(coll.createIndex({geo: "2dsphere", a: "text"}), "compound index, geo & text");
+assert.commandFailed(coll.createIndex({geo: "2d"}), "2d index");
 
 totalObjects = coll.count();
 
 // Test with none & 2dsphere index
-var indexes = ["none", "2dsphere"];
+const indexes = ["none", "2dsphere"];
 
 indexes.forEach(function(index) {
     // Reset indexes on collection
@@ -573,7 +589,7 @@ indexes.forEach(function(index) {
 
     if (index != "none") {
         // Create index
-        assert.commandWorked(coll.ensureIndex({geo: index}), "create " + index + " index");
+        assert.commandWorked(coll.createIndex({geo: index}), "create " + index + " index");
     }
 
     // These polygons should not be queryable
@@ -592,8 +608,8 @@ indexes.forEach(function(index) {
     // Tests for closed polygons
     polys.forEach(function(p) {
         // geoWithin query
-        var docArray = [];
-        var q = {geo: {$geoWithin: {$geometry: p}}};
+        let docArray = [];
+        let q = {geo: {$geoWithin: {$geometry: p}}};
         // Test query in aggregate
         docArray = coll.aggregate({$match: q}).toArray();
         assert.eq(p.nW, docArray.length, "aggregate within " + p.name);
@@ -608,14 +624,14 @@ indexes.forEach(function(index) {
         docArray = coll.find(q).toArray();
         assert.eq(p.nI, docArray.length, p.name + " intersects");
         // Update on matching docs
-        var result = coll.update(q, {$set: {stored: ObjectId()}}, {multi: true});
+        let result = coll.update(q, {$set: {stored: ObjectId()}}, {multi: true});
         // only check nModified if write commands are enabled
         if (coll.getMongo().writeMode() == "commands") {
             assert.eq(p.nI, result.nModified, "update " + p.name);
         }
         // Remove & restore matching docs
         assert.eq(p.nI, coll.remove(q).nRemoved, "remove " + p.name);
-        var bulk = coll.initializeUnorderedBulkOp();
+        let bulk = coll.initializeUnorderedBulkOp();
         docArray.forEach(function(doc) {
             bulk.insert(doc);
         });
@@ -632,3 +648,4 @@ indexes.forEach(function(index) {
             p.nI, coll.count({geo: {$geoIntersects: {$geometry: p}}}), "intersection " + p.name);
     });
 });
+})();

@@ -47,6 +47,7 @@
 namespace mongo {
 
 class Collection;
+class CollectionPtr;
 struct CollectionOptions;
 class OperationContext;
 
@@ -134,6 +135,17 @@ public:
      * Inserts the given documents, with associated timestamps and statement id's, into the
      * collection.
      * It is an error to call this function with an empty set of documents.
+     *
+     * NOTE: We have some limitations with this function if the caller plans to use it for
+     * replicated collection writes and 'docs' size greater than 1.
+     * 1) It will violate multi-timestamp constraints (See SERVER-48771).
+     * 2) It doesn't have batch size throttling logic so there are possibilities that we might cause
+     * stress on storage engine by trying to insert a big chunk of data in a single WUOW.
+     *    - Another side effect of writing a big chunk is that writers will hold RSTL lock for a
+     * long time, causing state transition (like step down) to get blocked.
+     *
+     * So, it's recommended to use write_ops_exec::performInserts() for replicated collection
+     * writes.
      */
     virtual Status insertDocuments(OperationContext* opCtx,
                                    const NamespaceStringOrUUID& nsOrUUID,
@@ -158,6 +170,16 @@ public:
     virtual Status createCollection(OperationContext* opCtx,
                                     const NamespaceString& nss,
                                     const CollectionOptions& options) = 0;
+
+    /**
+     * Creates all the specified non-_id indexes on a given collection, which must be empty.
+     * Note: This function assumes the give collection is a committed collection, so it takes
+     * an exclusive collection lock on that collection.
+     */
+    virtual Status createIndexesOnEmptyCollection(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        const std::vector<BSONObj>& secondaryIndexSpecs) = 0;
 
     /**
      * Drops a collection.
@@ -185,6 +207,7 @@ public:
     virtual Status setIndexIsMultikey(OperationContext* opCtx,
                                       const NamespaceString& nss,
                                       const std::string& indexName,
+                                      const KeyStringSet& multikeyMetadataKeys,
                                       const MultikeyPaths& paths,
                                       Timestamp ts) = 0;
     /**
@@ -317,7 +340,18 @@ public:
      * matches are found.
      */
     virtual boost::optional<BSONObj> findOplogEntryLessThanOrEqualToTimestamp(
-        OperationContext* opCtx, Collection* oplog, const Timestamp& timestamp) = 0;
+        OperationContext* opCtx, const CollectionPtr& oplog, const Timestamp& timestamp) = 0;
+
+    /**
+     * Calls findOplogEntryLessThanOrEqualToTimestamp with endless WriteConflictException retries.
+     * Other errors get thrown. Concurrent oplog reads with the validate cmd on the same collection
+     * may throw WCEs. Obeys opCtx interrupts.
+     *
+     * Call this function instead of findOplogEntryLessThanOrEqualToTimestamp if the caller cannot
+     * fail, say for correctness.
+     */
+    virtual boost::optional<BSONObj> findOplogEntryLessThanOrEqualToTimestampRetryOnWCE(
+        OperationContext* opCtx, const CollectionPtr& oplog, const Timestamp& timestamp) = 0;
 
     /**
      * Fetches the latest oplog entry's timestamp. Bypasses the oplog visibility rules.
@@ -353,10 +387,14 @@ public:
                                                                  const NamespaceString& nss) = 0;
 
     /**
-     * Sets the highest timestamp at which the storage engine is allowed to take a checkpoint.
-     * This timestamp can never decrease, and thus should be a timestamp that can never roll back.
+     * Sets the highest timestamp at which the storage engine is allowed to take a checkpoint. This
+     * timestamp must not decrease unless force=true is set, in which case we force the stable
+     * timestamp, the oldest timestamp, and the commit timestamp backward. Additionally when
+     * force=true is set, the all durable timestamp will be set to the stable timestamp.
      */
-    virtual void setStableTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) = 0;
+    virtual void setStableTimestamp(ServiceContext* serviceCtx,
+                                    Timestamp snapshotName,
+                                    bool force = false) = 0;
 
     /**
      * Tells the storage engine the timestamp of the data at startup. This is necessary because
@@ -412,8 +450,7 @@ public:
 
     /**
      * Returns the all_durable timestamp. All transactions with timestamps earlier than the
-     * all_durable timestamp are committed. Only storage engines that support document level locking
-     * must provide an implementation. Other storage engines may provide a no-op implementation.
+     * all_durable timestamp are committed.
      *
      * The all_durable timestamp only includes non-prepared transactions that have been given a
      * commit_timestamp and prepared transactions that have been given a durable_timestamp.
@@ -421,18 +458,6 @@ public:
      * that were prepared but not committed which could make the stable timestamp briefly jump back.
      */
     virtual Timestamp getAllDurableTimestamp(ServiceContext* serviceCtx) const = 0;
-
-    /**
-     * Returns the oldest read timestamp in use by an open transaction. Storage engines that support
-     * the 'snapshot' ReadConcern must provide an implementation. Other storage engines may provide
-     * a no-op implementation.
-     */
-    virtual Timestamp getOldestOpenReadTimestamp(ServiceContext* serviceCtx) const = 0;
-
-    /**
-     * Returns true if the storage engine supports document level locking.
-     */
-    virtual bool supportsDocLocking(ServiceContext* serviceCtx) const = 0;
 
     /**
      * Registers a timestamp with the storage engine so that it can enforce oplog visiblity rules.

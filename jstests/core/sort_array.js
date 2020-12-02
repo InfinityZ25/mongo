@@ -1,4 +1,8 @@
-// @tags: [does_not_support_stepdowns, requires_non_retryable_writes, requires_fcv_44]
+// @tags: [
+//   does_not_support_stepdowns,
+//   requires_non_retryable_writes,
+//   sbe_incompatible,
+// ]
 
 /**
  * Tests for sorting documents by fields that contain arrays.

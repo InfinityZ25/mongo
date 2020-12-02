@@ -1,10 +1,15 @@
 /**
  * Tests that a moveChunk operation is properly aborted when an index command is received from a
  * non-internal client while in the critical section.
+ *
+ * @tags: [
+ *   requires_fcv_47,
+ * ]
  */
 (function() {
 "use strict";
 
+load("jstests/libs/fail_point_util.js");
 load('jstests/libs/parallel_shell_helpers.js');
 
 const dbName = "test";

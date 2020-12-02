@@ -40,7 +40,7 @@ public:
     struct ErrorActions {
         bool dropConnections = false;
         bool requestImmediateCheck = false;
-        boost::optional<sdam::IsMasterOutcome> isMasterOutcome;
+        boost::optional<sdam::HelloOutcome> helloOutcome;
         BSONObj toBSON() const;
     };
 
@@ -58,10 +58,10 @@ public:
                                              BSONObj bson) noexcept = 0;
 
 protected:
-    sdam::IsMasterOutcome _createErrorIsMasterOutcome(const HostAndPort& host,
-                                                      boost::optional<BSONObj> bson,
-                                                      const Status& status) const {
-        return sdam::IsMasterOutcome(host.toString(), bson ? *bson : BSONObj(), status.toString());
+    sdam::HelloOutcome _createErrorHelloOutcome(const HostAndPort& host,
+                                                boost::optional<BSONObj> bson,
+                                                const Status& status) const {
+        return sdam::HelloOutcome(host, bson ? *bson : BSONObj(), status.toString());
     }
 };
 
@@ -76,19 +76,19 @@ public:
                                      BSONObj bson) noexcept override;
 
 private:
-    int _getConsecutiveErrorsWithoutIsMasterOutcome(const HostAndPort& host) const;
-    void _incrementConsecutiveErrorsWithoutIsMasterOutcome(const HostAndPort& host);
-    void _clearConsecutiveErrorsWithoutIsMasterOutcome(const HostAndPort& host);
+    int _getConsecutiveErrorsWithoutHelloOutcome(const HostAndPort& host) const;
+    void _incrementConsecutiveErrorsWithoutHelloOutcome(const HostAndPort& host);
+    void _clearConsecutiveErrorsWithoutHelloOutcome(const HostAndPort& host);
 
     bool _isNodeRecovering(const Status& status) const;
     bool _isNetworkTimeout(const Status& status) const;
     bool _isNodeShuttingDown(const Status& status) const;
     bool _isNetworkError(const Status& status) const;
-    bool _isNotMasterOrNotRecovering(const Status& status) const;
+    bool _isNotMasterOrNodeRecovering(const Status& status) const;
     bool _isNotMaster(const Status& status) const;
 
     const std::string _setName;
     mutable Mutex _mutex;
-    stdx::unordered_map<HostAndPort, int> _consecutiveErrorsWithoutIsMasterOutcome;
+    stdx::unordered_map<HostAndPort, int> _consecutiveErrorsWithoutHelloOutcome;
 };
 }  // namespace mongo

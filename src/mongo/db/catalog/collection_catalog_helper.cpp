@@ -44,24 +44,28 @@ void forEachCollectionFromDb(OperationContext* opCtx,
                              CollectionCatalog::CollectionInfoFn callback,
                              CollectionCatalog::CollectionInfoFn predicate) {
 
-    CollectionCatalog& catalog = CollectionCatalog::get(opCtx);
-    for (auto collectionIt = catalog.begin(dbName); collectionIt != catalog.end(); ++collectionIt) {
+    auto catalogForIteration = CollectionCatalog::get(opCtx);
+    for (auto collectionIt = catalogForIteration->begin(opCtx, dbName);
+         collectionIt != catalogForIteration->end(opCtx);
+         ++collectionIt) {
         auto uuid = collectionIt.uuid().get();
-        if (predicate && !catalog.checkIfCollectionSatisfiable(uuid, predicate)) {
+        if (predicate && !catalogForIteration->checkIfCollectionSatisfiable(uuid, predicate)) {
             continue;
         }
 
         boost::optional<Lock::CollectionLock> clk;
-        Collection* collection = nullptr;
+        CollectionPtr collection;
 
-        while (auto nss = catalog.lookupNSSByUUID(opCtx, uuid)) {
+        auto catalog = CollectionCatalog::get(opCtx);
+        while (auto nss = catalog->lookupNSSByUUID(opCtx, uuid)) {
             // Get a fresh snapshot for each locked collection to see any catalog changes.
             clk.emplace(opCtx, *nss, collLockMode);
             opCtx->recoveryUnit()->abandonSnapshot();
+            catalog = CollectionCatalog::get(opCtx);
 
-            if (catalog.lookupNSSByUUID(opCtx, uuid) == nss) {
+            if (catalog->lookupNSSByUUID(opCtx, uuid) == nss) {
                 // Success: locked the namespace and the UUID still maps to it.
-                collection = catalog.lookupCollectionByUUID(opCtx, uuid);
+                collection = catalog->lookupCollectionByUUID(opCtx, uuid);
                 invariant(collection);
                 break;
             }

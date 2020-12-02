@@ -38,7 +38,6 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/read_preference.h"
 #include "mongo/db/lasterror.h"
-#include "mongo/db/query/find_and_modify_request.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata.h"
@@ -147,13 +146,25 @@ StatusWith<OID> extractElectionId(const BSONObj& responseObj) {
                                       << hostContacted};
             }
 
-            return {ErrorCodes::NotMaster, "only primary can have electionId"};
+            return {ErrorCodes::NotWritablePrimary, "only primary can have electionId"};
         }
 
         return {ErrorCodes::UnsupportedFormat, electionIdStatus.reason()};
     }
 
     return electionId;
+}
+
+write_ops::FindAndModifyCommand makeFindAndModifyRequest(
+    NamespaceString fullNs, BSONObj query, boost::optional<write_ops::UpdateModification> update) {
+    auto request = write_ops::FindAndModifyCommand(fullNs);
+    request.setQuery(query);
+    if (update) {
+        request.setUpdate(std::move(update));
+    } else {
+        request.setRemove(true);
+    }
+    return request;
 }
 
 }  // unnamed namespace
@@ -191,12 +202,12 @@ StatusWith<LockpingsType> DistLockCatalogImpl::getPing(OperationContext* opCtx,
 }
 
 Status DistLockCatalogImpl::ping(OperationContext* opCtx, StringData processID, Date_t ping) {
-    auto request =
-        FindAndModifyRequest::makeUpdate(_lockPingNS,
-                                         BSON(LockpingsType::process() << processID),
-                                         BSON("$set" << BSON(LockpingsType::ping(ping))));
+    auto request = write_ops::FindAndModifyCommand(_lockPingNS);
+    request.setQuery(BSON(LockpingsType::process() << processID));
+    request.setUpdate(write_ops::UpdateModification::parseFromClassicUpdate(
+        BSON("$set" << BSON(LockpingsType::ping(ping)))));
     request.setUpsert(true);
-    request.setWriteConcern(kMajorityWriteConcern);
+    request.setWriteConcern(kMajorityWriteConcern.toBSON());
 
     auto const shardRegistry = Grid::get(opCtx)->shardRegistry();
     auto resultStatus = shardRegistry->getConfigShard()->runCommandWithFixedRetryAttempts(
@@ -224,13 +235,13 @@ StatusWith<LocksType> DistLockCatalogImpl::grabLock(OperationContext* opCtx,
                                 << LocksType::process() << processId << LocksType::when(time)
                                 << LocksType::why() << why));
 
-    auto request = FindAndModifyRequest::makeUpdate(
+    auto request = makeFindAndModifyRequest(
         _locksNS,
         BSON(LocksType::name() << lockID << LocksType::state(LocksType::UNLOCKED)),
-        BSON("$set" << newLockDetails));
+        write_ops::UpdateModification::parseFromClassicUpdate(BSON("$set" << newLockDetails)));
     request.setUpsert(true);
-    request.setShouldReturnNew(true);
-    request.setWriteConcern(writeConcern);
+    request.setNew(true);
+    request.setWriteConcern(writeConcern.toBSON());
 
     auto const shardRegistry = Grid::get(opCtx)->shardRegistry();
     auto resultStatus = shardRegistry->getConfigShard()->runCommandWithFixedRetryAttempts(
@@ -281,10 +292,12 @@ StatusWith<LocksType> DistLockCatalogImpl::overtakeLock(OperationContext* opCtx,
                                 << LocksType::process() << processId << LocksType::when(time)
                                 << LocksType::why() << why));
 
-    auto request = FindAndModifyRequest::makeUpdate(
-        _locksNS, BSON("$or" << orQueryBuilder.arr()), BSON("$set" << newLockDetails));
-    request.setShouldReturnNew(true);
-    request.setWriteConcern(kMajorityWriteConcern);
+    auto request = makeFindAndModifyRequest(
+        _locksNS,
+        BSON("$or" << orQueryBuilder.arr()),
+        write_ops::UpdateModification::parseFromClassicUpdate(BSON("$set" << newLockDetails)));
+    request.setNew(true);
+    request.setWriteConcern(kMajorityWriteConcern.toBSON());
 
     auto const shardRegistry = Grid::get(opCtx)->shardRegistry();
     auto resultStatus = shardRegistry->getConfigShard()->runCommandWithFixedRetryAttempts(
@@ -312,26 +325,29 @@ StatusWith<LocksType> DistLockCatalogImpl::overtakeLock(OperationContext* opCtx,
 }
 
 Status DistLockCatalogImpl::unlock(OperationContext* opCtx, const OID& lockSessionID) {
-    FindAndModifyRequest request = FindAndModifyRequest::makeUpdate(
-        _locksNS,
-        BSON(LocksType::lockID(lockSessionID)),
-        BSON("$set" << BSON(LocksType::state(LocksType::UNLOCKED))));
-    request.setWriteConcern(kMajorityWriteConcern);
+    auto request =
+        makeFindAndModifyRequest(_locksNS,
+                                 BSON(LocksType::lockID(lockSessionID)),
+                                 write_ops::UpdateModification::parseFromClassicUpdate(
+                                     BSON("$set" << BSON(LocksType::state(LocksType::UNLOCKED)))));
+    request.setWriteConcern(kMajorityWriteConcern.toBSON());
     return _unlock(opCtx, request);
 }
 
 Status DistLockCatalogImpl::unlock(OperationContext* opCtx,
                                    const OID& lockSessionID,
                                    StringData name) {
-    FindAndModifyRequest request = FindAndModifyRequest::makeUpdate(
+    auto request = makeFindAndModifyRequest(
         _locksNS,
         BSON(LocksType::lockID(lockSessionID) << LocksType::name(name.toString())),
-        BSON("$set" << BSON(LocksType::state(LocksType::UNLOCKED))));
-    request.setWriteConcern(kMajorityWriteConcern);
+        write_ops::UpdateModification::parseFromClassicUpdate(
+            BSON("$set" << BSON(LocksType::state(LocksType::UNLOCKED)))));
+    request.setWriteConcern(kMajorityWriteConcern.toBSON());
     return _unlock(opCtx, request);
 }
 
-Status DistLockCatalogImpl::_unlock(OperationContext* opCtx, const FindAndModifyRequest& request) {
+Status DistLockCatalogImpl::_unlock(OperationContext* opCtx,
+                                    const write_ops::FindAndModifyCommand& request) {
     auto const shardRegistry = Grid::get(opCtx)->shardRegistry();
     auto resultStatus = shardRegistry->getConfigShard()->runCommandWithFixedRetryAttempts(
         opCtx,
@@ -358,7 +374,8 @@ Status DistLockCatalogImpl::unlockAll(OperationContext* opCtx, const std::string
         updateOp.setUpdates({[&] {
             write_ops::UpdateOpEntry entry;
             entry.setQ(BSON(LocksType::process(processID)));
-            entry.setU(BSON("$set" << BSON(LocksType::state(LocksType::UNLOCKED))));
+            entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(
+                BSON("$set" << BSON(LocksType::state(LocksType::UNLOCKED)))));
             entry.setUpsert(false);
             entry.setMulti(true);
             return entry;
@@ -492,8 +509,8 @@ StatusWith<LocksType> DistLockCatalogImpl::getLockByName(OperationContext* opCtx
 
 Status DistLockCatalogImpl::stopPing(OperationContext* opCtx, StringData processId) {
     auto request =
-        FindAndModifyRequest::makeRemove(_lockPingNS, BSON(LockpingsType::process() << processId));
-    request.setWriteConcern(kMajorityWriteConcern);
+        makeFindAndModifyRequest(_lockPingNS, BSON(LockpingsType::process() << processId), {});
+    request.setWriteConcern(kMajorityWriteConcern.toBSON());
 
     auto const shardRegistry = Grid::get(opCtx)->shardRegistry();
     auto resultStatus = shardRegistry->getConfigShard()->runCommandWithFixedRetryAttempts(

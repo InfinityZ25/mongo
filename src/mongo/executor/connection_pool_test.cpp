@@ -105,7 +105,7 @@ protected:
     void dropConnectionsTest(std::shared_ptr<ConnectionPool> const& pool, Ptr t);
 
 private:
-    std::shared_ptr<OutOfLineExecutor> _executor = InlineCountingExecutor::make();
+    std::shared_ptr<OutOfLineExecutor> _executor = InlineQueuedCountingExecutor::make();
     std::shared_ptr<ConnectionPool> _pool;
 };
 
@@ -437,8 +437,6 @@ TEST_F(ConnectionPoolTest, TimeoutOnSetup) {
 
     ASSERT(!conn->isOK());
     ASSERT_EQ(conn->getStatus(), ErrorCodes::NetworkInterfaceExceededTimeLimit);
-    ASSERT_STRING_CONTAINS(conn->getStatus().reason(),
-                           fmt::format("{}", ConnectionPool::kHostRetryTimeout));
 }
 
 /**

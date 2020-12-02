@@ -4,10 +4,9 @@
  * initial sync (via heartbeats), it initiates a reconfig to remove the corresponding 'newlyAdded'
  * field.
  *
- * TODO(SERVER-46592): This test is multiversion-incompatible in 4.6.  If we use 'requires_fcv_46'
- *                     as the tag for that, removing 'requires_fcv_44' is sufficient.  Otherwise,
- *                     please set the appropriate tag when removing 'requires_fcv_44'
- * @tags: [requires_fcv_44, requires_fcv_46]
+ * @tags: [
+ *   requires_fcv_47,
+ * ]
  */
 
 (function() {
@@ -23,29 +22,15 @@ const collName = "testcoll";
 const rst = new ReplSetTest({
     name: testName,
     nodes: [{}, {}, {rsConfig: {priority: 0}}],
-    nodeOptions: {setParameter: {enableAutomaticReconfig: true}},
     settings: {chainingAllowed: false},
     useBridge: true
 });
 rst.startSet();
-
-// TODO (SERVER-47142): Replace with initiateWithHighElectionTimeout. The automatic reconfig will
-// dropAllSnapshots asynchronously, precluding waiting on a stable recovery timestamp.
-const cfg = rst.getReplSetConfig();
-cfg.settings = cfg.settings || {};
-cfg.settings["electionTimeoutMillis"] = ReplSetTest.kForeverMillis;
-rst.initiateWithAnyNodeAsPrimary(
-    cfg, "replSetInitiate", {doNotWaitForStableRecoveryTimestamp: true});
+rst.initiateWithHighElectionTimeout();
 
 const primary = rst.getPrimary();
 const primaryDb = primary.getDB(dbName);
 const primaryColl = primaryDb.getCollection(collName);
-
-// TODO (SERVER-46808): Move this into ReplSetTest.initiate
-waitForNewlyAddedRemovalForNodeToBeCommitted(primary, 0);
-waitForNewlyAddedRemovalForNodeToBeCommitted(primary, 1);
-waitForNewlyAddedRemovalForNodeToBeCommitted(primary, 2);
-waitForConfigReplication(primary, rst.nodes);
 
 // We did two automatic reconfigs to remove 'newlyAdded' fields (for members 1 and 2).
 const replMetricsAtStart = primaryDb.serverStatus().metrics.repl;
@@ -63,7 +48,6 @@ const secondary = rst.add({
     setParameter: {
         'failpoint.initialSyncHangBeforeFinish': tojson({mode: 'alwaysOn'}),
         'numInitialSyncAttempts': 1,
-        'enableAutomaticReconfig': true,
     }
 });
 rst.reInitiate();
@@ -81,12 +65,18 @@ let getConfigRes = assert.commandWorked(primary.adminCommand({replSetGetConfig: 
 let newNodeRes = getConfigRes.members[3];
 assert.eq(false, newNodeRes.hasOwnProperty("newlyAdded"), getConfigRes);
 
+jsTestLog("Making sure the 'newlyAdded' field is visible in replSetGetConfig with test param");
+getConfigRes = getConfigWithNewlyAdded(primary).config;
+newNodeRes = getConfigRes.members[3];
+assert.eq(true, newNodeRes.hasOwnProperty("newlyAdded"), getConfigRes);
+
 jsTestLog("Checking behavior with 'newlyAdded' field set, during initial sync");
 assertVoteCount(primary, {
     votingMembersCount: 3,
     majorityVoteCount: 2,
     writableVotingMembersCount: 3,
-    writeMajorityCount: 2
+    writeMajorityCount: 2,
+    totalMembersCount: 4,
 });
 assert.commandWorked(primaryColl.insert({a: 0}, {writeConcern: {w: 3}}));
 assert.commandWorked(primaryColl.insert({a: 1}, {writeConcern: {w: "majority"}}));
@@ -101,16 +91,16 @@ checkWriteConcernTimedOut(res);
 rst.nodes[2].disconnect(rst.nodes);
 assert.commandWorked(primaryColl.insert({a: 3}, {writeConcern: {w: "majority"}}));
 
-// TODO(SERVER-47612): Reinstate these elections in a more robust form.
-/**
- * // Only two nodes are needed for an election (0 and 1).
- * assert.commandWorked(rst.nodes[1].adminCommand({replSetStepUp: 1}));
- *
- * // Reset node 0 to be primary.
- * rst.awaitReplication(null, null, [rst.nodes[0], rst.nodes[1]]);
- * assert.commandWorked(rst.nodes[0].adminCommand({replSetStepUp: 1}));
- * assert.eq(rst.getPrimary(), rst.nodes[0]);
- */
+// Only two nodes are needed for an election (0 and 1).
+assert.commandWorked(rst.nodes[1].adminCommand({replSetStepUp: 1}));
+assert.eq(rst.getPrimary(), rst.nodes[1]);
+rst.waitForConfigReplication(rst.nodes[1], [rst.nodes[0], rst.nodes[1], rst.nodes[3]]);
+
+// Reset node 0 to be primary.
+rst.awaitReplication(null, null, [rst.nodes[0], rst.nodes[1]]);
+assert.commandWorked(rst.nodes[0].adminCommand({replSetStepUp: 1}));
+assert.eq(rst.getPrimary(), rst.nodes[0]);
+rst.waitForConfigReplication(rst.nodes[0], [rst.nodes[0], rst.nodes[1], rst.nodes[3]]);
 
 // Initial syncing nodes do not acknowledge replication.
 rst.nodes[1].disconnect(rst.nodes);
@@ -145,7 +135,8 @@ assertVoteCount(primary, {
     votingMembersCount: 3,
     majorityVoteCount: 2,
     writableVotingMembersCount: 3,
-    writeMajorityCount: 2
+    writeMajorityCount: 2,
+    totalMembersCount: 4,
 });
 
 // Voting isn't required for satisfying numerical write concerns.
@@ -156,16 +147,16 @@ rst.nodes[2].disconnect(rst.nodes);
 rst.nodes[3].disconnect(rst.nodes);
 assert.commandWorked(primaryColl.insert({a: 6}, {writeConcern: {w: "majority"}}));
 
-// TODO(SERVER-47612): Reinstate these elections in a more robust form.
-/**
- * // Only two nodes are needed for an election (0 and 1).
- * assert.commandWorked(rst.nodes[1].adminCommand({replSetStepUp: 1}));
- *
- * // Reset node 0 to be primary.
- * rst.awaitReplication(null, null, [rst.nodes[0], rst.nodes[1]]);
- * assert.commandWorked(rst.nodes[0].adminCommand({replSetStepUp: 1}));
- * assert.eq(rst.getPrimary(), rst.nodes[0]);
- */
+// Only two nodes are needed for an election (0 and 1).
+assert.commandWorked(rst.nodes[1].adminCommand({replSetStepUp: 1}));
+assert.eq(rst.getPrimary(), rst.nodes[1]);
+rst.waitForConfigReplication(rst.nodes[1], [rst.nodes[0], rst.nodes[1]]);
+
+// Reset node 0 to be primary.
+rst.awaitReplication(null, null, [rst.nodes[0], rst.nodes[1]]);
+assert.commandWorked(rst.nodes[0].adminCommand({replSetStepUp: 1}));
+assert.eq(rst.getPrimary(), rst.nodes[0]);
+rst.waitForConfigReplication(rst.nodes[0], [rst.nodes[0], rst.nodes[1]]);
 
 // 'newlyAdded' nodes cannot be one of the two nodes to satisfy w:majority.
 rst.nodes[3].reconnect(rst.nodes);
@@ -200,7 +191,8 @@ assertVoteCount(primary, {
     votingMembersCount: 4,
     majorityVoteCount: 3,
     writableVotingMembersCount: 4,
-    writeMajorityCount: 3
+    writeMajorityCount: 3,
+    totalMembersCount: 4,
 });
 
 jsTestLog("Checking that the metric for removal of 'newlyAdded' fields was incremented");
@@ -217,19 +209,18 @@ assert.commandWorked(primaryColl.insert({"steady": "state"}, {writeConcern: {w: 
 // is) can be one of them (0, 1, and 3).
 rst.nodes[2].disconnect(rst.nodes);
 
-// TODO (SERVER-47499): Uncomment this line.
-// assert.commandWorked(primaryColl.insert({a: 8}, {writeConcern: {w: "majority"}}));
+assert.commandWorked(primaryColl.insert({a: 8}, {writeConcern: {w: "majority"}}));
 
-// TODO(SERVER-47612): Reinstate these elections in a more robust form.
-/**
- * // Only three nodes are needed for an election (0, 1, and 3).
- * assert.commandWorked(rst.nodes[1].adminCommand({replSetStepUp: 1}));
- *
- * // Reset node 0 to be primary.
- * rst.awaitReplication(null, null, [rst.nodes[0], rst.nodes[1]]);
- * assert.commandWorked(rst.nodes[0].adminCommand({replSetStepUp: 1}));
- * assert.eq(rst.getPrimary(), rst.nodes[0]);
- */
+// Only three nodes are needed for an election (0, 1, and 3).
+assert.commandWorked(rst.nodes[1].adminCommand({replSetStepUp: 1}));
+assert.eq(rst.getPrimary(), rst.nodes[1]);
+rst.waitForConfigReplication(rst.nodes[1], [rst.nodes[0], rst.nodes[1], rst.nodes[3]]);
+
+// Reset node 0 to be primary.
+rst.awaitReplication(null, null, [rst.nodes[0], rst.nodes[1]]);
+assert.commandWorked(rst.nodes[0].adminCommand({replSetStepUp: 1}));
+assert.eq(rst.getPrimary(), rst.nodes[0]);
+rst.waitForConfigReplication(rst.nodes[0], [rst.nodes[0], rst.nodes[1], rst.nodes[3]]);
 
 // 3 nodes are needed for a w:majority write.
 rst.nodes[3].disconnect(rst.nodes);

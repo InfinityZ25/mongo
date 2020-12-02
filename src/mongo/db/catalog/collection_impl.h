@@ -37,7 +37,7 @@
 namespace mongo {
 class IndexConsistency;
 class CollectionCatalog;
-class CollectionImpl final : public Collection, public CappedCallback {
+class CollectionImpl final : public Collection {
 public:
     enum ValidationAction { WARN, ERROR_V };
     enum ValidationLevel { OFF, MODERATE, STRICT_V };
@@ -50,14 +50,23 @@ public:
 
     ~CollectionImpl();
 
+    std::shared_ptr<Collection> clone() const final;
+
     class FactoryImpl : public Factory {
     public:
-        std::unique_ptr<Collection> make(OperationContext* opCtx,
+        std::shared_ptr<Collection> make(OperationContext* opCtx,
                                          const NamespaceString& nss,
                                          RecordId catalogId,
                                          CollectionUUID uuid,
                                          std::unique_ptr<RecordStore> rs) const final;
     };
+
+    SharedCollectionDecorations* getSharedDecorations() const final;
+
+    void init(OperationContext* opCtx) final;
+    bool isInitialized() const final;
+    bool isCommitted() const final;
+    void setCommitted(bool val) final;
 
     const NamespaceString& ns() const final {
         return _ns;
@@ -81,12 +90,14 @@ public:
         return _indexCatalog.get();
     }
 
-    const RecordStore* getRecordStore() const final {
-        return _recordStore.get();
+    RecordStore* getRecordStore() const final {
+        return _shared->_recordStore.get();
     }
 
-    RecordStore* getRecordStore() final {
-        return _recordStore.get();
+    std::shared_ptr<Ident> getSharedIdent() const final {
+        // Use shared_ptr's aliasing constructor so we can keep all shared state in a single
+        // reference counted object
+        return {_shared, _shared->_recordStore.get()};
     }
 
     const BSONObj getValidatorDoc() const final {
@@ -97,7 +108,7 @@ public:
 
     Snapshotted<BSONObj> docFor(OperationContext* opCtx, RecordId loc) const final {
         return Snapshotted<BSONObj>(opCtx->recoveryUnit()->getSnapshotId(),
-                                    _recordStore->dataFor(opCtx, loc).releaseToBson());
+                                    _shared->_recordStore->dataFor(opCtx, loc).releaseToBson());
     }
 
     /**
@@ -110,8 +121,22 @@ public:
                                                     bool forward = true) const final;
 
     /**
-     * Deletes the document with the given RecordId from the collection.
-     *
+     * Deletes the document with the given RecordId from the collection. For a description of
+     * the parameters, see the overloaded function below.
+     */
+    void deleteDocument(
+        OperationContext* opCtx,
+        StmtId stmtId,
+        RecordId loc,
+        OpDebug* opDebug,
+        bool fromMigrate = false,
+        bool noWarn = false,
+        Collection::StoreDeletedDoc storeDeletedDoc = Collection::StoreDeletedDoc::Off) const final;
+
+    /**
+     * Deletes the document from the collection.
+
+     * 'doc' the document to be deleted.
      * 'stmtId' the statement id for this delete operation. Pass in kUninitializedStmtId if not
      * applicable.
      * 'fromMigrate' indicates whether the delete was induced by a chunk migration, and
@@ -126,12 +151,13 @@ public:
      */
     void deleteDocument(
         OperationContext* opCtx,
+        Snapshotted<BSONObj> doc,
         StmtId stmtId,
         RecordId loc,
         OpDebug* opDebug,
         bool fromMigrate = false,
         bool noWarn = false,
-        Collection::StoreDeletedDoc storeDeletedDoc = Collection::StoreDeletedDoc::Off) final;
+        Collection::StoreDeletedDoc storeDeletedDoc = Collection::StoreDeletedDoc::Off) const final;
 
     /*
      * Inserts all documents inside one WUOW.
@@ -144,7 +170,7 @@ public:
                            std::vector<InsertStatement>::const_iterator begin,
                            std::vector<InsertStatement>::const_iterator end,
                            OpDebug* opDebug,
-                           bool fromMigrate = false) final;
+                           bool fromMigrate = false) const final;
 
     /**
      * this does NOT modify the doc before inserting
@@ -155,7 +181,7 @@ public:
     Status insertDocument(OperationContext* opCtx,
                           const InsertStatement& doc,
                           OpDebug* opDebug,
-                          bool fromMigrate = false) final;
+                          bool fromMigrate = false) const final;
 
     /**
      * Callers must ensure no document validation is performed for this collection when calling
@@ -163,7 +189,7 @@ public:
      */
     Status insertDocumentsForOplog(OperationContext* opCtx,
                                    std::vector<Record>* records,
-                                   const std::vector<Timestamp>& timestamps) final;
+                                   const std::vector<Timestamp>& timestamps) const final;
 
     /**
      * Inserts a document into the record store for a bulk loader that manages the index building
@@ -174,7 +200,7 @@ public:
      */
     Status insertDocumentForBulkLoader(OperationContext* opCtx,
                                        const BSONObj& doc,
-                                       const OnRecordInsertedFn& onRecordInserted) final;
+                                       const OnRecordInsertedFn& onRecordInserted) const final;
 
     /**
      * Updates the document @ oldLocation with newDoc.
@@ -191,7 +217,7 @@ public:
                             const BSONObj& newDoc,
                             bool indexesAffected,
                             OpDebug* opDebug,
-                            CollectionUpdateArgs* args) final;
+                            CollectionUpdateArgs* args) const final;
 
     bool updateWithDamagesSupported() const final;
 
@@ -207,7 +233,7 @@ public:
                                                      const Snapshotted<RecordData>& oldRec,
                                                      const char* damageSource,
                                                      const mutablebson::DamageVector& damages,
-                                                     CollectionUpdateArgs* args) final;
+                                                     CollectionUpdateArgs* args) const final;
 
     // -----------
 
@@ -230,7 +256,7 @@ public:
      * The caller should hold a collection X lock and ensure there are no index builds in progress
      * on the collection.
      */
-    void cappedTruncateAfter(OperationContext* opCtx, RecordId end, bool inclusive) final;
+    void cappedTruncateAfter(OperationContext* opCtx, RecordId end, bool inclusive) const final;
 
     /**
      * Returns a non-ok Status if validator is not legal for this collection.
@@ -247,7 +273,7 @@ public:
      * An empty validator removes all validation.
      * Requires an exclusive lock on the collection.
      */
-    Status setValidator(OperationContext* opCtx, BSONObj validator) final;
+    void setValidator(OperationContext* opCtx, Validator validator) final;
 
     Status setValidationLevel(OperationContext* opCtx, StringData newLevel) final;
     Status setValidationAction(OperationContext* opCtx, StringData newAction) final;
@@ -277,6 +303,7 @@ public:
     bool isCapped() const final;
 
     CappedCallback* getCappedCallback() final;
+    const CappedCallback* getCappedCallback() const final;
 
     /**
      * Get a pointer to a capped insert notifier object. The caller can wait on this object
@@ -312,11 +339,13 @@ public:
                           BSONObjBuilder* details = nullptr,
                           int scale = 1) const final;
 
+    uint64_t getIndexFreeStorageBytes(OperationContext* const opCtx) const final;
+
     /**
      * If return value is not boost::none, reads with majority read concern using an older snapshot
      * must error.
      */
-    boost::optional<Timestamp> getMinimumVisibleSnapshot() final {
+    boost::optional<Timestamp> getMinimumVisibleSnapshot() const final {
         return _minVisibleSnapshot;
     }
 
@@ -325,13 +354,6 @@ public:
      * set the minimum visible snapshot backwards in time.
      */
     void setMinimumVisibleSnapshot(Timestamp newMinimumVisibleSnapshot) final;
-
-    bool haveCappedWaiters() final;
-
-    /**
-     * Notify (capped collection) waiters of data changes, like an insert.
-     */
-    void notifyCappedWaitersIfNeeded() final;
 
     /**
      * Get a pointer to the collection's default collator. The pointer must not be used after this
@@ -344,25 +366,21 @@ public:
 
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makePlanExecutor(
         OperationContext* opCtx,
-        PlanExecutor::YieldPolicy yieldPolicy,
-        ScanDirection scanDirection) final;
+        const CollectionPtr& yieldableCollection,
+        PlanYieldPolicy::YieldPolicy yieldPolicy,
+        ScanDirection scanDirection,
+        boost::optional<RecordId> resumeAfterRecordId) const final;
 
     void indexBuildSuccess(OperationContext* opCtx, IndexCatalogEntry* index) final;
 
     void establishOplogCollectionForLogging(OperationContext* opCtx) final;
-
-    void init(OperationContext* opCtx) final;
-    bool isInitialized() const final;
-    bool isCommitted() const final;
-    void setCommitted(bool val) final;
+    void onDeregisterFromCatalog() final;
 
 private:
     /**
      * Returns a non-ok Status if document does not pass this collection's validator.
      */
     Status checkValidation(OperationContext* opCtx, const BSONObj& document) const;
-
-    Status aboutToDeleteCapped(OperationContext* opCtx, const RecordId& loc, RecordData data);
 
     /**
      * same semantics as insertDocument, but doesn't do:
@@ -374,38 +392,82 @@ private:
     Status _insertDocuments(OperationContext* opCtx,
                             std::vector<InsertStatement>::const_iterator begin,
                             std::vector<InsertStatement>::const_iterator end,
-                            OpDebug* opDebug);
+                            OpDebug* opDebug) const;
+
+    /**
+     * Holder of shared state between CollectionImpl clones. Also implements CappedCallback, a
+     * pointer to which is given to the RecordStore, so that the CappedCallback logic can always be
+     * performed on the latest CollectionImpl instance without needing to know about copy-on-write
+     * on CollectionImpl instances.
+     */
+    struct SharedState : public CappedCallback {
+        SharedState(CollectionImpl* collection, std::unique_ptr<RecordStore> recordStore);
+        ~SharedState();
+
+        /**
+         * The Collection instance that need to be notified through the CappedCallback changes when
+         * the Collection is cloned for a write. When the constructor and destructor is run for
+         * CollectionImpl it notifies this class through this interface so we can keep track of the
+         * most recent Collection instance to be used when implementing CappedCallback.
+         */
+        void instanceCreated(CollectionImpl* collection);
+        void instanceDeleted(CollectionImpl* collection);
+
+        bool haveCappedWaiters() const final;
+        void notifyCappedWaitersIfNeeded() const final;
+        Status aboutToDeleteCapped(OperationContext* opCtx,
+                                   const RecordId& loc,
+                                   RecordData data) final;
+
+        // As we're holding a MODE_X lock when cloning Collections we may have up to two current
+        // Collection instances at the same time if there's a pending clone that is not commited to
+        // the catalog yet. We need to keep track of the previous instance in case of a rollback.
+        // When we delete from capped, operate on the latest collection.
+        CollectionImpl* _collectionLatest = nullptr;
+        CollectionImpl* _collectionPrev = nullptr;
+
+        // The RecordStore may be null during a repair operation.
+        std::unique_ptr<RecordStore> _recordStore;
+
+        // This object is decorable and decorated with unversioned data related to the collection.
+        // Not associated with any particular Collection instance for the collection, but shared
+        // across all all instances for the same collection. This is a vehicle for users of a
+        // collection to cache unversioned state for a collection that is accessible across all of
+        // the Collection instances.
+        SharedCollectionDecorations _sharedDecorations;
+
+        // The default collation which is applied to operations and indices which have no collation
+        // of their own. The collection's validator will respect this collation. If null, the
+        // default collation is simple binary compare.
+        std::unique_ptr<CollatorInterface> _collator;
+
+        // Notifier object for awaitData. Threads polling a capped collection for new data can wait
+        // on this object until notified of the arrival of new data.
+        //
+        // This is non-null if and only if the collection is a capped collection.
+        const std::shared_ptr<CappedInsertNotifier> _cappedNotifier;
+
+        const bool _needCappedLock;
+    };
+
 
     NamespaceString _ns;
     RecordId _catalogId;
     UUID _uuid;
     bool _committed = true;
+    std::shared_ptr<SharedState> _shared;
 
-    // The RecordStore may be null during a repair operation.
-    std::unique_ptr<RecordStore> _recordStore;  // owned
-    const bool _needCappedLock;
-    std::unique_ptr<IndexCatalog> _indexCatalog;
+    clonable_ptr<IndexCatalog> _indexCatalog;
 
-
-    // The default collation which is applied to operations and indices which have no collation of
-    // their own. The collection's validator will respect this collation.
-    //
-    // If null, the default collation is simple binary compare.
-    std::unique_ptr<CollatorInterface> _collator;
-
-
+    // The validator is using shared state internally. Collections share validator until a new
+    // validator is set in setValidator which sets a new instance.
     Validator _validator;
-
-    ValidationAction _validationAction;
-    ValidationLevel _validationLevel;
+    // The default values match the defaults of the functions that parse the validation action and
+    // level.
+    ValidationAction _validationAction = ERROR_V;
+    ValidationLevel _validationLevel = STRICT_V;
 
     bool _recordPreImages = false;
-
-    // Notifier object for awaitData. Threads polling a capped collection for new data can wait
-    // on this object until notified of the arrival of new data.
-    //
-    // This is non-null if and only if the collection is a capped collection.
-    const std::shared_ptr<CappedInsertNotifier> _cappedNotifier;
 
     // The earliest snapshot that is allowed to use this collection.
     boost::optional<Timestamp> _minVisibleSnapshot;

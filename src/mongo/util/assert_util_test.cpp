@@ -38,6 +38,7 @@
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/quick_exit.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -72,7 +73,7 @@ MONGO_STATIC_ASSERT(std::is_same<error_details::ErrorCategoriesFor<ErrorCodes::B
 MONGO_STATIC_ASSERT(std::is_base_of<AssertionException, ExceptionFor<ErrorCodes::BadValue>>());
 MONGO_STATIC_ASSERT(!std::is_base_of<ExceptionForCat<ErrorCategory::NetworkError>,
                                      ExceptionFor<ErrorCodes::BadValue>>());
-MONGO_STATIC_ASSERT(!std::is_base_of<ExceptionForCat<ErrorCategory::NotMasterError>,
+MONGO_STATIC_ASSERT(!std::is_base_of<ExceptionForCat<ErrorCategory::NotPrimaryError>,
                                      ExceptionFor<ErrorCodes::BadValue>>());
 MONGO_STATIC_ASSERT(!std::is_base_of<ExceptionForCat<ErrorCategory::Interruption>,
                                      ExceptionFor<ErrorCodes::BadValue>>());
@@ -83,43 +84,46 @@ TEST(AssertUtils, UassertNamedCodeWithoutCategories) {
     ASSERT_CATCHES(ErrorCodes::BadValue, ExceptionFor<ErrorCodes::BadValue>);
     ASSERT_NOT_CATCHES(ErrorCodes::BadValue, ExceptionFor<ErrorCodes::DuplicateKey>);
     ASSERT_NOT_CATCHES(ErrorCodes::BadValue, ExceptionForCat<ErrorCategory::NetworkError>);
-    ASSERT_NOT_CATCHES(ErrorCodes::BadValue, ExceptionForCat<ErrorCategory::NotMasterError>);
+    ASSERT_NOT_CATCHES(ErrorCodes::BadValue, ExceptionForCat<ErrorCategory::NotPrimaryError>);
     ASSERT_NOT_CATCHES(ErrorCodes::BadValue, ExceptionForCat<ErrorCategory::Interruption>);
 }
 
-// NotMaster - NotMasterError, RetriableError
-MONGO_STATIC_ASSERT(std::is_same<error_details::ErrorCategoriesFor<ErrorCodes::NotMaster>,
-                                 error_details::CategoryList<ErrorCategory::NotMasterError,
+// NotWritablePrimary - NotPrimaryError, RetriableError
+MONGO_STATIC_ASSERT(std::is_same<error_details::ErrorCategoriesFor<ErrorCodes::NotWritablePrimary>,
+                                 error_details::CategoryList<ErrorCategory::NotPrimaryError,
                                                              ErrorCategory::RetriableError>>());
-MONGO_STATIC_ASSERT(std::is_base_of<AssertionException, ExceptionFor<ErrorCodes::NotMaster>>());
+MONGO_STATIC_ASSERT(
+    std::is_base_of<AssertionException, ExceptionFor<ErrorCodes::NotWritablePrimary>>());
 MONGO_STATIC_ASSERT(!std::is_base_of<ExceptionForCat<ErrorCategory::NetworkError>,
-                                     ExceptionFor<ErrorCodes::NotMaster>>());
-MONGO_STATIC_ASSERT(std::is_base_of<ExceptionForCat<ErrorCategory::NotMasterError>,
-                                    ExceptionFor<ErrorCodes::NotMaster>>());
+                                     ExceptionFor<ErrorCodes::NotWritablePrimary>>());
+MONGO_STATIC_ASSERT(std::is_base_of<ExceptionForCat<ErrorCategory::NotPrimaryError>,
+                                    ExceptionFor<ErrorCodes::NotWritablePrimary>>());
 MONGO_STATIC_ASSERT(!std::is_base_of<ExceptionForCat<ErrorCategory::Interruption>,
-                                     ExceptionFor<ErrorCodes::NotMaster>>());
+                                     ExceptionFor<ErrorCodes::NotWritablePrimary>>());
 
 TEST(AssertUtils, UassertNamedCodeWithOneCategory) {
-    ASSERT_CATCHES(ErrorCodes::NotMaster, DBException);
-    ASSERT_CATCHES(ErrorCodes::NotMaster, AssertionException);
-    ASSERT_CATCHES(ErrorCodes::NotMaster, ExceptionFor<ErrorCodes::NotMaster>);
-    ASSERT_NOT_CATCHES(ErrorCodes::NotMaster, ExceptionFor<ErrorCodes::DuplicateKey>);
-    ASSERT_NOT_CATCHES(ErrorCodes::NotMaster, ExceptionForCat<ErrorCategory::NetworkError>);
-    ASSERT_CATCHES(ErrorCodes::NotMaster, ExceptionForCat<ErrorCategory::NotMasterError>);
-    ASSERT_NOT_CATCHES(ErrorCodes::NotMaster, ExceptionForCat<ErrorCategory::Interruption>);
+    ASSERT_CATCHES(ErrorCodes::NotWritablePrimary, DBException);
+    ASSERT_CATCHES(ErrorCodes::NotWritablePrimary, AssertionException);
+    ASSERT_CATCHES(ErrorCodes::NotWritablePrimary, ExceptionFor<ErrorCodes::NotWritablePrimary>);
+    ASSERT_NOT_CATCHES(ErrorCodes::NotWritablePrimary, ExceptionFor<ErrorCodes::DuplicateKey>);
+    ASSERT_NOT_CATCHES(ErrorCodes::NotWritablePrimary,
+                       ExceptionForCat<ErrorCategory::NetworkError>);
+    ASSERT_CATCHES(ErrorCodes::NotWritablePrimary, ExceptionForCat<ErrorCategory::NotPrimaryError>);
+    ASSERT_NOT_CATCHES(ErrorCodes::NotWritablePrimary,
+                       ExceptionForCat<ErrorCategory::Interruption>);
 }
 
-// InterruptedDueToReplStateChange - NotMasterError, Interruption, RetriableError
+// InterruptedDueToReplStateChange - NotPrimaryError, Interruption, RetriableError
 MONGO_STATIC_ASSERT(
     std::is_same<error_details::ErrorCategoriesFor<ErrorCodes::InterruptedDueToReplStateChange>,
                  error_details::CategoryList<ErrorCategory::Interruption,
-                                             ErrorCategory::NotMasterError,
+                                             ErrorCategory::NotPrimaryError,
                                              ErrorCategory::RetriableError>>());
 MONGO_STATIC_ASSERT(std::is_base_of<AssertionException,
                                     ExceptionFor<ErrorCodes::InterruptedDueToReplStateChange>>());
 MONGO_STATIC_ASSERT(!std::is_base_of<ExceptionForCat<ErrorCategory::NetworkError>,
                                      ExceptionFor<ErrorCodes::InterruptedDueToReplStateChange>>());
-MONGO_STATIC_ASSERT(std::is_base_of<ExceptionForCat<ErrorCategory::NotMasterError>,
+MONGO_STATIC_ASSERT(std::is_base_of<ExceptionForCat<ErrorCategory::NotPrimaryError>,
                                     ExceptionFor<ErrorCodes::InterruptedDueToReplStateChange>>());
 MONGO_STATIC_ASSERT(std::is_base_of<ExceptionForCat<ErrorCategory::Interruption>,
                                     ExceptionFor<ErrorCodes::InterruptedDueToReplStateChange>>());
@@ -134,7 +138,7 @@ TEST(AssertUtils, UassertNamedCodeWithTwoCategories) {
     ASSERT_NOT_CATCHES(ErrorCodes::InterruptedDueToReplStateChange,
                        ExceptionForCat<ErrorCategory::NetworkError>);
     ASSERT_CATCHES(ErrorCodes::InterruptedDueToReplStateChange,
-                   ExceptionForCat<ErrorCategory::NotMasterError>);
+                   ExceptionForCat<ErrorCategory::NotPrimaryError>);
     ASSERT_CATCHES(ErrorCodes::InterruptedDueToReplStateChange,
                    ExceptionForCat<ErrorCategory::Interruption>);
 }
@@ -147,7 +151,7 @@ TEST(AssertUtils, UassertNumericCode) {
     ASSERT_CATCHES(19999, AssertionException);
     ASSERT_NOT_CATCHES(19999, ExceptionFor<ErrorCodes::DuplicateKey>);
     ASSERT_NOT_CATCHES(19999, ExceptionForCat<ErrorCategory::NetworkError>);
-    ASSERT_NOT_CATCHES(19999, ExceptionForCat<ErrorCategory::NotMasterError>);
+    ASSERT_NOT_CATCHES(19999, ExceptionForCat<ErrorCategory::NotPrimaryError>);
     ASSERT_NOT_CATCHES(19999, ExceptionForCat<ErrorCategory::Interruption>);
 }
 
@@ -212,6 +216,48 @@ TEST(AssertUtils, UassertTypedExtraInfoWorks) {
     }
 }
 
+TEST(AssertUtils, UassertIncrementsUserAssertionCounter) {
+    auto userAssertions = assertionCount.user.load();
+    auto asserted = false;
+    try {
+        Status status = {ErrorCodes::BadValue, "Test"};
+        uassertStatusOK(status);
+    } catch (const DBException&) {
+        asserted = true;
+    }
+    ASSERT(asserted);
+    ASSERT_EQ(userAssertions + 1, assertionCount.user.load());
+}
+
+TEST(AssertUtils, InternalAssertWithStatus) {
+    auto userAssertions = assertionCount.user.load();
+    try {
+        Status status = {ErrorCodes::BadValue, "Test"};
+        iassert(status);
+    } catch (const DBException& ex) {
+        ASSERT_EQ(ex.code(), ErrorCodes::BadValue);
+        ASSERT_EQ(ex.reason(), "Test");
+    }
+
+    iassert(Status::OK());
+
+    ASSERT_EQ(userAssertions, assertionCount.user.load());
+}
+
+TEST(AssertUtils, InternalAssertWithExpression) {
+    auto userAssertions = assertionCount.user.load();
+    try {
+        iassert(48922, "Test", false);
+    } catch (const DBException& ex) {
+        ASSERT_EQ(ex.code(), 48922);
+        ASSERT_EQ(ex.reason(), "Test");
+    }
+
+    iassert(48922, "Another test", true);
+
+    ASSERT_EQ(userAssertions, assertionCount.user.load());
+}
+
 TEST(AssertUtils, MassertTypedExtraInfoWorks) {
     try {
         msgasserted(ErrorExtraInfoExample(123), "");
@@ -228,6 +274,94 @@ TEST(AssertUtils, MassertTypedExtraInfoWorks) {
         ASSERT(ex.extraInfo<ErrorExtraInfoExample>());
         ASSERT_EQ(ex.extraInfo<ErrorExtraInfoExample>()->data, 123);
         ASSERT_EQ(ex->data, 123);
+    }
+}
+
+// tassert
+namespace {
+
+void doTassert() {
+    auto tripwireAssertions = assertionCount.tripwire.load();
+
+    try {
+        Status status = {ErrorCodes::BadValue, "Test with Status"};
+        tassert(status);
+    } catch (const DBException& ex) {
+        ASSERT_EQ(ex.code(), ErrorCodes::BadValue);
+        ASSERT_EQ(ex.reason(), "Test with Status");
+    }
+    ASSERT_EQ(tripwireAssertions + 1, assertionCount.tripwire.load());
+
+    tassert(Status::OK());
+    ASSERT_EQ(tripwireAssertions + 1, assertionCount.tripwire.load());
+
+    try {
+        tassert(4457090, "Test with expression", false);
+    } catch (const DBException& ex) {
+        ASSERT_EQ(ex.code(), 4457090);
+        ASSERT_EQ(ex.reason(), "Test with expression");
+    }
+    ASSERT_EQ(tripwireAssertions + 2, assertionCount.tripwire.load());
+
+    tassert(4457091, "Another test with expression", true);
+    ASSERT_EQ(tripwireAssertions + 2, assertionCount.tripwire.load());
+
+    try {
+        tasserted(4457092, "Test with tasserted");
+    } catch (const DBException& ex) {
+        ASSERT_EQ(ex.code(), 4457092);
+        ASSERT_EQ(ex.reason(), "Test with tasserted");
+    }
+    ASSERT_EQ(tripwireAssertions + 3, assertionCount.tripwire.load());
+}
+
+}  // namespace
+
+DEATH_TEST(TassertTerminationTest,
+           tassertCleanLogMsg,
+           "Aborting process during clean exit due to prior failed tripwire assertions") {
+    doTassert();
+}
+
+DEATH_TEST(TassertTerminationTest, tassertCleanLogMsgCode, "4457001") {
+    doTassert();
+}
+
+DEATH_TEST(TassertTerminationTest, tassertCleanIndividualLogMsg, "Tripwire assertion") {
+    doTassert();
+}
+
+DEATH_TEST(TassertTerminationTest, tassertCleanIndividualLogMsgCode, "4457000") {
+    doTassert();
+}
+
+DEATH_TEST(TassertTerminationTest,
+           tassertUncleanLogMsg,
+           "Detected prior failed tripwire assertions during unclean exit") {
+    doTassert();
+    quickExit(EXIT_ABRUPT);
+}
+
+DEATH_TEST(TassertTerminationTest, tassertUncleanLogMsgCode, "4457002") {
+    doTassert();
+    quickExit(EXIT_ABRUPT);
+}
+
+DEATH_TEST(TassertTerminationTest, tassertUncleanIndividualLogMsg, "Tripwire assertion") {
+    doTassert();
+    quickExit(EXIT_ABRUPT);
+}
+
+DEATH_TEST(TassertTerminationTest, tassertUncleanIndividualLogMsgCode, "4457000") {
+    doTassert();
+    quickExit(EXIT_ABRUPT);
+}
+
+DEATH_TEST(TassertTerminationTest, mongoUnreachableNonFatal, "Hit a MONGO_UNREACHABLE_TASSERT!") {
+    try {
+        MONGO_UNREACHABLE_TASSERT(4457093);
+    } catch (const DBException&) {
+        // Catch the DBException, to ensure that we eventually abort during clean exit.
     }
 }
 

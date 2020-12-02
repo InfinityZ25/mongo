@@ -32,6 +32,7 @@
 #include <boost/optional.hpp>
 #include <functional>
 
+#include "mongo/db/api_parameters.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/cursor_id.h"
@@ -43,7 +44,6 @@
 
 namespace mongo {
 
-class Collection;
 class CursorManager;
 class RecoveryUnit;
 
@@ -55,46 +55,24 @@ class RecoveryUnit;
  * using a CursorManager. See cursor_manager.h for more details.
  */
 struct ClientCursorParams {
-    // Describes whether callers should acquire locks when using a ClientCursor. Not all cursors
-    // have the same locking behavior. In particular, find cursors require the caller to lock the
-    // collection in MODE_IS before calling methods on the underlying plan executor. Aggregate
-    // cursors, on the other hand, may access multiple collections and acquire their own locks on
-    // any involved collections while producing query results. Therefore, the caller need not
-    // explicitly acquire any locks when using a ClientCursor which houses execution machinery for
-    // an aggregate.
-    //
-    // The policy is consulted on getMore in order to determine locking behavior, since during
-    // getMore we otherwise could not easily know what flavor of cursor we're using.
-    enum class LockPolicy {
-        // The caller is responsible for locking the collection over which this ClientCursor
-        // executes.
-        kLockExternally,
-
-        // The caller need not hold no locks; this ClientCursor's plan executor acquires any
-        // necessary locks itself.
-        kLocksInternally,
-    };
-
     ClientCursorParams(std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> planExecutor,
                        NamespaceString nss,
                        UserNameIterator authenticatedUsersIter,
+                       APIParameters apiParameters,
                        WriteConcernOptions writeConcernOptions,
                        repl::ReadConcernArgs readConcernArgs,
                        BSONObj originatingCommandObj,
-                       LockPolicy lockPolicy,
-                       PrivilegeVector originatingPrivileges,
-                       bool needsMerge)
+                       PrivilegeVector originatingPrivileges)
         : exec(std::move(planExecutor)),
           nss(std::move(nss)),
+          apiParameters(std::move(apiParameters)),
           writeConcernOptions(std::move(writeConcernOptions)),
           readConcernArgs(std::move(readConcernArgs)),
           queryOptions(exec->getCanonicalQuery()
                            ? exec->getCanonicalQuery()->getQueryRequest().getOptions()
                            : 0),
           originatingCommandObj(originatingCommandObj.getOwned()),
-          lockPolicy(lockPolicy),
-          originatingPrivileges(std::move(originatingPrivileges)),
-          needsMerge(needsMerge) {
+          originatingPrivileges(std::move(originatingPrivileges)) {
         while (authenticatedUsersIter.more()) {
             authenticatedUsers.emplace_back(authenticatedUsersIter.next());
         }
@@ -117,13 +95,12 @@ struct ClientCursorParams {
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec;
     const NamespaceString nss;
     std::vector<UserName> authenticatedUsers;
+    const APIParameters apiParameters;
     const WriteConcernOptions writeConcernOptions;
     const repl::ReadConcernArgs readConcernArgs;
     int queryOptions = 0;
     BSONObj originatingCommandObj;
-    const LockPolicy lockPolicy;
     PrivilegeVector originatingPrivileges;
-    const bool needsMerge;
 };
 
 /**
@@ -167,16 +144,16 @@ public:
         return _txnNumber;
     }
 
-    repl::ReadConcernArgs getReadConcernArgs() const {
-        return _readConcernArgs;
+    APIParameters getAPIParameters() const {
+        return _apiParameters;
     }
 
     WriteConcernOptions getWriteConcernOptions() const {
         return _writeConcernOptions;
     }
 
-    bool needsMerge() const {
-        return _needsMerge;
+    repl::ReadConcernArgs getReadConcernArgs() const {
+        return _readConcernArgs;
     }
 
     /**
@@ -270,10 +247,6 @@ public:
 
     StringData getPlanSummary() const {
         return StringData(_planSummary);
-    }
-
-    ClientCursorParams::LockPolicy lockPolicy() const {
-        return _lockPolicy;
     }
 
     /**
@@ -392,6 +365,7 @@ private:
     // A transaction number for this cursor, if it was provided in the originating command.
     const boost::optional<TxnNumber> _txnNumber;
 
+    const APIParameters _apiParameters;
     const WriteConcernOptions _writeConcernOptions;
     const repl::ReadConcernArgs _readConcernArgs;
 
@@ -413,15 +387,6 @@ private:
 
     // See the QueryOptions enum in dbclientinterface.h.
     const int _queryOptions = 0;
-
-    const ClientCursorParams::LockPolicy _lockPolicy;
-
-    // The value of a flag specified on the originating command which indicates whether the result
-    // of this cursor will be consumed by a merging node (mongos or a mongod selected to perform a
-    // merge). Note that this flag is only set for aggregate() commands, and not for find()
-    // commands. It is therefore possible that 'needsMerge' is false when in fact there will be a
-    // merge performed.
-    const bool _needsMerge;
 
     // Unused maxTime budget for this cursor.
     Microseconds _leftoverMaxTimeMicros = Microseconds::max();

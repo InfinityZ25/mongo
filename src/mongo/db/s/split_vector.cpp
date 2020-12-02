@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -58,15 +58,15 @@ BSONObj prettyKey(const BSONObj& keyPattern, const BSONObj& key) {
 
 }  // namespace
 
-StatusWith<std::vector<BSONObj>> splitVector(OperationContext* opCtx,
-                                             const NamespaceString& nss,
-                                             const BSONObj& keyPattern,
-                                             const BSONObj& min,
-                                             const BSONObj& max,
-                                             bool force,
-                                             boost::optional<long long> maxSplitPoints,
-                                             boost::optional<long long> maxChunkObjects,
-                                             boost::optional<long long> maxChunkSizeBytes) {
+std::vector<BSONObj> splitVector(OperationContext* opCtx,
+                                 const NamespaceString& nss,
+                                 const BSONObj& keyPattern,
+                                 const BSONObj& min,
+                                 const BSONObj& max,
+                                 bool force,
+                                 boost::optional<long long> maxSplitPoints,
+                                 boost::optional<long long> maxChunkObjects,
+                                 boost::optional<long long> maxChunkSizeBytes) {
     std::vector<BSONObj> splitKeys;
     std::size_t splitVectorResponseSize = 0;
 
@@ -76,22 +76,18 @@ StatusWith<std::vector<BSONObj>> splitVector(OperationContext* opCtx,
     }
 
     {
-        AutoGetCollection autoColl(opCtx, nss, MODE_IS);
+        AutoGetCollection collection(opCtx, nss, MODE_IS);
 
-        Collection* const collection = autoColl.getCollection();
-        if (!collection) {
-            return {ErrorCodes::NamespaceNotFound, "ns not found"};
-        }
+        uassert(ErrorCodes::NamespaceNotFound, "ns not found", collection);
 
         // Allow multiKey based on the invariant that shard keys must be single-valued. Therefore,
         // any multi-key index prefixed by shard key cannot be multikey over the shard key fields.
         const IndexDescriptor* idx =
             collection->getIndexCatalog()->findShardKeyPrefixedIndex(opCtx, keyPattern, false);
-        if (idx == nullptr) {
-            return {ErrorCodes::IndexNotFound,
-                    "couldn't find index over splitting key " +
-                        keyPattern.clientReadable().toString()};
-        }
+        uassert(ErrorCodes::IndexNotFound,
+                str::stream() << "couldn't find index over splitting key "
+                              << keyPattern.clientReadable().toString(),
+                idx);
 
         // extend min to get (min, MinKey, MinKey, ....)
         KeyPattern kp(idx->keyPattern());
@@ -121,7 +117,7 @@ StatusWith<std::vector<BSONObj>> splitVector(OperationContext* opCtx,
 
         // We need a maximum size for the chunk.
         if (!maxChunkSizeBytes || maxChunkSizeBytes.get() <= 0) {
-            return {ErrorCodes::InvalidOptions, "need to specify the desired max chunk size"};
+            uasserted(ErrorCodes::InvalidOptions, "need to specify the desired max chunk size");
         }
 
         // If there's not enough data for more than one chunk, no point continuing.
@@ -167,39 +163,37 @@ StatusWith<std::vector<BSONObj>> splitVector(OperationContext* opCtx,
         long long numChunks = 0;
 
         auto exec = InternalPlanner::indexScan(opCtx,
-                                               collection,
+                                               &collection.getCollection(),
                                                idx,
                                                minKey,
                                                maxKey,
                                                BoundInclusion::kIncludeStartKeyOnly,
-                                               PlanExecutor::YIELD_AUTO,
+                                               PlanYieldPolicy::YieldPolicy::YIELD_AUTO,
                                                InternalPlanner::FORWARD);
 
         BSONObj currKey;
         PlanExecutor::ExecState state = exec->getNext(&currKey, nullptr);
-        if (PlanExecutor::ADVANCED != state) {
-            return {ErrorCodes::OperationFailed,
-                    "can't open a cursor to scan the range (desired range is possibly empty)"};
-        }
+        uassert(ErrorCodes::OperationFailed,
+                "can't open a cursor to scan the range (desired range is possibly empty)",
+                state == PlanExecutor::ADVANCED);
 
         // Get the final key in the range, and see if it's the same as the first key.
         BSONObj maxKeyInChunk;
         {
             auto exec = InternalPlanner::indexScan(opCtx,
-                                                   collection,
+                                                   &collection.getCollection(),
                                                    idx,
                                                    maxKey,
                                                    minKey,
                                                    BoundInclusion::kIncludeEndKeyOnly,
-                                                   PlanExecutor::YIELD_AUTO,
+                                                   PlanYieldPolicy::YieldPolicy::YIELD_AUTO,
                                                    InternalPlanner::BACKWARD);
 
             PlanExecutor::ExecState state = exec->getNext(&maxKeyInChunk, nullptr);
-            if (PlanExecutor::ADVANCED != state) {
-                return {ErrorCodes::OperationFailed,
-                        "can't open a cursor to find final key in range (desired range is possibly "
-                        "empty)"};
-            }
+            uassert(
+                ErrorCodes::OperationFailed,
+                "can't open a cursor to find final key in range (desired range is possibly empty)",
+                state == PlanExecutor::ADVANCED);
         }
 
         if (currKey.woCompare(maxKeyInChunk) == 0) {
@@ -287,11 +281,6 @@ StatusWith<std::vector<BSONObj>> splitVector(OperationContext* opCtx,
                 state = exec->getNext(&currKey, nullptr);
             }
 
-            if (PlanExecutor::FAILURE == state) {
-                return WorkingSetCommon::getMemberObjectStatus(currKey).withContext(
-                    "Executor error during splitVector command");
-            }
-
             if (!force)
                 break;
 
@@ -309,12 +298,12 @@ StatusWith<std::vector<BSONObj>> splitVector(OperationContext* opCtx,
                   "keyCount"_attr = keyCount);
 
             exec = InternalPlanner::indexScan(opCtx,
-                                              collection,
+                                              &collection.getCollection(),
                                               idx,
                                               minKey,
                                               maxKey,
                                               BoundInclusion::kIncludeStartKeyOnly,
-                                              PlanExecutor::YIELD_AUTO,
+                                              PlanYieldPolicy::YieldPolicy::YIELD_AUTO,
                                               InternalPlanner::FORWARD);
 
             state = exec->getNext(&currKey, nullptr);

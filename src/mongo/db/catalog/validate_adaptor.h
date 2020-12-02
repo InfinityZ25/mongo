@@ -43,16 +43,11 @@ class OperationContext;
  * collection validation operation.
  */
 class ValidateAdaptor {
-    using ValidateResultsMap = std::map<std::string, ValidateResults>;
-
 public:
     ValidateAdaptor(IndexConsistency* indexConsistency,
-                    CollectionValidation::ValidateState* validateState,
-                    ValidateResultsMap* irm)
+                    CollectionValidation::ValidateState* validateState)
 
-        : _indexConsistency(indexConsistency),
-          _validateState(validateState),
-          _indexNsResultsMap(irm) {}
+        : _indexConsistency(indexConsistency), _validateState(validateState) {}
 
     /**
      * Validates the record data and traverses through its key set to keep track of the
@@ -61,7 +56,8 @@ public:
     virtual Status validateRecord(OperationContext* opCtx,
                                   const RecordId& recordId,
                                   const RecordData& record,
-                                  size_t* dataSize);
+                                  size_t* dataSize,
+                                  ValidateResults* results);
 
     /**
      * Traverses the index getting index entries to validate them and keep track of the index keys
@@ -84,12 +80,11 @@ public:
      * Validates that the number of document keys matches the number of index keys previously
      * traversed in traverseIndex().
      */
-    void validateIndexKeyCount(const IndexDescriptor* idx, ValidateResults& results);
+    void validateIndexKeyCount(const IndexCatalogEntry* index, IndexValidateResults& results);
 
 private:
     IndexConsistency* _indexConsistency;
     CollectionValidation::ValidateState* _validateState;
-    ValidateResultsMap* _indexNsResultsMap;
 
     // Saves the record count from the record store traversal to be used later to validate the index
     // entries count. Reset every time traverseRecordStore() is called.

@@ -22,7 +22,7 @@ from buildscripts.ciconfig.evergreen import parse_evergreen_file
 import buildscripts.util.teststats as teststats_utils
 import buildscripts.resmokelib.parser as _parser
 import buildscripts.resmokelib.config as _config
-_parser.set_options()
+_parser.set_run_options()
 
 # pylint: disable=missing-docstring,protected-access,too-many-lines,no-self-use
 
@@ -77,7 +77,7 @@ def get_evergreen_config(config_file_path):
 
 class TestAcceptance(unittest.TestCase):
     def tearDown(self):
-        _parser.set_options()
+        _parser.set_run_options()
 
     @patch(ns("write_file"))
     def test_no_tests_run_if_none_changed(self, write_json_mock):
@@ -97,7 +97,7 @@ class TestAcceptance(unittest.TestCase):
         evg_conf_mock.get_task_names_by_tag.return_value = set()
 
         under_test.burn_in(repeat_config, gen_config, "", "testfile.json", False, evg_conf_mock,
-                           repos, None)
+                           repos, None, None)
 
         write_json_mock.assert_called_once()
         written_config = json.loads(write_json_mock.call_args[0][1])
@@ -128,7 +128,7 @@ class TestAcceptance(unittest.TestCase):
         evg_config = get_evergreen_config("etc/evergreen.yml")
 
         under_test.burn_in(repeat_config, gen_config, "", "testfile.json", False, evg_config, repos,
-                           None)
+                           None, None)
 
         write_json_mock.assert_called_once()
         written_config = json.loads(write_json_mock.call_args[0][1])
@@ -367,9 +367,8 @@ class TestGetTaskRuntimeHistory(unittest.TestCase):
                                                       "variant1")
         self.assertEqual(result, [("dir/test2.js", 10.1)])
         evergreen_api.test_stats_by_project.assert_called_with(
-            "project1", after_date=start_date.strftime("%Y-%m-%d"),
-            before_date=end_date.strftime("%Y-%m-%d"), group_by="test", group_num_days=14,
-            tasks=["task1"], variants=["variant1"])
+            "project1", after_date=start_date, before_date=end_date, group_by="test",
+            group_num_days=14, tasks=["task1"], variants=["variant1"])
 
     def test__get_task_runtime_history_evg_degraded_mode_error(self):  # pylint: disable=invalid-name
         response = Mock()
@@ -432,7 +431,7 @@ class TestSetResmokeCmd(unittest.TestCase):
         resmoke_cmds = under_test._set_resmoke_cmd(repeat_config, [])
 
         self.assertListEqual(resmoke_cmds,
-                             [sys.executable, "buildscripts/resmoke.py", '--repeatSuites=2'])
+                             [sys.executable, "buildscripts/resmoke.py", "run", '--repeatSuites=2'])
 
     def test__set_resmoke_cmd_no_opts(self):
         repeat_config = under_test.RepeatConfig()
@@ -541,7 +540,7 @@ class RunTests(unittest.TestCase):
     @patch(ns('subprocess.check_call'))
     def test_run_tests_no_tests(self, check_call_mock):
         tests_by_task = {}
-        resmoke_cmd = ["python", "buildscripts/resmoke.py", "--continueOnFailure"]
+        resmoke_cmd = ["python", "buildscripts/resmoke.py", "run", "--continueOnFailure"]
 
         under_test.run_tests(tests_by_task, resmoke_cmd)
 
@@ -551,7 +550,7 @@ class RunTests(unittest.TestCase):
     def test_run_tests_some_test(self, check_call_mock):
         n_tasks = 3
         tests_by_task = create_tests_by_task_mock(n_tasks, 5)
-        resmoke_cmd = ["python", "buildscripts/resmoke.py", "--continueOnFailure"]
+        resmoke_cmd = ["python", "buildscripts/resmoke.py", "run", "--continueOnFailure"]
 
         under_test.run_tests(tests_by_task, resmoke_cmd)
 
@@ -563,7 +562,7 @@ class RunTests(unittest.TestCase):
         error_code = 42
         n_tasks = 3
         tests_by_task = create_tests_by_task_mock(n_tasks, 5)
-        resmoke_cmd = ["python", "buildscripts/resmoke.py", "--continueOnFailure"]
+        resmoke_cmd = ["python", "buildscripts/resmoke.py", "run", "--continueOnFailure"]
         check_call_mock.side_effect = subprocess.CalledProcessError(error_code, "err1")
         exit_mock.side_effect = ValueError('exiting')
 

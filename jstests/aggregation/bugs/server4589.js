@@ -1,7 +1,7 @@
 // SERVER-4589: Add $arrayElemAt aggregation expression.
 
-// For assertErrorCode.
-load('jstests/aggregation/extras/utils.js');
+load('jstests/aggregation/extras/utils.js');        // For assertErrorCode.
+load("jstests/libs/sbe_assert_error_override.js");  // Override error-code-checking APIs.
 
 (function() {
 'use strict';

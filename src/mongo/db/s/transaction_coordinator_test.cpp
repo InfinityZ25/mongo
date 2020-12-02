@@ -345,7 +345,7 @@ TEST_F(TransactionCoordinatorDriverTest,
     auto response = future.get();
     ASSERT(response.vote == boost::none);
     ASSERT(response.prepareTimestamp == boost::none);
-    ASSERT_EQ(shutdownStatus.code(), response.abortReason->code());
+    ASSERT_EQ(response.abortReason->code(), ErrorCodes::NoSuchTransaction);
 }
 
 TEST_F(TransactionCoordinatorDriverTest,
@@ -537,7 +537,6 @@ TEST_F(TransactionCoordinatorDriverTest,
     ASSERT_EQ(ErrorCodes::ReadConcernMajorityNotEnabled, decision.getAbortStatus()->code());
 }
 
-
 class TransactionCoordinatorDriverPersistenceTest : public TransactionCoordinatorDriverTest {
 protected:
     void setUp() override {
@@ -718,13 +717,18 @@ TEST_F(TransactionCoordinatorDriverPersistenceTest,
 
 TEST_F(TransactionCoordinatorDriverPersistenceTest,
        PersistCommitDecisionWhenNoDocumentForTransactionExistsCanBeInterruptedAndReturnsError) {
-    Future<repl::OpTime> future =
-        txn::persistDecision(*_aws, _lsid, _txnNumber, _participants, [&] {
+    Future<repl::OpTime> future;
+
+    {
+        FailPointEnableBlock failpoint("hangBeforeWritingDecision");
+        future = txn::persistDecision(*_aws, _lsid, _txnNumber, _participants, [&] {
             txn::CoordinatorCommitDecision decision(txn::CommitDecision::kCommit);
             decision.setCommitTimestamp(_commitTimestamp);
             return decision;
         }());
-    _aws->shutdown({ErrorCodes::TransactionCoordinatorSteppingDown, "Shutdown for test"});
+        failpoint->waitForTimesEntered(failpoint.initialTimesEntered() + 1);
+        _aws->shutdown({ErrorCodes::TransactionCoordinatorSteppingDown, "Shutdown for test"});
+    }
 
     ASSERT_THROWS_CODE(
         future.get(), AssertionException, ErrorCodes::TransactionCoordinatorSteppingDown);
@@ -847,10 +851,10 @@ TEST_F(TransactionCoordinatorTest, RunCommitProducesAbortDecisionOnAbortAndCommi
     assertAbortSentAndRespondWithSuccess();
     assertAbortSentAndRespondWithSuccess();
 
-    auto commitDecision = commitDecisionFuture.get();
-    ASSERT_EQ(static_cast<int>(commitDecision), static_cast<int>(txn::CommitDecision::kAbort));
-
-    coordinator.onCompletion().get();
+    ASSERT_THROWS_CODE(
+        commitDecisionFuture.get(), AssertionException, ErrorCodes::NoSuchTransaction);
+    ASSERT_THROWS_CODE(
+        coordinator.onCompletion().get(), AssertionException, ErrorCodes::NoSuchTransaction);
 }
 
 TEST_F(TransactionCoordinatorTest, RunCommitProducesAbortDecisionOnCommitAndAbortResponses) {
@@ -869,10 +873,10 @@ TEST_F(TransactionCoordinatorTest, RunCommitProducesAbortDecisionOnCommitAndAbor
     assertAbortSentAndRespondWithSuccess();
     assertAbortSentAndRespondWithSuccess();
 
-    auto commitDecision = commitDecisionFuture.get();
-    ASSERT_EQ(static_cast<int>(commitDecision), static_cast<int>(txn::CommitDecision::kAbort));
-
-    coordinator.onCompletion().get();
+    ASSERT_THROWS_CODE(
+        commitDecisionFuture.get(), AssertionException, ErrorCodes::NoSuchTransaction);
+    ASSERT_THROWS_CODE(
+        coordinator.onCompletion().get(), AssertionException, ErrorCodes::NoSuchTransaction);
 }
 
 TEST_F(TransactionCoordinatorTest, RunCommitProducesAbortDecisionOnSingleAbortResponseOnly) {
@@ -891,10 +895,10 @@ TEST_F(TransactionCoordinatorTest, RunCommitProducesAbortDecisionOnSingleAbortRe
     assertAbortSentAndRespondWithSuccess();
     assertAbortSentAndRespondWithSuccess();
 
-    auto commitDecision = commitDecisionFuture.get();
-    ASSERT_EQ(static_cast<int>(commitDecision), static_cast<int>(txn::CommitDecision::kAbort));
-
-    coordinator.onCompletion().get();
+    ASSERT_THROWS_CODE(
+        commitDecisionFuture.get(), AssertionException, ErrorCodes::NoSuchTransaction);
+    ASSERT_THROWS_CODE(
+        coordinator.onCompletion().get(), AssertionException, ErrorCodes::NoSuchTransaction);
 }
 
 TEST_F(TransactionCoordinatorTest,
@@ -919,10 +923,10 @@ TEST_F(TransactionCoordinatorTest,
     assertAbortSentAndRespondWithSuccess();
     assertAbortSentAndRespondWithSuccess();
 
-    auto commitDecision = commitDecisionFuture.get();
-    ASSERT_EQ(static_cast<int>(commitDecision), static_cast<int>(txn::CommitDecision::kAbort));
-
-    coordinator.onCompletion().get();
+    ASSERT_THROWS_CODE(
+        commitDecisionFuture.get(), AssertionException, ErrorCodes::NoSuchTransaction);
+    ASSERT_THROWS_CODE(
+        coordinator.onCompletion().get(), AssertionException, ErrorCodes::NoSuchTransaction);
 }
 
 TEST_F(TransactionCoordinatorTest,
@@ -944,10 +948,10 @@ TEST_F(TransactionCoordinatorTest,
     assertAbortSentAndRespondWithSuccess();
     assertAbortSentAndRespondWithSuccess();
 
-    auto commitDecision = commitDecisionFuture.get();
-    ASSERT_EQ(static_cast<int>(commitDecision), static_cast<int>(txn::CommitDecision::kAbort));
-
-    coordinator.onCompletion().get();
+    ASSERT_THROWS_CODE(
+        commitDecisionFuture.get(), AssertionException, ErrorCodes::NoSuchTransaction);
+    ASSERT_THROWS_CODE(
+        coordinator.onCompletion().get(), AssertionException, ErrorCodes::NoSuchTransaction);
 }
 
 TEST_F(TransactionCoordinatorTest,
@@ -1015,13 +1019,12 @@ TEST_F(TransactionCoordinatorTest,
 class TransactionCoordinatorMetricsTest : public TransactionCoordinatorTestBase {
 public:
     void setUp() override {
-        TransactionCoordinatorTestBase::setUp();
-
         getServiceContext()->setPreciseClockSource(std::make_unique<ClockSourceMock>());
-
         auto tickSource = std::make_unique<TickSourceMock<Microseconds>>();
         tickSource->reset(1);
         getServiceContext()->setTickSource(std::move(tickSource));
+
+        TransactionCoordinatorTestBase::setUp();
     }
 
     ServerTransactionCoordinatorsMetrics* metrics() {
@@ -1716,7 +1719,7 @@ TEST_F(TransactionCoordinatorMetricsTest, CoordinatorIsCanceledWhileInactive) {
 
     coordinator.cancelIfCommitNotYetStarted();
     ASSERT_THROWS_CODE(
-        coordinator.onCompletion().get(), DBException, ErrorCodes::NoSuchTransaction);
+        coordinator.onCompletion().get(), DBException, ErrorCodes::TransactionCoordinatorCanceled);
 
     checkStats(stats, expectedStats);
     checkMetrics(expectedMetrics);
@@ -2023,7 +2026,8 @@ TEST_F(TransactionCoordinatorMetricsTest,
     network()->enterNetwork();
     network()->runReadyNetworkOperations();
     network()->exitNetwork();
-    coordinator.onCompletion().get();
+    ASSERT_THROWS_CODE(
+        coordinator.onCompletion().get(), DBException, ErrorCodes::InterruptedDueToReplStateChange);
 
     checkStats(stats, expectedStats);
     checkMetrics(expectedMetrics);
@@ -2100,7 +2104,8 @@ TEST_F(TransactionCoordinatorMetricsTest, CoordinatorsAWSIsShutDownWhileCoordina
     // The last thing the coordinator will do on the hijacked commit response thread is signal
     // the coordinator's completion.
     future.timed_get(kLongFutureTimeout);
-    coordinator.onCompletion().get();
+    ASSERT_THROWS_CODE(
+        coordinator.onCompletion().get(), DBException, ErrorCodes::InterruptedDueToReplStateChange);
 
     checkStats(stats, expectedStats);
     checkMetrics(expectedMetrics);
@@ -2204,10 +2209,11 @@ TEST_F(TransactionCoordinatorMetricsTest, LogsTransactionsOverSlowMSThreshold) {
 
     coordinator.runCommit(operationContext(), kTwoShardIdList);
 
+    assertPrepareSentAndRespondWithSuccess();
+    assertPrepareSentAndRespondWithSuccess();
+
     tickSource()->advance(Milliseconds(101));
 
-    assertPrepareSentAndRespondWithSuccess();
-    assertPrepareSentAndRespondWithSuccess();
     assertCommitSentAndRespondWithSuccess();
     assertCommitSentAndRespondWithSuccess();
 
@@ -2254,7 +2260,8 @@ TEST_F(TransactionCoordinatorMetricsTest, SlowLogLineIncludesTerminationCauseFor
     assertAbortSentAndRespondWithSuccess();
     assertAbortSentAndRespondWithSuccess();
 
-    coordinator.onCompletion().get();
+    ASSERT_THROWS_CODE(
+        coordinator.onCompletion().get(), AssertionException, ErrorCodes::NoSuchTransaction);
     stopCapturingLogMessages();
 
     ASSERT_EQUALS(1,

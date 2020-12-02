@@ -47,7 +47,7 @@ namespace mongo {
  */
 class MultiIteratorStage final : public RequiresCollectionStage {
 public:
-    MultiIteratorStage(ExpressionContext* expCtx, WorkingSet* ws, Collection* collection);
+    MultiIteratorStage(ExpressionContext* expCtx, WorkingSet* ws, const CollectionPtr& collection);
 
     void addIterator(std::unique_ptr<RecordCursor> it);
 
@@ -79,7 +79,6 @@ protected:
     void doRestoreStateRequiresCollection() final;
 
 private:
-    OperationContext* _opCtx;
     std::vector<std::unique_ptr<RecordCursor>> _iterators;
 
     // Not owned by us.

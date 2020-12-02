@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -83,10 +83,9 @@ public:
              const std::string& dbname,
              const BSONObj& jsobj,
              BSONObjBuilder& result) {
-        AutoGetCollection autoColl(opCtx, NamespaceString::kRsOplogNamespace, MODE_X);
-        Database* database = autoColl.getDb();
+        AutoGetCollection coll(opCtx, NamespaceString::kRsOplogNamespace, MODE_X);
+        Database* database = coll.getDb();
         uassert(ErrorCodes::NamespaceNotFound, "database local does not exist", database);
-        Collection* coll = autoColl.getCollection();
         uassert(ErrorCodes::NamespaceNotFound, "oplog does not exist", coll);
         uassert(ErrorCodes::IllegalOperation, "oplog isn't capped", coll->isCapped());
 
@@ -109,7 +108,7 @@ public:
             wunit.commit();
 
             LOGV2(20497,
-                  "replSetResizeOplog success.",
+                  "replSetResizeOplog success",
                   "size"_attr = DurableCatalog::get(opCtx)
                                     ->getCollectionOptions(opCtx, coll->getCatalogId())
                                     .cappedSize,

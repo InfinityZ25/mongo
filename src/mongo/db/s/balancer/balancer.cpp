@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -50,7 +50,6 @@
 #include "mongo/logv2/log.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/balancer_collection_status_gen.h"
@@ -156,9 +155,19 @@ void warnOnMultiVersion(const vector<ClusterStatistics::ShardStatistics>& cluste
                   "shardVersions"_attr = shardVersions.done());
 }
 
-ReplicaSetAwareServiceRegistry::Registerer<Balancer> balancerRegisterer("Balancer");
+const auto _balancerDecoration = ServiceContext::declareDecoration<Balancer>();
+
+const ReplicaSetAwareServiceRegistry::Registerer<Balancer> _balancerRegisterer("Balancer");
 
 }  // namespace
+
+Balancer* Balancer::get(ServiceContext* serviceContext) {
+    return &_balancerDecoration(serviceContext);
+}
+
+Balancer* Balancer::get(OperationContext* operationContext) {
+    return get(operationContext->getServiceContext());
+}
 
 Balancer::Balancer()
     : _balancedLastTime(0),
@@ -166,7 +175,7 @@ Balancer::Balancer()
       _clusterStats(std::make_unique<ClusterStatisticsImpl>(_random)),
       _chunkSelectionPolicy(
           std::make_unique<BalancerChunkSelectionPolicyImpl>(_clusterStats.get(), _random)),
-      _migrationManager(getServiceContext()) {}
+      _migrationManager(_balancerDecoration.owner(this)) {}
 
 
 Balancer::~Balancer() {
@@ -175,19 +184,25 @@ Balancer::~Balancer() {
     waitForBalancerToStop();
 }
 
-void Balancer::onStepUpBegin(OperationContext* opCtx) {
+void Balancer::onStepUpBegin(OperationContext* opCtx, long long term) {
     // Before starting step-up, ensure the balancer is ready to start. Specifically, that the
     // balancer is actually stopped, because it may still be in the process of stopping if this
     // node was previously primary.
     waitForBalancerToStop();
 }
 
-void Balancer::onStepUpComplete(OperationContext* opCtx) {
+void Balancer::onStepUpComplete(OperationContext* opCtx, long long term) {
     initiateBalancer(opCtx);
 }
 
 void Balancer::onStepDown() {
     interruptBalancer();
+}
+
+void Balancer::onBecomeArbiter() {
+    // The Balancer is only active on config servers, and arbiters are not permitted in config
+    // server replica sets.
+    MONGO_UNREACHABLE;
 }
 
 void Balancer::initiateBalancer(OperationContext* opCtx) {
@@ -596,13 +611,13 @@ Status Balancer::_splitChunksIfNeeded(OperationContext* opCtx) {
             return routingInfoStatus.getStatus();
         }
 
-        auto cm = routingInfoStatus.getValue().cm();
+        const auto& cm = routingInfoStatus.getValue();
 
         auto splitStatus =
             shardutil::splitChunkAtMultiplePoints(opCtx,
                                                   splitInfo.shardId,
                                                   splitInfo.nss,
-                                                  cm->getShardKeyPattern(),
+                                                  cm.getShardKeyPattern(),
                                                   splitInfo.collectionVersion,
                                                   ChunkRange(splitInfo.minKey, splitInfo.maxKey),
                                                   splitInfo.splitKeys);
@@ -685,18 +700,16 @@ int Balancer::_moveChunks(OperationContext* opCtx,
 void Balancer::_splitOrMarkJumbo(OperationContext* opCtx,
                                  const NamespaceString& nss,
                                  const BSONObj& minKey) {
-    auto routingInfo = uassertStatusOK(
+    const auto cm = uassertStatusOK(
         Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(opCtx, nss));
-    const auto cm = routingInfo.cm().get();
-
-    auto chunk = cm->findIntersectingChunkWithSimpleCollation(minKey);
+    auto chunk = cm.findIntersectingChunkWithSimpleCollation(minKey);
 
     try {
         const auto splitPoints = uassertStatusOK(shardutil::selectChunkSplitPoints(
             opCtx,
             chunk.getShardId(),
             nss,
-            cm->getShardKeyPattern(),
+            cm.getShardKeyPattern(),
             ChunkRange(chunk.getMin(), chunk.getMax()),
             Grid::get(opCtx)->getBalancerConfiguration()->getMaxChunkSizeBytes(),
             boost::none));
@@ -732,8 +745,8 @@ void Balancer::_splitOrMarkJumbo(OperationContext* opCtx,
             shardutil::splitChunkAtMultiplePoints(opCtx,
                                                   chunk.getShardId(),
                                                   nss,
-                                                  cm->getShardKeyPattern(),
-                                                  cm->getVersion(),
+                                                  cm.getShardKeyPattern(),
+                                                  cm.getVersion(),
                                                   ChunkRange(chunk.getMin(), chunk.getMax()),
                                                   splitPoints));
     } catch (const DBException&) {

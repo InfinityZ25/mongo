@@ -1,4 +1,4 @@
-/*
+/**
  * Test for $jsonSchema behavior in contexts other than document validation, including:
  * - read commands (count, geoNear, distinct, etc)
  * - queries that specify a collation
@@ -17,6 +17,7 @@
  *   requires_non_retryable_commands,
  *   requires_non_retryable_writes,
  *   requires_replication,
+ *   sbe_incompatible,
  * ]
  */
 (function() {
@@ -36,7 +37,7 @@ assert.commandWorked(testDB.createCollection(testName));
 const coll = testDB.getCollection(testName);
 coll.drop();
 
-const isMongos = (testDB.runCommand("ismaster").msg === "isdbgrid");
+const isMongos = (testDB.runCommand("hello").msg === "isdbgrid");
 
 // Test that $jsonSchema is rejected in an $elemMatch projection.
 assert.throws(function() {

@@ -66,8 +66,8 @@ TextMatchExpression::TextMatchExpression(OperationContext* opCtx,
                               << nss.ns() << "')",
                 db);
 
-        Collection* collection =
-            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
+        CollectionPtr collection =
+            CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss);
 
         uassert(ErrorCodes::IndexNotFound,
                 str::stream() << "text index required for $text query (no such collection '"
@@ -108,7 +108,7 @@ std::unique_ptr<MatchExpression> TextMatchExpression::shallowClone() const {
     if (getTag()) {
         expr->setTag(getTag()->clone());
     }
-    return std::move(expr);
+    return expr;
 }
 
 }  // namespace mongo

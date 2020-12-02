@@ -228,7 +228,7 @@ bool pushdownNode(MatchExpression* node,
         return pushdownNode(node, indexedOr, std::move(destinations));
     }
 
-    MONGO_UNREACHABLE;
+    MONGO_UNREACHABLE_TASSERT(4457014);
 }
 
 // Populates 'out' with all descendants of 'node' that have OrPushdownTags, assuming the initial
@@ -297,7 +297,7 @@ void resolveOrPushdowns(MatchExpression* tree) {
                 std::vector<MatchExpression*> orPushdownDescendants;
                 getElemMatchOrPushdownDescendants(child, &orPushdownDescendants);
                 for (auto descendant : orPushdownDescendants) {
-                    processOrPushdownNode(descendant, indexedOr);
+                    static_cast<void>(processOrPushdownNode(descendant, indexedOr));
                 }
             } else if (processOrPushdownNode(child, indexedOr)) {
                 // The indexed $or can completely satisfy the child predicate, so we trim it.

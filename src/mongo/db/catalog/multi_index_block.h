@@ -40,13 +40,14 @@
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/db/background.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/index_build_block.h"
 #include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_build_interceptor.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/resumable_index_builds_gen.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/util/fail_point.h"
 
@@ -55,6 +56,7 @@ namespace mongo {
 extern FailPoint leaveIndexBuildUnfinishedForShutdown;
 
 class Collection;
+class CollectionPtr;
 class MatchExpression;
 class NamespaceString;
 class OperationContext;
@@ -62,8 +64,8 @@ class OperationContext;
 /**
  * Builds one or more indexes.
  *
- * If any method other than insert() returns a not-ok Status, this MultiIndexBlock should be
- * considered failed and must be destroyed.
+ * If any method other than insertSingleDocumentForInitialSyncOrRecovery() returns a not-ok Status,
+ * this MultiIndexBlock should be considered failed and must be destroyed.
  *
  * If a MultiIndexBlock is destroyed before commit() or if commit() is rolled back, it will
  * clean up all traces of the indexes being constructed. MultiIndexBlocks should not be
@@ -109,14 +111,20 @@ public:
      * Requires holding an exclusive lock on the collection.
      */
     using OnInitFn = std::function<Status(std::vector<BSONObj>& specs)>;
+    StatusWith<std::vector<BSONObj>> init(
+        OperationContext* opCtx,
+        CollectionWriter& collection,
+        const std::vector<BSONObj>& specs,
+        OnInitFn onInit,
+        const boost::optional<ResumeIndexInfo>& resumeInfo = boost::none);
     StatusWith<std::vector<BSONObj>> init(OperationContext* opCtx,
-                                          Collection* collection,
-                                          const std::vector<BSONObj>& specs,
-                                          OnInitFn onInit);
-    StatusWith<std::vector<BSONObj>> init(OperationContext* opCtx,
-                                          Collection* collection,
+                                          CollectionWriter& collection,
                                           const BSONObj& spec,
                                           OnInitFn onInit);
+    StatusWith<std::vector<BSONObj>> initForResume(OperationContext* opCtx,
+                                                   const CollectionPtr& collection,
+                                                   const std::vector<BSONObj>& specs,
+                                                   const ResumeIndexInfo& resumeInfo);
 
     /**
      * Not all index initializations need an OnInitFn, in particular index builds that do not need
@@ -129,13 +137,14 @@ public:
      * When called on primaries, this generates a new optime, writes a no-op oplog entry, and
      * timestamps the first catalog write. Does nothing on secondaries.
      */
-    static OnInitFn makeTimestampedIndexOnInitFn(OperationContext* opCtx, const Collection* coll);
+    static OnInitFn makeTimestampedIndexOnInitFn(OperationContext* opCtx,
+                                                 const CollectionPtr& coll);
 
     /**
      * Inserts all documents in the Collection into the indexes and logs with timing info.
      *
-     * This is a simplified replacement for insert and doneInserting. Do not call this if you
-     * are calling either of them.
+     * This is a replacement for calling both insertSingleDocumentForInitialSyncOrRecovery and
+     * dumpInsertsFromBulk. Do not call this if you are calling either of them.
      *
      * Will fail if violators of uniqueness constraints exist.
      *
@@ -143,7 +152,10 @@ public:
      *
      * Should not be called inside of a WriteUnitOfWork.
      */
-    Status insertAllDocumentsInCollection(OperationContext* opCtx, Collection* collection);
+    Status insertAllDocumentsInCollection(
+        OperationContext* opCtx,
+        const CollectionPtr& collection,
+        boost::optional<RecordId> resumeAfterRecordId = boost::none);
 
     /**
      * Call this after init() for each document in the collection.
@@ -152,24 +164,25 @@ public:
      *
      * Should be called inside of a WriteUnitOfWork.
      */
-    Status insert(OperationContext* opCtx, const BSONObj& wholeDocument, const RecordId& loc);
+    Status insertSingleDocumentForInitialSyncOrRecovery(OperationContext* opCtx,
+                                                        const BSONObj& wholeDocument,
+                                                        const RecordId& loc);
 
     /**
-     * Call this after the last insert(). This gives the index builder a chance to do any
-     * long-running operations in separate units of work from commit().
+     * Call this after the last insertSingleDocumentForInitialSyncOrRecovery(). This gives the index
+     * builder a chance to do any long-running operations in separate units of work from commit().
      *
      * Do not call if you called insertAllDocumentsInCollection();
      *
-     * If 'dupRecords' is passed as non-NULL and duplicates are not allowed for the index, violators
-     * of uniqueness constraints will be added to the set. Records added to this set are not
-     * indexed, so callers MUST either fail this index build or delete the documents from the
-     * collection.
+     * If 'onDuplicateRecord' is passed as non-NULL and duplicates are not allowed for the index,
+     * violators of uniqueness constraints will be handled by 'onDuplicateRecord'.
      *
      * Should not be called inside of a WriteUnitOfWork.
      */
-    Status dumpInsertsFromBulk(OperationContext* opCtx);
-    Status dumpInsertsFromBulk(OperationContext* opCtx, std::set<RecordId>* const dupRecords);
-
+    Status dumpInsertsFromBulk(OperationContext* opCtx, const CollectionPtr& collection);
+    Status dumpInsertsFromBulk(OperationContext* opCtx,
+                               const CollectionPtr& collection,
+                               const IndexAccessMethod::RecordIdHandlerFn& onDuplicateRecord);
     /**
      * For background indexes using an IndexBuildInterceptor to capture inserts during a build,
      * drain these writes into the index. If intent locks are held on the collection, more writes
@@ -197,7 +210,7 @@ public:
      * of an index build, so it must ensure that before it finishes, it has indexed all documents in
      * a collection, requiring a call to this function upon completion.
      */
-    Status retrySkippedRecords(OperationContext* opCtx, Collection* collection);
+    Status retrySkippedRecords(OperationContext* opCtx, const CollectionPtr& collection);
 
     /**
      * Check any constraits that may have been temporarily violated during the index build for
@@ -206,11 +219,11 @@ public:
      *
      * Must not be in a WriteUnitOfWork.
      */
-    Status checkConstraints(OperationContext* opCtx);
+    Status checkConstraints(OperationContext* opCtx, const CollectionPtr& collection);
 
     /**
      * Marks the index ready for use. Should only be called as the last method after
-     * doneInserting() or insertAllDocumentsInCollection() return success.
+     * dumpInsertsFromBulk() or insertAllDocumentsInCollection() return success.
      *
      * Should be called inside of a WriteUnitOfWork. If the index building is to be logOp'd,
      * logOp() should be called from the same unit of work as commit().
@@ -247,7 +260,7 @@ public:
      */
     using OnCleanUpFn = std::function<void()>;
     void abortIndexBuild(OperationContext* opCtx,
-                         Collection* collection,
+                         CollectionWriter& collection,
                          OnCleanUpFn onCleanUp) noexcept;
 
     /**
@@ -258,13 +271,15 @@ public:
 
     /**
      * May be called at any time after construction but before a successful commit(). Suppresses
-     * the default behavior on destruction of removing all traces of uncommitted index builds. Does
-     * not perform any storage engine writes. May delete internal tables, but this is not
-     * transactional.
+     * the default behavior on destruction of removing all traces of uncommitted index builds. May
+     * delete internal tables, but this is not transactional. Writes the resumable index build
+     * state to disk if resumable index builds are supported.
      *
      * This should only be used during shutdown or rollback.
      */
-    void abortWithoutCleanup(OperationContext* opCtx);
+    void abortWithoutCleanup(OperationContext* opCtx,
+                             const CollectionPtr& collection,
+                             bool isResumable);
 
     /**
      * Returns true if this build block supports background writes while building an index. This is
@@ -285,16 +300,35 @@ private:
         InsertDeleteOptions options;
     };
 
+    void _writeStateToDisk(OperationContext* opCtx, const CollectionPtr& collection) const;
+
+    BSONObj _constructStateObject(OperationContext* opCtx, const CollectionPtr& collection) const;
+
+    Status _failPointHangDuringBuild(OperationContext* opCtx,
+                                     FailPoint* fp,
+                                     StringData where,
+                                     const BSONObj& doc,
+                                     unsigned long long iteration) const;
+
+    const IndexCatalogEntry* _findSmallestReferenceIdx(OperationContext* opCtx,
+                                                       const CollectionPtr& collection) const;
+
+    Status _scanReferenceIdxInsertAndCommit(OperationContext* opCtx,
+                                            const CollectionPtr& collection,
+                                            const IndexCatalogEntry* refIdx);
+
+    Status _insert(OperationContext* opCtx, const BSONObj& wholeDocument, const RecordId& loc);
+
     // Is set during init() and ensures subsequent function calls act on the same Collection.
     boost::optional<UUID> _collectionUUID;
 
     std::vector<IndexToBuild> _indexes;
 
-    std::unique_ptr<BackgroundOperation> _backgroundOperation;
-
     IndexBuildMethod _method = IndexBuildMethod::kHybrid;
 
     bool _ignoreUnique = false;
+
+    std::size_t _eachIndexBuildMaxMemoryUsageBytes = 0;
 
     // Set to true when no work remains to be done, the object can safely destruct without leaving
     // incorrect state set anywhere.
@@ -303,5 +337,12 @@ private:
     // A unique identifier associating this index build with a two-phase index build within a
     // replica set.
     boost::optional<UUID> _buildUUID;
+
+    // The RecordId corresponding to the object most recently inserted using this MultiIndexBlock,
+    // or boost::none if nothing has been inserted.
+    boost::optional<RecordId> _lastRecordIdInserted;
+
+    // The current phase of the index build.
+    IndexBuildPhaseEnum _phase = IndexBuildPhaseEnum::kInitialized;
 };
 }  // namespace mongo

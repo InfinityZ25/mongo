@@ -24,7 +24,6 @@ printjson(result);
 var metadata = result.metadata;
 
 assert.eq(metadata.chunks.length, 1);
-assert.eq(metadata.pending.length, 0);
 assert.eq(metadata.chunks[0][0]._id, MinKey);
 assert.eq(metadata.chunks[0][1]._id, MaxKey);
 assert.eq(metadata.shardVersion, result.global);
@@ -48,12 +47,11 @@ assert.commandWorked(result);
 metadata = result.metadata;
 
 assert.eq(metadata.chunks.length, 2);
-assert.eq(metadata.pending.length, 0);
 assert(metadata.chunks[0][0]._id + "" == MinKey + "");
 assert(metadata.chunks[0][1]._id == 0);
 assert(metadata.chunks[1][0]._id == 0);
 assert(metadata.chunks[1][1]._id + "" == MaxKey + "");
-assert(metadata.shardVersion + "" == result.global + "");
+assert(tojson(metadata.shardVersion) == tojson(result.global));
 
 st.stop();
 })();

@@ -29,13 +29,14 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
-#include "mongo/s/config_server_test_fixture.h"
 
 namespace mongo {
 namespace {
 
 const NamespaceString kNss("TestDB", "TestColl");
+const KeyPattern kKeyPattern(BSON("x" << 1));
 
 using EnsureChunkVersionIsGreaterThanTest = ConfigServerTestFixture;
 
@@ -103,7 +104,7 @@ TEST_F(EnsureChunkVersionIsGreaterThanTest, IfNoChunkWithMatchingEpochFoundRetur
     ChunkType existingChunkType = requestedChunkType;
     // Epoch is different.
     existingChunkType.setVersion(ChunkVersion(10, 2, OID::gen()));
-    setupChunks({existingChunkType});
+    setupCollection(kNss, kKeyPattern, {existingChunkType});
 
     ShardingCatalogManager::get(operationContext())
         ->ensureChunkVersionIsGreaterThan(operationContext(),
@@ -125,7 +126,7 @@ TEST_F(EnsureChunkVersionIsGreaterThanTest, IfNoChunkWithMatchingMinKeyFoundRetu
     ChunkType existingChunkType = requestedChunkType;
     // Min key is different.
     existingChunkType.setMin(BSON("a" << -1));
-    setupChunks({existingChunkType});
+    setupCollection(kNss, kKeyPattern, {existingChunkType});
 
     ShardingCatalogManager::get(operationContext())
         ->ensureChunkVersionIsGreaterThan(operationContext(),
@@ -147,7 +148,7 @@ TEST_F(EnsureChunkVersionIsGreaterThanTest, IfNoChunkWithMatchingMaxKeyFoundRetu
     ChunkType existingChunkType = requestedChunkType;
     // Max key is different.
     existingChunkType.setMax(BSON("a" << 20));
-    setupChunks({existingChunkType});
+    setupCollection(kNss, kKeyPattern, {existingChunkType});
 
     ShardingCatalogManager::get(operationContext())
         ->ensureChunkVersionIsGreaterThan(operationContext(),
@@ -168,7 +169,7 @@ TEST_F(EnsureChunkVersionIsGreaterThanTest,
     const auto existingChunkType = requestedChunkType;
     const auto highestChunkType = generateChunkType(
         kNss, ChunkVersion(20, 3, epoch), ShardId("shard0001"), BSON("a" << 11), BSON("a" << 20));
-    setupChunks({existingChunkType, highestChunkType});
+    setupCollection(kNss, kKeyPattern, {existingChunkType, highestChunkType});
 
     ShardingCatalogManager::get(operationContext())
         ->ensureChunkVersionIsGreaterThan(operationContext(),
@@ -191,7 +192,7 @@ TEST_F(
 
     ChunkType existingChunkType = requestedChunkType;
     existingChunkType.setVersion(ChunkVersion(11, 1, epoch));
-    setupChunks({existingChunkType});
+    setupCollection(kNss, kKeyPattern, {existingChunkType});
 
     ShardingCatalogManager::get(operationContext())
         ->ensureChunkVersionIsGreaterThan(operationContext(),

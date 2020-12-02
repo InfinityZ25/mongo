@@ -47,7 +47,7 @@ const joinStepDownThread = startParallelShell(() => {
 
     const freezeSecs = 24 * 60 * 60;  // 24 hours
     assert.commandFailedWithCode(db.adminCommand({"replSetStepDown": freezeSecs, "force": true}),
-                                 ErrorCodes.NotMaster);
+                                 ErrorCodes.NotWritablePrimary);
 }, primary.port);
 
 waitForCurOpByFailPointNoNS(primaryDB, "stepdownHangBeforeRSTLEnqueue");
@@ -93,7 +93,7 @@ jsTestLog("Do a read that hits a prepare conflict on the old primary");
 const wTPrintPrepareConflictLogFailPoint = configureFailPoint(primary, "WTPrintPrepareConflictLog");
 
 const joinReadThread = startParallelShell(() => {
-    db.getMongo().setSlaveOk(true);
+    db.getMongo().setSecondaryOk();
     oldPrimaryDB = db.getSiblingDB(TestData.dbName);
 
     assert.commandFailedWithCode(oldPrimaryDB.runCommand({

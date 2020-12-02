@@ -1,4 +1,7 @@
 // Integration tests for {$diacriticSensitive: true} option to $text query operator.
+// @tags: [
+//   sbe_incompatible,
+// ]
 
 load('jstests/libs/fts.js');
 
@@ -11,7 +14,7 @@ coll.drop();
 assert.commandWorked(coll.insert(
     {_id: 0, a: "O próximo vôo à noite sobre o Atlântico, põe freqüentemente o único médico."}));
 
-assert.commandWorked(coll.ensureIndex({a: "text"}, {default_language: "portuguese"}));
+assert.commandWorked(coll.createIndex({a: "text"}, {default_language: "portuguese"}));
 
 assert.throws(function() {
     queryIDS(coll, "hello", null, {$diacriticSensitive: "invalid"});

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/db/server_options_server_helpers.h"
 
@@ -48,13 +48,11 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_options_base.h"
 #include "mongo/db/server_options_helpers.h"
-#include "mongo/logger/log_component.h"
-#include "mongo/logger/message_event_utf8_encoder.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/transport/message_compressor_registry.h"
 #include "mongo/util/cmdline_utils/censor_cmdline.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/map_util.h"
 #include "mongo/util/net/sock.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/net/ssl_options.h"
@@ -176,14 +174,22 @@ Status validateServerOptions(const moe::Environment& params) {
             haveAuthenticationMechanisms = false;
         }
 
-        if (parameters.find("internalValidateFeaturesAsMaster") != parameters.end()) {
-            // Command line options that are disallowed when internalValidateFeaturesAsMaster is
-            // specified.
+        bool internalValidateFeaturesAsPrimaryUsed =
+            parameters.find("internalValidateFeaturesAsPrimary") != parameters.end();
+        bool internalValidateFeaturesAsMasterUsed =
+            parameters.find("internalValidateFeaturesAsMaster") != parameters.end();
+
+        if (internalValidateFeaturesAsPrimaryUsed || internalValidateFeaturesAsMasterUsed) {
+            // Command line options that are disallowed when internalValidateFeaturesAsPrimary or
+            // internalValidateFeaturesAsMaster, the deprecated alias, is specified.
+            std::string parameterName = internalValidateFeaturesAsPrimaryUsed
+                ? "internalValidateFeaturesAsPrimary"
+                : "internalValidateFeaturesAsMaster";
             if (params.count("replication.replSet")) {
                 return Status(ErrorCodes::BadValue,
                               str::stream() <<  //
-                                  "Cannot specify both internalValidateFeaturesAsMaster and "
-                                  "replication.replSet");
+                                  "Cannot specify both " + parameterName +
+                                      " and replication.replSet");
             }
         }
     }
@@ -303,17 +309,6 @@ Status storeServerOptions(const moe::Environment& params) {
         if (serverGlobalParams.transportLayer != "asio") {
             return {ErrorCodes::BadValue, "Unsupported value for transportLayer. Must be \"asio\""};
         }
-    }
-
-    if (params.count("net.serviceExecutor")) {
-        auto value = params["net.serviceExecutor"].as<std::string>();
-        const auto valid = {"synchronous"_sd, "adaptive"_sd};
-        if (std::find(valid.begin(), valid.end(), value) == valid.end()) {
-            return {ErrorCodes::BadValue, "Unsupported value for serviceExecutor"};
-        }
-        serverGlobalParams.serviceExecutor = value;
-    } else {
-        serverGlobalParams.serviceExecutor = "synchronous";
     }
 
     if (params.count("security.transitionToAuth")) {

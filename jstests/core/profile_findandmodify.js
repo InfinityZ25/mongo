@@ -1,5 +1,8 @@
 // Confirms that profiled findAndModify execution contains all expected metrics with proper values.
-// @tags: [requires_profiling]
+// @tags: [
+//   requires_profiling,
+//   requires_fcv_47,
+// ]
 
 (function() {
 "use strict";
@@ -91,7 +94,7 @@ assert.eq(profileObj.keysExamined, 0, tojson(profileObj));
 assert.eq(profileObj.docsExamined, 0, tojson(profileObj));
 assert.eq(profileObj.nMatched, 0, tojson(profileObj));
 assert.eq(profileObj.nModified, 0, tojson(profileObj));
-assert.eq(profileObj.upsert, true, tojson(profileObj));
+assert.eq(profileObj.nUpserted, 1, tojson(profileObj));
 assert.eq(profileObj.keysInserted, 1, tojson(profileObj));
 assert.eq(profileObj.appName, "MongoDB Shell", tojson(profileObj));
 

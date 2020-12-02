@@ -42,6 +42,9 @@ public:
 
     Database* getDb(OperationContext* opCtx, StringData ns) const override;
 
+    std::shared_ptr<ViewCatalog> getSharedViewCatalog(OperationContext* const opCtx,
+                                                      StringData dbName) const override;
+
     Database* openDb(OperationContext* opCtx, StringData ns, bool* justCreated = nullptr) override;
 
     void dropDb(OperationContext* opCtx, Database* db) override;
@@ -60,16 +63,6 @@ private:
     typedef StringMap<Database*> DBs;
     mutable SimpleMutex _m;
     DBs _dbs;
-
-    // Databases objects and their constituent collections are destroyed and recreated when
-    // databases are closed and opened. We use this counter to assign a new epoch to a database when
-    // it is reopened. This permits callers to detect after yielding and reacquiring locks whether
-    // their catalog pointers are still valid. Collection UUIDs are not sufficient, since they
-    // remain stable when databases are closed and reopened.
-    //
-    // A thread must hold the global exclusive lock to write to this variable, and must hold the
-    // global lock in at least MODE_IS to read it.
-    uint64_t _epoch = 0;
 };
 
 }  // namespace mongo

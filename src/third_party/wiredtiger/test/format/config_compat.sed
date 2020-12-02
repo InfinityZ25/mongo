@@ -5,7 +5,6 @@ s/^backup=/backups=/
 s/^btree.bitcnt=/bitcnt=/
 s/^btree.compression=/compression=/
 s/^btree.dictionary=/dictionary=/
-s/^btree.huffman_key=/huffman_key=/
 s/^btree.huffman_value=/huffman_value=/
 s/^btree.internal_key_truncation=/internal_key_truncation=/
 s/^btree.internal_page_max=/internal_page_max=/
@@ -57,7 +56,6 @@ s/^ops.pct.read=/read_pct=/
 s/^ops.pct.write=/write_pct=/
 s/^ops.prepare=/prepare=/
 s/^ops.random_cursor=/random_cursor=/
-s/^ops.rebalance=/rebalance=/
 s/^ops.salvage=/salvage=/
 s/^ops.truncate=/truncate=/
 s/^ops.verify=/verify=/

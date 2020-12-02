@@ -36,11 +36,13 @@
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/restore_context.h"
 
 namespace mongo {
 
 class ClockSource;
 class Collection;
+class CollectionPtr;
 class OperationContext;
 class RecordId;
 
@@ -74,6 +76,10 @@ class RecordId;
  * saveState() if any underlying database state changes.  If saveState() is called,
  * restoreState() must be called again before any work() is done.
  *
+ * If an error occurs at runtime (e.g. we reach resource limits for the request), then work() throws
+ * an exception. At this point, statistics may be extracted from the execution plan, but the
+ * execution tree is otherwise unusable and the plan must be discarded.
+ *
  * Here is a very simple usage example:
  *
  * WorkingSet workingSet;
@@ -91,9 +97,6 @@ class RecordId;
  *         break;
  *     case PlanStage::NEED_TIME:
  *         // Need more time.
- *         break;
- *     case PlanStage::FAILURE:
- *         // Throw exception or return error
  *         break;
  *     }
  *
@@ -170,28 +173,20 @@ public:
         // wants fetched. On the next call to work() that stage can assume a fetch was performed
         // on the WSM that the held WSID refers to.
         NEED_YIELD,
-
-        // Something has gone unrecoverably wrong.  Stop running this query.
-        // If the out parameter does not refer to an invalid working set member,
-        // call WorkingSetCommon::getStatusMemberObject() to get details on the failure.
-        // Any class implementing this interface must set the WSID out parameter to
-        // INVALID_ID or a valid WSM ID if FAILURE is returned.
-        FAILURE,
     };
 
     static std::string stateStr(const StageState& state) {
-        if (ADVANCED == state) {
-            return "ADVANCED";
-        } else if (IS_EOF == state) {
-            return "IS_EOF";
-        } else if (NEED_TIME == state) {
-            return "NEED_TIME";
-        } else if (NEED_YIELD == state) {
-            return "NEED_YIELD";
-        } else {
-            verify(FAILURE == state);
-            return "FAILURE";
+        switch (state) {
+            case PlanStage::ADVANCED:
+                return "ADVANCED";
+            case PlanStage::IS_EOF:
+                return "IS_EOF";
+            case PlanStage::NEED_TIME:
+                return "NEED_TIME";
+            case PlanStage::NEED_YIELD:
+                return "NEED_YIELD";
         }
+        MONGO_UNREACHABLE;
     }
 
 
@@ -199,13 +194,21 @@ public:
      * Perform a unit of work on the query.  Ask the stage to produce the next unit of output.
      * Stage returns StageState::ADVANCED if *out is set to the next unit of output.  Otherwise,
      * returns another value of StageState to indicate the stage's status.
+     *
+     * Throws an exception if an error is encountered while executing the query.
      */
     StageState work(WorkingSetID* out) {
         auto optTimer(getOptTimer());
 
         ++_commonStats.works;
 
-        StageState workResult = doWork(out);
+        StageState workResult;
+        try {
+            workResult = doWork(out);
+        } catch (...) {
+            _commonStats.failed = true;
+            throw;
+        }
 
         if (StageState::ADVANCED == workResult) {
             ++_commonStats.advanced;
@@ -213,8 +216,6 @@ public:
             ++_commonStats.needTime;
         } else if (StageState::NEED_YIELD == workResult) {
             ++_commonStats.needYield;
-        } else if (StageState::FAILURE == workResult) {
-            _commonStats.failed = true;
         }
 
         return workResult;
@@ -255,11 +256,15 @@ public:
      *
      * Propagates to all children, then calls doRestoreState().
      *
+     * RestoreContext is a context containing external state needed by plan stages to be able to
+     * restore into a valid state. The RequiresCollectionStage requires a valid CollectionPtr for
+     * example.
+     *
      * Throws a UserException on failure to restore due to a conflicting event such as a
      * collection drop. May throw a WriteConflictException, in which case the caller may choose to
      * retry.
      */
-    void restoreState();
+    void restoreState(const RestoreContext& context);
 
     /**
      * Detaches from the OperationContext and releases any storage-engine state.
@@ -281,29 +286,6 @@ public:
      * Propagates to all children, then calls doReattachToOperationContext().
      */
     void reattachToOperationContext(OperationContext* opCtx);
-
-    /*
-     * Releases any resources held by this stage. It is an error to use a PlanStage in any way after
-     * calling dispose(). Does not throw exceptions.
-     *
-     * Propagates to all children, then calls doDispose().
-     */
-    void dispose(OperationContext* opCtx) {
-        try {
-            // We may or may not be attached during disposal. We can't call
-            // reattachToOperationContext()
-            // directly, since that will assert that '_opCtx' is not set.
-            _opCtx = opCtx;
-            invariant(!_opCtx || opCtx == opCtx);
-
-            for (auto&& child : _children) {
-                child->dispose(opCtx);
-            }
-            doDispose();
-        } catch (...) {
-            std::terminate();
-        }
-    }
 
     /**
      * Retrieve a list of this stage's children. This stage keeps ownership of
@@ -389,7 +371,7 @@ protected:
     /**
      * Restores any stage-specific saved state and prepares to handle calls to work().
      */
-    virtual void doRestoreState() {}
+    virtual void doRestoreState(const RestoreContext& context) {}
 
     /**
      * Does stage-specific detaching.
@@ -405,11 +387,6 @@ protected:
      * OperationContext* (the one to which the stage is reattaching).
      */
     virtual void doReattachToOperationContext() {}
-
-    /**
-     * Does stage-specific destruction. Must not throw exceptions.
-     */
-    virtual void doDispose() {}
 
     ClockSource* getClock() const;
 

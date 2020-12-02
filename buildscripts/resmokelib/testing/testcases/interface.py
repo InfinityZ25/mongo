@@ -8,8 +8,8 @@ import os.path
 import unittest
 import uuid
 
-from ... import logging
-from ...utils import registry
+from buildscripts.resmokelib import logging
+from buildscripts.resmokelib.utils import registry
 
 _TEST_CASES = {}  # type: ignore
 
@@ -54,6 +54,7 @@ class TestCase(unittest.TestCase, metaclass=registry.make_registry_metaclass(_TE
 
         self.fixture = None
         self.return_code = None
+        self.propagate_error = None
 
         self.is_configured = False
 

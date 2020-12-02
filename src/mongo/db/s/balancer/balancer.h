@@ -29,7 +29,7 @@
 
 #pragma once
 
-#include "mongo/db/replica_set_aware_service.h"
+#include "mongo/db/repl/replica_set_aware_service.h"
 #include "mongo/db/s/balancer/balancer_chunk_selection_policy.h"
 #include "mongo/db/s/balancer/balancer_random.h"
 #include "mongo/db/s/balancer/migration_manager.h"
@@ -59,6 +59,12 @@ class Balancer : public ReplicaSetAwareServiceConfigSvr<Balancer> {
     Balancer& operator=(const Balancer&) = delete;
 
 public:
+    /**
+     * Provide access to the Balancer decoration on ServiceContext.
+     */
+    static Balancer* get(ServiceContext* serviceContext);
+    static Balancer* get(OperationContext* operationContext);
+
     Balancer();
     ~Balancer();
 
@@ -161,9 +167,12 @@ private:
     /**
      * ReplicaSetAwareService entry points.
      */
-    void onStepUpBegin(OperationContext* opCtx) final;
-    void onStepUpComplete(OperationContext* opCtx) final;
+    void onStartup(OperationContext* opCtx) final {}
+    void onShutdown() final {}
+    void onStepUpBegin(OperationContext* opCtx, long long term) final;
+    void onStepUpComplete(OperationContext* opCtx, long long term) final;
     void onStepDown() final;
+    void onBecomeArbiter() final;
 
     /**
      * The main balancer loop, which runs in a separate thread.

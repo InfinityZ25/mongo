@@ -48,7 +48,11 @@ public:
         EnqueueDocumentsFn enqueueDocumentsFn,
         OnShutdownCallbackFn onShutdownCallbackFn,
         const int batchSize,
-        StartingPoint startingPoint = StartingPoint::kSkipFirstDoc);
+        StartingPoint startingPoint = StartingPoint::kSkipFirstDoc,
+        BSONObj filter = BSONObj(),
+        ReadConcernArgs readConcern = ReadConcernArgs(),
+        bool requestResumeToken = false,
+        StringData name = "oplog fetcher"_sd);
 
     virtual ~OplogFetcherMock();
 
@@ -57,7 +61,9 @@ public:
      * the enqueueDocumentsFn.
      * This is not thread-safe.
      */
-    void receiveBatch(CursorId cursorId, OplogFetcher::Documents documents);
+    void receiveBatch(CursorId cursorId,
+                      OplogFetcher::Documents documents,
+                      boost::optional<Timestamp> resumeToken = boost::none);
 
     /**
      * Simulate an response error received by the OplogFetcher.
@@ -112,5 +118,8 @@ private:
 
     bool _first = true;
 };
+
+typedef OplogFetcherFactoryImpl<OplogFetcherMock> CreateOplogFetcherMockFn;
+
 }  // namespace repl
 }  // namespace mongo

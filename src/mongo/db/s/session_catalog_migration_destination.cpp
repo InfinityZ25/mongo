@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -61,7 +61,7 @@ const WriteConcernOptions kMajorityWC(WriteConcernOptions::kMajority,
 
 struct ProcessOplogResult {
     LogicalSessionId sessionId;
-    TxnNumber txnNum;
+    TxnNumber txnNum{kUninitializedTxnNumber};
 
     repl::OpTime oplogTime;
     bool isPrePostImage = false;
@@ -188,13 +188,15 @@ ProcessOplogResult processSessionOplog(const BSONObj& oplogBSON,
 
     if (oplogEntry.getOpType() == repl::OpTypeEnum::kNoop) {
         // Note: Oplog is already no-op type, no need to nest.
-        // There are two types of type 'n' oplog format expected here:
+        // There are three types of type 'n' oplog format expected here:
         // (1) Oplog entries that has been transformed by a previous migration into a
         //     nested oplog. In this case, o field contains {$sessionMigrateInfo: 1}
         //     and o2 field contains the details of the original oplog.
         // (2) Oplog entries that contains the pre/post-image information of a
         //     findAndModify operation. In this case, o field contains the relevant info
         //     and o2 will be empty.
+        // (3) Oplog entries that are a dead sentinel, which the donor sent over as the replacement
+        //     for a prepare oplog entry or unprepared transaction commit oplog entry.
 
         BSONObj object2;
         if (oplogEntry.getObject2()) {
@@ -264,10 +266,9 @@ ProcessOplogResult processSessionOplog(const BSONObj& oplogBSON,
         NamespaceString::kSessionTransactionsTableNamespace.ns(),
         [&] {
             // Need to take global lock here so repl::logOp will not unlock it and trigger the
-            // invariant that disallows unlocking global lock while inside a WUOW. Grab a DBLock
-            // here instead of plain GlobalLock to make sure the MMAPV1 flush lock will be
-            // lock/unlocked correctly. Take the transaction table db lock to ensure the same lock
-            // ordering with normal replicated updates to the table.
+            // invariant that disallows unlocking global lock while inside a WUOW. Take the
+            // transaction table db lock to ensure the same lock ordering with normal replicated
+            // updates to the table.
             Lock::DBLock lk(
                 opCtx, NamespaceString::kSessionTransactionsTableNamespace.db(), MODE_IX);
             WriteUnitOfWork wunit(opCtx);
@@ -289,7 +290,7 @@ ProcessOplogResult processSessionOplog(const BSONObj& oplogBSON,
                 sessionTxnRecord.setLastWriteOpTime(oplogOpTime);
                 sessionTxnRecord.setLastWriteDate(oplogEntry.getWallClockTime());
                 // We do not migrate transaction oplog entries so don't set the txn state.
-                txnParticipant.onMigrateCompletedOnPrimary(opCtx, {stmtId}, sessionTxnRecord);
+                txnParticipant.onRetryableWriteCloningCompleted(opCtx, {stmtId}, sessionTxnRecord);
             }
 
             wunit.commit();
@@ -365,8 +366,13 @@ void SessionCatalogMigrationDestination::join() {
  * 6. Wait for writes to be committed to majority of the replica set.
  */
 void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(ServiceContext* service) {
-    Client::initKillableThread("sessionCatalogMigrationProducer-" + _migrationSessionId.toString(),
-                               service);
+    Client::initThread(
+        "sessionCatalogMigrationProducer-" + _migrationSessionId.toString(), service, nullptr);
+    auto client = Client::getCurrent();
+    {
+        stdx::lock_guard lk(*client);
+        client->setSystemOperationKillableByStepdown(lk);
+    }
 
     bool oplogDrainedAfterCommiting = false;
     ProcessOplogResult lastResult;
@@ -426,10 +432,6 @@ void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(Service
         for (BSONArrayIteratorSorted oplogIter(oplogArray); oplogIter.more();) {
             try {
                 lastResult = processSessionOplog(oplogIter.next().Obj(), lastResult);
-            } catch (const ExceptionFor<ErrorCodes::ConfigurationInProgress>&) {
-                // This means that the server has a newer txnNumber than the oplog being
-                // migrated, so just skip it
-                continue;
             } catch (const ExceptionFor<ErrorCodes::TransactionTooOld>&) {
                 // This means that the server has a newer txnNumber than the oplog being
                 // migrated, so just skip it

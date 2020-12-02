@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -37,14 +37,9 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/repl/read_concern_args.h"
-#include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/repl/repl_set_config.h"
-#include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/s/config/initial_split_policy.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/shard_key_util.h"
 #include "mongo/s/balancer_configuration.h"
@@ -54,13 +49,12 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/config_server_client.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/request_types/shard_collection_gen.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
-
-using std::string;
 
 const long long kMaxSizeMBDefault = 0;
 
@@ -88,20 +82,8 @@ void validateAndDeduceFullRequestOptions(OperationContext* opCtx,
     // Ensure the namespace is valid.
     uassert(ErrorCodes::IllegalOperation,
             "can't shard system namespaces",
-            !nss.isSystem() || nss == NamespaceString::kLogicalSessionsNamespace);
-
-    // Ensure the collation is valid. Currently we only allow the simple collation.
-    bool simpleCollationSpecified = false;
-    if (request->getCollation()) {
-        auto& collation = *request->getCollation();
-        auto collator = uassertStatusOK(
-            CollatorFactoryInterface::get(opCtx->getServiceContext())->makeFromBSON(collation));
-        uassert(ErrorCodes::BadValue,
-                str::stream() << "The collation for shardCollection must be {locale: 'simple'}, "
-                              << "but found: " << collation,
-                !collator);
-        simpleCollationSpecified = true;
-    }
+            !nss.isSystem() || nss == NamespaceString::kLogicalSessionsNamespace ||
+                nss.isTemporaryReshardingCollection());
 
     // Ensure numInitialChunks is within valid bounds.
     // Cannot have more than 8192 initial chunks per shard. Setting a maximum of 1,000,000
@@ -117,8 +99,23 @@ void validateAndDeduceFullRequestOptions(OperationContext* opCtx,
             numChunks >= 0 && numChunks <= maxNumInitialChunksForShards &&
                 numChunks <= maxNumInitialChunksTotal);
 
-    // Retrieve the collection metadata in order to verify that it is legal to shard this
-    // collection.
+    // TODO (SERVER-48639): As of 4.7, this check is also performed on the shard itself, under the
+    // critical section, so the code below should be removed when 5.0 becomes last-lts.
+    //
+    // Ensure the collation is valid. Currently we only allow the simple collation.
+    bool simpleCollationSpecified = false;
+    if (request->getCollation()) {
+        auto& collation = *request->getCollation();
+        auto collator = uassertStatusOK(
+            CollatorFactoryInterface::get(opCtx->getServiceContext())->makeFromBSON(collation));
+        uassert(ErrorCodes::BadValue,
+                str::stream() << "The collation for shardCollection must be {locale: 'simple'}, "
+                              << "but found: " << collation,
+                !collator);
+        simpleCollationSpecified = true;
+    }
+
+    // Retrieve the collection metadata in order to verify the collection's collation settings
     BSONObj res;
     {
         auto listCollectionsCmd =
@@ -261,11 +258,8 @@ public:
         // Until all metadata commands are on the config server, the CatalogCache on the config
         // server may be stale. Read the database entry directly rather than purging and reloading
         // the database into the CatalogCache, which is very expensive.
-        auto dbType =
-            uassertStatusOK(
-                Grid::get(opCtx)->catalogClient()->getDatabase(
-                    opCtx, nss.db().toString(), repl::ReadConcernArgs::get(opCtx).getLevel()))
-                .value;
+        auto dbType = catalogClient->getDatabase(
+            opCtx, nss.db(), repl::ReadConcernArgs::get(opCtx).getLevel());
         uassert(ErrorCodes::IllegalOperation,
                 str::stream() << "sharding not enabled for db " << nss.db(),
                 dbType.getSharded());
@@ -307,7 +301,7 @@ public:
 
         // For the config db, pick a new host shard for this collection, otherwise
         // make a connection to the real primary shard for this database.
-        auto primaryShardId = [&]() {
+        const auto primaryShardId = [&] {
             if (nss.db() == NamespaceString::kConfigDb) {
                 return shardIds[0];
             } else {
@@ -331,7 +325,7 @@ public:
         // mutex.
         Lock::ExclusiveLock lk = catalogManager->lockZoneMutex(opCtx);
 
-        ShardsvrShardCollection shardsvrShardCollectionRequest;
+        ShardsvrShardCollectionRequest shardsvrShardCollectionRequest;
         shardsvrShardCollectionRequest.set_shardsvrShardCollection(nss);
         shardsvrShardCollectionRequest.setKey(request.getKey());
         shardsvrShardCollectionRequest.setUnique(request.getUnique());
@@ -346,7 +340,7 @@ public:
             opCtx,
             ReadPreferenceSetting(ReadPreference::PrimaryOnly),
             "admin",
-            CommandHelpers::appendMajorityWriteConcern(CommandHelpers::appendPassthroughFields(
+            CommandHelpers::appendMajorityWriteConcern(CommandHelpers::appendGenericCommandArgs(
                 cmdObj, shardsvrShardCollectionRequest.toBSON())),
             Shard::RetryPolicy::kIdempotent));
 
@@ -361,12 +355,7 @@ public:
             result << "collectionUUID" << *uuid;
         }
 
-        auto routingInfo =
-            uassertStatusOK(catalogCache->getCollectionRoutingInfoWithRefresh(opCtx, nss));
-        uassert(ErrorCodes::ConflictingOperationInProgress,
-                "Collection was successfully written as sharded but got dropped before it "
-                "could be evenly distributed",
-                routingInfo.cm());
+        catalogCache->invalidateCollectionEntry_LINEARIZABLE(nss);
 
         return true;
     }

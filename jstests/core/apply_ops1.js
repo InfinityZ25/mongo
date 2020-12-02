@@ -4,6 +4,8 @@
 //   requires_non_retryable_commands,
 //   # applyOps uses the oplog that require replication support
 //   requires_replication,
+//   # Uses $v: 2 update oplog entries, only available in 4.7+.
+//   requires_fcv_47,
 // ]
 
 (function() {
@@ -413,11 +415,11 @@ res = assert.commandFailed(db.adminCommand({
             "op": "u",
             "ns": t.getFullName(),
             "o2": {_id: 7},
-            "o": {$v: NumberLong(0), $set: {z: 1, a: 2}}
+            "o": {$v: NumberInt(0), $set: {z: 1, a: 2}}
         }
     ]
 }));
-assert.eq(res.code, 40682);
+assert.eq(res.code, 4772604);
 
 // When we explicitly specify {$v: 1}, we should get 'UpdateNode' update semantics, and $set
 // operations get performed in lexicographic order.
@@ -428,9 +430,96 @@ res = assert.commandWorked(db.adminCommand({
             "op": "u",
             "ns": t.getFullName(),
             "o2": {_id: 10},
-            "o": {$v: NumberLong(1), $set: {z: 1, a: 2}}
+            "o": {$v: NumberInt(1), $set: {z: 1, a: 2}}
         }
     ]
 }));
 assert.eq(t.findOne({_id: 10}), {_id: 10, a: 2, z: 1});  // Note: 'a' and 'z' have been sorted.
+
+// {$v: 2} entries encode diffs differently, and operations are applied in the order specified
+// rather than in lexicographic order.
+res = assert.commandWorked(db.adminCommand({
+    applyOps: [
+        {"op": "i", "ns": t.getFullName(), "o": {_id: 11, deleteField: 1}},
+        {
+            "op": "u",
+            "ns": t.getFullName(),
+            "o2": {_id: 11},
+            // The diff indicates that 'deleteField' will be removed and 'newField' will be added
+            // with value "foo".
+            "o": {$v: NumberInt(2), diff: {d: {deleteField: false}, i: {newField: "foo"}}}
+        }
+    ]
+}));
+assert.eq(t.findOne({_id: 11}), {_id: 11, newField: "foo"});
+
+// {$v: 3} does not exist yet, and we check that trying to use it throws an error.
+res = assert.commandFailed(db.adminCommand({
+    applyOps: [
+        {"op": "i", "ns": t.getFullName(), "o": {_id: 12}},
+        {
+            "op": "u",
+            "ns": t.getFullName(),
+            "o2": {_id: 12},
+            "o": {$v: NumberInt(3), diff: {d: {deleteField: false}}}
+        }
+    ]
+}));
+assert.eq(res.code, 4772604);
+
+var insert_op1 = {_id: 13, x: 'inserted apply ops1'};
+var insert_op2 = {_id: 14, x: 'inserted apply ops2'};
+assert.commandWorked(db.adminCommand({
+    "applyOps": [{
+        op: 'c',
+        ns: 'admin.$cmd',
+        o: {
+            "applyOps": [{
+                op: 'c',
+                ns: 'test.$cmd',
+                o: {
+                    "applyOps": [
+                        {op: 'i', ns: t.getFullName(), o: insert_op1},
+                        {op: 'i', ns: t.getFullName(), o: insert_op2}
+                    ]
+                }
+            }],
+        }
+    }]
+}),
+                     "Nested apply ops was NOT successful");
+assert.eq(t.findOne({_id: 13}), insert_op1);
+assert.eq(t.findOne({_id: 14}), insert_op2);
+
+assert.commandWorked(db.adminCommand({
+    "applyOps": [{
+        op: 'c',
+        ns: 'admin.$cmd',
+        o: {
+            "applyOps": [{
+                op: 'c',
+                ns: 'test.$cmd',
+                o: {
+                    "applyOps": [
+                        {
+                            op: 'u',
+                            ns: t.getFullName(),
+                            o2: {_id: 13},
+                            o: {$set: {x: 'nested apply op update1'}}
+                        },
+                        {
+                            op: 'u',
+                            ns: t.getFullName(),
+                            o2: {_id: 14},
+                            o: {$set: {x: 'nested apply op update2'}}
+                        }
+                    ]
+                }
+            }],
+        }
+    }]
+}),
+                     "Nested apply ops was NOT successful");
+assert.eq(t.findOne({_id: 13}), {_id: 13, x: 'nested apply op update1'});
+assert.eq(t.findOne({_id: 14}), {_id: 14, x: 'nested apply op update2'});
 })();

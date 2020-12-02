@@ -1,5 +1,7 @@
 // Test $text with $textScore projection.
-// @tags: [requires_fcv_44]
+// @tags: [
+//   sbe_incompatible,
+// ]
 (function() {
 "use strict";
 

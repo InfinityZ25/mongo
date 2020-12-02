@@ -27,14 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/apply_ops.h"
 
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
@@ -151,7 +150,8 @@ Status _applyOps(OperationContext* opCtx,
             // NamespaceNotFound.
             // Additionally for inserts, we fail early on non-existent collections.
             Lock::CollectionLock collectionLock(opCtx, nss, MODE_IX);
-            auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
+            auto collection =
+                CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss);
             if (!collection && (*opType == 'i' || *opType == 'u')) {
                 uasserted(
                     ErrorCodes::AtomicityFailure,
@@ -231,7 +231,8 @@ Status _applyOps(OperationContext* opCtx,
                             return Status::OK();
                         }
 
-                        AutoGetCollection autoColl(opCtx, nss, MODE_IX);
+                        AutoGetCollection autoColl(
+                            opCtx, nss, fixLockModeForSystemDotViewsChanges(nss, MODE_IX));
                         if (!autoColl.getCollection()) {
                             // For idempotency reasons, return success on delete operations.
                             if (*opType == 'd') {
@@ -260,7 +261,7 @@ Status _applyOps(OperationContext* opCtx,
                 result->append("codeName", ErrorCodes::errorString(ex.code()));
                 result->append("errmsg", ex.what());
                 result->append("results", ab.arr());
-                return Status(ex.code(), ex.what());
+                return ex.toStatus();
             }
         }
 
@@ -315,8 +316,8 @@ Status _checkPrecondition(OperationContext* opCtx,
         if (!database) {
             return {ErrorCodes::NamespaceNotFound, "database in ns does not exist: " + nss.ns()};
         }
-        Collection* collection =
-            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
+        CollectionPtr collection =
+            CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss);
         if (!collection) {
             return {ErrorCodes::NamespaceNotFound, "collection in ns does not exist: " + nss.ns()};
         }
@@ -412,7 +413,7 @@ Status applyOps(OperationContext* opCtx,
         opCtx->writesAreReplicated() && !replCoord->canAcceptWritesForDatabase(opCtx, dbName);
 
     if (userInitiatedWritesAndNotPrimary)
-        return Status(ErrorCodes::NotMaster,
+        return Status(ErrorCodes::NotWritablePrimary,
                       str::stream() << "Not primary while applying ops to database " << dbName);
 
     if (auto preCondition = info.getPreCondition()) {
@@ -451,8 +452,8 @@ Status applyOps(OperationContext* opCtx,
             }
             // Generate oplog entry for all atomic ops collectively.
             if (opCtx->writesAreReplicated()) {
-                // We want this applied atomically on slaves so we rewrite the oplog entry without
-                // the pre-condition for speed.
+                // We want this applied atomically on secondaries so we rewrite the oplog entry
+                // without the pre-condition for speed.
 
                 BSONObjBuilder cmdBuilder;
 

@@ -964,6 +964,32 @@ TEST_F(ClusterCursorManagerTest, DoNotDestroyKilledPinnedCursors) {
     ASSERT(isMockCursorKilled(0));
 }
 
+// Test that a cursor correctly stores API parameters.
+TEST_F(ClusterCursorManagerTest, CursorStoresAPIParameters) {
+    APIParameters apiParams = APIParameters();
+    apiParams.setAPIVersion("2");
+    apiParams.setAPIStrict(true);
+    apiParams.setAPIDeprecationErrors(true);
+
+    auto cursor = allocateMockCursor();
+    cursor->setAPIParameters(apiParams);
+
+    auto cursorId =
+        assertGet(getManager()->registerCursor(_opCtx.get(),
+                                               std::move(cursor),
+                                               nss,
+                                               ClusterCursorManager::CursorType::SingleTarget,
+                                               ClusterCursorManager::CursorLifetime::Mortal,
+                                               UserNameIterator()));
+    auto pinnedCursor =
+        assertGet(getManager()->checkOutCursor(nss, cursorId, _opCtx.get(), successAuthChecker));
+
+    auto storedAPIParams = pinnedCursor->getAPIParameters();
+    ASSERT_EQ("2", *storedAPIParams.getAPIVersion());
+    ASSERT_TRUE(*storedAPIParams.getAPIStrict());
+    ASSERT_TRUE(*storedAPIParams.getAPIDeprecationErrors());
+}
+
 TEST_F(ClusterCursorManagerTest, CannotRegisterCursorDuringShutdown) {
     ASSERT_OK(getManager()->registerCursor(_opCtx.get(),
                                            allocateMockCursor(),

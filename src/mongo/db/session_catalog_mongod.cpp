@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kTransaction
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTransaction
 
 #include "mongo/platform/basic.h"
 
@@ -212,6 +212,7 @@ void abortInProgressTransactions(OperationContext* opCtx) {
                     "sessionId"_attr = txnRecord.getSessionId().toBSON(),
                     "txnNumber"_attr = txnRecord.getTxnNum());
         txnParticipant.abortTransaction(opCtx);
+        opCtx->resetMultiDocumentTransactionState();
     }
 }
 }  // namespace
@@ -269,9 +270,8 @@ void MongoDSessionCatalog::onStepUp(OperationContext* opCtx) {
 }
 
 boost::optional<UUID> MongoDSessionCatalog::getTransactionTableUUID(OperationContext* opCtx) {
-    AutoGetCollection autoColl(opCtx, NamespaceString::kSessionTransactionsTableNamespace, MODE_IS);
+    AutoGetCollection coll(opCtx, NamespaceString::kSessionTransactionsTableNamespace, MODE_IS);
 
-    const auto coll = autoColl.getCollection();
     if (!coll) {
         return boost::none;
     }

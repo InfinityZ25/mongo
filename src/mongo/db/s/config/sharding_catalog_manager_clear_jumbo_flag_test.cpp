@@ -33,17 +33,18 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/client/read_preference.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/config_server_test_fixture.h"
 
 namespace mongo {
 namespace {
 
 using unittest::assertGet;
 
+const KeyPattern kKeyPattern(BSON("x" << 1));
 
 class ClearJumboFlagTest : public ConfigServerTestFixture {
 public:
@@ -73,14 +74,6 @@ protected:
 
         setupShards({shard});
 
-        CollectionType collection;
-        collection.setNs(_namespace);
-        collection.setEpoch(_epoch);
-        collection.setKeyPattern(BSON("x" << 1));
-
-        ASSERT_OK(insertToConfigCollection(
-            operationContext(), CollectionType::ConfigNS, collection.toBSON()));
-
         ChunkType chunk;
         chunk.setName(OID::gen());
         chunk.setNS(_namespace);
@@ -98,7 +91,7 @@ protected:
         otherChunk.setMin(nonJumboChunk().getMin());
         otherChunk.setMax(nonJumboChunk().getMax());
 
-        setupChunks({chunk, otherChunk});
+        setupCollection(_namespace, kKeyPattern, {chunk, otherChunk});
     }
 
 private:

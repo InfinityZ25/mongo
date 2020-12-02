@@ -27,19 +27,16 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/pipeline_d.h"
 
-#include <memory>
-
 #include "mongo/base/exact_cast.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
-#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -68,25 +65,20 @@
 #include "mongo/db/pipeline/document_source_single_document_transformation.h"
 #include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/skip_and_limit.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/get_executor.h"
+#include "mongo/db/query/plan_executor_factory.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/sort_pattern.h"
 #include "mongo/db/s/collection_sharding_state.h"
-#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/sorted_data_interface.h"
-#include "mongo/db/transaction_participant.h"
-#include "mongo/rpc/metadata/client_metadata_ismaster.h"
-#include "mongo/s/catalog_cache.h"
-#include "mongo/s/chunk_manager.h"
-#include "mongo/s/chunk_version.h"
-#include "mongo/s/grid.h"
+#include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/s/query/document_source_merge_cursors.h"
-#include "mongo/s/write_ops/cluster_write.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -102,12 +94,17 @@ namespace {
  * Returns a PlanExecutor which uses a random cursor to sample documents if successful. Returns {}
  * if the storage engine doesn't support random cursors, or if 'sampleSize' is a large enough
  * percentage of the collection.
+ *
+ * If needed, adds DocumentSourceSampleFromRandomCursor to the front of the pipeline, replacing the
+ * $sample stage. This is needed if we select an optimized plan for $sample taking advantage of
+ * storage engine support for random cursors.
  */
 StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> createRandomCursorExecutor(
-    Collection* coll,
+    const CollectionPtr& coll,
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     long long sampleSize,
-    long long numRecords) {
+    long long numRecords,
+    Pipeline* pipeline) {
     OperationContext* opCtx = expCtx->opCtx;
 
     // Verify that we are already under a collection lock. We avoid taking locks ourselves in this
@@ -139,6 +136,8 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> createRandomCursorEx
             ->getOwnershipFilter(
                 opCtx, CollectionShardingState::OrphanCleanupPolicy::kDisallowOrphanCleanup);
 
+    TrialStage* trialStage = nullptr;
+
     // Because 'numRecords' includes orphan documents, our initial decision to optimize the $sample
     // cursor may have been mistaken. For sharded collections, build a TRIAL plan that will switch
     // to a collection scan if the ratio of orphaned to owned documents encountered over the first
@@ -167,21 +166,35 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> createRandomCursorEx
                                             std::move(collScanPlan),
                                             kMaxPresampleSize,
                                             minWorkAdvancedRatio);
+        trialStage = static_cast<TrialStage*>(root.get());
     }
 
-    return PlanExecutor::make(
-        expCtx, std::move(ws), std::move(root), coll, PlanExecutor::YIELD_AUTO);
+    auto exec = plan_executor_factory::make(
+        expCtx, std::move(ws), std::move(root), &coll, PlanYieldPolicy::YieldPolicy::YIELD_AUTO);
+
+    // For sharded collections, the root of the plan tree is a TrialStage that may have chosen
+    // either a random-sampling cursor trial plan or a COLLSCAN backup plan. We can only optimize
+    // the $sample aggregation stage if the trial plan was chosen.
+    if (!trialStage || !trialStage->pickedBackupPlan()) {
+        // Replace $sample stage with $sampleFromRandomCursor stage.
+        pipeline->popFront();
+        std::string idString = coll->ns().isOplog() ? "ts" : "_id";
+        pipeline->addInitialSource(
+            DocumentSourceSampleFromRandomCursor::create(expCtx, sampleSize, idString, numRecords));
+    }
+
+    return exec;
 }
 
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExecutor(
     const intrusive_ptr<ExpressionContext>& expCtx,
-    Collection* collection,
+    const CollectionPtr& collection,
     const NamespaceString& nss,
     BSONObj queryObj,
     BSONObj projectionObj,
     const QueryMetadataBitSet& metadataRequested,
     BSONObj sortObj,
-    boost::optional<long long> limit,
+    SkipThenLimit skipThenLimit,
     boost::optional<std::string> groupIdForDistinctScan,
     const AggregationRequest* aggRequest,
     const size_t plannerOpts,
@@ -191,7 +204,8 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
     qr->setFilter(queryObj);
     qr->setProj(projectionObj);
     qr->setSort(sortObj);
-    qr->setLimit(limit);
+    qr->setSkip(skipThenLimit.getSkip());
+    qr->setLimit(skipThenLimit.getLimit());
     if (aggRequest) {
         qr->setExplain(static_cast<bool>(aggRequest->getExplain()));
         qr->setHint(aggRequest->getHint());
@@ -238,7 +252,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
         // example, if we have a document {a: [1,2]} and group by "a" a DISTINCT_SCAN on an "a"
         // index would produce one result for '1' and another for '2', which would be incorrect.
         auto distinctExecutor = getExecutorDistinct(
-            collection, plannerOpts | QueryPlannerParams::STRICT_DISTINCT_ONLY, &parsedDistinct);
+            &collection, plannerOpts | QueryPlannerParams::STRICT_DISTINCT_ONLY, &parsedDistinct);
         if (!distinctExecutor.isOK()) {
             return distinctExecutor.getStatus().withContext(
                 "Unable to use distinct scan to optimize $group stage");
@@ -252,7 +266,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
 
     bool permitYield = true;
     return getExecutorFind(
-        expCtx->opCtx, collection, std::move(cq.getValue()), permitYield, plannerOpts);
+        expCtx->opCtx, &collection, std::move(cq.getValue()), permitYield, plannerOpts);
 }
 
 /**
@@ -261,7 +275,8 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
  *
  * The 'collection' is required to exist. Throws if no usable 2d or 2dsphere index could be found.
  */
-StringData extractGeoNearFieldFromIndexes(OperationContext* opCtx, Collection* collection) {
+StringData extractGeoNearFieldFromIndexes(OperationContext* opCtx,
+                                          const CollectionPtr& collection) {
     invariant(collection);
 
     std::vector<const IndexDescriptor*> idxs;
@@ -301,7 +316,7 @@ StringData extractGeoNearFieldFromIndexes(OperationContext* opCtx, Collection* c
 }  // namespace
 
 std::pair<PipelineD::AttachExecutorCallback, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
-PipelineD::buildInnerQueryExecutor(Collection* collection,
+PipelineD::buildInnerQueryExecutor(const CollectionPtr& collection,
                                    const NamespaceString& nss,
                                    const AggregationRequest* aggRequest,
                                    Pipeline* pipeline) {
@@ -324,34 +339,19 @@ PipelineD::buildInnerQueryExecutor(Collection* collection,
             const long long sampleSize = sampleStage->getSampleSize();
             const long long numRecords = collection->getRecordStore()->numRecords(expCtx->opCtx);
             auto exec = uassertStatusOK(
-                createRandomCursorExecutor(collection, expCtx, sampleSize, numRecords));
+                createRandomCursorExecutor(collection, expCtx, sampleSize, numRecords, pipeline));
             if (exec) {
-                // For sharded collections, the root of the plan tree is a TrialStage that may have
-                // chosen either a random-sampling cursor trial plan or a COLLSCAN backup plan. We
-                // can only optimize the $sample aggregation stage if the trial plan was chosen.
-                auto* trialStage = (exec->getRootStage()->stageType() == StageType::STAGE_TRIAL
-                                        ? static_cast<TrialStage*>(exec->getRootStage())
-                                        : nullptr);
-                if (!trialStage || !trialStage->pickedBackupPlan()) {
-                    // Replace $sample stage with $sampleFromRandomCursor stage.
-                    pipeline->popFront();
-                    std::string idString = collection->ns().isOplog() ? "ts" : "_id";
-                    pipeline->addInitialSource(DocumentSourceSampleFromRandomCursor::create(
-                        expCtx, sampleSize, idString, numRecords));
-                }
-
                 // The order in which we evaluate these arguments is significant. We'd like to be
                 // sure that the DocumentSourceCursor is created _last_, because if we run into a
                 // case where a DocumentSourceCursor has been created (yet hasn't been put into a
                 // Pipeline) and an exception is thrown, an invariant will trigger in the
                 // DocumentSourceCursor. This is a design flaw in DocumentSourceCursor.
-
                 auto deps = pipeline->getDependencies(DepsTracker::kAllMetadata);
                 const auto cursorType = deps.hasNoRequirements()
                     ? DocumentSourceCursor::CursorType::kEmptyDocuments
                     : DocumentSourceCursor::CursorType::kRegular;
                 auto attachExecutorCallback =
-                    [cursorType](Collection* collection,
+                    [cursorType](const CollectionPtr& collection,
                                  std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
                                  Pipeline* pipeline) {
                         auto cursor = DocumentSourceCursor::create(
@@ -375,7 +375,7 @@ PipelineD::buildInnerQueryExecutor(Collection* collection,
 }
 
 void PipelineD::attachInnerQueryExecutorToPipeline(
-    Collection* collection,
+    const CollectionPtr& collection,
     PipelineD::AttachExecutorCallback attachExecutorCallback,
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
     Pipeline* pipeline) {
@@ -387,7 +387,7 @@ void PipelineD::attachInnerQueryExecutorToPipeline(
     }
 }
 
-void PipelineD::buildAndAttachInnerQueryExecutorToPipeline(Collection* collection,
+void PipelineD::buildAndAttachInnerQueryExecutorToPipeline(const CollectionPtr& collection,
                                                            const NamespaceString& nss,
                                                            const AggregationRequest* aggRequest,
                                                            Pipeline* pipeline) {
@@ -434,19 +434,41 @@ getSortAndGroupStagesFromPipeline(const Pipeline::SourceContainer& sources) {
     return std::make_pair(sortStage, groupStage);
 }
 
-boost::optional<long long> extractLimitForPushdown(Pipeline* pipeline) {
-    // If the disablePipelineOptimization failpoint is enabled, then do not attempt the limit
+boost::optional<long long> extractSkipForPushdown(Pipeline* pipeline) {
+    // If the disablePipelineOptimization failpoint is enabled, then do not attempt the skip
     // pushdown optimization.
     if (MONGO_unlikely(disablePipelineOptimization.shouldFail())) {
         return boost::none;
     }
     auto&& sources = pipeline->getSources();
-    auto limit = DocumentSourceSort::extractLimitForPushdown(sources.begin(), &sources);
-    if (limit) {
-        // Removing $limit stages may have produced the opportunity for additional optimizations.
+
+    auto skip = extractSkipForPushdown(sources.begin(), &sources);
+    if (skip) {
+        // Removing stages may have produced the opportunity for additional optimizations.
         pipeline->optimizePipeline();
     }
-    return limit;
+    return skip;
+}
+
+SkipThenLimit extractSkipAndLimitForPushdown(Pipeline* pipeline) {
+    // If the disablePipelineOptimization failpoint is enabled, then do not attempt the limit and
+    // skip pushdown optimization.
+    if (MONGO_unlikely(disablePipelineOptimization.shouldFail())) {
+        return {boost::none, boost::none};
+    }
+    auto&& sources = pipeline->getSources();
+
+    // It is important to call 'extractLimitForPushdown' before 'extractSkipForPushdown'. Otherwise
+    // there could be a situation when $limit stages in pipeline would prevent
+    // 'extractSkipForPushdown' from extracting all $skip stages.
+    auto limit = extractLimitForPushdown(sources.begin(), &sources);
+    auto skip = extractSkipForPushdown(sources.begin(), &sources);
+    auto skipThenLimit = LimitThenSkip(limit, skip).flip();
+    if (skipThenLimit.getSkip() || skipThenLimit.getLimit()) {
+        // Removing stages may have produced the opportunity for additional optimizations.
+        pipeline->optimizePipeline();
+    }
+    return skipThenLimit;
 }
 
 /**
@@ -486,7 +508,7 @@ auto buildProjectionForPushdown(const DepsTracker& deps, Pipeline* pipeline) {
 }  // namespace
 
 std::pair<PipelineD::AttachExecutorCallback, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
-PipelineD::buildInnerQueryExecutorGeneric(Collection* collection,
+PipelineD::buildInnerQueryExecutorGeneric(const CollectionPtr& collection,
                                           const NamespaceString& nss,
                                           const AggregationRequest* aggRequest,
                                           Pipeline* pipeline) {
@@ -519,9 +541,9 @@ PipelineD::buildInnerQueryExecutorGeneric(Collection* collection,
         rewrittenGroupStage = groupStage->rewriteGroupAsTransformOnFirstDocument();
     }
 
-    // If there is a $limit stage (or multiple $limit stages) that could be pushed down into the
-    // PlanStage layer, obtain the value of the limit and remove the $limit stages from the
-    // pipeline.
+    // If there is a $limit or $skip stage (or multiple of them) that could be pushed down into the
+    // PlanStage layer, obtain the value of the limit and skip and remove the $limit and $skip
+    // stages from the pipeline.
     //
     // This analysis is done here rather than in 'optimizePipeline()' because swapping $limit before
     // stages such as $project is not always useful, and can sometimes defeat other optimizations.
@@ -531,10 +553,10 @@ PipelineD::buildInnerQueryExecutorGeneric(Collection* collection,
     // merging shard first, and then apply the projection serially. See SERVER-24981 for a more
     // detailed discussion.
     //
-    // This only handles the case in which the the $limit can logically be swapped to the front of
-    // the pipeline. We can also push down a $limit which comes after a $sort into the PlanStage
-    // layer, but that is handled elsewhere.
-    const auto limit = extractLimitForPushdown(pipeline);
+    // This only handles the case in which the the $limit or $skip can logically be swapped to the
+    // front of the pipeline. We can also push down a $limit which comes after a $sort into the
+    // PlanStage layer, but that is handled elsewhere.
+    const auto skipThenLimit = extractSkipAndLimitForPushdown(pipeline);
 
     auto unavailableMetadata = DocumentSourceMatch::isTextQuery(queryObj)
         ? DepsTracker::kDefaultUnavailableMetadata & ~DepsTracker::kOnlyTextScore
@@ -550,7 +572,7 @@ PipelineD::buildInnerQueryExecutorGeneric(Collection* collection,
                                                 std::move(rewrittenGroupStage),
                                                 unavailableMetadata,
                                                 queryObj,
-                                                limit,
+                                                skipThenLimit,
                                                 aggRequest,
                                                 Pipeline::kAllowedMatcherFeatures,
                                                 &shouldProduceEmptyDocs));
@@ -564,7 +586,7 @@ PipelineD::buildInnerQueryExecutorGeneric(Collection* collection,
         (pipeline->peekFront() && pipeline->peekFront()->constraints().isChangeStreamStage());
 
     auto attachExecutorCallback =
-        [cursorType, trackOplogTS](Collection* collection,
+        [cursorType, trackOplogTS](const CollectionPtr& collection,
                                    std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
                                    Pipeline* pipeline) {
             auto cursor = DocumentSourceCursor::create(
@@ -575,7 +597,7 @@ PipelineD::buildInnerQueryExecutorGeneric(Collection* collection,
 }
 
 std::pair<PipelineD::AttachExecutorCallback, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
-PipelineD::buildInnerQueryExecutorGeoNear(Collection* collection,
+PipelineD::buildInnerQueryExecutorGeoNear(const CollectionPtr& collection,
                                           const NamespaceString& nss,
                                           const AggregationRequest* aggRequest,
                                           Pipeline* pipeline) {
@@ -610,7 +632,7 @@ PipelineD::buildInnerQueryExecutorGeoNear(Collection* collection,
                         nullptr, /* rewrittenGroupStage */
                         DepsTracker::kDefaultUnavailableMetadata & ~DepsTracker::kAllGeoNearData,
                         std::move(fullQuery),
-                        boost::none, /* limit */
+                        SkipThenLimit{boost::none, boost::none},
                         aggRequest,
                         Pipeline::kGeoNearMatcherFeatures,
                         &shouldProduceEmptyDocs));
@@ -619,7 +641,7 @@ PipelineD::buildInnerQueryExecutorGeoNear(Collection* collection,
                                    locationField = geoNearStage->getLocationField(),
                                    distanceMultiplier =
                                        geoNearStage->getDistanceMultiplier().value_or(1.0)](
-                                      Collection* collection,
+                                      const CollectionPtr& collection,
                                       std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
                                       Pipeline* pipeline) {
         auto cursor = DocumentSourceGeoNearCursor::create(collection,
@@ -637,14 +659,14 @@ PipelineD::buildInnerQueryExecutorGeoNear(Collection* collection,
 
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prepareExecutor(
     const intrusive_ptr<ExpressionContext>& expCtx,
-    Collection* collection,
+    const CollectionPtr& collection,
     const NamespaceString& nss,
     Pipeline* pipeline,
     const boost::intrusive_ptr<DocumentSourceSort>& sortStage,
     std::unique_ptr<GroupFromFirstDocumentTransformation> rewrittenGroupStage,
     QueryMetadataBitSet unavailableMetadata,
     const BSONObj& queryObj,
-    boost::optional<long long> limit,
+    SkipThenLimit skipThenLimit,
     const AggregationRequest* aggRequest,
     const MatchExpressionParser::AllowedFeatureSet& matcherFeatures,
     bool* hasNoRequirements) {
@@ -654,7 +676,14 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
 
     if (pipeline->peekFront() && pipeline->peekFront()->constraints().isChangeStreamStage()) {
         invariant(expCtx->tailableMode == TailableModeEnum::kTailableAndAwaitData);
-        plannerOpts |= QueryPlannerParams::TRACK_LATEST_OPLOG_TS;
+        plannerOpts |= (QueryPlannerParams::TRACK_LATEST_OPLOG_TS |
+                        QueryPlannerParams::ASSERT_MIN_TS_HAS_NOT_FALLEN_OFF_OPLOG);
+    }
+
+    // The $_requestReshardingResumeToken parameter is only valid for an oplog scan.
+    if (aggRequest && aggRequest->getRequestReshardingResumeToken()) {
+        plannerOpts |= (QueryPlannerParams::TRACK_LATEST_OPLOG_TS |
+                        QueryPlannerParams::ASSERT_MIN_TS_HAS_NOT_FALLEN_OFF_OPLOG);
     }
 
     // If there is a sort stage eligible for pushdown, serialize its SortPattern to a BSONObj. The
@@ -667,12 +696,21 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
                       .serialize(SortPattern::SortKeySerialization::kForPipelineSerialization)
                       .toBson();
 
-        // If the $sort has a coalesced $limit, then we push it down as well. Since the $limit was
-        // after a $sort in the pipeline, it should not have been provided by the caller.
-        invariant(!limit);
-        limit = sortStage->getLimit();
-
         pipeline->popFrontWithName(DocumentSourceSort::kStageName);
+
+        // Now that we've pushed down the sort, see if there is a $limit and $skip to push down
+        // also. We should not already have a limit or skip here, otherwise it would be incorrect
+        // for the caller to pass us a sort stage to push down, since the order matters.
+        invariant(!skipThenLimit.getLimit());
+        invariant(!skipThenLimit.getSkip());
+
+        // Since all $limit stages were already pushdowned to the sort stage, we are only looking
+        // for $skip stages.
+        auto skip = extractSkipForPushdown(pipeline);
+
+        // Since the limit from $sort is going before the extracted $skip stages, we construct
+        // 'LimitThenSkip' object and then convert it 'SkipThenLimit'.
+        skipThenLimit = LimitThenSkip(sortStage->getLimit(), skip).flip();
     }
 
     // Perform dependency analysis. In order to minimize the dependency set, we only analyze the
@@ -703,7 +741,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
                                                       projObj,
                                                       deps.metadataDeps(),
                                                       sortObj,
-                                                      boost::none, /* limit */
+                                                      SkipThenLimit{boost::none, boost::none},
                                                       rewrittenGroupStage->groupId(),
                                                       aggRequest,
                                                       plannerOpts,
@@ -743,7 +781,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
                                 projObj,
                                 deps.metadataDeps(),
                                 sortObj,
-                                limit,
+                                skipThenLimit,
                                 boost::none, /* groupIdForDistinctScan */
                                 aggRequest,
                                 plannerOpts,
@@ -757,32 +795,4 @@ Timestamp PipelineD::getLatestOplogTimestamp(const Pipeline* pipeline) {
     }
     return Timestamp();
 }
-
-std::string PipelineD::getPlanSummaryStr(const Pipeline* pipeline) {
-    if (auto docSourceCursor =
-            dynamic_cast<DocumentSourceCursor*>(pipeline->_sources.front().get())) {
-        return docSourceCursor->getPlanSummaryStr();
-    }
-
-    return "";
-}
-
-void PipelineD::getPlanSummaryStats(const Pipeline* pipeline, PlanSummaryStats* statsOut) {
-    invariant(statsOut);
-
-    if (auto docSourceCursor =
-            dynamic_cast<DocumentSourceCursor*>(pipeline->_sources.front().get())) {
-        *statsOut = docSourceCursor->getPlanSummaryStats();
-    }
-
-    for (auto&& source : pipeline->_sources) {
-        if (dynamic_cast<DocumentSourceSort*>(source.get()))
-            statsOut->hasSortStage = true;
-
-        statsOut->usedDisk = statsOut->usedDisk || source->usedDisk();
-        if (statsOut->usedDisk && statsOut->hasSortStage)
-            break;
-    }
-}
-
 }  // namespace mongo

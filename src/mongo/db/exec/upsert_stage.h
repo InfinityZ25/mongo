@@ -54,7 +54,7 @@ public:
     UpsertStage(ExpressionContext* expCtx,
                 const UpdateStageParams& params,
                 WorkingSet* ws,
-                Collection* collection,
+                const CollectionPtr& collection,
                 PlanStage* child);
 
     bool isEOF() final;
@@ -68,9 +68,7 @@ private:
     void _generateNewDocumentFromUpdateOp(const FieldRefSet& immutablePaths);
 
     void _assertDocumentToBeInsertedIsValid(const mutablebson::Document& document,
-                                            const FieldRefSet& shardKeyPaths,
-                                            bool isInternalRequest,
-                                            bool enforceOkForStorage);
+                                            const FieldRefSet& shardKeyPaths);
 };
 
 }  // namespace mongo

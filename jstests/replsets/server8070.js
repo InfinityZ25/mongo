@@ -12,8 +12,8 @@ load("jstests/replsets/rslib.js");
 // helper to ensure two nodes are at the same place in the oplog
 var waitForSameOplogPosition = function(db1, db2, errmsg) {
     assert.soon(function() {
-        var last1 = db1.getSisterDB("local").oplog.rs.find().sort({$natural: -1}).limit(1).next();
-        var last2 = db2.getSisterDB("local").oplog.rs.find().sort({$natural: -1}).limit(1).next();
+        var last1 = db1.getSiblingDB("local").oplog.rs.find().sort({$natural: -1}).limit(1).next();
+        var last2 = db2.getSiblingDB("local").oplog.rs.find().sort({$natural: -1}).limit(1).next();
         jsTest.log("primary: " + tojson(last1) + " secondary: " + tojson(last2));
 
         return ((last1.ts.t === last2.ts.t) && (last1.ts.i === last2.ts.i));
@@ -34,32 +34,32 @@ replSet.initiate({
 });
 
 // set up common points of access
-var master = replSet.getPrimary();
-var primary = master.getDB("foo");
-replSet.nodes[1].setSlaveOk();
-replSet.nodes[2].setSlaveOk();
+var primary = replSet.getPrimary();
+var primaryDB = primary.getDB("foo");
+replSet.nodes[1].setSecondaryOk();
+replSet.nodes[2].setSecondaryOk();
 var member2 = replSet.nodes[1].getDB("admin");
 var member3 = replSet.nodes[2].getDB("admin");
 
 // Do an initial write
-master.getDB("foo").bar.insert({x: 1});
+primary.getDB("foo").bar.insert({x: 1});
 replSet.awaitReplication();
 
 jsTest.log("Make sure 2 & 3 are syncing from the primary");
-assert.eq(master, replSet.nodes[0]);
-syncFrom(replSet.nodes[1], master, replSet);
-syncFrom(replSet.nodes[2], master, replSet);
+assert.eq(primary, replSet.nodes[0]);
+syncFrom(replSet.nodes[1], primary, replSet);
+syncFrom(replSet.nodes[2], primary, replSet);
 
 jsTest.log("Stop 2's replication");
 member2.runCommand({configureFailPoint: 'rsSyncApplyStop', mode: 'alwaysOn'});
 
 jsTest.log("Do a few writes");
 for (var i = 0; i < 25; i++) {
-    primary.bar.insert({x: i});
+    primaryDB.bar.insert({x: i});
 }
 
 jsTest.log("Make sure 3 is at write #25");
-waitForSameOplogPosition(primary, member3, "node 3 failed to catch up to the primary");
+waitForSameOplogPosition(primaryDB, member3, "node 3 failed to catch up to the primary");
 // This means 3's buffer is empty
 
 jsTest.log("Stop 3's replication");
@@ -73,11 +73,11 @@ member2.runCommand({configureFailPoint: 'rsSyncApplyStop', mode: 'off'});
 
 jsTest.log("Do some writes");
 for (var i = 25; i < 50; i++) {
-    primary.bar.insert({x: i});
+    primaryDB.bar.insert({x: i});
 }
 
 jsTest.log("Make sure 2 is at write #50");
-waitForSameOplogPosition(primary, member2, "node 2 failed to catch up to the primary");
+waitForSameOplogPosition(primaryDB, member2, "node 2 failed to catch up to the primary");
 // This means 2's buffer is empty
 
 jsTest.log("Stop 2's replication");
@@ -85,11 +85,11 @@ member2.runCommand({configureFailPoint: 'rsSyncApplyStop', mode: 'alwaysOn'});
 
 jsTest.log("Do some writes - 2 & 3 should have up to write #75 in their buffers, but unapplied");
 for (var i = 50; i < 75; i++) {
-    primary.bar.insert({x: i});
+    primaryDB.bar.insert({x: i});
 }
-var primaryCollectionSize = primary.bar.find().itcount();
+var primaryCollectionSize = primaryDB.bar.find().itcount();
 jsTest.log("primary collection size: " + primaryCollectionSize);
-var last = primary.getSisterDB("local").oplog.rs.find().sort({$natural: -1}).limit(1).next();
+var last = primaryDB.getSiblingDB("local").oplog.rs.find().sort({$natural: -1}).limit(1).next();
 
 jsTest.log("waiting a bit for the secondaries to get the write");
 sleep(10000);
@@ -111,7 +111,7 @@ stopServerReplication(member3.getMongo());
 
 // count documents in member 3
 assert.eq(26,
-          member3.getSisterDB("foo").bar.find().itcount(),
+          member3.getSiblingDB("foo").bar.find().itcount(),
           "collection size incorrect on node 3 before applying ops 25-75");
 
 jsTest.log("Allow 3 to apply ops 25-75");
@@ -119,11 +119,11 @@ assert.commandWorked(member3.runCommand({configureFailPoint: 'rsSyncApplyStop', 
                      "member 3 rsSyncApplyStop admin command failed");
 
 assert.soon(function() {
-    var last3 = member3.getSisterDB("local").oplog.rs.find().sort({$natural: -1}).limit(1).next();
+    var last3 = member3.getSiblingDB("local").oplog.rs.find().sort({$natural: -1}).limit(1).next();
     jsTest.log("primary: " + tojson(last, '', true) + " secondary: " + tojson(last3, '', true));
-    jsTest.log("member 3 collection size: " + member3.getSisterDB("foo").bar.find().itcount());
+    jsTest.log("member 3 collection size: " + member3.getSiblingDB("foo").bar.find().itcount());
     jsTest.log("curop: ");
-    printjson(member3.getSisterDB("foo").currentOp(true));
+    printjson(member3.getSiblingDB("foo").currentOp(true));
     return ((last.ts.t === last3.ts.t) && (last.ts.i === last3.ts.i));
 }, "Replication member 3 did not apply ops 25-75");
 

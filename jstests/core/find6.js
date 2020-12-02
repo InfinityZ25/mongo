@@ -1,8 +1,7 @@
 // @tags: [
-//     requires_fastcount,
-//
-//     # Uses $where operator
-//     requires_scripting,
+//   requires_fastcount,
+//   # Uses $where operator
+//   requires_scripting,
 // ]
 
 t = db.find6;
@@ -34,7 +33,7 @@ function f() {
 
 for (var pass = 0; pass <= 1; pass++) {
     f();
-    q.ensureIndex({a: 1});
+    q.createIndex({a: 1});
 }
 
 t = db.multidim;

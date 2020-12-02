@@ -37,6 +37,7 @@
 #include "mongo/platform/mutex.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/util/concurrency/mutex.h"
+#include "mongo/util/static_immortal.h"
 
 namespace mongo {
 
@@ -98,10 +99,17 @@ public:
     }
 
     /**
-     * Get the number of CPUs
+     * Get the number of (logical) CPUs
      */
     static unsigned getNumCores() {
         return sysInfo().numCores;
+    }
+
+    /**
+     * Get the number of physical CPUs
+     */
+    static unsigned getNumPhysicalCores() {
+        return sysInfo().numPhysicalCores;
     }
 
     /**
@@ -159,18 +167,11 @@ public:
     static bool blockInMemory(const void* start);
 
     /**
-     * Returns a positive floating point number between 0.0 and 1.0 to inform MMapV1 how much it
-     * must remap pages to bring the system page file implementation back below a certain
-     * threshold. A number of 1.0 means remap everything.
-     */
-    static double getSystemMemoryPressurePercentage();
-
-    /**
      * @return a pointer aligned to the start of the page the provided pointer belongs to.
      *
      * NOTE requires blockCheckSupported() == true
      */
-    inline static const void* alignToStartOfPage(const void* ptr) {
+    static const void* alignToStartOfPage(const void* ptr) {
         return reinterpret_cast<const void*>(reinterpret_cast<unsigned long long>(ptr) &
                                              ~(getPageSize() - 1));
     }
@@ -185,6 +186,10 @@ public:
      */
     static bool pagesInMemory(const void* start, size_t numPages, std::vector<char>* out);
 
+    static const std::string& getProcessName() {
+        return appInfo().getProcessName();
+    }
+
 private:
     /**
      * Host and operating system info.  Does not change over time.
@@ -198,6 +203,7 @@ private:
         unsigned long long memSize;
         unsigned long long memLimit;
         unsigned numCores;
+        unsigned numPhysicalCores;
         unsigned long long pageSize;
         std::string cpuArch;
         bool hasNuma;
@@ -215,6 +221,7 @@ private:
               memSize(0),
               memLimit(0),
               numCores(0),
+              numPhysicalCores(0),
               pageSize(0),
               hasNuma(false),
               preferMsyncOverFSync(true) {
@@ -227,13 +234,37 @@ private:
         void collectSystemInfo();
     };
 
+    class ApplicationInfo {
+    public:
+        void init(const std::vector<std::string>& argv) {
+            invariant(!_isInitialized);
+            _isInitialized = true;
+            if (!argv.empty()) {
+                _processName = argv[0];
+            }
+        }
+        const std::string& getProcessName() const {
+            return _processName;
+        }
+
+    private:
+        bool _isInitialized = false;
+        std::string _processName;
+    };
+
     ProcessId _pid;
 
     static bool checkNumaEnabled();
 
-    inline static const SystemInfo& sysInfo() {
+    static const SystemInfo& sysInfo() {
         static ProcessInfo::SystemInfo systemInfo;
         return systemInfo;
+    }
+
+public:
+    static ApplicationInfo& appInfo() {
+        static StaticImmortal<ApplicationInfo> applicationInfo{};
+        return applicationInfo.value();
     }
 
 private:

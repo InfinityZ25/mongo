@@ -28,6 +28,7 @@
  */
 
 #include "mongo/db/storage/recovery_unit_test_harness.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/storage/record_store.h"
@@ -84,23 +85,29 @@ private:
 };
 
 TEST_F(RecoveryUnitTestHarness, CommitUnitOfWork) {
+    Lock::GlobalLock globalLk(opCtx.get(), MODE_IX);
     const auto rs = harnessHelper->createRecordStore(opCtx.get(), "table1");
+    opCtx->lockState()->beginWriteUnitOfWork();
     ru->beginUnitOfWork(opCtx.get());
     StatusWith<RecordId> s = rs->insertRecord(opCtx.get(), "data", 4, Timestamp());
     ASSERT_TRUE(s.isOK());
     ASSERT_EQUALS(1, rs->numRecords(opCtx.get()));
     ru->commitUnitOfWork();
+    opCtx->lockState()->endWriteUnitOfWork();
     RecordData rd;
     ASSERT_TRUE(rs->findRecord(opCtx.get(), s.getValue(), &rd));
 }
 
 TEST_F(RecoveryUnitTestHarness, AbortUnitOfWork) {
+    Lock::GlobalLock globalLk(opCtx.get(), MODE_IX);
     const auto rs = harnessHelper->createRecordStore(opCtx.get(), "table1");
+    opCtx->lockState()->beginWriteUnitOfWork();
     ru->beginUnitOfWork(opCtx.get());
     StatusWith<RecordId> s = rs->insertRecord(opCtx.get(), "data", 4, Timestamp());
     ASSERT_TRUE(s.isOK());
     ASSERT_EQUALS(1, rs->numRecords(opCtx.get()));
     ru->abortUnitOfWork();
+    opCtx->lockState()->endWriteUnitOfWork();
     ASSERT_FALSE(rs->findRecord(opCtx.get(), s.getValue(), nullptr));
 }
 
@@ -121,22 +128,30 @@ TEST_F(RecoveryUnitTestHarness, CommitAndRollbackChanges) {
     ASSERT_EQUALS(count, 0);
 }
 
-TEST_F(RecoveryUnitTestHarness, CheckInActiveTxnWithCommit) {
+TEST_F(RecoveryUnitTestHarness, CheckIsActiveWithCommit) {
+    Lock::GlobalLock globalLk(opCtx.get(), MODE_IX);
     const auto rs = harnessHelper->createRecordStore(opCtx.get(), "table1");
+    opCtx->lockState()->beginWriteUnitOfWork();
     ru->beginUnitOfWork(opCtx.get());
-    ASSERT_TRUE(ru->inActiveTxn());
+    // TODO SERVER-51787: to re-enable this.
+    // ASSERT_TRUE(ru->isActive());
     StatusWith<RecordId> s = rs->insertRecord(opCtx.get(), "data", 4, Timestamp());
     ru->commitUnitOfWork();
-    ASSERT_FALSE(ru->inActiveTxn());
+    opCtx->lockState()->endWriteUnitOfWork();
+    ASSERT_FALSE(ru->isActive());
 }
 
-TEST_F(RecoveryUnitTestHarness, CheckInActiveTxnWithAbort) {
+TEST_F(RecoveryUnitTestHarness, CheckIsActiveWithAbort) {
+    Lock::GlobalLock globalLk(opCtx.get(), MODE_IX);
     const auto rs = harnessHelper->createRecordStore(opCtx.get(), "table1");
+    opCtx->lockState()->beginWriteUnitOfWork();
     ru->beginUnitOfWork(opCtx.get());
-    ASSERT_TRUE(ru->inActiveTxn());
+    // TODO SERVER-51787: to re-enable this.
+    // ASSERT_TRUE(ru->isActive());
     StatusWith<RecordId> s = rs->insertRecord(opCtx.get(), "data", 4, Timestamp());
     ru->abortUnitOfWork();
-    ASSERT_FALSE(ru->inActiveTxn());
+    opCtx->lockState()->endWriteUnitOfWork();
+    ASSERT_FALSE(ru->isActive());
 }
 
 TEST_F(RecoveryUnitTestHarness, BeginningUnitOfWorkDoesNotIncrementSnapshotId) {

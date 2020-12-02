@@ -35,8 +35,8 @@
  * TODO: De-inline.
  */
 
+#include <algorithm>
 #include <boost/optional.hpp>
-#include <ctype.h>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -44,6 +44,8 @@
 
 #include "mongo/base/string_data.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/platform/bits.h"
+#include "mongo/util/ctype.h"
 
 namespace mongo::str {
 
@@ -200,7 +202,7 @@ inline unsigned toUnsigned(const std::string& a) {
     unsigned x = 0;
     const char* p = a.c_str();
     while (1) {
-        if (!isdigit(*p))
+        if (!ctype::isDigit(*p))
             break;
         x = x * 10 + (*p - '0');
         p++;
@@ -258,6 +260,34 @@ inline mongo::StringData ltrim(mongo::StringData s) {
     for (; i != end && *i == ' '; ++i) {
     }
     return s.substr(i - s.rawData());
+}
+
+/**
+ * UTF-8 multi-byte code points consist of one leading byte of the form 11xxxxxx, and potentially
+ * many continuation bytes of the form 10xxxxxx. This method checks whether 'charByte' is a leading
+ * byte.
+ */
+inline bool isLeadingByte(char charByte) {
+    return (charByte & 0xc0) == 0xc0;
+}
+
+/**
+ * UTF-8 single-byte code points are of the form 0xxxxxxx. This method checks whether 'charByte' is
+ * a single-byte code point.
+ */
+inline bool isSingleByte(char charByte) {
+    return (charByte & 0x80) == 0x0;
+}
+
+inline size_t getCodePointLength(char charByte) {
+    if (isSingleByte(charByte)) {
+        return 1;
+    }
+
+    invariant(isLeadingByte(charByte));
+
+    // In UTF-8, the number of leading ones is the number of bytes the code point takes up.
+    return countLeadingZeros64(static_cast<unsigned char>(~charByte)) - 56;
 }
 
 /**
@@ -336,17 +366,10 @@ void splitStringDelim(const std::string& str, std::vector<std::string>* res, cha
 void joinStringDelim(const std::vector<std::string>& strs, std::string* res, char delim);
 
 inline std::string toLower(StringData input) {
-    std::string::size_type sz = input.size();
-
-    std::unique_ptr<char[]> line(new char[sz + 1]);
-    char* copy = line.get();
-
-    for (std::string::size_type i = 0; i < sz; i++) {
-        char c = input[i];
-        copy[i] = (char)tolower((int)c);
-    }
-    copy[sz] = 0;
-    return copy;
+    std::string r{input};
+    for (char& c : r)
+        c = ctype::toLower(c);
+    return r;
 }
 
 /** Functor for combining lexical and numeric comparisons. */

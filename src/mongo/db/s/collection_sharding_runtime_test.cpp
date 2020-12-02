@@ -32,9 +32,10 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/repl/wait_for_majority_service.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
-#include "mongo/db/s/wait_for_majority_service.h"
-#include "mongo/s/shard_server_test_fixture.h"
+#include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/util/fail_point.h"
 
 namespace mongo {
@@ -44,22 +45,48 @@ const NamespaceString kTestNss("TestDB", "TestColl");
 const std::string kShardKey = "_id";
 const BSONObj kShardKeyPattern = BSON(kShardKey << 1);
 
-using CollectionShardingRuntimeTest = ShardServerTestFixture;
+class CollectionShardingRuntimeTest : public ShardServerTestFixture {
+protected:
+    static CollectionMetadata makeShardedMetadata(OperationContext* opCtx,
+                                                  UUID uuid = UUID::gen()) {
+        const OID epoch = OID::gen();
+        auto range = ChunkRange(BSON(kShardKey << MINKEY), BSON(kShardKey << MAXKEY));
+        auto chunk =
+            ChunkType(kTestNss, std::move(range), ChunkVersion(1, 0, epoch), ShardId("other"));
+        ChunkManager cm(
+            ShardId("0"),
+            DatabaseVersion(UUID::gen()),
+            makeStandaloneRoutingTableHistory(RoutingTableHistory::makeNew(kTestNss,
+                                                                           uuid,
+                                                                           kShardKeyPattern,
+                                                                           nullptr,
+                                                                           false,
+                                                                           epoch,
+                                                                           boost::none,
+                                                                           true,
+                                                                           {std::move(chunk)})),
+            boost::none);
 
-CollectionMetadata makeShardedMetadata(UUID uuid = UUID::gen()) {
-    const OID epoch = OID::gen();
-    auto range = ChunkRange(BSON(kShardKey << MINKEY), BSON(kShardKey << MAXKEY));
-    auto chunk = ChunkType(kTestNss, std::move(range), ChunkVersion(1, 0, epoch), ShardId("other"));
-    auto rt = RoutingTableHistory::makeNew(
-        kTestNss, uuid, kShardKeyPattern, nullptr, false, epoch, {std::move(chunk)});
-    std::shared_ptr<ChunkManager> cm = std::make_shared<ChunkManager>(rt, boost::none);
-    return CollectionMetadata(std::move(cm), ShardId("this"));
-}
+        if (!OperationShardingState::isOperationVersioned(opCtx)) {
+            const auto version = cm.getVersion(ShardId("0"));
+            BSONObjBuilder builder;
+            version.appendToCommand(&builder);
+
+            auto& oss = OperationShardingState::get(opCtx);
+            oss.initializeClientRoutingVersionsFromCommand(kTestNss, builder.obj());
+        }
+
+        return CollectionMetadata(std::move(cm), ShardId("0"));
+    }
+};
 
 TEST_F(CollectionShardingRuntimeTest,
-       GetCollectionDescriptionThrowsStaleConfigBeforeSetFilteringMetadataIsCalled) {
+       GetCollectionDescriptionThrowsStaleConfigBeforeSetFilteringMetadataIsCalledAndNoOSSSet) {
+    OperationContext* opCtx = operationContext();
     CollectionShardingRuntime csr(getServiceContext(), kTestNss, executor());
-    ASSERT_THROWS_CODE(csr.getCollectionDescription(), DBException, ErrorCodes::StaleConfig);
+    ASSERT_FALSE(csr.getCollectionDescription(opCtx).isSharded());
+    makeShardedMetadata(opCtx);
+    ASSERT_THROWS_CODE(csr.getCollectionDescription(opCtx), DBException, ErrorCodes::StaleConfig);
 }
 
 TEST_F(
@@ -67,14 +94,15 @@ TEST_F(
     GetCollectionDescriptionReturnsUnshardedAfterSetFilteringMetadataIsCalledWithUnshardedMetadata) {
     CollectionShardingRuntime csr(getServiceContext(), kTestNss, executor());
     csr.setFilteringMetadata(operationContext(), CollectionMetadata());
-    ASSERT_FALSE(csr.getCollectionDescription().isSharded());
+    ASSERT_FALSE(csr.getCollectionDescription(operationContext()).isSharded());
 }
 
 TEST_F(CollectionShardingRuntimeTest,
        GetCollectionDescriptionReturnsShardedAfterSetFilteringMetadataIsCalledWithShardedMetadata) {
     CollectionShardingRuntime csr(getServiceContext(), kTestNss, executor());
-    csr.setFilteringMetadata(operationContext(), makeShardedMetadata());
-    ASSERT_TRUE(csr.getCollectionDescription().isSharded());
+    OperationContext* opCtx = operationContext();
+    csr.setFilteringMetadata(opCtx, makeShardedMetadata(opCtx));
+    ASSERT_TRUE(csr.getCollectionDescription(opCtx).isSharded());
 }
 
 TEST_F(CollectionShardingRuntimeTest,
@@ -100,8 +128,9 @@ TEST_F(
     GetCurrentMetadataIfKnownReturnsShardedAfterSetFilteringMetadataIsCalledWithShardedMetadata) {
 
     CollectionShardingRuntime csr(getServiceContext(), kTestNss, executor());
-    auto metadata = makeShardedMetadata();
-    csr.setFilteringMetadata(operationContext(), metadata);
+    OperationContext* opCtx = operationContext();
+    auto metadata = makeShardedMetadata(opCtx);
+    csr.setFilteringMetadata(opCtx, metadata);
     const auto optCurrMetadata = csr.getCurrentMetadataIfKnown();
     ASSERT_TRUE(optCurrMetadata);
     ASSERT_TRUE(optCurrMetadata->isSharded());
@@ -111,20 +140,22 @@ TEST_F(
 TEST_F(CollectionShardingRuntimeTest,
        GetCurrentMetadataIfKnownReturnsNoneAfterClearFilteringMetadataIsCalled) {
     CollectionShardingRuntime csr(getServiceContext(), kTestNss, executor());
-    csr.setFilteringMetadata(operationContext(), makeShardedMetadata());
-    csr.clearFilteringMetadata();
+    OperationContext* opCtx = operationContext();
+    csr.setFilteringMetadata(opCtx, makeShardedMetadata(opCtx));
+    csr.clearFilteringMetadata(opCtx);
     ASSERT_FALSE(csr.getCurrentMetadataIfKnown());
 }
 
 TEST_F(CollectionShardingRuntimeTest, SetFilteringMetadataWithSameUUIDKeepsSameMetadataManager) {
     CollectionShardingRuntime csr(getServiceContext(), kTestNss, executor());
     ASSERT_EQ(csr.getNumMetadataManagerChanges_forTest(), 0);
-    auto metadata = makeShardedMetadata();
-    csr.setFilteringMetadata(operationContext(), metadata);
+    OperationContext* opCtx = operationContext();
+    auto metadata = makeShardedMetadata(opCtx);
+    csr.setFilteringMetadata(opCtx, metadata);
     // Should create a new MetadataManager object, bumping the count to 1.
     ASSERT_EQ(csr.getNumMetadataManagerChanges_forTest(), 1);
     // Set it again.
-    csr.setFilteringMetadata(operationContext(), metadata);
+    csr.setFilteringMetadata(opCtx, metadata);
     // Should not have reset metadata, so the counter should still be 1.
     ASSERT_EQ(csr.getNumMetadataManagerChanges_forTest(), 1);
 }
@@ -132,24 +163,25 @@ TEST_F(CollectionShardingRuntimeTest, SetFilteringMetadataWithSameUUIDKeepsSameM
 TEST_F(CollectionShardingRuntimeTest,
        SetFilteringMetadataWithDifferentUUIDReplacesPreviousMetadataManager) {
     CollectionShardingRuntime csr(getServiceContext(), kTestNss, executor());
-
-    auto metadata = makeShardedMetadata();
-    csr.setFilteringMetadata(operationContext(), metadata);
+    OperationContext* opCtx = operationContext();
+    auto metadata = makeShardedMetadata(opCtx);
+    csr.setFilteringMetadata(opCtx, metadata);
     ASSERT_EQ(csr.getNumMetadataManagerChanges_forTest(), 1);
 
     // Set it again with a different metadata object (UUID is generated randomly in
     // makeShardedMetadata()).
-    auto newMetadata = makeShardedMetadata();
-    csr.setFilteringMetadata(operationContext(), newMetadata);
+    auto newMetadata = makeShardedMetadata(opCtx);
+    csr.setFilteringMetadata(opCtx, newMetadata);
 
     ASSERT_EQ(csr.getNumMetadataManagerChanges_forTest(), 2);
-    ASSERT(csr.getCollectionDescription().uuidMatches(*newMetadata.getChunkManager()->getUUID()));
+    ASSERT(
+        csr.getCollectionDescription(opCtx).uuidMatches(*newMetadata.getChunkManager()->getUUID()));
 }
 
 /**
  * Fixture for when range deletion functionality is required in CollectionShardingRuntime tests.
  */
-class CollectionShardingRuntimeWithRangeDeleterTest : public ShardServerTestFixture {
+class CollectionShardingRuntimeWithRangeDeleterTest : public CollectionShardingRuntimeTest {
 public:
     void setUp() override {
         ShardServerTestFixture::setUp();
@@ -206,12 +238,13 @@ TEST_F(CollectionShardingRuntimeWithRangeDeleterTest,
 
 TEST_F(CollectionShardingRuntimeWithRangeDeleterTest,
        WaitForCleanReturnsErrorIfCollectionUUIDDoesNotMatchFilteringMetadata) {
-    auto metadata = makeShardedMetadata(uuid());
-    csr().setFilteringMetadata(operationContext(), metadata);
+    OperationContext* opCtx = operationContext();
+    auto metadata = makeShardedMetadata(opCtx, uuid());
+    csr().setFilteringMetadata(opCtx, metadata);
     auto randomUuid = UUID::gen();
 
     auto status = CollectionShardingRuntime::waitForClean(
-        operationContext(),
+        opCtx,
         kTestNss,
         randomUuid,
         ChunkRange(BSON(kShardKey << MINKEY), BSON(kShardKey << MAXKEY)));
@@ -220,14 +253,12 @@ TEST_F(CollectionShardingRuntimeWithRangeDeleterTest,
 
 TEST_F(CollectionShardingRuntimeWithRangeDeleterTest,
        WaitForCleanReturnsOKIfNoDeletionsAreScheduled) {
-    auto metadata = makeShardedMetadata(uuid());
-    csr().setFilteringMetadata(operationContext(), metadata);
+    OperationContext* opCtx = operationContext();
+    auto metadata = makeShardedMetadata(opCtx, uuid());
+    csr().setFilteringMetadata(opCtx, metadata);
 
     auto status = CollectionShardingRuntime::waitForClean(
-        operationContext(),
-        kTestNss,
-        uuid(),
-        ChunkRange(BSON(kShardKey << MINKEY), BSON(kShardKey << MAXKEY)));
+        opCtx, kTestNss, uuid(), ChunkRange(BSON(kShardKey << MINKEY), BSON(kShardKey << MAXKEY)));
 
     ASSERT_OK(status);
 }
@@ -236,21 +267,19 @@ TEST_F(CollectionShardingRuntimeWithRangeDeleterTest,
        WaitForCleanBlocksBehindOneScheduledDeletion) {
     // Enable fail point to suspendRangeDeletion.
     globalFailPointRegistry().find("suspendRangeDeletion")->setMode(FailPoint::alwaysOn);
+    OperationContext* opCtx = operationContext();
 
-    auto metadata = makeShardedMetadata(uuid());
-    csr().setFilteringMetadata(operationContext(), metadata);
+    auto metadata = makeShardedMetadata(opCtx, uuid());
+    csr().setFilteringMetadata(opCtx, metadata);
 
     auto cleanupComplete =
         csr().cleanUpRange(ChunkRange(BSON(kShardKey << MINKEY), BSON(kShardKey << MAXKEY)),
                            boost::none,
                            CollectionShardingRuntime::CleanWhen::kNow);
 
-    operationContext()->setDeadlineAfterNowBy(Milliseconds(100), ErrorCodes::MaxTimeMSExpired);
+    opCtx->setDeadlineAfterNowBy(Milliseconds(100), ErrorCodes::MaxTimeMSExpired);
     auto status = CollectionShardingRuntime::waitForClean(
-        operationContext(),
-        kTestNss,
-        uuid(),
-        ChunkRange(BSON(kShardKey << MINKEY), BSON(kShardKey << MAXKEY)));
+        opCtx, kTestNss, uuid(), ChunkRange(BSON(kShardKey << MINKEY), BSON(kShardKey << MAXKEY)));
 
     ASSERT_EQ(status.code(), ErrorCodes::MaxTimeMSExpired);
 
@@ -260,8 +289,9 @@ TEST_F(CollectionShardingRuntimeWithRangeDeleterTest,
 
 TEST_F(CollectionShardingRuntimeWithRangeDeleterTest,
        WaitForCleanBlocksBehindAllScheduledDeletions) {
-    auto metadata = makeShardedMetadata(uuid());
-    csr().setFilteringMetadata(operationContext(), metadata);
+    OperationContext* opCtx = operationContext();
+    auto metadata = makeShardedMetadata(opCtx, uuid());
+    csr().setFilteringMetadata(opCtx, metadata);
 
     const auto middleKey = 5;
 
@@ -276,10 +306,7 @@ TEST_F(CollectionShardingRuntimeWithRangeDeleterTest,
                            CollectionShardingRuntime::CleanWhen::kNow);
 
     auto status = CollectionShardingRuntime::waitForClean(
-        operationContext(),
-        kTestNss,
-        uuid(),
-        ChunkRange(BSON(kShardKey << MINKEY), BSON(kShardKey << MAXKEY)));
+        opCtx, kTestNss, uuid(), ChunkRange(BSON(kShardKey << MINKEY), BSON(kShardKey << MAXKEY)));
 
     // waitForClean should block until both cleanup tasks have run. This is a best-effort check,
     // since even if it did not block, it is possible that the cleanup tasks could complete before
@@ -292,8 +319,9 @@ TEST_F(CollectionShardingRuntimeWithRangeDeleterTest,
 
 TEST_F(CollectionShardingRuntimeWithRangeDeleterTest,
        WaitForCleanReturnsOKAfterSuccessfulDeletion) {
-    auto metadata = makeShardedMetadata(uuid());
-    csr().setFilteringMetadata(operationContext(), metadata);
+    OperationContext* opCtx = operationContext();
+    auto metadata = makeShardedMetadata(opCtx, uuid());
+    csr().setFilteringMetadata(opCtx, metadata);
 
     auto cleanupComplete =
         csr().cleanUpRange(ChunkRange(BSON(kShardKey << MINKEY), BSON(kShardKey << MAXKEY)),
@@ -301,10 +329,7 @@ TEST_F(CollectionShardingRuntimeWithRangeDeleterTest,
                            CollectionShardingRuntime::CleanWhen::kNow);
 
     auto status = CollectionShardingRuntime::waitForClean(
-        operationContext(),
-        kTestNss,
-        uuid(),
-        ChunkRange(BSON(kShardKey << MINKEY), BSON(kShardKey << MAXKEY)));
+        opCtx, kTestNss, uuid(), ChunkRange(BSON(kShardKey << MINKEY), BSON(kShardKey << MAXKEY)));
 
     ASSERT_OK(status);
     ASSERT(cleanupComplete.isReady());

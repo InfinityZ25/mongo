@@ -5,6 +5,9 @@
 // Note that this test does *not* use the drop shell helper but instead runs the drop command
 // manually. This is to avoid implicit creation and sharding of the $merge target collections in the
 // passthrough suites.
+// @tags: [
+//   sbe_incompatible,
+// ]
 (function() {
 "use strict";
 
@@ -236,12 +239,6 @@ function dropWithoutImplicitRecreate(coll) {
     assert.commandWorked(target.createIndex({geo: "2d"}, {unique: true}));
     assertMergeFailsWithoutUniqueIndex({source: source, onFields: ["a", "geo"], target: target});
     assertMergeFailsWithoutUniqueIndex({source: source, onFields: "geo", target: target});
-
-    dropWithoutImplicitRecreate(target);
-    assert.commandWorked(
-        target.createIndex({geo: "geoHaystack", a: 1}, {unique: true, bucketSize: 5}));
-    assertMergeFailsWithoutUniqueIndex({source: source, onFields: ["a", "geo"], target: target});
-    assertMergeFailsWithoutUniqueIndex({source: source, onFields: ["geo", "a"], target: target});
 
     dropWithoutImplicitRecreate(target);
     // MongoDB does not support unique hashed indexes.

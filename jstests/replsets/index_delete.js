@@ -19,11 +19,8 @@ function indexBuildInProgress(checkDB) {
 }
 
 // Set up replica set.
-// This test create indexes with fail point enabled on secondary which prevents secondary from
-// voting. So, disabling index build commit quorum.
 var replTest = new ReplSetTest({
     nodes: [{}, {}, {arbiter: true}],
-    nodeOptions: {setParameter: "enableIndexBuildCommitQuorum=false"}
 });
 var nodes = replTest.nodeList();
 
@@ -33,9 +30,9 @@ replTest.initiate();
 
 var dbName = 'foo';
 var collName = 'coll';
-var master = replTest.getPrimary();
+var primary = replTest.getPrimary();
 var second = replTest.getSecondary();
-var masterDB = master.getDB(dbName);
+var primaryDB = primary.getDB(dbName);
 var secondDB = second.getDB(dbName);
 
 var size = 100;
@@ -44,15 +41,17 @@ var size = 100;
 assert.commandWorked(
     secondDB.adminCommand({configureFailPoint: 'hangAfterStartingIndexBuild', mode: 'alwaysOn'}));
 
-var bulk = masterDB[collName].initializeUnorderedBulkOp();
+var bulk = primaryDB[collName].initializeUnorderedBulkOp();
 for (var i = 0; i < size; ++i) {
     bulk.insert({i: i, j: i, k: i});
 }
 assert.commandWorked(bulk.execute());
 
+// This test create indexes with fail point enabled on secondary which prevents secondary from
+// voting. So, disabling index build commit quorum.
 jsTest.log("Creating index");
-masterDB[collName].ensureIndex({i: 1});
-assert.eq(2, masterDB[collName].getIndexes().length);
+assert.commandWorked(primaryDB[collName].createIndex({i: 1}, {}, 0));
+assert.eq(2, primaryDB[collName].getIndexes().length);
 
 try {
     assert.soon(function() {
@@ -65,14 +64,14 @@ try {
 }
 
 jsTest.log("Index created on secondary");
-masterDB.runCommand({dropIndexes: collName, index: "i_1"});
-assert.eq(1, masterDB[collName].getIndexes().length);
+primaryDB.runCommand({dropIndexes: collName, index: "i_1"});
+assert.eq(1, primaryDB[collName].getIndexes().length);
 
 jsTest.log("Waiting on replication of first index drop");
 replTest.awaitReplication();
 
 print("Primary indexes");
-masterDB[collName].getIndexes().forEach(printjson);
+primaryDB[collName].getIndexes().forEach(printjson);
 print("Secondary indexes");
 secondDB[collName].getIndexes().forEach(printjson);
 assert.soon(function() {
@@ -80,16 +79,17 @@ assert.soon(function() {
 }, "Index not dropped on secondary");
 assert.eq(1, secondDB[collName].getIndexes().length);
 
+// Secondary index builds have been unblocked, so we can build indexes with commit quorum enabled.
 jsTest.log("Creating two more indexes on primary");
-masterDB[collName].ensureIndex({j: 1});
-masterDB[collName].ensureIndex({k: 1});
-assert.eq(3, masterDB[collName].getIndexes().length);
+assert.commandWorked(primaryDB[collName].createIndex({j: 1}));
+assert.commandWorked(primaryDB[collName].createIndex({k: 1}));
+assert.eq(3, primaryDB[collName].getIndexes().length);
 
 jsTest.log("Waiting on replication of second index creations");
 replTest.awaitReplication();
 
 print("Primary indexes");
-masterDB[collName].getIndexes().forEach(printjson);
+primaryDB[collName].getIndexes().forEach(printjson);
 print("Secondary indexes");
 secondDB[collName].getIndexes().forEach(printjson);
 assert.soon(function() {
@@ -99,11 +99,11 @@ assert.eq(3, secondDB[collName].getIndexes().length);
 
 jsTest.log("Dropping the rest of the indexes");
 
-masterDB.runCommand({deleteIndexes: collName, index: "*"});
-assert.eq(1, masterDB[collName].getIndexes().length);
+primaryDB.runCommand({deleteIndexes: collName, index: "*"});
+assert.eq(1, primaryDB[collName].getIndexes().length);
 
 // Assert that we normalize 'dropIndexes' oplog entries properly.
-master.getCollection('local.oplog.rs').find().forEach(function(entry) {
+primary.getCollection('local.oplog.rs').find().forEach(function(entry) {
     assert.neq(entry.o.index, "*");
     assert(!entry.o.deleteIndexes);
     if (entry.o.dropIndexes) {
@@ -118,7 +118,7 @@ jsTest.log("Waiting on replication of second index drops");
 replTest.awaitReplication();
 
 print("Primary indexes");
-masterDB[collName].getIndexes().forEach(printjson);
+primaryDB[collName].getIndexes().forEach(printjson);
 print("Secondary indexes");
 secondDB[collName].getIndexes().forEach(printjson);
 assert.soon(function() {

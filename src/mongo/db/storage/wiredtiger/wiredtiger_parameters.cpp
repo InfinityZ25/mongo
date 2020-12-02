@@ -26,7 +26,7 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -37,38 +37,6 @@
 namespace mongo {
 
 using std::string;
-
-namespace {
-
-Status applyMaxCacheOverflowSizeGBParameter(WiredTigerMaxCacheOverflowSizeGBParameter& param,
-                                            double value) {
-    if (value != 0.0 && value < 0.1) {
-        return {ErrorCodes::BadValue,
-                "MaxCacheOverflowFileSizeGB must be either 0 (unbounded) or greater than 0.1."};
-    }
-
-    const auto valueMB = static_cast<size_t>(1024 * value);
-
-    LOGV2(22375,
-          "Reconfiguring WiredTiger max cache overflow size with value: \"{valueMB}MB\'",
-          "valueMB"_attr = valueMB);
-
-    invariant(param._data.second);
-    int ret = param._data.second->reconfigure(
-        fmt::format("cache_overflow=(file_max={}M)", valueMB).c_str());
-    if (ret != 0) {
-        string result = (str::stream() << "WiredTiger reconfiguration failed with error code ("
-                                       << ret << "): " << wiredtiger_strerror(ret));
-        LOGV2_ERROR(22377, "{result}", "result"_attr = result);
-
-        return Status(ErrorCodes::BadValue, result);
-    }
-
-    param._data.first = value;
-    return Status::OK();
-}
-
-}  // namespace
 
 void WiredTigerEngineRuntimeConfigParameter::append(OperationContext* opCtx,
                                                     BSONObjBuilder& b,
@@ -87,50 +55,26 @@ Status WiredTigerEngineRuntimeConfigParameter::setFromString(const std::string& 
     }
 
     LOGV2(22376,
-          "Reconfiguring WiredTiger storage engine with config string: \"{str}\"",
-          "str"_attr = str);
+          "Reconfiguring WiredTiger storage engine with config string: \"{config}\"",
+          "Reconfiguring WiredTiger storage engine",
+          "config"_attr = str);
 
     invariant(_data.second);
     int ret = _data.second->reconfigure(str.c_str());
     if (ret != 0) {
+        const char* errorStr = wiredtiger_strerror(ret);
         string result = (str::stream() << "WiredTiger reconfiguration failed with error code ("
-                                       << ret << "): " << wiredtiger_strerror(ret));
-        LOGV2_ERROR(22378, "{result}", "result"_attr = result);
+                                       << ret << "): " << errorStr);
+        LOGV2_ERROR(22378,
+                    "WiredTiger reconfiguration failed",
+                    "error"_attr = ret,
+                    "message"_attr = errorStr);
 
         return Status(ErrorCodes::BadValue, result);
     }
 
     _data.first = str;
     return Status::OK();
-}
-
-void WiredTigerMaxCacheOverflowSizeGBParameter::append(OperationContext* opCtx,
-                                                       BSONObjBuilder& b,
-                                                       const std::string& name) {
-    b << name << _data.first;
-}
-
-Status WiredTigerMaxCacheOverflowSizeGBParameter::set(const BSONElement& element) {
-    if (element.type() == String) {
-        return setFromString(element.valuestrsafe());
-    }
-
-    double value;
-    if (!element.coerce(&value)) {
-        return {ErrorCodes::BadValue, "MaxCacheOverflowFileSizeGB must be a numeric value."};
-    }
-
-    return applyMaxCacheOverflowSizeGBParameter(*this, value);
-}
-
-Status WiredTigerMaxCacheOverflowSizeGBParameter::setFromString(const std::string& str) {
-    double value;
-    const auto status = NumberParser{}(str, &value);
-    if (!status.isOK()) {
-        return status;
-    }
-
-    return applyMaxCacheOverflowSizeGBParameter(*this, value);
 }
 
 }  // namespace mongo

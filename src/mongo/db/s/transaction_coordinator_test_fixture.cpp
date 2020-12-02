@@ -37,9 +37,8 @@
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/commands/txn_two_phase_commit_cmds_gen.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/s/wait_for_majority_service.h"
+#include "mongo/db/repl/wait_for_majority_service.h"
 #include "mongo/rpc/metadata/client_metadata.h"
-#include "mongo/rpc/metadata/client_metadata_ismaster.h"
 #include "mongo/s/catalog/sharding_catalog_client_mock.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/unittest/unittest.h"
@@ -137,7 +136,6 @@ void TransactionCoordinatorTestFixture::associateClientMetadata(Client* client,
                                                &metadataBuilder));
     auto clientMetadata = metadataBuilder.obj();
     auto clientMetadataParse = ClientMetadata::parse(clientMetadata["client"]);
-    ClientMetadataIsMasterState::setClientMetadata(client,
-                                                   std::move(clientMetadataParse.getValue()));
+    ClientMetadata::setAndFinalize(client, std::move(clientMetadataParse.getValue()));
 }
 }  // namespace mongo

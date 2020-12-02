@@ -1,7 +1,6 @@
 /**
  * Tests that unconditional step down terminates writes, but not reads. And, doesn't disconnect
  * the connections if primary is stepping down to secondary.
- * @tags: [requires_document_locking]
  */
 (function() {
 "use strict";
@@ -68,7 +67,7 @@ function runStepDownTest({testMsg, stepDownFn, toRemovedState}) {
     var startSafeParallelShell = (func, port) => {
         TestData.func = func;
         var safeFunc = (toRemovedState) ? () => {
-            assert.commandWorked(db.adminCommand({isMaster: 1, hangUpOnStepDown: false}));
+            assert.commandWorked(db.adminCommand({hello: 1, hangUpOnStepDown: false}));
             TestData.func();
         } : func;
         return startParallelShell(safeFunc, port);

@@ -51,7 +51,7 @@ const FieldRef idFieldRef(idFieldName);
 UpsertStage::UpsertStage(ExpressionContext* expCtx,
                          const UpdateStageParams& params,
                          WorkingSet* ws,
-                         Collection* collection,
+                         const CollectionPtr& collection,
                          PlanStage* child)
     : UpdateStage(expCtx, params, ws, collection) {
     // We should never create this stage for a non-upsert request.
@@ -61,7 +61,7 @@ UpsertStage::UpsertStage(ExpressionContext* expCtx,
 
 // We're done when updating is finished and we have either matched or inserted.
 bool UpsertStage::isEOF() {
-    return UpdateStage::isEOF() && (_specificStats.nMatched > 0 || _specificStats.inserted);
+    return UpdateStage::isEOF() && (_specificStats.nMatched > 0 || _specificStats.nUpserted > 0);
 }
 
 PlanStage::StageState UpsertStage::doWork(WorkingSetID* out) {
@@ -83,15 +83,15 @@ PlanStage::StageState UpsertStage::doWork(WorkingSetID* out) {
     invariant(updateState == PlanStage::IS_EOF && !isEOF());
 
     // Since this is an insert, we will be logging it as such in the oplog. We don't need the
-    // driver's help to build the oplog record. We also set the 'inserted' stats flag here.
+    // driver's help to build the oplog record. We also set the 'nUpserted' stats counter here.
     _params.driver->setLogOp(false);
-    _specificStats.inserted = true;
+    _specificStats.nUpserted = 1;
 
     // Generate the new document to be inserted.
     _specificStats.objInserted = _produceNewDocumentForInsert();
 
     // If this is an explain, skip performing the actual insert.
-    if (!_params.request->isExplain()) {
+    if (!_params.request->explain()) {
         _performInsert(_specificStats.objInserted);
     }
 
@@ -117,12 +117,11 @@ void UpsertStage::_performInsert(BSONObj newDocument) {
     // mongoS uses the query field to target a shard, and it is possible the shard key fields in the
     // 'q' field belong to this shard, but those in the 'u' field do not. In this case we need to
     // throw so that MongoS can target the insert to the correct shard.
-    if (_shouldCheckForShardKeyUpdate) {
+    if (_isUserInitiatedWrite) {
         auto* const css = CollectionShardingState::get(opCtx(), collection()->ns());
-        const auto collFilter = css->getOwnershipFilter(
-            opCtx(), CollectionShardingState::OrphanCleanupPolicy::kAllowOrphanCleanup);
-
-        if (collFilter.isSharded()) {
+        if (css->getCollectionDescription(opCtx()).isSharded()) {
+            const auto collFilter = css->getOwnershipFilter(
+                opCtx(), CollectionShardingState::OrphanCleanupPolicy::kAllowOrphanCleanup);
             const ShardKeyPattern shardKeyPattern(collFilter.getKeyPattern());
             auto newShardKey = shardKeyPattern.extractShardKeyFromDoc(newDocument);
 
@@ -168,14 +167,10 @@ BSONObj UpsertStage::_produceNewDocumentForInsert() {
     boost::optional<ScopedCollectionDescription> optCollDesc;
     FieldRefSet shardKeyPaths, immutablePaths;
 
-    // Determine whether this is a user-initiated or internal request.
-    const bool isInternalRequest =
-        !opCtx()->writesAreReplicated() || _params.request->isFromMigration();
-
-    if (!isInternalRequest) {
+    if (_isUserInitiatedWrite) {
         optCollDesc.emplace(
             CollectionShardingState::get(opCtx(), _params.request->getNamespaceString())
-                ->getCollectionDescription());
+                ->getCollectionDescription(opCtx()));
 
         // If the collection is sharded, add all fields from the shard key to the 'shardKeyPaths'
         // set.
@@ -216,8 +211,7 @@ BSONObj UpsertStage::_produceNewDocumentForInsert() {
     _ensureIdFieldIsFirst(&_doc, true);
 
     // Fourth: assert that the finished document has all required fields and is valid for storage.
-    _assertDocumentToBeInsertedIsValid(
-        _doc, shardKeyPaths, isInternalRequest, _enforceOkForStorage);
+    _assertDocumentToBeInsertedIsValid(_doc, shardKeyPaths);
 
     // Fifth: validate that the newly-produced document does not exceed the maximum BSON user size.
     auto newDocument = _doc.getObject();
@@ -235,7 +229,7 @@ void UpsertStage::_generateNewDocumentFromUpdateOp(const FieldRefSet& immutableP
     const bool validateForStorage = false;
     const bool isInsert = true;
     uassertStatusOK(
-        _params.driver->update({}, &_doc, validateForStorage, immutablePaths, isInsert));
+        _params.driver->update(opCtx(), {}, &_doc, validateForStorage, immutablePaths, isInsert));
 };
 
 void UpsertStage::_generateNewDocumentFromSuppliedDoc(const FieldRefSet& immutablePaths) {
@@ -252,7 +246,7 @@ void UpsertStage::_generateNewDocumentFromSuppliedDoc(const FieldRefSet& immutab
     UpdateDriver replacementDriver(nullptr);
 
     // Create a new replacement-style update from the supplied document.
-    replacementDriver.parse({suppliedDoc}, {});
+    replacementDriver.parse(write_ops::UpdateModification::parseFromClassicUpdate(suppliedDoc), {});
     replacementDriver.setLogOp(false);
 
     // We do not validate for storage, as we will validate the full document before inserting.
@@ -260,27 +254,24 @@ void UpsertStage::_generateNewDocumentFromSuppliedDoc(const FieldRefSet& immutab
     const bool validateForStorage = false;
     const bool isInsert = true;
     uassertStatusOK(
-        replacementDriver.update({}, &_doc, validateForStorage, immutablePaths, isInsert));
+        replacementDriver.update(opCtx(), {}, &_doc, validateForStorage, immutablePaths, isInsert));
 }
 
 void UpsertStage::_assertDocumentToBeInsertedIsValid(const mb::Document& document,
-                                                     const FieldRefSet& shardKeyPaths,
-                                                     bool isInternalRequest,
-                                                     bool enforceOkForStorage) {
+                                                     const FieldRefSet& shardKeyPaths) {
     // For a non-internal operation, we assert that the document contains all required paths, that
     // no shard key fields have arrays at any point along their paths, and that the document is
     // valid for storage. Skip all such checks for an internal operation.
-    if (!isInternalRequest) {
-        if (enforceOkForStorage) {
-            storage_validation::storageValid(document);
-        }
+    if (_isUserInitiatedWrite) {
         // Shard key values are permitted to be missing, and so the only required field is _id. We
         // should always have an _id here, since we generated one earlier if not already present.
         invariant(document.root().ok() && document.root()[idFieldName].ok());
+        storage_validation::storageValid(document);
 
         //  Neither _id nor the shard key fields may have arrays at any point along their paths.
         _assertPathsNotArray(document, {{&idFieldRef}});
         _assertPathsNotArray(document, shardKeyPaths);
     }
 }
+
 }  // namespace mongo

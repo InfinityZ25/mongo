@@ -5,7 +5,7 @@
  * includes multi=true updates and multi=false updates with exact _id queries.
  *
  * @tags: [requires_sharding, assumes_balancer_off, assumes_autosplit_off,
- * requires_non_retryable_writes, uses_transactions, requires_fcv_44];
+ * requires_non_retryable_writes, uses_transactions];
  */
 load('jstests/concurrency/fsm_libs/extend_workload.js');
 load('jstests/concurrency/fsm_workloads/random_moveChunk_base.js');
@@ -23,8 +23,8 @@ var $config = extendWorkload($config, function($config, $super) {
 
     // The variables used by the random_moveChunk_base config in order to move chunks.
     $config.data.shardKey = {a: 1};
-
     $config.data.newShardKey = {a: 1, b: 1};
+    $config.data.newShardKeyFields = ["a", "b"];
 
     // Use a CountDownLatch as if it were a std::atomic<long long> shared between all of the
     // threads. The collection name is suffixed with the current this.latch.getCount() value
@@ -41,7 +41,7 @@ var $config = extendWorkload($config, function($config, $super) {
     };
 
     $config.data.getCurrentOrPreviousLatchCollName = function(collName) {
-        const latchNumber = (Math.random() < 0.5)
+        const latchNumber = (Random.rand() < 0.5)
             ? this.latch.getCount()
             : Math.min(this.latch.getCount() + 1, this.latchCount);
 
@@ -53,17 +53,19 @@ var $config = extendWorkload($config, function($config, $super) {
     // migrated back in. The particular error code is replaced with a more generic one, so this
     // is identified by the failed migration's error message.
     $config.data.isMoveChunkErrorAcceptable = (err) => {
-        return err.message &&
-            (err.message.indexOf("CommandFailed") > -1 ||
-             err.message.indexOf("Documents in target range may still be in use") > -1 ||
-             // This error will occur as a result of trying to move a chunk with a pre-refine
-             // collection epoch.
-             err.message.indexOf("collection may have been dropped") ||
-             // This error will occur if a moveChunk command has been sent with chunk boundaries
-             // that represent the pre-refine chunks, but the collection has already been changed
-             // to possess the post-refine chunk boundaries.
-             (err.message.indexOf("shard key bounds") > -1 &&
-              err.message.indexOf("are not valid for shard key pattern") > -1));
+        const codes = [ErrorCodes.LockBusy, ErrorCodes.ShardKeyNotFound, ErrorCodes.LockTimeout];
+        return (err.code && codes.includes(err.code)) ||
+            (err.message &&
+             (err.message.includes("CommandFailed") ||
+              err.message.includes("Documents in target range may still be in use") ||
+              // This error will occur as a result of trying to move a chunk with a pre-refine
+              // collection epoch.
+              err.message.includes("collection may have been dropped") ||
+              // This error will occur if a moveChunk command has been sent with chunk boundaries
+              // that represent the pre-refine chunks, but the collection has already been changed
+              // to possess the post-refine chunk boundaries.
+              (err.message.includes("shard key bounds") &&
+               err.message.includes("are not valid for shard key pattern"))));
     };
 
     $config.states.refineCollectionShardKey = function refineCollectionShardKey(
@@ -79,14 +81,18 @@ var $config = extendWorkload($config, function($config, $super) {
             // There is a race that could occur where two threads run refineCollectionShardKey
             // concurrently on the same collection. Since the epoch of the collection changes,
             // the later thread may receive a StaleEpoch error, which is an acceptable error.
-            if (e.code == ErrorCodes.StaleEpoch) {
+            //
+            // It is also possible to receive a LockBusy error if refineCollectionShardKey is unable
+            // to acquire the distlock before timing out due to ongoing migrations acquiring the
+            // distlock first.
+            if (e.code == ErrorCodes.StaleEpoch || e.code == ErrorCodes.LockBusy) {
                 print("Ignoring acceptable refineCollectionShardKey error: " + tojson(e));
                 return;
             }
             throw e;
         }
 
-        this.shardKeyField[latchCollName] = ['a', 'b'];
+        this.shardKeyField[latchCollName] = this.newShardKeyFields;
         this.latch.countDown();
     };
 
@@ -102,10 +108,18 @@ var $config = extendWorkload($config, function($config, $super) {
         }
     };
 
+    // Occasionally flush the router's cached metadata to verify the metadata for the refined
+    // collections can be successfully loaded.
+    $config.states.flushRouterConfig = function flushRouterConfig(db, collName, connCache) {
+        assert.commandWorked(db.adminCommand({flushRouterConfig: db.getName()}));
+    };
+
     $config.transitions = {
-        init: {moveChunk: 0.5, refineCollectionShardKey: 0.5},
-        moveChunk: {moveChunk: 0.5, refineCollectionShardKey: 0.5},
-        refineCollectionShardKey: {moveChunk: 0.5, refineCollectionShardKey: 0.5},
+        init: {moveChunk: 0.4, refineCollectionShardKey: 0.4, flushRouterConfig: 0.2},
+        moveChunk: {moveChunk: 0.4, refineCollectionShardKey: 0.4, flushRouterConfig: 0.2},
+        refineCollectionShardKey:
+            {moveChunk: 0.4, refineCollectionShardKey: 0.4, flushRouterConfig: 0.2},
+        flushRouterConfig: {moveChunk: 0.5, refineCollectionShardKey: 0.5},
     };
 
     $config.setup = function setup(db, collName, cluster) {

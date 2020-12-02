@@ -1,7 +1,11 @@
 /**
  * Test that a change stream pipeline which encounters a retryable exception responds to the client
  * with an error object that includes the "ResumableChangeStreamError" label.
- * @tags: [requires_sharding, uses_change_streams, requires_fcv_44, requires_find_command]
+ * @tags: [
+ *   requires_find_command,
+ *   requires_sharding,
+ *   uses_change_streams,
+ * ]
  */
 (function() {
 "use strict";
@@ -28,11 +32,11 @@ const expectedStopShardErrors = [
     ErrorCodes.SocketException,
     ErrorCodes.ShutdownInProgress,
     ErrorCodes.PrimarySteppedDown,
-    ErrorCodes.NotMaster,
+    ErrorCodes.NotWritablePrimary,
     ErrorCodes.InterruptedAtShutdown,
     ErrorCodes.InterruptedDueToReplStateChange,
-    ErrorCodes.NotMasterNoSlaveOk,
-    ErrorCodes.NotMasterOrSecondary
+    ErrorCodes.NotPrimaryNoSecondaryOk,
+    ErrorCodes.NotPrimaryOrSecondary
 ];
 
 // First, verify that the 'failGetMoreAfterCursorCheckout' failpoint can effectively exercise the
@@ -70,7 +74,9 @@ testFailGetMoreAfterCursorCheckoutFailpoint(
     {errorCode: ErrorCodes.FailedToParse, expectedLabel: false});
 
 // Now test both aggregate and getMore under conditions of an actual cluster outage. Shard the
-// collection, split at {_id: 0}, and move the upper chunk to the other shard.
+// collection on shard0, split at {_id: 0}, and move the upper chunk to the other shard.
+assert.commandWorked(st.s.adminCommand({enableSharding: testDB.getName()}));
+st.ensurePrimaryShard(testDB.getName(), st.shard0.shardName);
 st.shardColl(coll, {_id: 1}, {_id: 0}, {_id: 0});
 
 // Open a change stream on the collection...
@@ -97,8 +103,8 @@ assert.eq(findCursor.objsLeftInBatch(), 0);
 // getMore will not attempt to contact a shard and will not throw the expected network exception.
 const aggCursor = coll.aggregate([{$match: {}}, {$sort: {_id: 1}}], {cursor: {batchSize: 0}});
 
-// Now stop shard1...
-st.rs1.stopSet();
+// Now stop shard0...
+st.rs0.stopSet();
 
 // ...  and confirm that getMore on the $changeStream throws one of the expected exceptions.
 let err = assert.throws(() => assert.soon(() => csCursor.hasNext()));

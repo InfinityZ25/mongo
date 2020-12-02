@@ -1,4 +1,7 @@
-// @tags: [requires_getmore]
+// @tags: [
+//   requires_getmore,
+//   sbe_incompatible,
+// ]
 
 //
 // Tests the error handling of spherical queries
@@ -47,7 +50,7 @@ for (var test = 0; test < numTests; test++) {
     do {
         t.drop();
         startPoint = randomPoint();
-        t.ensureIndex({loc: "2d"}, {bits: bits});
+        t.createIndex({loc: "2d"}, {bits: bits});
     } while (!pointIsOK(startPoint, radius));
 
     var pointsIn = 0;

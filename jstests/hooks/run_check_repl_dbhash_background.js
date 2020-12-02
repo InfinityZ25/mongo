@@ -183,7 +183,7 @@ function checkReplDbhashBackgroundThread(hosts) {
                         return bsonWoCompare(appliedOpTime.ts, clusterTime) >= 0;
                     },
                     "The majority commit point on secondary " + i + " failed to reach " +
-                        clusterTime,
+                        tojson(clusterTime),
                     10 * 60 * 1000);
             }
         }
@@ -306,6 +306,14 @@ function checkReplDbhashBackgroundThread(hosts) {
             // at varying times, it's possible that we may run dbHash while a prepared
             // transactions has yet to commit or abort.
             if (e.code === ErrorCodes.InvalidOptions) {
+                hasTransientError = true;
+            }
+
+            // In debug builds, read-only operations can receive write conflicts when the storage
+            // engine cache is full. Since dbHash holds open a read snapshot for an extended period
+            // of time and pulls all collection data into cache, the storage engine may abort the
+            // operation if it needs to free up space. Try again after space has been freed.
+            if (e.code === ErrorCodes.WriteConflict && buildInfo().debug) {
                 hasTransientError = true;
             }
 

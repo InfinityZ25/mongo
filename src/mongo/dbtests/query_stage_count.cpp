@@ -71,14 +71,15 @@ public:
         WriteUnitOfWork wunit(&_opCtx);
 
         _ctx.db()->dropCollection(&_opCtx, nss()).transitional_ignore();
-        _coll = _ctx.db()->createCollection(&_opCtx, nss());
+        auto coll = _ctx.db()->createCollection(&_opCtx, nss());
 
-        _coll->getIndexCatalog()
+        coll->getIndexCatalog()
             ->createIndexOnEmptyCollection(&_opCtx,
                                            BSON("key" << BSON("x" << 1) << "name"
                                                       << "x_1"
                                                       << "v" << 1))
             .status_with_transitional_ignore();
+        _coll = coll;
 
         for (int i = 0; i < kDocuments; i++) {
             insert(BSON(GENOID << "x" << i));
@@ -175,32 +176,29 @@ public:
 
     // Performs a test using a count stage whereby each unit of work is interjected
     // in some way by the invocation of interject().
-    const CountStats* runCount(CountStage& count_stage) {
+    const CountStats* runCount(CountStage& countStage) {
         int interjection = 0;
         WorkingSetID wsid;
 
-        while (!count_stage.isEOF()) {
-            // do some work -- assumes that one work unit counts a single doc
-            PlanStage::StageState state = count_stage.work(&wsid);
-            ASSERT_NOT_EQUALS(state, PlanStage::FAILURE);
+        while (!countStage.isEOF()) {
+            countStage.work(&wsid);
+            // Prepare for yield.
+            countStage.saveState();
 
-            // prepare for yield
-            count_stage.saveState();
-
-            // interject in some way kInterjection times
+            // Interject in some way kInterjection times.
             if (interjection < kInterjections) {
-                interject(count_stage, interjection++);
+                interject(countStage, interjection++);
             }
 
-            // resume from yield
-            count_stage.restoreState();
+            // Resume from yield.
+            countStage.restoreState(&_coll);
         }
 
-        return static_cast<const CountStats*>(count_stage.getSpecificStats());
+        return static_cast<const CountStats*>(countStage.getSpecificStats());
     }
 
     IndexScan* createIndexScan(MatchExpression* expr, WorkingSet* ws) {
-        IndexCatalog* catalog = _coll->getIndexCatalog();
+        const IndexCatalog* catalog = _coll->getIndexCatalog();
         std::vector<const IndexDescriptor*> indexes;
         catalog->findIndexesByKeyPattern(&_opCtx, BSON("x" << 1), false, &indexes);
         ASSERT_EQ(indexes.size(), 1U);
@@ -215,7 +213,7 @@ public:
         params.direction = 1;
 
         // This child stage gets owned and freed by its parent CountStage
-        return new IndexScan(_expCtx.get(), params, ws, expr);
+        return new IndexScan(_expCtx.get(), _coll, params, ws, expr);
     }
 
     CollectionScan* createCollScan(MatchExpression* expr, WorkingSet* ws) {
@@ -240,7 +238,7 @@ protected:
     Lock::DBLock _dbLock;
     OldClientContext _ctx;
     boost::intrusive_ptr<ExpressionContext> _expCtx;
-    Collection* _coll;
+    CollectionPtr _coll;
 };
 
 class QueryStageCountNoChangeDuringYield : public CountStageTest {

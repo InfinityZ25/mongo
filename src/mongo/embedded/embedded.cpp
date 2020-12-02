@@ -34,6 +34,7 @@
 #include "mongo/embedded/embedded.h"
 
 #include "mongo/base/initializer.h"
+#include "mongo/base/status.h"
 #include "mongo/config.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_impl.h"
@@ -48,19 +49,19 @@
 #include "mongo/db/global_settings.h"
 #include "mongo/db/index/index_access_method_factory_impl.h"
 #include "mongo/db/kill_sessions_local.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_session_cache_impl.h"
 #include "mongo/db/op_observer_impl.h"
 #include "mongo/db/op_observer_registry.h"
-#include "mongo/db/repair_database_and_check_version.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_liaison_mongod.h"
 #include "mongo/db/session_killer.h"
 #include "mongo/db/sessions_collection_standalone.h"
+#include "mongo/db/startup_recovery.h"
 #include "mongo/db/storage/control/storage_control.h"
 #include "mongo/db/storage/encryption_hooks.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/ttl.h"
+#include "mongo/embedded/embedded_options_parser_init.h"
 #include "mongo/embedded/index_builds_coordinator_embedded.h"
 #include "mongo/embedded/periodic_runner_embedded.h"
 #include "mongo/embedded/read_write_concern_defaults_cache_lookup_embedded.h"
@@ -82,19 +83,18 @@ namespace mongo {
 namespace embedded {
 namespace {
 
-void initWireSpec() {
-    WireSpec& spec = WireSpec::instance();
-
+MONGO_INITIALIZER_WITH_PREREQUISITES(WireSpec, ("EndStartupOptionHandling"))(InitializerContext*) {
     // The featureCompatibilityVersion behavior defaults to the downgrade behavior while the
     // in-memory version is unset.
-
+    WireSpec::Specification spec;
     spec.incomingInternalClient.minWireVersion = RELEASE_2_4_AND_BEFORE;
     spec.incomingInternalClient.maxWireVersion = LATEST_WIRE_VERSION;
-
     spec.outgoing.minWireVersion = RELEASE_2_4_AND_BEFORE;
     spec.outgoing.maxWireVersion = LATEST_WIRE_VERSION;
-
     spec.isInternalClient = true;
+
+    WireSpec::instance().initialize(std::move(spec));
+    return Status::OK();
 }
 
 // Noop, to fulfill dependencies for other initializers.
@@ -115,12 +115,8 @@ ServiceContext::ConstructorActionRegisterer replicationManagerInitializer(
     "CreateReplicationManager", {"SSLManager", "default"}, [](ServiceContext* serviceContext) {
         repl::StorageInterface::set(serviceContext, std::make_unique<repl::StorageInterfaceImpl>());
 
-        auto logicalClock = std::make_unique<LogicalClock>(serviceContext);
-        LogicalClock::set(serviceContext, std::move(logicalClock));
-
         auto replCoord = std::make_unique<ReplicationCoordinatorEmbedded>(serviceContext);
         repl::ReplicationCoordinator::set(serviceContext, std::move(replCoord));
-        repl::setOplogCollectionName(serviceContext);
 
         IndexBuildsCoordinator::set(serviceContext,
                                     std::make_unique<IndexBuildsCoordinatorEmbedded>());
@@ -176,12 +172,12 @@ void shutdown(ServiceContext* srvContext) {
             if (serviceContext->getStorageEngine()) {
                 shutdownGlobalStorageEngineCleanly(serviceContext);
             }
-
-            Status status = mongo::runGlobalDeinitializers();
-            uassertStatusOKWithContext(status, "Global deinitilization failed");
         }
     }
     setGlobalServiceContext(nullptr);
+
+    Status status = mongo::runGlobalDeinitializers();
+    uassertStatusOKWithContext(status, "Global deinitilization failed");
 
     LOGV2_OPTIONS(22551, {LogComponent::kControl}, "now exiting");
 }
@@ -190,11 +186,10 @@ void shutdown(ServiceContext* srvContext) {
 ServiceContext* initialize(const char* yaml_config) {
     srand(static_cast<unsigned>(curTimeMicros64()));
 
-    // yaml_config is passed to the options parser through the argc/argv interface that already
-    // existed. If it is nullptr then use 0 count which will be interpreted as empty string.
-    const char* argv[2] = {yaml_config, nullptr};
+    if (yaml_config)
+        embedded::EmbeddedOptionsConfig::instance().set(yaml_config);
 
-    Status status = mongo::runGlobalInitializers(yaml_config ? 1 : 0, argv, nullptr);
+    Status status = mongo::runGlobalInitializers(std::vector<std::string>{});
     uassertStatusOKWithContext(status, "Global initilization failed");
     auto giGuard = makeGuard([] { mongo::runGlobalDeinitializers().ignore(); });
     setGlobalServiceContext(ServiceContext::make());
@@ -202,8 +197,6 @@ ServiceContext* initialize(const char* yaml_config) {
     Client::initThread("initandlisten");
     // Make sure current thread have no client set in thread_local when we leave this function
     auto clientGuard = makeGuard([] { Client::releaseCurrent(); });
-
-    initWireSpec();
 
     auto serviceContext = getGlobalServiceContext();
     serviceContext->setServiceEntryPoint(std::make_unique<ServiceEntryPointEmbedded>());
@@ -238,7 +231,14 @@ ServiceContext* initialize(const char* yaml_config) {
     serviceContext->setPeriodicRunner(std::move(periodicRunner));
 
     setUpCatalog(serviceContext);
-    initializeStorageEngine(serviceContext, StorageEngineInitFlags::kAllowNoLockFile);
+
+    // Creating the operation context before initializing the storage engine allows the storage
+    // engine initialization to make use of the lock manager.
+    auto startupOpCtx = serviceContext->makeOperationContext(&cc());
+
+    auto lastStorageEngineShutdownState =
+        initializeStorageEngine(startupOpCtx.get(), StorageEngineInitFlags::kAllowNoLockFile);
+    invariant(LastStorageEngineShutdownState::kClean == lastStorageEngineShutdownState);
     StorageControl::startStorageControls(serviceContext);
 
     // Warn if we detect configurations for multiple registered storage engines in the same
@@ -280,8 +280,6 @@ ServiceContext* initialize(const char* yaml_config) {
 
     ReadWriteConcernDefaults::create(serviceContext, readWriteConcernDefaultsCacheLookupEmbedded);
 
-    auto startupOpCtx = serviceContext->makeOperationContext(&cc());
-
     bool canCallFCVSetIfCleanStartup =
         !storageGlobalParams.readOnly && !(storageGlobalParams.engine == "devnull");
     if (canCallFCVSetIfCleanStartup) {
@@ -291,7 +289,8 @@ ServiceContext* initialize(const char* yaml_config) {
     }
 
     try {
-        repairDatabasesAndCheckVersion(startupOpCtx.get());
+        startup_recovery::repairAndRecoverDatabases(startupOpCtx.get(),
+                                                    lastStorageEngineShutdownState);
     } catch (const ExceptionFor<ErrorCodes::MustDowngrade>& error) {
         LOGV2_FATAL_OPTIONS(22555,
                             logv2::LogOptions(LogComponent::kControl, logv2::FatalMode::kContinue),
@@ -300,14 +299,13 @@ ServiceContext* initialize(const char* yaml_config) {
         quickExit(EXIT_NEED_DOWNGRADE);
     }
 
-    // Assert that the in-memory featureCompatibilityVersion parameter has been explicitly set.
-    // If we are part of a replica set and are started up with no data files, we do not set the
-    // featureCompatibilityVersion until a primary is chosen. For this case, we expect the
-    // in-memory featureCompatibilityVersion parameter to still be uninitialized until after
-    // startup.
-    if (canCallFCVSetIfCleanStartup) {
-        invariant(serverGlobalParams.featureCompatibility.isVersionInitialized());
-    }
+    // Ensure FCV document exists and is initialized in-memory. Fatally asserts if there is an
+    // error.
+    FeatureCompatibilityVersion::fassertInitializedAfterStartup(startupOpCtx.get());
+
+    // Notify the storage engine that startup is completed before repair exits below, as repair sets
+    // the upgrade flag to true.
+    serviceContext->getStorageEngine()->notifyStartupComplete();
 
     if (storageGlobalParams.upgrade) {
         LOGV2(22553, "finished checking dbs");

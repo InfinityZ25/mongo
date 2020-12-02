@@ -31,22 +31,28 @@
 
 #include "mongo/db/namespace_string.h"
 #include "mongo/s/chunk_version.h"
-#include "mongo/s/database_version_gen.h"
+#include "mongo/s/database_version.h"
 #include "mongo/s/shard_id.h"
 #include "mongo/util/concurrency/notification.h"
 
 namespace mongo {
 
-class StaleConfigInfo final : public ErrorExtraInfo {
+template <class T>
+class StaleChunkVersionExtraInfo : public ErrorExtraInfo {
+protected:
+    StaleChunkVersionExtraInfo(
+        NamespaceString nss,
+        ChunkVersion received,
+        boost::optional<ChunkVersion> wanted,
+        ShardId shardId,
+        boost::optional<SharedSemiFuture<void>> criticalSectionSignal = boost::none)
+        : _nss(std::move(nss)),
+          _received(received),
+          _wanted(wanted),
+          _shardId(shardId),
+          _criticalSectionSignal(criticalSectionSignal) {}
+
 public:
-    static constexpr auto code = ErrorCodes::StaleConfig;
-
-    StaleConfigInfo(NamespaceString nss,
-                    ChunkVersion received,
-                    boost::optional<ChunkVersion> wanted,
-                    ShardId shardId,
-                    std::shared_ptr<Notification<void>> criticalSectionSignal = nullptr);
-
     const auto& getNss() const {
         return _nss;
     }
@@ -67,11 +73,40 @@ public:
         return _criticalSectionSignal;
     }
 
-    void serialize(BSONObjBuilder* bob) const override;
-    static std::shared_ptr<const ErrorExtraInfo> parse(const BSONObj&);
-    static StaleConfigInfo parseFromCommandError(const BSONObj& commandError);
+    void serialize(BSONObjBuilder* bob) const {
+        bob->append("ns", _nss.ns());
+        _received.appendLegacyWithField(bob, "vReceived");
+        if (_wanted) {
+            _wanted->appendLegacyWithField(bob, "vWanted");
+        }
 
-private:
+        invariant(_shardId != "");
+        bob->append("shardId", _shardId.toString());
+    }
+
+    static std::shared_ptr<const ErrorExtraInfo> parse(const BSONObj& obj) {
+        return std::make_shared<T>(parseFromCommandError(obj));
+    }
+
+    static T parseFromCommandError(const BSONObj& obj) {
+        const auto shardId = obj["shardId"].String();
+        invariant(shardId != "");
+
+        auto extractOptionalChunkVersion = [&obj](StringData field) {
+            boost::optional<ChunkVersion> ret;
+            auto swChunkVersion = ChunkVersion::parseLegacyWithField(obj, field);
+            if (swChunkVersion != ErrorCodes::NoSuchKey)
+                ret = uassertStatusOK(std::move(swChunkVersion));
+            return ret;
+        };
+
+        return T(NamespaceString(obj["ns"].String()),
+                 uassertStatusOK(ChunkVersion::parseLegacyWithField(obj, "vReceived")),
+                 extractOptionalChunkVersion("vWanted"),
+                 ShardId(shardId));
+    }
+
+protected:
     NamespaceString _nss;
     ChunkVersion _received;
     boost::optional<ChunkVersion> _wanted;
@@ -79,8 +114,33 @@ private:
 
     // This signal does not get serialized and therefore does not get propagated
     // to the router.
-    std::shared_ptr<Notification<void>> _criticalSectionSignal;
+    boost::optional<SharedSemiFuture<void>> _criticalSectionSignal;
 };
+
+class StaleConfigInfo final : public StaleChunkVersionExtraInfo<StaleConfigInfo> {
+public:
+    static constexpr auto code = ErrorCodes::StaleConfig;
+
+    StaleConfigInfo(NamespaceString nss,
+                    ChunkVersion received,
+                    boost::optional<ChunkVersion> wanted,
+                    ShardId shardId,
+                    boost::optional<SharedSemiFuture<void>> criticalSectionSignal = boost::none)
+        : StaleChunkVersionExtraInfo(nss, received, wanted, shardId, criticalSectionSignal) {}
+};
+
+class StaleEpochInfo final : public StaleChunkVersionExtraInfo<StaleEpochInfo> {
+public:
+    static constexpr auto code = ErrorCodes::StaleEpoch;
+
+    StaleEpochInfo(NamespaceString nss,
+                   ChunkVersion received,
+                   boost::optional<ChunkVersion> wanted,
+                   ShardId shardId,
+                   boost::optional<SharedSemiFuture<void>> criticalSectionSignal = boost::none)
+        : StaleChunkVersionExtraInfo(nss, received, wanted, shardId, criticalSectionSignal) {}
+};
+
 using StaleConfigException = ExceptionFor<ErrorCodes::StaleConfig>;
 
 class StaleDbRoutingVersion final : public ErrorExtraInfo {

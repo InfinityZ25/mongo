@@ -31,17 +31,16 @@
 
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/persistent_task_store.h"
+#include "mongo/db/repl/wait_for_majority_service.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/metadata_manager.h"
 #include "mongo/db/s/migration_util.h"
-#include "mongo/db/s/persistent_task_store.h"
 #include "mongo/db/s/range_deletion_task_gen.h"
 #include "mongo/db/s/range_deletion_util.h"
+#include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/s/sharding_runtime_d_params_gen.h"
-#include "mongo/db/s/wait_for_majority_service.h"
-#include "mongo/s/shard_server_test_fixture.h"
 #include "mongo/unittest/death_test.h"
-#include "mongo/unittest/unittest.h"
 #include "mongo/util/fail_point.h"
 
 namespace mongo {
@@ -97,18 +96,23 @@ public:
             nullptr,
             false,
             epoch,
+            boost::none,
+            true,
             {ChunkType{kNss,
                        ChunkRange{BSON(kShardKey << MINKEY), BSON(kShardKey << MAXKEY)},
                        ChunkVersion(1, 0, epoch),
                        ShardId("dummyShardId")}});
 
-        std::shared_ptr<ChunkManager> cm = std::make_shared<ChunkManager>(rt, boost::none);
-
         AutoGetDb autoDb(operationContext(), kNss.db(), MODE_IX);
         Lock::CollectionLock collLock(operationContext(), kNss, MODE_IX);
         CollectionShardingRuntime::get(operationContext(), kNss)
-            ->setFilteringMetadata(operationContext(),
-                                   CollectionMetadata(cm, ShardId("dummyShardId")));
+            ->setFilteringMetadata(
+                operationContext(),
+                CollectionMetadata(ChunkManager(ShardId("dummyShardId"),
+                                                DatabaseVersion(UUID::gen()),
+                                                makeStandaloneRoutingTableHistory(std::move(rt)),
+                                                boost::none),
+                                   ShardId("dummyShardId")));
     }
 
     UUID uuid() const {
@@ -705,6 +709,7 @@ TEST_F(RangeDeleterTest, RemoveDocumentsInRangeRespectsOrphanCleanupDelay) {
     auto queriesComplete = SemiFuture<void>::makeReady();
 
     // Insert documents in range.
+    setFilteringMetadataWithUUID(uuid());
     DBDirectClient dbclient(operationContext());
     for (auto i = 0; i < numDocsToInsert; ++i) {
         dbclient.insert(kNss.toString(), BSON(kShardKey << i));

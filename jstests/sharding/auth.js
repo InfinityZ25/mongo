@@ -39,8 +39,8 @@ function logout(userObj, thingToUse) {
 }
 
 function getShardName(rsTest) {
-    var master = rsTest.getPrimary();
-    var config = master.getDB("local").system.replset.findOne();
+    var primary = rsTest.getPrimary();
+    var config = primary.getDB("local").system.replset.findOne();
     var members = config.members.map(function(elem) {
         return elem.host;
     });
@@ -89,8 +89,7 @@ print("adding shard w/out auth " + shardName);
 logout(adminUser);
 
 var result = s.getDB("admin").runCommand({addShard: shardName});
-printjson(result);
-assert.eq(result.code, 13);
+assert.commandFailedWithCode(result, ErrorCodes.Unauthorized);
 
 login(adminUser);
 
@@ -111,12 +110,12 @@ d1.stopSet();
 d1.startSet({keyFile: "jstests/libs/key1", restart: true});
 d1.initiate();
 
-var master = d1.getPrimary();
+var primary = d1.getPrimary();
 
 print("adding shard w/auth " + shardName);
 
 result = s.getDB("admin").runCommand({addShard: shardName});
-assert.eq(result.ok, 1, tojson(result));
+assert.commandWorked(result);
 
 s.getDB("admin").runCommand({enableSharding: "test"});
 s.getDB("admin").runCommand({shardCollection: "test.foo", key: {x: 1}});
@@ -167,6 +166,7 @@ print("adding shard " + shardName);
 login(adminUser);
 print("logged in");
 result = s.getDB("admin").runCommand({addShard: shardName});
+assert.commandWorked(result);
 
 awaitRSClientHosts(s.s, d1.nodes, {ok: true});
 awaitRSClientHosts(s.s, d2.nodes, {ok: true});

@@ -50,18 +50,22 @@ public:
     /**
      * Construct an unknown ServerDescription with default values except the server's address.
      */
-    ServerDescription(ServerAddress address)
+    ServerDescription(HostAndPort address)
         : _address(std::move(address)), _type(ServerType::kUnknown) {}
 
     /**
      * Build a new ServerDescription according to the rules of the SDAM spec based on the
-     * last RTT to the server and isMaster response.
+     * last RTT to the server and hello response.
      */
     ServerDescription(ClockSource* clockSource,
-                      const IsMasterOutcome& isMasterOutcome,
-                      boost::optional<IsMasterRTT> lastRtt = boost::none,
-                      boost::optional<TopologyVersion> topologyVersion = boost::none,
-                      boost::optional<int> poolResetCounter = boost::none);
+                      const HelloOutcome& helloOutcome,
+                      boost::optional<HelloRTT> lastRtt = boost::none,
+                      boost::optional<TopologyVersion> topologyVersion = boost::none);
+
+    /**
+     * Copy ServerDescriptionPtr, but set server type explicitly
+     */
+    ServerDescription(const ServerDescriptionPtr& source, ServerType serverType);
 
     /**
      * This determines if a server description is equivalent according to the Server Discovery and
@@ -71,24 +75,22 @@ public:
     bool isEquivalent(const ServerDescription& other) const;
 
     // server identity
-    const ServerAddress& getAddress() const;
+    const HostAndPort& getAddress() const;
     ServerType getType() const;
-    const boost::optional<ServerAddress>& getMe() const;
+    const boost::optional<HostAndPort>& getMe() const;
     const boost::optional<std::string>& getSetName() const;
     const std::map<std::string, std::string>& getTags() const;
     void appendBsonTags(BSONObjBuilder& builder) const;
 
     // network attributes
     const boost::optional<std::string>& getError() const;
-    const boost::optional<IsMasterRTT>& getRtt() const;
+    const boost::optional<HelloRTT>& getRtt() const;
     const boost::optional<int>& getLogicalSessionTimeoutMinutes() const;
-    int getPoolResetCounter();
 
     // server capabilities
     int getMinWireVersion() const;
     int getMaxWireVersion() const;
     bool isDataBearingServer() const;
-    bool isStreamable() const;
 
     // server 'time'
     const Date_t getLastUpdateTime() const;
@@ -96,10 +98,10 @@ public:
     const boost::optional<repl::OpTime>& getOpTime() const;
 
     // topology membership
-    const boost::optional<ServerAddress>& getPrimary() const;
-    const std::set<ServerAddress>& getHosts() const;
-    const std::set<ServerAddress>& getPassives() const;
-    const std::set<ServerAddress>& getArbiters() const;
+    const boost::optional<HostAndPort>& getPrimary() const;
+    const std::set<HostAndPort>& getHosts() const;
+    const std::set<HostAndPort>& getPassives() const;
+    const std::set<HostAndPort>& getArbiters() const;
     const boost::optional<int>& getSetVersion() const;
     const boost::optional<OID>& getElectionId() const;
     const boost::optional<TopologyVersion>& getTopologyVersion() const;
@@ -107,36 +109,35 @@ public:
 
     BSONObj toBson() const;
     std::string toString() const;
-    ServerDescriptionPtr cloneWithRTT(IsMasterRTT rtt);
+    ServerDescriptionPtr cloneWithRTT(HelloRTT rtt);
 
 private:
     /**
-     * Classify the server's type based on the ismaster response.
-     * @param isMaster - reply information for the ismaster command
+     * Classify the server's type based on the hello response.
+     * @param helloReply - reply information for the hello command
      */
-    void parseTypeFromIsMaster(const BSONObj isMaster);
+    void parseTypeFromHelloReply(BSONObj helloReply);
 
 
-    void calculateRtt(const boost::optional<IsMasterRTT> currentRtt,
-                      const boost::optional<IsMasterRTT> lastRtt);
+    void calculateRtt(const boost::optional<HelloRTT> currentRtt,
+                      const boost::optional<HelloRTT> lastRtt);
     void saveLastWriteInfo(BSONObj lastWriteBson);
 
     void storeHostListIfPresent(const std::string key,
                                 const BSONObj response,
-                                std::set<ServerAddress>& destination);
+                                std::set<HostAndPort>& destination);
     void saveHosts(const BSONObj response);
     void saveTags(BSONObj tagsObj);
     void saveElectionId(BSONElement electionId);
     void saveTopologyVersion(BSONElement topologyVersionField);
-    void saveStreamable(BSONElement streamableField);
 
     static inline const std::string kIsDbGrid = "isdbgrid";
     static inline const double kRttAlpha = 0.2;
 
     // address: the hostname or IP, and the port number, that the client connects to. Note that this
-    // is not the server's ismaster.me field, in the case that the server reports an address
+    // is not the server's hello.me field, in the case that the server reports an address
     // different from the address the client uses.
-    ServerAddress _address;
+    HostAndPort _address;
 
     // topologyVersion: the server's topology version. Updated upon a significant topology change.
     boost::optional<TopologyVersion> _topologyVersion;
@@ -144,11 +145,11 @@ private:
     // error: information about the last error related to this server. Default null.
     boost::optional<std::string> _error;
 
-    // roundTripTime: the duration of the ismaster call. Default null.
-    boost::optional<IsMasterRTT> _rtt;
+    // roundTripTime: the duration of the hello call. Default null.
+    boost::optional<HelloRTT> _rtt;
 
     // lastWriteDate: a 64-bit BSON datetime or null. The "lastWriteDate" from the server's most
-    // recent ismaster response.
+    // recent hello response.
     boost::optional<Date_t> _lastWriteDate;
 
     // opTime: an ObjectId or null. The last opTime reported by the server; an ObjectId or null.
@@ -166,14 +167,14 @@ private:
 
     // (=) me: The hostname or IP, and the port number, that this server was configured with in the
     // replica set. Default null.
-    boost::optional<ServerAddress> _me;
+    boost::optional<HostAndPort> _me;
 
     // (=) hosts, passives, arbiters: Sets of addresses. This server's opinion of the replica set's
     // members, if any. These hostnames are normalized to lower-case. Default empty. The client
     // monitors all three types of servers in a replica set.
-    std::set<ServerAddress> _hosts;
-    std::set<ServerAddress> _passives;
-    std::set<ServerAddress> _arbiters;
+    std::set<HostAndPort> _hosts;
+    std::set<HostAndPort> _passives;
+    std::set<HostAndPort> _arbiters;
 
     // (=) tags: map from string to string. Default empty.
     std::map<std::string, std::string> _tags;
@@ -189,20 +190,13 @@ private:
     boost::optional<OID> _electionId;
 
     // (=) primary: an address. This server's opinion of who the primary is. Default null.
-    boost::optional<ServerAddress> _primary;
+    boost::optional<HostAndPort> _primary;
 
     // lastUpdateTime: when this server was last checked. Default "infinity ago".
     boost::optional<Date_t> _lastUpdateTime = Date_t::min();
 
     // (=) logicalSessionTimeoutMinutes: integer or null. Default null.
     boost::optional<int> _logicalSessionTimeoutMinutes;
-
-    // (=) streamable: whether this server can stream isMaster responses. Default false.
-    bool _streamable = false;
-
-    // (=) poolResetCounter: integer, default 0. Initialized when client first creates connection
-    // pool for server. Incremented on network error or timeout.
-    int _poolResetCounter = 0;
 
     // The topology description of that we are a part of. Since this is a weak_ptr, code that
     // accesses this variable should ensure that the TopologyDescription cannot be destroyed by

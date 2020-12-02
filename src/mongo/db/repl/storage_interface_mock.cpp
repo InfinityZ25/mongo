@@ -26,7 +26,7 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include <numeric>
 
@@ -69,7 +69,9 @@ StatusWith<int> StorageInterfaceMock::incrementRollbackID(OperationContext* opCt
     return _rbid;
 }
 
-void StorageInterfaceMock::setStableTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) {
+void StorageInterfaceMock::setStableTimestamp(ServiceContext* serviceCtx,
+                                              Timestamp snapshotName,
+                                              bool force) {
     stdx::lock_guard<Latch> lock(_mutex);
     _stableTimestamp = snapshotName;
 }
@@ -92,14 +94,6 @@ Timestamp StorageInterfaceMock::getInitialDataTimestamp() const {
 
 Timestamp StorageInterfaceMock::getAllDurableTimestamp(ServiceContext* serviceCtx) const {
     return allDurableTimestamp;
-}
-
-Timestamp StorageInterfaceMock::getOldestOpenReadTimestamp(ServiceContext* serviceCtx) const {
-    return oldestOpenReadTimestamp;
-}
-
-bool StorageInterfaceMock::supportsDocLocking(ServiceContext* serviceCtx) const {
-    return supportsDocLockingBool;
 }
 
 Status CollectionBulkLoaderMock::init(const std::vector<BSONObj>& secondaryIndexSpecs) {

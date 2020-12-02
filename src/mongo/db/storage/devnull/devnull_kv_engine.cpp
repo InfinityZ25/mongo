@@ -33,8 +33,7 @@
 
 #include <memory>
 
-#include "mongo/db/snapshot_window_options.h"
-#include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_record_store.h"
+#include "mongo/db/storage/devnull/ephemeral_catalog_record_store.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/sorted_data_interface.h"
 
@@ -58,18 +57,14 @@ public:
 
 class DevNullRecordStore : public RecordStore {
 public:
-    DevNullRecordStore(StringData ns, const CollectionOptions& options)
-        : RecordStore(ns), _options(options) {
+    DevNullRecordStore(StringData ns, StringData identName, const CollectionOptions& options)
+        : RecordStore(ns, identName), _options(options) {
         _numInserts = 0;
         _dummy = BSON("_id" << 1);
     }
 
     virtual const char* name() const {
         return "devnull";
-    }
-
-    const std::string& getIdent() const override {
-        return _ident;
     }
 
     virtual void setCappedCallback(CappedCallback*) {}
@@ -155,7 +150,6 @@ private:
     CollectionOptions _options;
     long long _numInserts;
     BSONObj _dummy;
-    std::string _ident;
 };
 
 class DevNullSortedDataBuilderInterface : public SortedDataBuilderInterface {
@@ -172,8 +166,9 @@ public:
 
 class DevNullSortedDataInterface : public SortedDataInterface {
 public:
-    DevNullSortedDataInterface()
-        : SortedDataInterface(KeyString::Version::kLatestVersion, Ordering::make(BSONObj())) {}
+    DevNullSortedDataInterface(StringData identName)
+        : SortedDataInterface(
+              identName, KeyString::Version::kLatestVersion, Ordering::make(BSONObj())) {}
 
     virtual ~DevNullSortedDataInterface() {}
 
@@ -197,7 +192,7 @@ public:
 
     virtual void fullValidate(OperationContext* opCtx,
                               long long* numKeysOut,
-                              ValidateResults* fullResults) const {}
+                              IndexValidateResults* fullResults) const {}
 
     virtual bool appendCustomStats(OperationContext* opCtx,
                                    BSONObjBuilder* output,
@@ -206,6 +201,10 @@ public:
     }
 
     virtual long long getSpaceUsedBytes(OperationContext* opCtx) const {
+        return 0;
+    }
+
+    virtual long long getFreeStorageBytes(OperationContext* opCtx) const {
         return 0;
     }
 
@@ -229,36 +228,57 @@ std::unique_ptr<RecordStore> DevNullKVEngine::getRecordStore(OperationContext* o
                                                              StringData ident,
                                                              const CollectionOptions& options) {
     if (ident == "_mdb_catalog") {
-        return std::make_unique<EphemeralForTestRecordStore>(ns, &_catalogInfo);
+        return std::make_unique<EphemeralForTestRecordStore>(ns, ident, &_catalogInfo);
     }
-    return std::make_unique<DevNullRecordStore>(ns, options);
+    return std::make_unique<DevNullRecordStore>(ns, ident, options);
 }
 
 std::unique_ptr<RecordStore> DevNullKVEngine::makeTemporaryRecordStore(OperationContext* opCtx,
                                                                        StringData ident) {
-    return std::make_unique<DevNullRecordStore>("", CollectionOptions());
+    return std::make_unique<DevNullRecordStore>("" /* ns */, ident, CollectionOptions());
 }
 
 std::unique_ptr<SortedDataInterface> DevNullKVEngine::getSortedDataInterface(
     OperationContext* opCtx, StringData ident, const IndexDescriptor* desc) {
-    return std::make_unique<DevNullSortedDataInterface>();
+    return std::make_unique<DevNullSortedDataInterface>(ident);
 }
 
-bool DevNullKVEngine::isCacheUnderPressure(OperationContext* opCtx) const {
-    return (_cachePressureForTest >= snapshotWindowParams.cachePressureThreshold.load());
-}
+namespace {
 
-void DevNullKVEngine::setCachePressureForTest(int pressure) {
-    invariant(pressure >= 0 && pressure <= 100);
-    _cachePressureForTest = pressure;
-}
+class StreamingCursorImpl : public StorageEngine::StreamingCursor {
+public:
+    StreamingCursorImpl() = delete;
+    StreamingCursorImpl(StorageEngine::BackupOptions options)
+        : StorageEngine::StreamingCursor(options) {
+        _backupBlocks = {{"filename.wt"}};
+        _exhaustCursor = false;
+    };
 
-StatusWith<StorageEngine::BackupInformation> DevNullKVEngine::beginNonBlockingBackup(
+    ~StreamingCursorImpl() = default;
+
+    BSONObj getMetadataObject(UUID backupId) {
+        return BSONObj();
+    }
+
+    StatusWith<std::vector<StorageEngine::BackupBlock>> getNextBatch(const std::size_t batchSize) {
+        if (_exhaustCursor) {
+            std::vector<StorageEngine::BackupBlock> emptyVector;
+            return emptyVector;
+        }
+        _exhaustCursor = true;
+        return _backupBlocks;
+    }
+
+private:
+    std::vector<StorageEngine::BackupBlock> _backupBlocks;
+    bool _exhaustCursor;
+};
+
+}  // namespace
+
+StatusWith<std::unique_ptr<StorageEngine::StreamingCursor>> DevNullKVEngine::beginNonBlockingBackup(
     OperationContext* opCtx, const StorageEngine::BackupOptions& options) {
-    StorageEngine::BackupInformation backupInformation;
-    StorageEngine::BackupFile backupFile(0);
-    backupInformation.insert({"filename.wt", backupFile});
-    return backupInformation;
+    return std::make_unique<StreamingCursorImpl>(options);
 }
 
 StatusWith<std::vector<std::string>> DevNullKVEngine::extendBackupCursor(OperationContext* opCtx) {

@@ -33,6 +33,7 @@
 #include <string>
 
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/repl/replication_coordinator.h"
@@ -102,6 +103,7 @@ public:
     }
 
     RecordId insertRecord(OperationContext* opCtx, std::string contents = "abcd") {
+        Lock::GlobalLock globalLock(opCtx, MODE_IX);
         auto id = rs->insertRecord(opCtx, contents.c_str(), contents.length() + 1, _counter);
         ASSERT_OK(id);
         return id.getValue();
@@ -109,6 +111,7 @@ public:
 
     RecordId insertRecordAndCommit(std::string contents = "abcd") {
         auto op = makeOperation();
+        Lock::GlobalLock globalLock(op, MODE_IX);
         WriteUnitOfWork wuow(op);
         auto id = insertRecord(op, contents);
         wuow.commit();
@@ -117,6 +120,7 @@ public:
 
     void updateRecordAndCommit(RecordId id, std::string contents) {
         auto op = makeOperation();
+        Lock::GlobalLock globalLock(op, MODE_IX);
         WriteUnitOfWork wuow(op);
         ASSERT_OK(op->recoveryUnit()->setTimestamp(_counter));
         ASSERT_OK(rs->updateRecord(op, id, contents.c_str(), contents.length() + 1));
@@ -125,6 +129,7 @@ public:
 
     void deleteRecordAndCommit(RecordId id) {
         auto op = makeOperation();
+        Lock::GlobalLock globalLock(op, MODE_IX);
         WriteUnitOfWork wuow(op);
         ASSERT_OK(op->recoveryUnit()->setTimestamp(_counter));
         rs->deleteRecord(op, id);
@@ -135,6 +140,7 @@ public:
      * Returns the number of records seen iterating rs using the passed-in OperationContext.
      */
     int itCountOn(OperationContext* opCtx) {
+        Lock::GlobalLock globalLock(opCtx, MODE_IS);
         auto cursor = rs->getCursor(opCtx);
         int count = 0;
         while (auto record = cursor->next()) {
@@ -146,17 +152,18 @@ public:
     int itCountCommitted() {
         auto op = makeOperation();
         op->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kMajorityCommitted);
-        ASSERT_OK(op->recoveryUnit()->obtainMajorityCommittedSnapshot());
+        ASSERT_OK(op->recoveryUnit()->majorityCommittedSnapshotAvailable());
         return itCountOn(op);
     }
 
-    int itCountLocal() {
+    int itCountLastApplied() {
         auto op = makeOperation();
-        op->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kLastApplied);
+        op->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoOverlap);
         return itCountOn(op);
     }
 
     boost::optional<Record> readRecordOn(OperationContext* op, RecordId id) {
+        Lock::GlobalLock globalLock(op, MODE_IS);
         auto cursor = rs->getCursor(op);
         auto record = cursor->seekExact(id);
         if (record)
@@ -165,8 +172,9 @@ public:
     }
     boost::optional<Record> readRecordCommitted(RecordId id) {
         auto op = makeOperation();
+        Lock::GlobalLock globalLock(op, MODE_IS);
         op->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kMajorityCommitted);
-        ASSERT_OK(op->recoveryUnit()->obtainMajorityCommittedSnapshot());
+        ASSERT_OK(op->recoveryUnit()->majorityCommittedSnapshotAvailable());
         return readRecordOn(op, id);
     }
 
@@ -176,14 +184,14 @@ public:
         return std::string(record->data.data());
     }
 
-    boost::optional<Record> readRecordLocal(RecordId id) {
+    boost::optional<Record> readRecordLastApplied(RecordId id) {
         auto op = makeOperation();
-        op->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kLastApplied);
+        op->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoOverlap);
         return readRecordOn(op, id);
     }
 
-    std::string readStringLocal(RecordId id) {
-        auto record = readRecordLocal(id);
+    std::string readStringLastApplied(RecordId id) {
+        auto record = readRecordLastApplied(id);
         ASSERT(record);
         return std::string(record->data.data());
     }
@@ -221,7 +229,7 @@ TEST_F(SnapshotManagerTests, ConsistentIfNotSupported) {
     auto ru = op->recoveryUnit();
     auto readSource = ru->getTimestampReadSource();
     ASSERT(readSource != RecoveryUnit::ReadSource::kMajorityCommitted);
-    ASSERT(!ru->getPointInTimeReadTimestamp());
+    ASSERT(!ru->getPointInTimeReadTimestamp(op));
 }
 
 TEST_F(SnapshotManagerTests, FailsWithNoCommittedSnapshot) {
@@ -233,21 +241,21 @@ TEST_F(SnapshotManagerTests, FailsWithNoCommittedSnapshot) {
     op->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kMajorityCommitted);
 
     // Before first snapshot is created.
-    ASSERT_EQ(ru->obtainMajorityCommittedSnapshot(),
+    ASSERT_EQ(ru->majorityCommittedSnapshotAvailable(),
               ErrorCodes::ReadConcernMajorityNotAvailableYet);
 
     // There is a snapshot but it isn't committed.
     auto snap = fetchAndIncrementTimestamp();
-    ASSERT_EQ(ru->obtainMajorityCommittedSnapshot(),
+    ASSERT_EQ(ru->majorityCommittedSnapshotAvailable(),
               ErrorCodes::ReadConcernMajorityNotAvailableYet);
 
     // Now there is a committed snapshot.
     snapshotManager->setCommittedSnapshot(snap);
-    ASSERT_OK(ru->obtainMajorityCommittedSnapshot());
+    ASSERT_OK(ru->majorityCommittedSnapshotAvailable());
 
     // Not anymore!
-    snapshotManager->dropAllSnapshots();
-    ASSERT_EQ(ru->obtainMajorityCommittedSnapshot(),
+    snapshotManager->clearCommittedSnapshot();
+    ASSERT_EQ(ru->majorityCommittedSnapshotAvailable(),
               ErrorCodes::ReadConcernMajorityNotAvailableYet);
 }
 
@@ -258,14 +266,18 @@ TEST_F(SnapshotManagerTests, FailsAfterDropAllSnapshotsWhileYielded) {
     auto op = makeOperation();
     op->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kMajorityCommitted);
 
+    // Hold the outer most global lock throughout the test to avoid getting snapshots abandoned when
+    // inner global locks are destructed.
+    Lock::GlobalLock globalLock(op, MODE_IS);
+
     // Start an operation using a committed snapshot.
     auto snap = fetchAndIncrementTimestamp();
     snapshotManager->setCommittedSnapshot(snap);
-    ASSERT_OK(op->recoveryUnit()->obtainMajorityCommittedSnapshot());
+    ASSERT_OK(op->recoveryUnit()->majorityCommittedSnapshotAvailable());
     ASSERT_EQ(itCountOn(op), 0);  // acquires a snapshot.
 
     // Everything still works until we abandon our snapshot.
-    snapshotManager->dropAllSnapshots();
+    snapshotManager->clearCommittedSnapshot();
     ASSERT_EQ(itCountOn(op), 0);
 
     // Now it doesn't.
@@ -310,10 +322,13 @@ TEST_F(SnapshotManagerTests, BasicFunctionality) {
     snapshotManager->setCommittedSnapshot(snap3);
     ASSERT_EQ(itCountCommitted(), 3);
 
-    // This op should keep its original snapshot until abandoned.
+    // Hold the outer most global lock throughout the remainder of the test to avoid getting
+    // snapshots abandoned when inner global locks are destructed. This op should keep its original
+    // snapshot until abandoned.
     auto longOp = makeOperation();
+    Lock::GlobalLock globalLock(longOp, MODE_IS);
     longOp->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kMajorityCommitted);
-    ASSERT_OK(longOp->recoveryUnit()->obtainMajorityCommittedSnapshot());
+    ASSERT_OK(longOp->recoveryUnit()->majorityCommittedSnapshotAvailable());
     ASSERT_EQ(itCountOn(longOp), 3);
 
     // If this fails, the snapshot contains writes that were rolled back.
@@ -360,7 +375,7 @@ TEST_F(SnapshotManagerTests, UpdateAndDelete) {
     ASSERT(!readRecordCommitted(id));
 }
 
-TEST_F(SnapshotManagerTests, InsertAndReadOnLocalSnapshot) {
+TEST_F(SnapshotManagerTests, InsertAndReadOnLastAppliedSnapshot) {
     if (!snapshotManager)
         return;  // This test is only for engines that DO support SnapshotManagers.
 
@@ -369,28 +384,28 @@ TEST_F(SnapshotManagerTests, InsertAndReadOnLocalSnapshot) {
     auto id = insertRecordAndCommit();
     auto afterInsert = fetchAndIncrementTimestamp();
 
-    // Not reading on the last local timestamp returns the most recent data.
+    // Not reading on the last applied timestamp returns the most recent data.
     auto op = makeOperation();
     auto ru = op->recoveryUnit();
-    ru->setTimestampReadSource(RecoveryUnit::ReadSource::kUnset);
+    ru->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
     ASSERT_EQ(itCountOn(op), 1);
     ASSERT(readRecordOn(op, id));
 
     deleteRecordAndCommit(id);
     auto afterDelete = fetchAndIncrementTimestamp();
 
-    // Reading at the local snapshot timestamps returns data in order.
-    snapshotManager->setLocalSnapshot(beforeInsert);
-    ASSERT_EQ(itCountLocal(), 0);
-    ASSERT(!readRecordLocal(id));
+    // Reading at the last applied snapshot timestamps returns data in order.
+    snapshotManager->setLastApplied(beforeInsert);
+    ASSERT_EQ(itCountLastApplied(), 0);
+    ASSERT(!readRecordLastApplied(id));
 
-    snapshotManager->setLocalSnapshot(afterInsert);
-    ASSERT_EQ(itCountLocal(), 1);
-    ASSERT(readRecordLocal(id));
+    snapshotManager->setLastApplied(afterInsert);
+    ASSERT_EQ(itCountLastApplied(), 1);
+    ASSERT(readRecordLastApplied(id));
 
-    snapshotManager->setLocalSnapshot(afterDelete);
-    ASSERT_EQ(itCountLocal(), 0);
-    ASSERT(!readRecordLocal(id));
+    snapshotManager->setLastApplied(afterDelete);
+    ASSERT_EQ(itCountLastApplied(), 0);
+    ASSERT(!readRecordLastApplied(id));
 }
 
 TEST_F(SnapshotManagerTests, UpdateAndDeleteOnLocalSnapshot) {
@@ -408,7 +423,7 @@ TEST_F(SnapshotManagerTests, UpdateAndDeleteOnLocalSnapshot) {
     // Not reading on the last local timestamp returns the most recent data.
     auto op = makeOperation();
     auto ru = op->recoveryUnit();
-    ru->setTimestampReadSource(RecoveryUnit::ReadSource::kUnset);
+    ru->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
     ASSERT_EQ(itCountOn(op), 1);
     auto record = readRecordOn(op, id);
     ASSERT_EQ(std::string(record->data.data()), "Blue spotted stingray");
@@ -416,20 +431,20 @@ TEST_F(SnapshotManagerTests, UpdateAndDeleteOnLocalSnapshot) {
     deleteRecordAndCommit(id);
     auto afterDelete = fetchAndIncrementTimestamp();
 
-    snapshotManager->setLocalSnapshot(beforeInsert);
-    ASSERT_EQ(itCountLocal(), 0);
-    ASSERT(!readRecordLocal(id));
+    snapshotManager->setLastApplied(beforeInsert);
+    ASSERT_EQ(itCountLastApplied(), 0);
+    ASSERT(!readRecordLastApplied(id));
 
-    snapshotManager->setLocalSnapshot(afterInsert);
-    ASSERT_EQ(itCountLocal(), 1);
-    ASSERT_EQ(readStringLocal(id), "Aardvark");
+    snapshotManager->setLastApplied(afterInsert);
+    ASSERT_EQ(itCountLastApplied(), 1);
+    ASSERT_EQ(readStringLastApplied(id), "Aardvark");
 
-    snapshotManager->setLocalSnapshot(afterUpdate);
-    ASSERT_EQ(itCountLocal(), 1);
-    ASSERT_EQ(readStringLocal(id), "Blue spotted stingray");
+    snapshotManager->setLastApplied(afterUpdate);
+    ASSERT_EQ(itCountLastApplied(), 1);
+    ASSERT_EQ(readStringLastApplied(id), "Blue spotted stingray");
 
-    snapshotManager->setLocalSnapshot(afterDelete);
-    ASSERT_EQ(itCountLocal(), 0);
-    ASSERT(!readRecordLocal(id));
+    snapshotManager->setLastApplied(afterDelete);
+    ASSERT_EQ(itCountLastApplied(), 0);
+    ASSERT(!readRecordLastApplied(id));
 }
 }  // namespace mongo

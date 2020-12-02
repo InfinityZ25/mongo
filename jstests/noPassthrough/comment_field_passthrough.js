@@ -42,7 +42,7 @@ const impls = {
         const command = (typeof (testObj.command) === "function")
             ? testObj.command(state, testCase.commandArgs)
             : testObj.command;
-        command['comment'] = "comment";
+        command['comment'] = {comment: true};
         const res = runOnDb.runCommand(command);
         assert(res.ok == 1 || testCase.expectFail || res.code == ErrorCodes.CommandNotSupported,
                tojson(res));
@@ -60,9 +60,10 @@ runTests(tests, conn, impls);
 
 MongoRunner.stopMongod(conn);
 
+// Test with a sharded cluster. Some tests require the first shard's name acquired from the
+// auth commands library to be up-to-date in order to set up correctly.
 conn = new ShardingTest({shards: 1, mongos: 2});
-
-// Test with a sharded cluster.
+shard0name = conn.shard0.shardName;
 runTests(tests, conn, impls);
 
 conn.stop();

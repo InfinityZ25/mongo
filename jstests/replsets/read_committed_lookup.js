@@ -1,9 +1,10 @@
 /**
  * Tests that a $lookup and $graphLookup stage within an aggregation pipeline will read only
  * committed data if the pipeline is using a majority readConcern.
+ *
+ * @tags: [requires_majority_read_concern]
  */
 
-load("jstests/replsets/rslib.js");           // For startSetIfSupportsReadMajority.
 load("jstests/libs/read_committed_lib.js");  // For testReadCommittedLookup
 
 (function() {
@@ -20,11 +21,7 @@ let rst = new ReplSetTest({
     }
 });
 
-if (!startSetIfSupportsReadMajority(rst)) {
-    jsTest.log("skipping test since storage engine doesn't support committed reads");
-    rst.stopSet();
-    return;
-}
+rst.startSet();
 
 const nodes = rst.nodeList();
 const config = {
@@ -38,7 +35,7 @@ const config = {
 
 rst.initiate(config);
 
-let shardSecondary = rst._slaves[0];
+let shardSecondary = rst.getSecondary();
 
 testReadCommittedLookup(rst.getPrimary().getDB("test"), shardSecondary, rst);
 

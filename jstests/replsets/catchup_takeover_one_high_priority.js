@@ -37,7 +37,7 @@ replSet.waitForState(2, ReplSetTest.State.PRIMARY, replSet.kDefaultTimeoutMS);
 jsTestLog('node 2 is now primary');
 
 replSet.awaitReplication();
-waitForConfigReplication(nodes[2]);
+replSet.waitForConfigReplication(nodes[2]);
 
 // Stop replication and disconnect node 2 so that it cannot do a priority takeover.
 stopServerReplication(nodes[2]);
@@ -71,7 +71,7 @@ nodes[2].reconnect(nodes[0]);
 nodes[2].reconnect(nodes[1]);
 
 // Wait until nodes have learned the latest config.
-waitForConfigReplication(nodes[1], [nodes[1], nodes[2]]);
+replSet.waitForConfigReplication(nodes[1], [nodes[1], nodes[2]]);
 
 // Step up a lagged node.
 assert.commandWorked(nodes[1].adminCommand({replSetStepUp: 1}));
@@ -83,7 +83,7 @@ jsTestLog('node 1 is now primary, but cannot accept writes');
 
 // Confirm that the most up-to-date node becomes primary
 // after the default catchup delay.
-replSet.waitForState(0, ReplSetTest.State.PRIMARY, 60 * 1000);
+replSet.waitForState(0, ReplSetTest.State.PRIMARY, replSet.kDefaultTimeoutMS);
 jsTestLog('node 0 performed catchup takeover and is now primary');
 
 // Wait until the old primary steps down.
@@ -96,7 +96,7 @@ replSet.awaitReplication();
 
 // Confirm that the highest priority node becomes primary
 // after catching up.
-replSet.waitForState(2, ReplSetTest.State.PRIMARY, 30 * 1000);
+replSet.waitForState(2, ReplSetTest.State.PRIMARY, replSet.kDefaultTimeoutMS);
 jsTestLog('node 2 performed priority takeover and is now primary');
 
 // Wait until the old primary steps down so the connections won't be closed during stopSet().

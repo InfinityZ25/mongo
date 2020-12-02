@@ -89,21 +89,28 @@ server_parameters:
   #
   # Plan cache
   #
-  internalQueryCacheSize:
-    description: "How many entries in the cache?"
+
+  internalQueryCacheMaxEntriesPerCollection:
+    description: "The maximum number of entries allowed in a given collection's plan cache."
     set_at: [ startup, runtime ]
-    cpp_varname: "internalQueryCacheSize"
+    cpp_varname: "internalQueryCacheMaxEntriesPerCollection"
     cpp_vartype: AtomicWord<int>
+    deprecated_name: "internalQueryCacheSize"
     default: 5000
     validator:
       gte: 0
 
-  internalQueryCacheFeedbacksStored:
-    description: "How many feedback entries do we collect before possibly evicting from the cache based on bad performance?"
+  internalQueryCacheMaxSizeBytesBeforeStripDebugInfo:
+    description: "Limits the amount of debug info stored across all plan caches in the system. Once
+    the estimate of the number of bytes used across all plan caches exceeds this threshold, then
+    debug info is not stored alongside new cache entries, in order to limit plan cache memory
+    consumption. If plan cache entries are freed and the estimate once again dips below this
+    threshold, then new cache entries will once again have debug info associated with them."
     set_at: [ startup, runtime ]
-    cpp_varname: "internalQueryCacheFeedbacksStored"
-    cpp_vartype: AtomicWord<int>
-    default: 20
+    cpp_varname: "internalQueryCacheMaxSizeBytesBeforeStripDebugInfo"
+    cpp_vartype: AtomicWord<long long>
+    default:
+      expr: 512 * 1024 * 1024
     validator:
       gte: 0
 
@@ -133,6 +140,19 @@ server_parameters:
     default: false
 
   #
+  # Parsing
+  #
+
+  internalPipelineLengthLimit:
+    description: "The maximum length allowed for an an aggregation pipeline."
+    set_at: [ startup ]
+    cpp_varname: "internalPipelineLengthLimit"
+    cpp_vartype: int
+    default: 1000
+    validator:
+      gt: 0
+
+  #
   # Planning and enumeration
   #
   internalQueryPlannerMaxIndexedSolutions:
@@ -143,6 +163,25 @@ server_parameters:
     default: 64
     validator:
       gte: 0
+
+  internalQueryEnumerationPreferLockstepOrEnumeration:
+    description: "If set to true, instructs the plan enumerator to enumerate contained $ors in a
+    special order. $or enumeration can generate an exponential number of plans, and is therefore
+    limited at some arbitrary cutoff controlled by a parameter. When this limit is hit, the order of
+    enumeration is important. For example, a query like the following has a 'contained $or' (within
+    an $and): {a: 1, $or: [{b: 1, c: 1}, {b: 2, c: 2}]} For this query if there are indexes
+    a_b={a: 1, b: 1} and a_c={a: 1, c: 1}, the normal enumeration order would output assignments
+    [a_b, a_b], [a_c, a_b], [a_b, a_c], then [a_c, a_c]. This flag will instruct the enumerator to
+    instead prefer a different order. It's hard to summarize, but perhaps the phrases 'lockstep
+    enumeration', 'simultaneous advancement', or 'parallel iteration' will help the reader. The
+    effect is to give earlier enumeration to plans which use the same choice across all branches. In
+    this order, we would get assignments [a_b, a_b], [a_c, a_c], [a_c, a_b], then [a_b, a_c]. This
+    is thought to be helpful in general, but particularly in cases where all children of the $or use
+    the same fields and have the same indexes available, as in this example."
+    set_at: [ startup, runtime ]
+    cpp_varname: "internalQueryEnumerationPreferLockstepOrEnumeration"
+    cpp_vartype: AtomicWord<bool>
+    default: false
 
   internalQueryEnumerationMaxOrSolutions:
     description: "How many solutions will the enumerator consider at each OR?"
@@ -228,6 +267,16 @@ server_parameters:
     set_at: [ startup, runtime ]
     cpp_varname: "internalQueryFacetBufferSizeBytes"
     cpp_vartype: AtomicWord<int>
+    default:
+      expr: 100 * 1024 * 1024
+    validator:
+      gt: 0
+
+  internalQueryFacetMaxOutputDocSizeBytes:
+    description: "The number of bytes to buffer at once during a $facet stage."
+    set_at: [ startup, runtime ]
+    cpp_varname: "internalQueryFacetMaxOutputDocSizeBytes"
+    cpp_vartype: AtomicWord<long long>
     default:
       expr: 100 * 1024 * 1024
     validator:
@@ -355,3 +404,55 @@ server_parameters:
     cpp_varname: "internalQueryDesugarWhereToFunction"
     cpp_vartype: AtomicWord<bool>
     default: false
+
+  internalQueryEnableSlotBasedExecutionEngine:
+    description: "If true, activates the slot-based execution engine to execute queries."
+    set_at: [ startup, runtime ]
+    cpp_varname: "internalQueryEnableSlotBasedExecutionEngine"
+    cpp_vartype: AtomicWord<bool>
+    default: false
+
+  internalQueryDefaultDOP:
+    description: "Default degree of parallelism. This an internal experimental parameter and should not be changed on live systems."
+    set_at: [ startup, runtime ]
+    cpp_varname: "internalQueryDefaultDOP"
+    cpp_vartype: AtomicWord<int>
+    default: 1
+    test_only: true
+    validator:
+      gt: 0
+
+  internalQueryEnableLoggingV2OplogEntries:
+    description: "If true, this node may log $v:2 delta-style oplog entries."
+    set_at: [ startup, runtime ]
+    cpp_varname: "internalQueryEnableLoggingV2OplogEntries"
+    cpp_vartype: AtomicWord<bool>
+    default: true
+
+  internalQuerySlotBasedExecutionMaxStaticIndexScanIntervals:
+    description: "Limits the number of statically known intervals that SBE can decompose index bounds into when possible."
+    set_at: [ startup, runtime ]
+    cpp_varname: "internalQuerySlotBasedExecutionMaxStaticIndexScanIntervals"
+    cpp_vartype: AtomicWord<int>
+    default:
+      expr: 1000
+    validator:
+        gt: 0
+
+  internalQueryEnableCSTParser:
+    description: "If true, use the grammar-based parser and CST to parse queries."
+    set_at: [ startup, runtime ]
+    cpp_varname: "internalQueryEnableCSTParser"
+    cpp_vartype: AtomicWord<bool>
+    default: false
+
+  internalQueryMaxDocValidationErrorConsideredValues:
+    description: "Limits the number of values reported in the 'consideredValues' array when
+    generating a descriptive document validation error."
+    set_at: [ startup, runtime ]
+    cpp_varname: "internalQueryMaxDocValidationErrorConsideredValues"
+    cpp_vartype: AtomicWord<int>
+    default:
+        expr: 10
+    validator:
+        gt: 0

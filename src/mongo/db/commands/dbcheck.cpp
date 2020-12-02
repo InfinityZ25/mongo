@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -35,7 +35,6 @@
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/health_log.h"
-#include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -45,6 +44,7 @@
 #include "mongo/db/repl/dbcheck.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/idl/command_generic_argument.h"
 #include "mongo/util/background.h"
 
 #include "mongo/logv2/log.h"
@@ -84,7 +84,6 @@ bool canRunDbCheckOn(const NamespaceString& nss) {
     // TODO: SERVER-30826.
     const std::set<StringData> replicatedSystemCollections{"system.backup_users",
                                                            "system.js",
-                                                           "system.new_users",
                                                            "system.roles",
                                                            "system.users",
                                                            "system.version",
@@ -139,7 +138,8 @@ std::unique_ptr<DbCheckRun> fullDatabaseRun(OperationContext* opCtx,
     int64_t max = std::numeric_limits<int64_t>::max();
     auto rate = invocation.getMaxCountPerSecond();
 
-    for (auto collIt = db->begin(opCtx); collIt != db->end(opCtx); ++collIt) {
+    auto catalog = CollectionCatalog::get(opCtx);
+    for (auto collIt = catalog->begin(opCtx, db->name()); collIt != catalog->end(opCtx); ++collIt) {
         auto coll = *collIt;
         if (!coll) {
             break;
@@ -335,7 +335,7 @@ private:
         }
 
         auto collection =
-            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, info.nss);
+            CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, info.nss);
         if (!collection) {
             return false;
         }
@@ -394,7 +394,7 @@ private:
             return Status(ErrorCodes::PrimarySteppedDown, "dbCheck terminated due to stepdown");
         }
 
-        auto collection = agc.getCollection();
+        const auto& collection = agc.getCollection();
 
         if (!collection) {
             return {ErrorCodes::NamespaceNotFound, "dbCheck collection no longer exists"};

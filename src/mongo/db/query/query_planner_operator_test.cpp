@@ -396,6 +396,7 @@ TEST_F(QueryPlannerTest, NotEqualsNullInElemMatchObjectSparseMultiKeyAboveElemMa
     auto keyPattern = BSON("a.b.c.d" << 1);
     IndexEntry ind(keyPattern,
                    IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                   IndexDescriptor::kLatestIndexVersion,
                    true,
                    {},
                    {},
@@ -425,6 +426,7 @@ TEST_F(QueryPlannerTest, NotEqualsNullInElemMatchObjectSparseMultiKeyBelowElemMa
     auto keyPattern = BSON("a.b.c.d" << 1);
     IndexEntry ind(keyPattern,
                    IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                   IndexDescriptor::kLatestIndexVersion,
                    true,
                    {},
                    {},
@@ -843,6 +845,23 @@ TEST_F(QueryPlannerTest, SortSkipSoftLimit) {
         "{skip: {n: 2, node: "
         "{sort: {pattern: {a: 1}, limit: 5, type: 'simple', node: "
         "{cscan: {dir: 1}}}}}}}}");
+}
+
+// Push project behind sort even when there is a skip between them.
+TEST_F(QueryPlannerTest, PushProjectBehindSortWithSkipBetween) {
+    runQueryAsCommand(fromjson(R"({
+        find: 'testns',
+        filter: {},
+        sort: {a: 1},
+        projection: {_id: 0, a: 1},
+        skip: 2
+    })"));
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{skip: {n: 2, node: "
+        "{sort: {pattern: {a: 1}, limit: 0, type: 'simple', node: "
+        "{proj: {spec: {_id: 0, a: 1}, node: "
+        "{cscan: {dir: 1}}}}}}}}}");
 }
 
 //

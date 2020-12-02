@@ -1,3 +1,8 @@
+/**
+ * @tags: [
+ *   sbe_incompatible,
+ * ]
+ */
 t = db.geo_sort1;
 t.drop();
 
@@ -7,7 +12,7 @@ for (x = 0; x < 10; x++) {
     }
 }
 
-t.ensureIndex({loc: "2d", foo: 1});
+t.createIndex({loc: "2d", foo: 1});
 
 q = t.find({loc: {$near: [5, 5]}, foo: {$gt: 20}});
 m = function(z) {

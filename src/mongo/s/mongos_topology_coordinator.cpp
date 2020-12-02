@@ -33,6 +33,7 @@
 
 #include "mongo/db/client.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/shutdown_in_progress_quiesce_info.h"
 #include "mongo/s/mongos_topology_coordinator.h"
 #include "mongo/util/fail_point.h"
 
@@ -53,10 +54,33 @@ MONGO_INITIALIZER(GenerateMongosInstanceId)(InitializerContext*) {
     return Status::OK();
 }
 
-// Awaitable isMaster requests with the proper topologyVersions are expected to wait for
+// Signals that a hello request has started waiting.
+MONGO_FAIL_POINT_DEFINE(waitForHelloResponse);
+// Awaitable hello requests with the proper topologyVersions are expected to wait for
 // maxAwaitTimeMS on mongos. When set, this failpoint will hang right before waiting on a
 // topology change.
-MONGO_FAIL_POINT_DEFINE(hangWhileWaitingForIsMasterResponse);
+MONGO_FAIL_POINT_DEFINE(hangWhileWaitingForHelloResponse);
+// Failpoint for hanging during quiesce mode on mongos.
+MONGO_FAIL_POINT_DEFINE(hangDuringQuiesceMode);
+
+template <typename T>
+StatusOrStatusWith<T> futureGetNoThrowWithDeadline(OperationContext* opCtx,
+                                                   SharedSemiFuture<T>& f,
+                                                   Date_t deadline,
+                                                   ErrorCodes::Error error) {
+    try {
+        return opCtx->runWithDeadline(deadline, error, [&] { return f.getNoThrow(opCtx); });
+    } catch (const DBException& e) {
+        return e.toStatus();
+    }
+}
+
+/**
+ * ShutdownInProgress error message
+ */
+
+constexpr StringData kQuiesceModeShutdownMessage =
+    "Mongos is in quiesce mode and will shut down"_sd;
 
 }  // namespace
 
@@ -65,29 +89,54 @@ MongosTopologyCoordinator* MongosTopologyCoordinator::get(OperationContext* opCt
     return &getMongosTopologyCoordinator(opCtx->getClient()->getServiceContext());
 }
 
-MongosTopologyCoordinator::MongosTopologyCoordinator() : _topologyVersion(instanceId, 0) {}
+MongosTopologyCoordinator::MongosTopologyCoordinator()
+    : _topologyVersion(instanceId, 0),
+      _inQuiesceMode(false),
+      _promise(std::make_shared<SharedPromise<std::shared_ptr<const MongosHelloResponse>>>()) {}
 
-std::shared_ptr<MongosIsMasterResponse> MongosTopologyCoordinator::_makeIsMasterResponse(
+long long MongosTopologyCoordinator::_calculateRemainingQuiesceTimeMillis() const {
+    auto preciseClock = getGlobalServiceContext()->getPreciseClockSource();
+    auto remainingQuiesceTimeMillis =
+        std::max(Milliseconds::zero(), _quiesceDeadline - preciseClock->now());
+    // Turn remainingQuiesceTimeMillis into an int64 so that it's a supported BSONElement.
+    long long remainingQuiesceTimeLong = durationCount<Milliseconds>(remainingQuiesceTimeMillis);
+    return remainingQuiesceTimeLong;
+}
+
+std::shared_ptr<MongosHelloResponse> MongosTopologyCoordinator::_makeHelloResponse(
     WithLock lock) const {
-    auto response = std::make_shared<MongosIsMasterResponse>(_topologyVersion);
+    // It's possible for us to transition to Quiesce Mode after a hello request timed out.
+    // Check that we are not in Quiesce Mode before returning a response to avoid responding with
+    // a higher topology version, but no indication that we are shutting down.
+    uassert(ShutdownInProgressQuiesceInfo(_calculateRemainingQuiesceTimeMillis()),
+            kQuiesceModeShutdownMessage,
+            !_inQuiesceMode);
+
+    auto response = std::make_shared<MongosHelloResponse>(_topologyVersion);
     return response;
 }
 
-std::shared_ptr<const MongosIsMasterResponse> MongosTopologyCoordinator::awaitIsMasterResponse(
+std::shared_ptr<const MongosHelloResponse> MongosTopologyCoordinator::awaitHelloResponse(
     OperationContext* opCtx,
     boost::optional<TopologyVersion> clientTopologyVersion,
-    boost::optional<long long> maxAwaitTimeMS) const {
+    boost::optional<Date_t> deadline) const {
     stdx::unique_lock lk(_mutex);
+
+    // Fail all new hello requests with ShutdownInProgress if we've transitioned to Quiesce
+    // Mode.
+    uassert(ShutdownInProgressQuiesceInfo(_calculateRemainingQuiesceTimeMillis()),
+            kQuiesceModeShutdownMessage,
+            !_inQuiesceMode);
 
     // Respond immediately if:
     // (1) There is no clientTopologyVersion, which indicates that the client is not using
-    //     awaitable ismaster.
+    //     awaitable hello.
     // (2) The process IDs are different.
     // (3) The clientTopologyVersion counter is less than mongos' counter.
     if (!clientTopologyVersion ||
         clientTopologyVersion->getProcessId() != _topologyVersion.getProcessId() ||
         clientTopologyVersion->getCounter() < _topologyVersion.getCounter()) {
-        return _makeIsMasterResponse(lk);
+        return _makeHelloResponse(lk);
     }
     uassert(51761,
             str::stream() << "Received a topology version with counter: "
@@ -96,32 +145,77 @@ std::shared_ptr<const MongosIsMasterResponse> MongosTopologyCoordinator::awaitIs
                           << _topologyVersion.getCounter(),
             clientTopologyVersion->getCounter() == _topologyVersion.getCounter());
 
+    auto future = _promise->getFuture();
+    // At this point, we have verified that clientTopologyVersion is not none. It this is true,
+    // deadline must also be not none.
+    invariant(deadline);
+
+    HelloMetrics::get(opCtx)->incrementNumAwaitingTopologyChanges();
     lk.unlock();
 
-    // At this point, we have verified that clientTopologyVersion is not none. It this is true,
-    // maxAwaitTimeMS must also be not none.
-    invariant(maxAwaitTimeMS);
-
-    IsMasterMetrics::get(opCtx)->incrementNumAwaitingTopologyChanges();
-
-    ON_BLOCK_EXIT([&] { IsMasterMetrics::get(opCtx)->decrementNumAwaitingTopologyChanges(); });
-
-    if (MONGO_unlikely(hangWhileWaitingForIsMasterResponse.shouldFail())) {
-        LOGV2(4695501, "hangWhileWaitingForIsMasterResponse failpoint enabled");
-        hangWhileWaitingForIsMasterResponse.pauseWhileSet(opCtx);
+    if (MONGO_unlikely(waitForHelloResponse.shouldFail())) {
+        // Used in tests that wait for this failpoint to be entered before shutting down mongos,
+        // which is the only action that triggers a topology change.
+        LOGV2(4695704, "waitForHelloResponse failpoint enabled");
     }
 
-    // Sleep for maxTimeMS.
+    if (MONGO_unlikely(hangWhileWaitingForHelloResponse.shouldFail())) {
+        LOGV2(4695501, "hangWhileWaitingForHelloResponse failpoint enabled");
+        hangWhileWaitingForHelloResponse.pauseWhileSet(opCtx);
+    }
+
+    // Wait for a mongos topology change with timeout set to deadline.
     LOGV2_DEBUG(4695502,
                 1,
-                "Waiting for an isMaster response for maxAwaitTimeMS",
-                "maxAwaitTimeMS"_attr = maxAwaitTimeMS.get(),
+                "Waiting for a hello response from a topology change or until deadline",
+                "deadline"_attr = deadline.get(),
                 "currentMongosTopologyVersionCounter"_attr = _topologyVersion.getCounter());
 
-    opCtx->sleepFor(Milliseconds(*maxAwaitTimeMS));
+    auto statusWithHello =
+        futureGetNoThrowWithDeadline(opCtx, future, deadline.get(), opCtx->getTimeoutError());
+    auto status = statusWithHello.getStatus();
 
-    lk.lock();
-    return _makeIsMasterResponse(lk);
+    if (status == ErrorCodes::ExceededTimeLimit) {
+        // Return a MongosHelloResponse with the current topology version on timeout when
+        // waiting for a topology change.
+        stdx::lock_guard lk(_mutex);
+        HelloMetrics::get(opCtx)->decrementNumAwaitingTopologyChanges();
+        return _makeHelloResponse(lk);
+    }
+
+    // A topology change has happened so we return a MongosHelloResponse with the updated
+    // topology version.
+    uassertStatusOK(status);
+    return statusWithHello.getValue();
+}
+
+void MongosTopologyCoordinator::enterQuiesceModeAndWait(OperationContext* opCtx,
+                                                        Milliseconds quiesceTime) {
+    {
+        stdx::lock_guard lk(_mutex);
+        _inQuiesceMode = true;
+        _quiesceDeadline = getGlobalServiceContext()->getPreciseClockSource()->now() + quiesceTime;
+
+        // Increment the topology version and respond to any waiting hello request with an error.
+        auto counter = _topologyVersion.getCounter();
+        _topologyVersion.setCounter(counter + 1);
+        _promise->setError(
+            Status(ShutdownInProgressQuiesceInfo(_calculateRemainingQuiesceTimeMillis()),
+                   kQuiesceModeShutdownMessage));
+
+        // Reset counter to 0 since we will respond to all waiting hello requests with an error.
+        // All new hello requests will immediately fail with ShutdownInProgress.
+        HelloMetrics::get(getGlobalServiceContext())->resetNumAwaitingTopologyChanges();
+    }
+
+    if (MONGO_unlikely(hangDuringQuiesceMode.shouldFail())) {
+        LOGV2(4695700, "hangDuringQuiesceMode failpoint enabled");
+        hangDuringQuiesceMode.pauseWhileSet(opCtx);
+    }
+
+    LOGV2(4695701, "Entering quiesce mode for mongos shutdown", "quiesceTime"_attr = quiesceTime);
+    opCtx->sleepUntil(_quiesceDeadline);
+    LOGV2(4695702, "Exiting quiesce mode for mongos shutdown");
 }
 
 }  // namespace mongo

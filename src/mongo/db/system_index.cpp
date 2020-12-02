@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -41,6 +41,7 @@
 #include "mongo/db/catalog/commit_quorum_options.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_key_validate.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_builds_coordinator.h"
@@ -94,7 +95,7 @@ void generateSystemIndexForExistingCollection(OperationContext* opCtx,
                                               const IndexSpec& spec) {
     // Do not try to generate any system indexes on a secondary.
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-    uassert(ErrorCodes::NotMaster,
+    uassert(ErrorCodes::NotWritablePrimary,
             "Not primary while creating authorization index",
             replCoord->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet ||
                 replCoord->canAcceptWritesForDatabase(opCtx, ns.db()));
@@ -107,20 +108,23 @@ void generateSystemIndexForExistingCollection(OperationContext* opCtx,
         BSONObj indexSpec = fassert(40452, indexSpecStatus);
 
         LOGV2(22488,
-              "No authorization index detected on {ns} collection. Attempting to recover by "
+              "No authorization index detected on {namespace} collection. Attempting to recover by "
               "creating an index with spec: {indexSpec}",
-              "ns"_attr = ns,
+              "No authorization index detected. Attempting to recover by "
+              "creating an index",
+              logAttrs(ns),
               "indexSpec"_attr = indexSpec);
 
         auto indexConstraints = IndexBuildsManager::IndexConstraints::kEnforce;
         auto fromMigrate = false;
-        IndexBuildsCoordinator::get(opCtx)->createIndexes(
-            opCtx, collectionUUID, {indexSpec}, indexConstraints, fromMigrate);
+        IndexBuildsCoordinator::get(opCtx)->createIndex(
+            opCtx, collectionUUID, indexSpec, indexConstraints, fromMigrate);
     } catch (const DBException& e) {
         LOGV2_FATAL_CONTINUE(22490,
-                             "Failed to regenerate index for {ns}. Exception: {e_what}",
-                             "ns"_attr = ns,
-                             "e_what"_attr = e.what());
+                             "Failed to regenerate index for {namespace}. Exception: {error}",
+                             "Failed to regenerate index",
+                             logAttrs(ns),
+                             "error"_attr = e.what());
         throw;
     }
 }
@@ -140,10 +144,10 @@ Status verifySystemIndexes(OperationContext* opCtx) {
 
     // Create indexes for the admin.system.users collection.
     {
-        AutoGetCollection autoColl(opCtx, systemUsers, MODE_X);
+        AutoGetCollection collection(opCtx, systemUsers, MODE_X);
 
-        if (Collection* collection = autoColl.getCollection()) {
-            IndexCatalog* indexCatalog = collection->getIndexCatalog();
+        if (collection) {
+            const IndexCatalog* indexCatalog = collection->getIndexCatalog();
             invariant(indexCatalog);
 
             // Make sure the old unique index from v2.4 on system.users doesn't exist.
@@ -173,11 +177,11 @@ Status verifySystemIndexes(OperationContext* opCtx) {
 
     // Create indexes for the admin.system.roles collection.
     {
-        AutoGetCollection autoColl(opCtx, systemRoles, MODE_X);
+        AutoGetCollection collection(opCtx, systemRoles, MODE_X);
 
         // Ensure that system indexes exist for the roles collection, if it exists.
-        if (Collection* collection = autoColl.getCollection()) {
-            IndexCatalog* indexCatalog = collection->getIndexCatalog();
+        if (collection) {
+            const IndexCatalog* indexCatalog = collection->getIndexCatalog();
             invariant(indexCatalog);
 
             std::vector<const IndexDescriptor*> indexes;
@@ -196,7 +200,7 @@ Status verifySystemIndexes(OperationContext* opCtx) {
     return Status::OK();
 }
 
-void createSystemIndexes(OperationContext* opCtx, Collection* collection) {
+void createSystemIndexes(OperationContext* opCtx, CollectionWriter& collection) {
     invariant(collection);
     const NamespaceString& ns = collection->ns();
     BSONObj indexSpec;
@@ -216,7 +220,9 @@ void createSystemIndexes(OperationContext* opCtx, Collection* collection) {
         auto fromMigrate = false;
         try {
             IndexBuildsCoordinator::get(opCtx)->createIndexesOnEmptyCollection(
-                opCtx, collection->uuid(), {indexSpec}, fromMigrate);
+                opCtx, collection, {indexSpec}, fromMigrate);
+        } catch (WriteConflictException&) {
+            throw;
         } catch (DBException& ex) {
             fassertFailedWithStatus(40456, ex.toStatus());
         }

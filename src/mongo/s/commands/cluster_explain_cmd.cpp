@@ -29,9 +29,9 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/query/explain.h"
+#include "mongo/idl/command_generic_argument.h"
 #include "mongo/s/query/cluster_find.h"
 
 namespace mongo {
@@ -53,6 +53,10 @@ namespace {
 class ClusterExplainCmd final : public Command {
 public:
     ClusterExplainCmd() : Command("explain") {}
+
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
 
     std::unique_ptr<CommandInvocation> parse(OperationContext* opCtx,
                                              const OpMsgRequest& request) override;
@@ -170,6 +174,9 @@ std::unique_ptr<CommandInvocation> ClusterExplainCmd::parse(OperationContext* op
     CommandHelpers::uassertNoDocumentSequences(getName(), request);
     std::string dbName = request.getDatabase().toString();
     const BSONObj& cmdObj = request.body;
+    uassert(ErrorCodes::FailedToParse,
+            "Unrecognized field 'jsonSchema'. This command may be meant for a mongocryptd process.",
+            !cmdObj.hasField("jsonSchema"_sd));
     ExplainOptions::Verbosity verbosity = uassertStatusOK(ExplainOptions::parseCmdBSON(cmdObj));
 
     // This is the nested command which we are explaining. We need to propagate generic

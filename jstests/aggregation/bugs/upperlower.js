@@ -1,23 +1,23 @@
 // $toUpper, $toLower tests.
-
-t = db.jstests_aggregation_upperlower;
-t.drop();
-
-t.save({});
-
+(function() {
+'use strict';
+const coll = db.jstests_aggregation_upperlower;
+coll.drop();
+assert.commandWorked(coll.insert({}));
 function assertResult(expectedUpper, expectedLower, string) {
-    result = t.aggregate({
-                  $project: {upper: {$toUpper: string}, lower: {$toLower: string}}
-              }).toArray()[0];
+    const result =
+        coll.aggregate({$project: {upper: {$toUpper: string}, lower: {$toLower: string}}})
+            .toArray()[0];
     assert.eq(expectedUpper, result.upper);
     assert.eq(expectedLower, result.lower);
 }
 
 function assertException(string) {
-    assert.commandFailed(
-        t.runCommand('aggregate', {pipeline: [{$project: {upper: {$toUpper: string}}}]}));
-    assert.commandFailed(
-        t.runCommand('aggregate', {pipeline: [{$project: {lower: {$toLower: string}}}]}));
+    const error1 = assert.throws(() => coll.aggregate([{$project: {upper: {$toUpper: string}}}]));
+    assert.commandFailedWithCode(error1, [16020, 16007, ErrorCodes.TypeMismatch]);
+
+    const error2 = assert.throws(() => coll.aggregate([{$project: {lower: {$toLower: string}}}]));
+    assert.commandFailedWithCode(error2, [16020, 16007, ErrorCodes.TypeMismatch]);
 }
 
 // Wrong number of arguments.
@@ -42,10 +42,11 @@ assertResult('555.5', '555.5', 555.5);
 assertResult('1970-01-01T00:00:00.000Z', '1970-01-01t00:00:00.000z', new Date(0));
 assertResult('', '', null);
 assertException(/abc/);
+assertException(true);
 
 // Nested.
-spec = 'aBcDeFg';
-for (i = 0; i < 10; ++i) {
+let spec = 'aBcDeFg';
+for (let i = 0; i < 10; ++i) {
     assertResult('ABCDEFG', 'abcdefg', spec);
     if (i % 2 == 0) {
         spec = [{$toUpper: spec}];
@@ -60,6 +61,21 @@ assertResult('ó', 'ó', 'ó');  // Not handled.
 assertResult('Ó', 'Ó', 'Ó');  // Not handled.
 
 // Value from field path.
-t.drop();
-t.save({string: '-_aB'});
+assert(coll.drop());
+assert.commandWorked(coll.insert({
+    string: "-_ab",
+    longString: "abcdefghijklmnopQRSTUVWXYZ123456789",
+    numberLong: NumberLong("2090845886852"),
+    numberInt: NumberInt(42),
+    numberDecimal: NumberDecimal(42.213),
+    nested: {str: "hello world"},
+    unicode: "\u1ebd"
+}));
 assertResult('-_AB', '-_ab', '$string');
+assertResult(
+    'ABCDEFGHIJKLMNOPQRSTUVWXYZ123456789', 'abcdefghijklmnopqrstuvwxyz123456789', '$longString');
+assertResult('2090845886852', '2090845886852', '$numberLong');
+assertResult('42', '42', '$numberInt');
+assertResult('HELLO WORLD', 'hello world', '$nested.str');
+assertResult('\u1ebd', '\u1ebd', '$unicode');
+}());

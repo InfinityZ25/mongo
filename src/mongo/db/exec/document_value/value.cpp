@@ -57,8 +57,7 @@ using std::ostream;
 using std::string;
 using std::stringstream;
 using std::vector;
-
-constexpr StringData Value::kISOFormatString;
+using namespace std::string_literals;
 
 void ValueStorage::verifyRefCountingIfShould() const {
     switch (type) {
@@ -634,7 +633,9 @@ string Value::coerceToString() const {
             return getTimestamp().toStringPretty();
 
         case Date:
-            return TimeZoneDatabase::utcZone().formatDate(Value::kISOFormatString, getDate());
+            return uassertStatusOKWithContext(
+                TimeZoneDatabase::utcZone().formatDate(kISOFormatString, getDate()),
+                "failed while coercing date to string");
 
         case EOO:
         case jstNULL:
@@ -1170,8 +1171,14 @@ ostream& operator<<(ostream& out, const Value& val) {
         case Undefined:
             return out << "undefined";
         case Date:
-            return out << TimeZoneDatabase::utcZone().formatDate(Value::kISOFormatString,
-                                                                 val.coerceToDate());
+            return out << [&] {
+                if (auto string = TimeZoneDatabase::utcZone().formatDate(kISOFormatString,
+                                                                         val.coerceToDate());
+                    string.isOK())
+                    return string.getValue();
+                else
+                    return "illegal date"s;
+            }();
         case bsonTimestamp:
             return out << val.getTimestamp().toString();
         case Object:
@@ -1194,8 +1201,7 @@ ostream& operator<<(ostream& out, const Value& val) {
 
         case BinData:
             return out << "BinData(" << val._storage.binDataType() << ", \""
-                       << toHex(val._storage.getString().rawData(), val._storage.getString().size())
-                       << "\")";
+                       << hexblob::encode(val._storage.getString()) << "\")";
 
         case DBRef:
             return out << "DBRef(\"" << val._storage.getDBRef()->ns << "\", "

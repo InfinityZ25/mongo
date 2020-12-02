@@ -92,17 +92,20 @@ public:
  * and verifies the results.
  */
 void foregroundValidate(
-    OperationContext* opCtx, bool valid, int numRecords, int numInvalidDocuments, int numErrors) {
-    std::vector<CollectionValidation::ValidateOptions> optionsList = {
-        CollectionValidation::ValidateOptions::kNoFullValidation,
-        CollectionValidation::ValidateOptions::kFullRecordStoreValidation,
-        CollectionValidation::ValidateOptions::kFullIndexValidation,
-        CollectionValidation::ValidateOptions::kFullValidation};
-    for (auto options : optionsList) {
+    OperationContext* opCtx,
+    bool valid,
+    int numRecords,
+    int numInvalidDocuments,
+    int numErrors,
+    std::initializer_list<CollectionValidation::ValidateMode> modes =
+        {CollectionValidation::ValidateMode::kForeground,
+         CollectionValidation::ValidateMode::kForegroundFull},
+    CollectionValidation::RepairMode repairMode = CollectionValidation::RepairMode::kNone) {
+    for (auto mode : modes) {
         ValidateResults validateResults;
         BSONObjBuilder output;
         ASSERT_OK(CollectionValidation::validate(
-            opCtx, kNss, options, /*background*/ false, &validateResults, &output));
+            opCtx, kNss, mode, repairMode, &validateResults, &output));
         ASSERT_EQ(validateResults.valid, valid);
         ASSERT_EQ(validateResults.errors.size(), static_cast<long unsigned int>(numErrors));
 
@@ -134,13 +137,12 @@ void backgroundValidate(OperationContext* opCtx,
 
     ValidateResults validateResults;
     BSONObjBuilder output;
-    ASSERT_OK(
-        CollectionValidation::validate(opCtx,
-                                       kNss,
-                                       CollectionValidation::ValidateOptions::kNoFullValidation,
-                                       /*background*/ true,
-                                       &validateResults,
-                                       &output));
+    ASSERT_OK(CollectionValidation::validate(opCtx,
+                                             kNss,
+                                             CollectionValidation::ValidateMode::kBackground,
+                                             CollectionValidation::RepairMode::kNone,
+                                             &validateResults,
+                                             &output));
     BSONObj obj = output.obj();
 
     ASSERT_EQ(validateResults.valid, valid);
@@ -161,8 +163,7 @@ int insertDataRange(OperationContext* opCtx, int startIDNum, int endIDNum) {
                             << " to " << endIDNum);
 
 
-    AutoGetCollection autoColl(opCtx, kNss, MODE_IX);
-    Collection* coll = autoColl.getCollection();
+    AutoGetCollection coll(opCtx, kNss, MODE_IX);
     std::vector<InsertStatement> inserts;
     for (int i = startIDNum; i < endIDNum; ++i) {
         auto doc = BSON("_id" << i);
@@ -181,8 +182,7 @@ int insertDataRange(OperationContext* opCtx, int startIDNum, int endIDNum) {
  * Inserts a single invalid document into the kNss collection and then returns that count.
  */
 int setUpInvalidData(OperationContext* opCtx) {
-    AutoGetCollection autoColl(opCtx, kNss, MODE_IX);
-    Collection* coll = autoColl.getCollection();
+    AutoGetCollection coll(opCtx, kNss, MODE_IX);
     RecordStore* rs = coll->getRecordStore();
 
     {
@@ -255,6 +255,17 @@ TEST_F(BackgroundCollectionValidationTest, BackgroundValidateError) {
                        /*runForegroundAsWell*/ true);
 }
 
+// Verify calling validate() with enforceFastCount=true.
+TEST_F(CollectionValidationTest, ValidateEnforceFastCount) {
+    auto opCtx = operationContext();
+    foregroundValidate(opCtx,
+                       /*valid*/ true,
+                       /*numRecords*/ insertDataRange(opCtx, 0, 5),
+                       /*numInvalidDocuments*/ 0,
+                       /*numErrors*/ 0,
+                       {CollectionValidation::ValidateMode::kForegroundFullEnforceFastCount});
+}
+
 /**
  * Waits for a parallel running collection validation operation to start and then hang at a
  * failpoint.
@@ -298,7 +309,11 @@ TEST_F(BackgroundCollectionValidationTest, BackgroundValidateRunsConcurrentlyWit
     runBackgroundValidate.join();
 
     // Run regular foreground collection validation to make sure everything is OK.
-    foregroundValidate(opCtx, /*valid*/ true, /*numRecords*/ numRecords + numRecords2, 0, 0);
+    foregroundValidate(opCtx,
+                       /*valid*/ true,
+                       /*numRecords*/ numRecords + numRecords2,
+                       0,
+                       0);
 }
 
 }  // namespace

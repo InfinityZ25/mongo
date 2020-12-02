@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -41,9 +41,16 @@
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/exit.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
+
+namespace {
+
+MONGO_FAIL_POINT_DEFINE(hangOplogCapMaintainerThread);
+
+}  // namespace
 
 bool OplogCapMaintainerThread::_deleteExcessDocuments() {
     if (!getGlobalServiceContext()->getStorageEngine()) {
@@ -62,7 +69,7 @@ bool OplogCapMaintainerThread::_deleteExcessDocuments() {
         // interruptions such as restartCatalog. PBWM, database lock or collection lock is not
         // needed. This improves concurrency if oplog truncation takes long time.
         AutoGetOplog oplogWrite(opCtx.get(), OplogAccessMode::kWrite);
-        auto oplog = oplogWrite.getCollection();
+        const auto& oplog = oplogWrite.getCollection();
         if (!oplog) {
             LOGV2_DEBUG(4562600, 2, "oplog collection does not exist");
             return false;
@@ -75,8 +82,10 @@ bool OplogCapMaintainerThread::_deleteExcessDocuments() {
     } catch (const ExceptionForCat<ErrorCategory::Interruption>&) {
         return false;
     } catch (const std::exception& e) {
-        LOGV2_FATAL_NOTRACE(
-            22243, "error in OplogCapMaintainerThread: {e_what}", "e_what"_attr = e.what());
+        LOGV2_FATAL_NOTRACE(22243,
+                            "error in OplogCapMaintainerThread: {error}",
+                            "Error in OplogCapMaintainerThread",
+                            "error"_attr = e.what());
     } catch (...) {
         fassertFailedNoTrace(!"unknown error in OplogCapMaintainerThread");
     }
@@ -87,6 +96,11 @@ void OplogCapMaintainerThread::run() {
     ThreadClient tc(_name, getGlobalServiceContext());
 
     while (!globalInShutdownDeprecated()) {
+        if (MONGO_unlikely(hangOplogCapMaintainerThread.shouldFail())) {
+            LOGV2(5095500, "Hanging the oplog cap maintainer thread due to fail point");
+            hangOplogCapMaintainerThread.pauseWhileSet();
+        }
+
         if (!_deleteExcessDocuments()) {
             sleepmillis(1000);  // Back off in case there were problems deleting.
         }

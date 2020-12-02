@@ -139,7 +139,7 @@ public:
     }
 
     StatusWith<PrivilegeVector> getPrivilegesForAggregate(const NamespaceString&,
-                                                          const BSONObj&,
+                                                          const AggregationRequest&,
                                                           bool) override {
         return PrivilegeVector();
     }
@@ -173,7 +173,7 @@ public:
         return true;
     }
 
-    bool isAuthorizedToCreateRole(const auth::CreateOrUpdateRoleArgs&) override {
+    bool isAuthorizedToCreateRole(const RoleName&) override {
         return true;
     }
 

@@ -148,8 +148,8 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    BSONObj attachCursorSourceAndExplain(Pipeline* ownedPipeline,
-                                         ExplainOptions::Verbosity verbosity) final;
+    BSONObj preparePipelineAndExplain(Pipeline* ownedPipeline,
+                                      ExplainOptions::Verbosity verbosity) final;
 
     std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipelineForLocalRead(
         Pipeline* pipeline) final {
@@ -211,6 +211,12 @@ public:
         MONGO_UNREACHABLE;
     }
 
+    void setExpectedShardVersion(OperationContext* opCtx,
+                                 const NamespaceString& nss,
+                                 boost::optional<ChunkVersion> chunkVersion) override {
+        MONGO_UNREACHABLE;
+    }
+
     std::unique_ptr<ResourceYielder> getResourceYielder() const override {
         return nullptr;
     }
@@ -243,6 +249,11 @@ protected:
     void _reportCurrentOpsForTransactionCoordinators(OperationContext* opCtx,
                                                      bool includeIdle,
                                                      std::vector<BSONObj>* ops) const final;
+
+    void _reportCurrentOpsForPrimaryOnlyServices(OperationContext* opCtx,
+                                                 CurrentOpConnectionsMode connMode,
+                                                 CurrentOpSessionsMode sessionMode,
+                                                 std::vector<BSONObj>* ops) const final;
 };
 
 }  // namespace mongo

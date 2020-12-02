@@ -3,8 +3,10 @@
  * and $lookup.
  *
  * Uses $lookup, which doesn't support sharded foreign collection.
- * DBRef fields aren't supported in agg pre 4.4.
- * @tags: [assumes_unsharded_collection, requires_fcv_44]
+ * @tags: [
+ *   assumes_unsharded_collection,
+ *   sbe_incompatible,
+ * ]
  */
 
 (function() {

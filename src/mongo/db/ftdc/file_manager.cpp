@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kFTDC
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kFTDC
 
 #include "mongo/platform/basic.h"
 
@@ -91,7 +91,7 @@ StatusWith<std::unique_ptr<FTDCFileManager>> FTDCFileManager::create(
     auto interimDocs = mgr->recoverInterimFile();
 
     // Open the archive file for writing
-    auto swFile = mgr->generateArchiveFileName(path, terseUTCCurrentTime());
+    auto swFile = mgr->generateArchiveFileName(path, terseCurrentTimeForFilename(true));
     if (!swFile.isOK()) {
         return swFile.getStatus();
     }
@@ -276,7 +276,7 @@ FTDCFileManager::recoverInterimFile() {
         LOGV2(20630,
               "Unclean full-time diagnostic data capture shutdown detected, found interim file,  "
               "but failed to open it, some metrics may have been lost",
-              "status"_attr = s);
+              "error"_attr = s);
 
         // Note: We ignore any actual errors as reading from the interim files is a best-effort
         return docs;
@@ -294,7 +294,7 @@ FTDCFileManager::recoverInterimFile() {
         LOGV2(20631,
               "Unclean full-time diagnostic data capture shutdown detected, found interim file, "
               "some metrics may have been lost",
-              "status"_attr = m.getStatus());
+              "error"_attr = m.getStatus());
     }
 
     // Note: We ignore any actual errors as reading from the interim files is a best-effort
@@ -315,7 +315,7 @@ Status FTDCFileManager::rotate(Client* client) {
         return s;
     }
 
-    auto swFile = generateArchiveFileName(_path, terseUTCCurrentTime());
+    auto swFile = generateArchiveFileName(_path, terseCurrentTimeForFilename(true));
     if (!swFile.isOK()) {
         return swFile.getStatus();
     }

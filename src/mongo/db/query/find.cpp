@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -60,6 +60,7 @@
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/stats/resource_consumption_metrics.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/views/view_catalog.h"
@@ -81,13 +82,9 @@ MONGO_FAIL_POINT_DEFINE(failReceivedGetmore);
 MONGO_FAIL_POINT_DEFINE(legacyGetMoreWaitWithCursor)
 
 bool shouldSaveCursor(OperationContext* opCtx,
-                      const Collection* collection,
+                      const CollectionPtr& collection,
                       PlanExecutor::ExecState finalState,
                       PlanExecutor* exec) {
-    if (PlanExecutor::FAILURE == finalState) {
-        return false;
-    }
-
     const QueryRequest& qr = exec->getCanonicalQuery()->getQueryRequest();
     if (!qr.wantMore()) {
         return false;
@@ -106,18 +103,8 @@ bool shouldSaveCursor(OperationContext* opCtx,
     return !exec->isEOF();
 }
 
-bool shouldSaveCursorGetMore(PlanExecutor::ExecState finalState,
-                             PlanExecutor* exec,
-                             bool isTailable) {
-    if (PlanExecutor::FAILURE == finalState) {
-        return false;
-    }
-
-    if (isTailable) {
-        return true;
-    }
-
-    return !exec->isEOF();
+bool shouldSaveCursorGetMore(PlanExecutor* exec, bool isTailable) {
+    return isTailable || !exec->isEOF();
 }
 
 void beginQueryOp(OperationContext* opCtx,
@@ -134,7 +121,7 @@ void beginQueryOp(OperationContext* opCtx,
 }
 
 void endQueryOp(OperationContext* opCtx,
-                Collection* collection,
+                const CollectionPtr& collection,
                 const PlanExecutor& exec,
                 long long numResults,
                 CursorId cursorId) {
@@ -147,32 +134,29 @@ void endQueryOp(OperationContext* opCtx,
 
     // Fill out CurOp based on explain summary statistics.
     PlanSummaryStats summaryStats;
-    Explain::getSummaryStats(exec, &summaryStats);
+    auto&& explainer = exec.getPlanExplainer();
+    explainer.getSummaryStats(&summaryStats);
     curOp->debug().setPlanSummaryMetrics(summaryStats);
 
     if (collection) {
-        CollectionQueryInfo::get(collection).notifyOfQuery(opCtx, summaryStats);
+        CollectionQueryInfo::get(collection).notifyOfQuery(opCtx, collection, summaryStats);
     }
 
-    if (curOp->shouldDBProfile()) {
-        BSONObjBuilder statsBob;
-        Explain::getWinningPlanStats(&exec, &statsBob);
-        curOp->debug().execStats = statsBob.obj();
+    if (curOp->shouldDBProfile(opCtx)) {
+        auto&& [stats, _] = explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
+        curOp->debug().execStats = std::move(stats);
     }
 }
 
 namespace {
 
 /**
- * Uses 'cursor' to fill out 'bb' with the batch of result documents to
- * be returned by this getMore.
+ * Uses 'cursor' to fill out 'bb' with the batch of result documents to be returned by this getMore.
  *
  * Returns the number of documents in the batch in 'numResults', which must be initialized to
- * zero by the caller. Returns the final ExecState returned by the cursor in *state. Returns
- * whether or not to save the ClientCursor in 'shouldSaveCursor'.
+ * zero by the caller. Returns the final ExecState returned by the cursor in *state.
  *
- * Returns an OK status if the batch was successfully generated, and a non-OK status if the
- * PlanExecutor encounters a failure.
+ * Throws an exception if the PlanExecutor encounters a failure.
  */
 void generateBatch(int ntoreturn,
                    ClientCursor* cursor,
@@ -181,42 +165,30 @@ void generateBatch(int ntoreturn,
                    PlanExecutor::ExecState* state) {
     PlanExecutor* exec = cursor->getExecutor();
 
-    Document doc;
-    while (!FindCommon::enoughForGetMore(ntoreturn, *numResults) &&
-           PlanExecutor::ADVANCED == (*state = exec->getNext(&doc, nullptr))) {
-        BSONObj obj = doc.toBson();
+    try {
+        BSONObj obj;
+        while (!FindCommon::enoughForGetMore(ntoreturn, *numResults) &&
+               PlanExecutor::ADVANCED == (*state = exec->getNext(&obj, nullptr))) {
 
-        // If we can't fit this result inside the current batch, then we stash it for later.
-        if (!FindCommon::haveSpaceForNext(obj, *numResults, bb->len())) {
-            exec->enqueue(obj);
-            break;
+            // If we can't fit this result inside the current batch, then we stash it for later.
+            if (!FindCommon::haveSpaceForNext(obj, *numResults, bb->len())) {
+                exec->enqueue(obj);
+                break;
+            }
+
+            // Add result to output buffer.
+            bb->appendBuf((void*)obj.objdata(), obj.objsize());
+
+            // Count the result.
+            (*numResults)++;
         }
-
-        // Add result to output buffer.
-        bb->appendBuf((void*)obj.objdata(), obj.objsize());
-
-        // Count the result.
-        (*numResults)++;
+    } catch (DBException& exception) {
+        auto&& explainer = exec->getPlanExplainer();
+        auto&& [stats, _] = explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
+        LOGV2_ERROR(20918, "getMore executor error", "stats"_attr = redact(stats));
+        exception.addContext("Executor error during OP_GET_MORE");
+        throw;
     }
-
-    // Propagate any errors to the caller.
-    switch (*state) {
-        // Log an error message and then perform the cleanup.
-        case PlanExecutor::FAILURE: {
-            LOGV2_ERROR(20918,
-                        "getMore executor error, stats: {Explain_getWinningPlanStats_exec}",
-                        "Explain_getWinningPlanStats_exec"_attr =
-                            redact(Explain::getWinningPlanStats(exec)));
-            // We should always have a valid status object by this point.
-            auto status = WorkingSetCommon::getMemberObjectStatus(doc);
-            invariant(!status.isOK());
-            uassertStatusOK(status);
-        }
-        default:
-            return;
-    }
-
-    MONGO_UNREACHABLE;
 }
 
 Message makeCursorNotFoundResponse() {
@@ -246,7 +218,7 @@ Message getMore(OperationContext* opCtx,
                 bool* isCursorAuthorized) {
     invariant(ntoreturn >= 0);
 
-    LOGV2_DEBUG(20909, 5, "Running getMore, cursorid: {cursorid}", "cursorid"_attr = cursorid);
+    LOGV2_DEBUG(20909, 5, "Running getMore", "cursorId"_attr = cursorid);
 
     CurOp& curOp = *CurOp::get(opCtx);
     curOp.ensureStarted();
@@ -259,6 +231,8 @@ Message getMore(OperationContext* opCtx,
     *exhaust = false;
 
     const NamespaceString nss(ns);
+
+    ResourceConsumption::ScopedMetricsCollector scopedMetrics(opCtx, nss.db().toString());
 
     // Cursors come in one of two flavors:
     //
@@ -277,7 +251,7 @@ Message getMore(OperationContext* opCtx,
     // Top. We avoid using AutoGetCollectionForReadCommand because we may need to drop and reacquire
     // locks when the cursor is awaitData, but we don't want to update the stats twice.
     UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-    boost::optional<AutoGetCollectionForRead> readLock;
+    boost::optional<AutoGetCollectionForReadMaybeLockFree> readLock;
     boost::optional<AutoStatsTracker> statsTracker;
 
     // These are set in the QueryResult msg we return.
@@ -293,17 +267,14 @@ Message getMore(OperationContext* opCtx,
 
     opCtx->setExhaust(cursorPin->queryOptions() & QueryOption_Exhaust);
 
-    if (cursorPin->lockPolicy() == ClientCursorParams::LockPolicy::kLocksInternally) {
+    if (cursorPin->getExecutor()->lockPolicy() == PlanExecutor::LockPolicy::kLocksInternally) {
         if (!nss.isCollectionlessCursorNamespace()) {
             AutoGetDb autoDb(opCtx, nss.db(), MODE_IS);
-            const auto profilingLevel = autoDb.getDb()
-                ? boost::optional<int>{autoDb.getDb()->getProfilingLevel()}
-                : boost::none;
             statsTracker.emplace(opCtx,
                                  nss,
                                  Top::LockType::NotLocked,
                                  AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
-                                 profilingLevel);
+                                 CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(nss.db()));
             auto view = autoDb.getDb() ? ViewCatalog::get(autoDb.getDb())->lookup(opCtx, nss.ns())
                                        : nullptr;
             uassert(
@@ -316,13 +287,11 @@ Message getMore(OperationContext* opCtx,
         }
     } else {
         readLock.emplace(opCtx, nss);
-        const int doNotChangeProfilingLevel = 0;
         statsTracker.emplace(opCtx,
                              nss,
                              Top::LockType::ReadLocked,
                              AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
-                             readLock->getDb() ? readLock->getDb()->getProfilingLevel()
-                                               : doNotChangeProfilingLevel);
+                             CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(nss.db()));
 
         // This checks to make sure the operation is allowed on a replicated node.  Since we are not
         // passing in a query object (necessary to check SlaveOK query option), we allow reads
@@ -395,7 +364,7 @@ Message getMore(OperationContext* opCtx,
         cursorPin->getReadConcernArgs().getLevel() ==
             repl::ReadConcernLevel::kMajorityReadConcern) {
         opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kMajorityCommitted);
-        uassertStatusOK(opCtx->recoveryUnit()->obtainMajorityCommittedSnapshot());
+        uassertStatusOK(opCtx->recoveryUnit()->majorityCommittedSnapshotAvailable());
     }
 
     uassert(40548,
@@ -441,9 +410,9 @@ Message getMore(OperationContext* opCtx,
 
     PlanExecutor* exec = cursorPin->getExecutor();
     exec->reattachToOperationContext(opCtx);
-    exec->restoreState();
+    exec->restoreState(readLock ? &readLock->getCollection() : nullptr);
 
-    auto planSummary = Explain::getPlanSummary(exec);
+    auto planSummary = exec->getPlanExplainer().getPlanSummary();
     {
         stdx::lock_guard<Client> lk(*opCtx->getClient());
         curOp.setPlanSummary_inlock(planSummary);
@@ -479,7 +448,7 @@ Message getMore(OperationContext* opCtx,
     // these values we need to take a diff of the pre-execution and post-execution metrics, as they
     // accumulate over the course of a cursor's lifetime.
     PlanSummaryStats preExecutionStats;
-    Explain::getSummaryStats(*exec, &preExecutionStats);
+    exec->getPlanExplainer().getSummaryStats(&preExecutionStats);
     if (MONGO_unlikely(waitWithPinnedCursorDuringGetMoreBatch.shouldFail())) {
         CurOpFailpointHelpers::waitWhileFailPointEnabled(&waitWithPinnedCursorDuringGetMoreBatch,
                                                          opCtx,
@@ -507,7 +476,7 @@ Message getMore(OperationContext* opCtx,
 
         // Reacquiring locks.
         readLock.emplace(opCtx, nss);
-        exec->restoreState();
+        exec->restoreState(&readLock->getCollection());
 
         // We woke up because either the timed_wait expired, or there was more data. Either way,
         // attempt to generate another batch of results.
@@ -515,7 +484,8 @@ Message getMore(OperationContext* opCtx,
     }
 
     PlanSummaryStats postExecutionStats;
-    Explain::getSummaryStats(*exec, &postExecutionStats);
+    auto&& explainer = exec->getPlanExplainer();
+    explainer.getSummaryStats(&postExecutionStats);
     postExecutionStats.totalKeysExamined -= preExecutionStats.totalKeysExamined;
     postExecutionStats.totalDocsExamined -= preExecutionStats.totalDocsExamined;
     curOp.debug().setPlanSummaryMetrics(postExecutionStats);
@@ -525,11 +495,11 @@ Message getMore(OperationContext* opCtx,
     // info for an aggregation, but the source PlanExecutor could be destroyed before we know if we
     // need 'execStats' and we do not want to generate the stats eagerly for all operations due to
     // cost.
-    if (cursorPin->lockPolicy() != ClientCursorParams::LockPolicy::kLocksInternally &&
-        curOp.shouldDBProfile()) {
-        BSONObjBuilder execStatsBob;
-        Explain::getWinningPlanStats(exec, &execStatsBob);
-        curOp.debug().execStats = execStatsBob.obj();
+    if (cursorPin->getExecutor()->lockPolicy() != PlanExecutor::LockPolicy::kLocksInternally &&
+        curOp.shouldDBProfile(opCtx)) {
+        auto&& [stats, _] = explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
+
+        curOp.debug().execStats = std::move(stats);
     }
 
     // Our two possible ClientCursorPin cleanup paths are:
@@ -538,16 +508,15 @@ Message getMore(OperationContext* opCtx,
     // the pin's destructor will be invoked, which will call release() on the pin.  Because our
     // ClientCursorPin is declared after our lock is declared, this will happen under the lock if
     // any locking was necessary.
-    if (!shouldSaveCursorGetMore(state, exec, cursorPin->isTailable())) {
+    if (!shouldSaveCursorGetMore(exec, cursorPin->isTailable())) {
         // cc is now invalid, as is the executor
         cursorid = 0;
         curOp.debug().cursorExhausted = true;
 
-        LOGV2_DEBUG(
-            20910,
-            5,
-            "getMore NOT saving client cursor, ended with state {PlanExecutor_statestr_state}",
-            "PlanExecutor_statestr_state"_attr = PlanExecutor::statestr(state));
+        LOGV2_DEBUG(20910,
+                    5,
+                    "getMore NOT saving client cursor",
+                    "planExecutorState"_attr = PlanExecutor::statestr(state));
     } else {
         cursorFreer.dismiss();
         // Continue caching the ClientCursor.
@@ -557,8 +526,8 @@ Message getMore(OperationContext* opCtx,
         exec->detachFromOperationContext();
         LOGV2_DEBUG(20911,
                     5,
-                    "getMore saving client cursor ended with state {PlanExecutor_statestr_state}",
-                    "PlanExecutor_statestr_state"_attr = PlanExecutor::statestr(state));
+                    "getMore saving client cursor",
+                    "planExecutorState"_attr = PlanExecutor::statestr(state));
 
         // Set 'exhaust' if the client requested exhaust and the cursor is not exhausted.
         *exhaust = opCtx->isExhaust();
@@ -591,8 +560,7 @@ Message getMore(OperationContext* opCtx,
     qr.setCursorId(cursorid);
     qr.setStartingFrom(startingResult);
     qr.setNReturned(numResults);
-    LOGV2_DEBUG(
-        20912, 5, "getMore returned {numResults} results\n", "numResults"_attr = numResults);
+    LOGV2_DEBUG(20912, 5, "getMore returned results", "numResults"_attr = numResults);
     return Message(bb.release());
 }
 
@@ -607,6 +575,8 @@ bool runQuery(OperationContext* opCtx,
             str::stream() << "Invalid ns [" << nss.ns() << "]",
             nss.isValid());
     invariant(!nss.isCommand());
+
+    ResourceConsumption::ScopedMetricsCollector scopedMetrics(opCtx, nss.db().toString());
 
     // Set CurOp information.
     const auto upconvertedQuery = upconvertQueryEntry(q.query, nss, q.ntoreturn, q.ntoskip);
@@ -630,13 +600,12 @@ bool runQuery(OperationContext* opCtx,
         "Can't canonicalize query");
     invariant(cq.get());
 
-    LOGV2_DEBUG(20913, 5, "Running query:\n{cq}", "cq"_attr = redact(cq->toString()));
-    LOGV2_DEBUG(
-        20914, 2, "Running query: {cq_Short}", "cq_Short"_attr = redact(cq->toStringShort()));
+    LOGV2_DEBUG(20913, 5, "Running query", "query"_attr = redact(cq->toString()));
+    LOGV2_DEBUG(20914, 2, "Running query", "query"_attr = redact(cq->toStringShort()));
 
     // Parse, canonicalize, plan, transcribe, and get a plan executor.
-    AutoGetCollectionForReadCommand ctx(opCtx, nss, AutoGetCollection::ViewMode::kViewsForbidden);
-    Collection* const collection = ctx.getCollection();
+    AutoGetCollectionForReadCommandMaybeLockFree collection(
+        opCtx, nss, AutoGetCollectionViewMode::kViewsForbidden);
     const QueryRequest& qr = cq->getQueryRequest();
 
     opCtx->setExhaust(qr.isExhaust());
@@ -655,7 +624,8 @@ bool runQuery(OperationContext* opCtx,
     // Get the execution plan for the query.
     constexpr auto verbosity = ExplainOptions::Verbosity::kExecAllPlans;
     expCtx->explain = qr.isExplain() ? boost::make_optional(verbosity) : boost::none;
-    auto exec = uassertStatusOK(getExecutorLegacyFind(opCtx, collection, std::move(cq)));
+    auto exec =
+        uassertStatusOK(getExecutorLegacyFind(opCtx, &collection.getCollection(), std::move(cq)));
 
     // If it's actually an explain, do the explain and return rather than falling through
     // to the normal query execution loop.
@@ -664,7 +634,12 @@ bool runQuery(OperationContext* opCtx,
         bb.skip(sizeof(QueryResult::Value));
 
         BSONObjBuilder explainBob;
-        Explain::explainStages(exec.get(), collection, verbosity, BSONObj(), &explainBob);
+        Explain::explainStages(exec.get(),
+                               collection.getCollection(),
+                               verbosity,
+                               BSONObj(),
+                               upconvertedQuery,
+                               &explainBob);
 
         // Add the resulting object to the return buffer.
         BSONObj explainObj = explainBob.obj();
@@ -710,55 +685,50 @@ bool runQuery(OperationContext* opCtx,
     // Get summary info about which plan the executor is using.
     {
         stdx::lock_guard<Client> lk(*opCtx->getClient());
-        curOp.setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
+        curOp.setPlanSummary_inlock(exec->getPlanExplainer().getPlanSummary());
     }
 
-    Document doc;
-    while (PlanExecutor::ADVANCED == (state = exec->getNext(&doc, nullptr))) {
-        obj = doc.toBson();
+    try {
+        while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, nullptr))) {
+            // If we can't fit this result inside the current batch, then we stash it for later.
+            if (!FindCommon::haveSpaceForNext(obj, numResults, bb.len())) {
+                exec->enqueue(obj);
+                break;
+            }
 
-        // If we can't fit this result inside the current batch, then we stash it for later.
-        if (!FindCommon::haveSpaceForNext(obj, numResults, bb.len())) {
-            exec->enqueue(obj);
-            break;
+            // Add result to output buffer.
+            bb.appendBuf((void*)obj.objdata(), obj.objsize());
+
+            // Count the result.
+            ++numResults;
+
+            if (FindCommon::enoughForFirstBatch(qr, numResults)) {
+                LOGV2_DEBUG(20915,
+                            5,
+                            "Enough for first batch",
+                            "wantMore"_attr = qr.wantMore(),
+                            "numToReturn"_attr = qr.getNToReturn().value_or(0),
+                            "numResults"_attr = numResults);
+                break;
+            }
         }
-
-        // Add result to output buffer.
-        bb.appendBuf((void*)obj.objdata(), obj.objsize());
-
-        // Count the result.
-        ++numResults;
-
-        if (FindCommon::enoughForFirstBatch(qr, numResults)) {
-            LOGV2_DEBUG(20915,
-                        5,
-                        "Enough for first batch, wantMore={qr_wantMore} "
-                        "ntoreturn={qr_getNToReturn_value_or_0} numResults={numResults}",
-                        "qr_wantMore"_attr = qr.wantMore(),
-                        "qr_getNToReturn_value_or_0"_attr = qr.getNToReturn().value_or(0),
-                        "numResults"_attr = numResults);
-            break;
-        }
-    }
-
-    // Caller expects exceptions thrown in certain cases.
-    if (PlanExecutor::FAILURE == state) {
+    } catch (DBException& exception) {
+        auto&& explainer = exec->getPlanExplainer();
+        auto&& [stats, _] = explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
         LOGV2_ERROR(20919,
-                    "Plan executor error during find: {PlanExecutor_statestr_state}, stats: "
-                    "{Explain_getWinningPlanStats_exec_get}",
-                    "PlanExecutor_statestr_state"_attr = PlanExecutor::statestr(state),
-                    "Explain_getWinningPlanStats_exec_get"_attr =
-                        redact(Explain::getWinningPlanStats(exec.get())));
-        uassertStatusOKWithContext(WorkingSetCommon::getMemberObjectStatus(doc),
-                                   "Executor error during OP_QUERY find");
-        MONGO_UNREACHABLE;
+                    "Plan executor error during find",
+                    "error"_attr = redact(exception.toStatus()),
+                    "stats"_attr = redact(stats));
+
+        exception.addContext("Executor error during find");
+        throw;
     }
 
     // Fill out CurOp based on query results. If we have a cursorid, we will fill out CurOp with
     // this cursorid later.
     long long ccId = 0;
 
-    if (shouldSaveCursor(opCtx, collection, state, exec.get())) {
+    if (shouldSaveCursor(opCtx, collection.getCollection(), state, exec.get())) {
         // We won't use the executor until it's getMore'd.
         exec->saveState();
         exec->detachFromOperationContext();
@@ -767,23 +737,20 @@ bool runQuery(OperationContext* opCtx,
         // Allocate a new ClientCursor and register it with the cursor manager.
         ClientCursorPin pinnedCursor = CursorManager::get(opCtx)->registerCursor(
             opCtx,
-            {
-                std::move(exec),
-                nss,
-                AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
-                opCtx->getWriteConcern(),
-                readConcernArgs,
-                upconvertedQuery,
-                ClientCursorParams::LockPolicy::kLockExternally,
-                {Privilege(ResourcePattern::forExactNamespace(nss), ActionType::find)},
-                false  // needsMerge always 'false' for find().
-            });
+            {std::move(exec),
+             nss,
+             AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
+             APIParameters::get(opCtx),
+             opCtx->getWriteConcern(),
+             readConcernArgs,
+             upconvertedQuery,
+             {Privilege(ResourcePattern::forExactNamespace(nss), ActionType::find)}});
         ccId = pinnedCursor.getCursor()->cursorid();
 
         LOGV2_DEBUG(20916,
                     5,
-                    "caching executor with cursorid {ccId} after returning {numResults} results",
-                    "ccId"_attr = ccId,
+                    "Caching executor after returning results",
+                    "cursorId"_attr = ccId,
                     "numResults"_attr = numResults);
 
         // Set curOp.debug().exhaust if the client requested exhaust and the cursor is not
@@ -803,13 +770,15 @@ bool runQuery(OperationContext* opCtx,
             pinnedCursor.getCursor()->setLeftoverMaxTimeMicros(opCtx->getRemainingMaxTimeMicros());
         }
 
-        endQueryOp(opCtx, collection, *pinnedCursor.getCursor()->getExecutor(), numResults, ccId);
+        endQueryOp(opCtx,
+                   collection.getCollection(),
+                   *pinnedCursor.getCursor()->getExecutor(),
+                   numResults,
+                   ccId);
     } else {
-        LOGV2_DEBUG(20917,
-                    5,
-                    "Not caching executor but returning {numResults} results.",
-                    "numResults"_attr = numResults);
-        endQueryOp(opCtx, collection, *exec, numResults, ccId);
+        LOGV2_DEBUG(
+            20917, 5, "Not caching executor but returning results", "numResults"_attr = numResults);
+        endQueryOp(opCtx, collection.getCollection(), *exec, numResults, ccId);
     }
 
     // Fill out the output buffer's header.

@@ -39,6 +39,7 @@
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/logv2/log_attr.h"
 
 namespace mongo {
 
@@ -64,15 +65,18 @@ class UUID {
 
     // Make the IDL generated parser a friend
     friend class ConfigsvrShardCollectionResponse;
-    friend class ConfigsvrCommitShardCollection;
-    friend class ShardsvrShardCollectionResponse;
-    friend class ShardsvrRenameCollection;
+    friend class CommonReshardingMetadata;
+    friend class DonorStartMigration;
+    friend class DonorWaitForMigrationToCommit;
+    friend class DonorForgetMigration;
+    friend class DonorStateMachine;
     friend class DatabaseVersion;
     friend class DbCheckOplogCollection;
     friend class EncryptionPlaceholder;
     friend class idl::import::One_UUID;
     friend class IndexBuildEntry;
     friend class KeyStoreRecord;
+    friend class ListCollectionsReplyInfo;
     friend class LogicalSessionId;
     friend class LogicalSessionToClient;
     friend class LogicalSessionIdToClient;
@@ -85,9 +89,24 @@ class UUID {
     friend class repl::OplogEntryBase;
     friend class repl::DurableReplOperation;
     friend class repl::InitialSyncIdDocument;
+    friend class RecipientForgetMigration;
+    friend class RecipientSyncData;
+    friend class ReshardingDonorDocument;
+    friend class ReshardingSourceId;
+    friend class ResumeIndexInfo;
     friend class ResumeTokenInternal;
     friend class ShardCollectionTypeBase;
+    friend class ShardsvrShardCollectionResponse;
+    friend class ShardsvrRenameCollection;
+    friend class TenantMigrationDonorDocument;
+    friend class TenantMigrationRecipientDocument;
+    friend class TestReshardCloneCollection;
+    friend class TypeCollectionRecipientFields;
+    friend class TypeCollectionReshardingFields;
     friend class VoteCommitIndexBuild;
+    friend class ImportCollectionOplogEntry;
+    friend class VoteCommitImportCollection;
+
 
 public:
     /**
@@ -202,6 +221,10 @@ public:
             return hash;
         }
     };
+
+    friend auto logAttrs(const UUID& uuid) {
+        return "uuid"_attr = uuid;
+    }
 
 private:
     UUID(const UUIDStorage& uuid) : _uuid(uuid) {}

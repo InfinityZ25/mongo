@@ -23,7 +23,6 @@ import structlog
 import yaml
 
 from evergreen.api import EvergreenApi, RetryingEvergreenApi
-from evergreen.stats import TestStats
 
 from shrub.v2 import Task, TaskDependency, BuildVariant, ExistingTask, ShrubProject
 
@@ -37,7 +36,7 @@ import buildscripts.resmokelib.suitesconfig as suitesconfig
 from buildscripts.util.fileops import write_file_to_dir
 import buildscripts.util.read_config as read_config
 import buildscripts.util.taskname as taskname
-import buildscripts.util.teststats as teststats
+from buildscripts.util.teststats import HistoricTaskData, TestRuntime, normalize_test_name
 from buildscripts.patch_builds.task_generation import TimeoutInfo, resmoke_commands
 # pylint: enable=wrong-import-position
 
@@ -67,7 +66,7 @@ REQUIRED_CONFIG_KEYS = {
 DEFAULT_CONFIG_VALUES = {
     "generated_config_dir": "generated_resmoke_config",
     "max_tests_per_suite": 100,
-    "max_sub_suites": 10,
+    "max_sub_suites": 3,
     "resmoke_args": "",
     "resmoke_repeat_suites": 1,
     "run_multiple_jobs": "true",
@@ -167,6 +166,11 @@ class ConfigOptions(object):
     def display_task_name(self):
         """Return the name to use as the display task."""
         return self.task
+
+    @property
+    def generated_suite_filename(self):
+        """Filename for the generated suite file."""
+        return self.suite
 
     @property
     def gen_task_set(self):
@@ -296,8 +300,8 @@ def _new_suite_needed(current_suite, test_runtime, max_suite_runtime, max_tests_
     return False
 
 
-def divide_tests_into_suites(suite_name, tests_runtimes, max_time_seconds, max_suites=None,
-                             max_tests_per_suite=None):
+def divide_tests_into_suites(suite_name, tests_runtimes: List[TestRuntime], max_time_seconds,
+                             max_suites=None, max_tests_per_suite=None):
     """
     Divide the given tests into suites.
 
@@ -394,8 +398,8 @@ def generate_resmoke_suite_config(source_config, source_file, roots=None, exclud
     return contents
 
 
-def render_suite_files(suites: List, suite_name: str, test_list: List[str], suite_dir,
-                       create_misc_suite: bool) -> Dict:
+def render_suite_files(suites: List, suite_name: str, generated_suite_filename: str,
+                       test_list: List[str], suite_dir, create_misc_suite: bool) -> Dict:
     """
     Render the given list of suites.
 
@@ -404,19 +408,21 @@ def render_suite_files(suites: List, suite_name: str, test_list: List[str], suit
 
     :param suites: List of suites to render.
     :param suite_name: Base name of suites.
+    :param generated_suite_filename: The name to use as the file name for generated suite file.
     :param test_list: List of tests used in suites.
     :param suite_dir: Directory containing test suite configurations.
     :param create_misc_suite: Whether or not a _misc suite file should be created.
     :return: Dictionary of rendered resmoke config files.
     """
+    # pylint: disable=too-many-arguments
     source_config = read_yaml(suite_dir, suite_name + ".yml")
     suite_configs = {
         f"{os.path.basename(suite.name)}.yml": suite.generate_resmoke_config(source_config)
         for suite in suites
     }
     if create_misc_suite:
-        suite_configs[f"{os.path.basename(suite_name)}_misc.yml"] = generate_resmoke_suite_config(
-            source_config, suite_name, excludes=test_list)
+        suite_configs[f"{generated_suite_filename}_misc.yml"] = generate_resmoke_suite_config(
+            source_config, generated_suite_filename, excludes=test_list)
     return suite_configs
 
 
@@ -722,7 +728,7 @@ class EvergreenConfigGenerator(object):
 
         if self.options.create_misc_suite:
             # Add the misc suite
-            misc_suite_name = f"{os.path.basename(self.options.suite)}_misc"
+            misc_suite_name = f"{os.path.basename(self.options.generated_suite_filename)}_misc"
             misc_task_name = f"{self.options.task}_misc_{self.options.variant}"
             tasks.add(
                 self._generate_task(misc_suite_name, misc_task_name,
@@ -760,7 +766,7 @@ class GenerateSubSuites(object):
         self.test_list = []
 
         # Populate config values for methods like list_tests()
-        _parser.set_options()
+        _parser.set_run_options()
 
     def calculate_suites(self, start_date: datetime, end_date: datetime) -> List[Suite]:
         """
@@ -771,9 +777,10 @@ class GenerateSubSuites(object):
         :return: List of sub suites to be generated.
         """
         try:
-            evg_stats = self.get_evg_stats(self.config_options.project, start_date, end_date,
-                                           self.config_options.task, self.config_options.variant)
-            if not evg_stats:
+            evg_stats = HistoricTaskData.from_evg(self.evergreen_api, self.config_options.project,
+                                                  start_date, end_date, self.config_options.task,
+                                                  self.config_options.variant)
+            if not evg_stats.get_tests_runtimes():
                 LOGGER.debug("No test history, using fallback suites")
                 # This is probably a new suite, since there is no test history, just use the
                 # fallback values.
@@ -790,47 +797,25 @@ class GenerateSubSuites(object):
             else:
                 raise
 
-    def get_evg_stats(self, project: str, start_date: datetime, end_date: datetime, task: str,
-                      variant: str) -> List[TestStats]:
-        """
-        Collect test execution statistics data from Evergreen.
-
-        :param project: Evergreen project to query.
-        :param start_date: Time to start historical analysis.
-        :param end_date: Time to end historical analysis.
-        :param task: Task to query.
-        :param variant: Build variant to query.
-        :return: List of test stats for specified task.
-        """
-        # pylint: disable=too-many-arguments
-
-        days = (end_date - start_date).days
-        return self.evergreen_api.test_stats_by_project(
-            project, after_date=start_date.strftime("%Y-%m-%d"),
-            before_date=end_date.strftime("%Y-%m-%d"), tasks=[task], variants=[variant],
-            group_by="test", group_num_days=days)
-
-    def calculate_suites_from_evg_stats(self, data: List[TestStats],
+    def calculate_suites_from_evg_stats(self, test_stats: HistoricTaskData,
                                         execution_time_secs: int) -> List[Suite]:
         """
         Divide tests into suites that can be run in less than the specified execution time.
 
-        :param data: Historical test results for task being split.
+        :param test_stats: Historical test results for task being split.
         :param execution_time_secs: Target execution time of each suite (in seconds).
         :return: List of sub suites calculated.
         """
-        test_stats = teststats.TestStats(data)
         tests_runtimes = self.filter_tests(test_stats.get_tests_runtimes())
         if not tests_runtimes:
             LOGGER.debug("No test runtimes after filter, using fallback")
             return self.calculate_fallback_suites()
         self.test_list = [info.test_name for info in tests_runtimes]
-        return divide_tests_into_suites(self.config_options.suite, tests_runtimes,
-                                        execution_time_secs, self.config_options.max_sub_suites,
-                                        self.config_options.max_tests_per_suite)
+        return divide_tests_into_suites(
+            self.config_options.generated_suite_filename, tests_runtimes, execution_time_secs,
+            self.config_options.max_sub_suites, self.config_options.max_tests_per_suite)
 
-    def filter_tests(self,
-                     tests_runtimes: List[teststats.TestRuntime]) -> List[teststats.TestRuntime]:
+    def filter_tests(self, tests_runtimes: List[TestRuntime]) -> List[TestRuntime]:
         """
         Filter relevant tests.
 
@@ -843,10 +828,9 @@ class GenerateSubSuites(object):
                                                     tests_runtimes)
         return tests_runtimes
 
-    def filter_existing_tests(self, tests_runtimes: List[teststats.TestRuntime]) \
-            -> List[teststats.TestRuntime]:
+    def filter_existing_tests(self, tests_runtimes: List[TestRuntime]) -> List[TestRuntime]:
         """Filter out tests that do not exist in the filesystem."""
-        all_tests = [teststats.normalize_test_name(test) for test in self.list_tests()]
+        all_tests = [normalize_test_name(test) for test in self.list_tests()]
         return [
             info for info in tests_runtimes
             if os.path.exists(info.test_name) and info.test_name in all_tests
@@ -859,12 +843,12 @@ class GenerateSubSuites(object):
         self.test_list = self.list_tests()
         num_suites = min(self.config_options.fallback_num_sub_suites, len(self.test_list),
                          self.config_options.max_sub_suites)
-        suites = [Suite(self.config_options.suite) for _ in range(num_suites)]
+        suites = [Suite(self.config_options.generated_suite_filename) for _ in range(num_suites)]
         for idx, test_file in enumerate(self.test_list):
             suites[idx % num_suites].add_test(test_file, 0)
         return suites
 
-    def list_tests(self) -> List[Dict]:
+    def list_tests(self) -> List[str]:
         """List the test files that are part of the suite being split."""
         return suitesconfig.get_suite(self.config_options.suite).tests
 
@@ -894,7 +878,8 @@ class GenerateSubSuites(object):
 
         :return: The suites files and evergreen configuration for the generated task.
         """
-        return render_suite_files(suites, self.config_options.suite, self.test_list,
+        return render_suite_files(suites, self.config_options.suite,
+                                  self.config_options.generated_suite_filename, self.test_list,
                                   self.config_options.test_suites_dir,
                                   self.config_options.create_misc_suite)
 
@@ -928,7 +913,7 @@ class GenerateSubSuites(object):
         write_file_dict(self.config_options.generated_config_dir, config_dict_of_suites)
 
 
-def filter_specified_tests(specified_tests: Set[str], tests_runtimes: List[teststats.TestRuntime]):
+def filter_specified_tests(specified_tests: Set[str], tests_runtimes: List[TestRuntime]):
     """
     Filter out tests that have not been specified in the specified tests config option.
 

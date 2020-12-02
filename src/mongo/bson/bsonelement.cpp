@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/bson/bsonelement.h"
 
@@ -116,12 +116,16 @@ BSONObj BSONElement::_jsonStringGenerator(const Generator& g,
     size_t before = buffer.size();
     if (includeSeparator)
         buffer.push_back(',');
+    if (pretty)
+        fmt::format_to(buffer, "\n{:<{}}", "", (pretty - 1) * 4);
 
     if (includeFieldNames) {
         g.writePadding(buffer);
         g.writeString(buffer, fieldNameStringData());
         g.writePadding(buffer);
         buffer.push_back(':');
+        if (pretty)
+            buffer.push_back(' ');
     }
 
     g.writePadding(buffer);
@@ -155,8 +159,8 @@ BSONObj BSONElement::_jsonStringGenerator(const Generator& g,
             g.writeUndefined(buffer);
             break;
         case Object: {
-            BSONObj truncated = embeddedObject().jsonStringGenerator(
-                g, pretty ? pretty + 1 : 0, false, buffer, writeLimit);
+            BSONObj truncated =
+                embeddedObject().jsonStringGenerator(g, pretty, false, buffer, writeLimit);
             if (!truncated.isEmpty()) {
                 BSONObjBuilder builder;
                 builder.append(fieldNameStringData(), truncated);
@@ -166,8 +170,8 @@ BSONObj BSONElement::_jsonStringGenerator(const Generator& g,
             return truncated;
         }
         case mongo::Array: {
-            BSONObj truncated = embeddedObject().jsonStringGenerator(
-                g, pretty ? pretty + 1 : 0, true, buffer, writeLimit);
+            BSONObj truncated =
+                embeddedObject().jsonStringGenerator(g, pretty, true, buffer, writeLimit);
             if (!truncated.isEmpty()) {
                 BSONObjBuilder builder;
                 builder.append(fieldNameStringData(), truncated);
@@ -855,25 +859,21 @@ void BSONElement::toString(
             const char* data = binDataClean(len);
             // If the BinData is a correctly sized newUUID, display it as such.
             if (binDataType() == newUUID && len == 16) {
+                using namespace fmt::literals;
+                StringData sd(data, len);
                 // 4 Octets - 2 Octets - 2 Octets - 2 Octets - 6 Octets
-                s << "UUID(\"";
-                s << toHexLower(&data[0], 4);
-                s << "-";
-                s << toHexLower(&data[4], 2);
-                s << "-";
-                s << toHexLower(&data[6], 2);
-                s << "-";
-                s << toHexLower(&data[8], 2);
-                s << "-";
-                s << toHexLower(&data[10], 6);
-                s << "\")";
+                s << "UUID(\"{}-{}-{}-{}-{}\")"_format(hexblob::encodeLower(sd.substr(0, 4)),
+                                                       hexblob::encodeLower(sd.substr(4, 2)),
+                                                       hexblob::encodeLower(sd.substr(6, 2)),
+                                                       hexblob::encodeLower(sd.substr(8, 2)),
+                                                       hexblob::encodeLower(sd.substr(10, 6)));
                 break;
             }
             s << "BinData(" << binDataType() << ", ";
             if (!full && len > 80) {
-                s << toHex(data, 70) << "...)";
+                s << hexblob::encode(data, 70) << "...)";
             } else {
-                s << toHex(data, len) << ")";
+                s << hexblob::encode(data, std::max(len, 0)) << ")";
             }
         } break;
 
@@ -970,5 +970,26 @@ bool BSONObj::coerceVector(std::vector<T>* out) const {
     }
     return true;
 }
+
+/**
+ * Types used to represent BSONElement memory in the Visual Studio debugger
+ */
+#if defined(_MSC_VER) && defined(_DEBUG)
+struct BSONElementData {
+    char type;
+    char name;
+} bsonElementDataInstance;
+
+struct BSONElementBinaryType {
+    int32_t size;
+    uint8_t subtype;
+} bsonElementBinaryType;
+struct BSONElementRegexType {
+} bsonElementRegexType;
+struct BSONElementDBRefType {
+} bsonElementDBPointerType;
+struct BSONElementCodeWithScopeType {
+} bsonElementCodeWithScopeType;
+#endif  // defined(_MSC_VER) && defined(_DEBUG)
 
 }  // namespace mongo

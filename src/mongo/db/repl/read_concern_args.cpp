@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -71,9 +71,9 @@ ReadConcernArgs::ReadConcernArgs(boost::optional<OpTime> opTime,
                                  boost::optional<ReadConcernLevel> level)
     : _opTime(std::move(opTime)), _level(std::move(level)), _specified(_opTime || _level) {}
 
-ReadConcernArgs::ReadConcernArgs(boost::optional<LogicalTime> clusterTime,
+ReadConcernArgs::ReadConcernArgs(boost::optional<LogicalTime> afterClusterTime,
                                  boost::optional<ReadConcernLevel> level)
-    : _afterClusterTime(std::move(clusterTime)),
+    : _afterClusterTime(std::move(afterClusterTime)),
       _level(std::move(level)),
       _specified(_afterClusterTime || _level) {}
 
@@ -209,8 +209,10 @@ Status ReadConcernArgs::parse(const BSONObj& readConcernObj) {
 
     if (_afterClusterTime && _atClusterTime) {
         return Status(ErrorCodes::InvalidOptions,
-                      str::stream() << "Can not specify both " << kAfterClusterTimeFieldName
-                                    << " and " << kAtClusterTimeFieldName);
+                      "Specifying a timestamp for readConcern snapshot in a causally consistent "
+                      "session is not allowed. See "
+                      "https://docs.mongodb.com/manual/core/read-isolation-consistency-recency/"
+                      "#causal-consistency");
     }
 
     // Note: 'available' should not be used with after cluster time, as cluster time can wait for

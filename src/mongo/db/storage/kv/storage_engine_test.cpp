@@ -44,12 +44,10 @@
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/storage/devnull/devnull_kv_engine.h"
 #include "mongo/db/storage/durable_catalog.h"
-#include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_engine.h"
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/storage_engine_impl.h"
 #include "mongo/db/storage/storage_engine_test_fixture.h"
 #include "mongo/db/storage/storage_repair_observer.h"
-#include "mongo/db/unclean_shutdown.h"
 #include "mongo/unittest/barrier.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/periodic_runner_factory.h"
@@ -80,20 +78,28 @@ TEST_F(StorageEngineTest, ReconcileIdentsTest) {
     ASSERT_TRUE(idents.find("_mdb_catalog") != idents.end());
 
     // Create a catalog entry for the `_id` index. Drop the created the table.
-    ASSERT_OK(createIndex(
-        opCtx.get(), NamespaceString("db.coll1"), "_id", false /* isBackgroundSecondaryBuild */));
+    {
+        WriteUnitOfWork wuow(opCtx.get());
+        ASSERT_OK(createIndex(opCtx.get(),
+                              NamespaceString("db.coll1"),
+                              "_id",
+                              false /* isBackgroundSecondaryBuild */));
+        wuow.commit();
+    }
+
     ASSERT_OK(dropIndexTable(opCtx.get(), NamespaceString("db.coll1"), "_id"));
     // The reconcile response should include this index as needing to be rebuilt.
     reconcileResult = unittest::assertGet(reconcile(opCtx.get()));
     ASSERT_EQUALS(1UL, reconcileResult.indexesToRebuild.size());
     ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToRestart.size());
+    ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToResume.size());
 
     StorageEngine::IndexIdentifier& toRebuild = reconcileResult.indexesToRebuild[0];
     ASSERT_EQUALS("db.coll1", toRebuild.nss.ns());
     ASSERT_EQUALS("_id", toRebuild.indexName);
 
     // Now drop the `db.coll1` table, while leaving the DurableCatalog entry.
-    ASSERT_OK(dropIdent(opCtx.get(), opCtx.get()->recoveryUnit(), swCollInfo.getValue().ident));
+    ASSERT_OK(dropIdent(opCtx.get()->recoveryUnit(), swCollInfo.getValue().ident));
     ASSERT_EQUALS(static_cast<const unsigned long>(1), getAllKVEngineIdents(opCtx.get()).size());
 
     // Reconciling this should result in an error.
@@ -109,7 +115,7 @@ TEST_F(StorageEngineTest, LoadCatalogDropsOrphansAfterUncleanShutdown) {
     auto swCollInfo = createCollection(opCtx.get(), collNs);
     ASSERT_OK(swCollInfo.getStatus());
 
-    ASSERT_OK(dropIdent(opCtx.get(), opCtx.get()->recoveryUnit(), swCollInfo.getValue().ident));
+    ASSERT_OK(dropIdent(opCtx.get()->recoveryUnit(), swCollInfo.getValue().ident));
     ASSERT(collectionExists(opCtx.get(), collNs));
 
     // After the catalog is reloaded, we expect that the collection has been dropped because the
@@ -117,8 +123,8 @@ TEST_F(StorageEngineTest, LoadCatalogDropsOrphansAfterUncleanShutdown) {
     {
         Lock::GlobalWrite writeLock(opCtx.get(), Date_t::max(), Lock::InterruptBehavior::kThrow);
         _storageEngine->closeCatalog(opCtx.get());
-        startingAfterUncleanShutdown(getGlobalServiceContext()) = true;
-        _storageEngine->loadCatalog(opCtx.get());
+        auto loadingFromUncleanShutdown = true;
+        _storageEngine->loadCatalog(opCtx.get(), loadingFromUncleanShutdown);
     }
 
     ASSERT(!identExists(opCtx.get(), swCollInfo.getValue().ident));
@@ -136,14 +142,42 @@ TEST_F(StorageEngineTest, ReconcileDropsTemporary) {
 
     ASSERT(identExists(opCtx.get(), ident));
 
-    auto reconcileResult = unittest::assertGet(reconcile(opCtx.get()));
+    // Reconcile will only drop temporary idents when starting up after an unclean shutdown.
+    auto reconcileResult = unittest::assertGet(reconcileAfterUncleanShutdown(opCtx.get()));
     ASSERT_EQUALS(0UL, reconcileResult.indexesToRebuild.size());
     ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToRestart.size());
+    ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToResume.size());
 
     // The storage engine is responsible for dropping its temporary idents.
     ASSERT(!identExists(opCtx.get(), ident));
 
-    rs->deleteTemporaryTable(opCtx.get());
+    rs->finalizeTemporaryTable(opCtx.get(), TemporaryRecordStore::FinalizationAction::kDelete);
+}
+
+TEST_F(StorageEngineTest, ReconcileKeepsTemporary) {
+    auto opCtx = cc().makeOperationContext();
+
+    Lock::GlobalLock lk(&*opCtx, MODE_IS);
+
+    auto rs = makeTemporary(opCtx.get());
+    ASSERT(rs.get());
+    const std::string ident = rs->rs()->getIdent();
+
+    ASSERT(identExists(opCtx.get(), ident));
+
+    auto reconcileResult = unittest::assertGet(reconcile(opCtx.get()));
+    ASSERT_EQUALS(0UL, reconcileResult.indexesToRebuild.size());
+    ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToRestart.size());
+
+    if (_storageEngine->supportsResumableIndexBuilds()) {
+        // The storage engine does not drop its temporary idents outside of starting up after an
+        // unclean shutdown.
+        ASSERT(identExists(opCtx.get(), ident));
+    } else {
+        ASSERT_FALSE(identExists(opCtx.get(), ident));
+    }
+
+    rs->finalizeTemporaryTable(opCtx.get(), TemporaryRecordStore::FinalizationAction::kDelete);
 }
 
 TEST_F(StorageEngineTest, TemporaryDropsItself) {
@@ -159,7 +193,7 @@ TEST_F(StorageEngineTest, TemporaryDropsItself) {
 
         ASSERT(identExists(opCtx.get(), ident));
 
-        rs->deleteTemporaryTable(opCtx.get());
+        rs->finalizeTemporaryTable(opCtx.get(), TemporaryRecordStore::FinalizationAction::kDelete);
     }
 
     // The temporary record store RAII class should drop itself.
@@ -181,7 +215,12 @@ TEST_F(StorageEngineTest, ReconcileUnfinishedIndex) {
     // Start an non-backgroundSecondary single-phase (i.e. no build UUID) index.
     const bool isBackgroundSecondaryBuild = false;
     const boost::optional<UUID> buildUUID = boost::none;
-    ASSERT_OK(startIndexBuild(opCtx.get(), ns, indexName, isBackgroundSecondaryBuild, buildUUID));
+    {
+        WriteUnitOfWork wuow(opCtx.get());
+        ASSERT_OK(
+            startIndexBuild(opCtx.get(), ns, indexName, isBackgroundSecondaryBuild, buildUUID));
+        wuow.commit();
+    }
 
     const auto indexIdent = _storageEngine->getCatalog()->getIndexIdent(
         opCtx.get(), swCollInfo.getValue().catalogId, indexName);
@@ -195,8 +234,9 @@ TEST_F(StorageEngineTest, ReconcileUnfinishedIndex) {
     // not require it to be rebuilt.
     ASSERT_EQUALS(0UL, reconcileResult.indexesToRebuild.size());
 
-    // There are no two-phase builds to restart.
+    // There are no two-phase builds to resume or restart.
     ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToRestart.size());
+    ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToResume.size());
 }
 
 TEST_F(StorageEngineTest, ReconcileUnfinishedBackgroundSecondaryIndex) {
@@ -213,7 +253,12 @@ TEST_F(StorageEngineTest, ReconcileUnfinishedBackgroundSecondaryIndex) {
     // Start a backgroundSecondary single-phase (i.e. no build UUID) index.
     const bool isBackgroundSecondaryBuild = true;
     const boost::optional<UUID> buildUUID = boost::none;
-    ASSERT_OK(startIndexBuild(opCtx.get(), ns, indexName, isBackgroundSecondaryBuild, buildUUID));
+    {
+        WriteUnitOfWork wuow(opCtx.get());
+        ASSERT_OK(
+            startIndexBuild(opCtx.get(), ns, indexName, isBackgroundSecondaryBuild, buildUUID));
+        wuow.commit();
+    }
 
     const auto indexIdent = _storageEngine->getCatalog()->getIndexIdent(
         opCtx.get(), swCollInfo.getValue().catalogId, indexName);
@@ -231,8 +276,9 @@ TEST_F(StorageEngineTest, ReconcileUnfinishedBackgroundSecondaryIndex) {
     ASSERT_EQUALS(ns.ns(), toRebuild.nss.ns());
     ASSERT_EQUALS(indexName, toRebuild.indexName);
 
-    // There are no two-phase builds to restart.
+    // There are no two-phase builds to restart or resume.
     ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToRestart.size());
+    ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToResume.size());
 }
 
 TEST_F(StorageEngineTest, ReconcileTwoPhaseIndexBuilds) {
@@ -254,8 +300,16 @@ TEST_F(StorageEngineTest, ReconcileTwoPhaseIndexBuilds) {
 
     // Start two indexes with the same buildUUID to simulate building multiple indexes within the
     // same build.
-    ASSERT_OK(startIndexBuild(opCtx.get(), ns, indexA, isBackgroundSecondaryBuild, buildUUID));
-    ASSERT_OK(startIndexBuild(opCtx.get(), ns, indexB, isBackgroundSecondaryBuild, buildUUID));
+    {
+        WriteUnitOfWork wuow(opCtx.get());
+        ASSERT_OK(startIndexBuild(opCtx.get(), ns, indexA, isBackgroundSecondaryBuild, buildUUID));
+        wuow.commit();
+    }
+    {
+        WriteUnitOfWork wuow(opCtx.get());
+        ASSERT_OK(startIndexBuild(opCtx.get(), ns, indexB, isBackgroundSecondaryBuild, buildUUID));
+        wuow.commit();
+    }
 
     const auto indexIdentA = _storageEngine->getCatalog()->getIndexIdent(
         opCtx.get(), swCollInfo.getValue().catalogId, indexA);
@@ -283,6 +337,9 @@ TEST_F(StorageEngineTest, ReconcileTwoPhaseIndexBuilds) {
     ASSERT_EQ(2UL, specs.size());
     ASSERT_EQ(indexA, specs[0]["name"].str());
     ASSERT_EQ(indexB, specs[1]["name"].str());
+
+    // There should be no index builds to resume.
+    ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToResume.size());
 }
 
 TEST_F(StorageEngineRepairTest, LoadCatalogRecoversOrphans) {
@@ -292,7 +349,7 @@ TEST_F(StorageEngineRepairTest, LoadCatalogRecoversOrphans) {
     auto swCollInfo = createCollection(opCtx.get(), collNs);
     ASSERT_OK(swCollInfo.getStatus());
 
-    ASSERT_OK(dropIdent(opCtx.get(), opCtx.get()->recoveryUnit(), swCollInfo.getValue().ident));
+    ASSERT_OK(dropIdent(opCtx.get()->recoveryUnit(), swCollInfo.getValue().ident));
     ASSERT(collectionExists(opCtx.get(), collNs));
 
     // After the catalog is reloaded, we expect that the ident has been recovered because the
@@ -300,7 +357,8 @@ TEST_F(StorageEngineRepairTest, LoadCatalogRecoversOrphans) {
     {
         Lock::GlobalWrite writeLock(opCtx.get(), Date_t::max(), Lock::InterruptBehavior::kThrow);
         _storageEngine->closeCatalog(opCtx.get());
-        _storageEngine->loadCatalog(opCtx.get());
+        auto loadingFromUncleanShutdown = false;
+        _storageEngine->loadCatalog(opCtx.get(), loadingFromUncleanShutdown);
     }
 
     ASSERT(identExists(opCtx.get(), swCollInfo.getValue().ident));
@@ -316,7 +374,7 @@ TEST_F(StorageEngineRepairTest, ReconcileSucceeds) {
     auto swCollInfo = createCollection(opCtx.get(), collNs);
     ASSERT_OK(swCollInfo.getStatus());
 
-    ASSERT_OK(dropIdent(opCtx.get(), opCtx.get()->recoveryUnit(), swCollInfo.getValue().ident));
+    ASSERT_OK(dropIdent(opCtx.get()->recoveryUnit(), swCollInfo.getValue().ident));
     ASSERT(collectionExists(opCtx.get(), collNs));
 
     // Reconcile would normally return an error if a collection existed with a missing ident in the
@@ -324,6 +382,7 @@ TEST_F(StorageEngineRepairTest, ReconcileSucceeds) {
     auto reconcileResult = unittest::assertGet(reconcile(opCtx.get()));
     ASSERT_EQUALS(0UL, reconcileResult.indexesToRebuild.size());
     ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToRestart.size());
+    ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToResume.size());
 
     ASSERT(!identExists(opCtx.get(), swCollInfo.getValue().ident));
     ASSERT(collectionExists(opCtx.get(), collNs));
@@ -343,11 +402,17 @@ TEST_F(StorageEngineRepairTest, LoadCatalogRecoversOrphansInCatalog) {
     // Only drop the catalog entry; storage engine still knows about this ident.
     // This simulates an unclean shutdown happening between dropping the catalog entry and
     // the actual drop in storage engine.
-    ASSERT_OK(removeEntry(opCtx.get(), collNs.ns(), _storageEngine->getCatalog()));
+    {
+        WriteUnitOfWork wuow(opCtx.get());
+        ASSERT_OK(removeEntry(opCtx.get(), collNs.ns(), _storageEngine->getCatalog()));
+        wuow.commit();
+    }
+
     ASSERT(!collectionExists(opCtx.get(), collNs));
 
     // When in a repair context, loadCatalog() recreates catalog entries for orphaned idents.
-    _storageEngine->loadCatalog(opCtx.get());
+    auto loadingFromUncleanShutdown = false;
+    _storageEngine->loadCatalog(opCtx.get(), loadingFromUncleanShutdown);
     auto identNs = swCollInfo.getValue().ident;
     std::replace(identNs.begin(), identNs.end(), '-', '_');
     NamespaceString orphanNs = NamespaceString("local.orphan." + identNs);
@@ -371,12 +436,17 @@ TEST_F(StorageEngineTest, LoadCatalogDropsOrphans) {
     // Only drop the catalog entry; storage engine still knows about this ident.
     // This simulates an unclean shutdown happening between dropping the catalog entry and
     // the actual drop in storage engine.
-    ASSERT_OK(removeEntry(opCtx.get(), collNs.ns(), _storageEngine->getCatalog()));
+    {
+        WriteUnitOfWork wuow(opCtx.get());
+        ASSERT_OK(removeEntry(opCtx.get(), collNs.ns(), _storageEngine->getCatalog()));
+        wuow.commit();
+    }
     ASSERT(!collectionExists(opCtx.get(), collNs));
 
     // When in a normal startup context, loadCatalog() does not recreate catalog entries for
     // orphaned idents.
-    _storageEngine->loadCatalog(opCtx.get());
+    auto loadingFromUncleanShutdown = false;
+    _storageEngine->loadCatalog(opCtx.get(), loadingFromUncleanShutdown);
     // reconcileCatalogAndIdents() drops orphaned idents.
     auto reconcileResult = unittest::assertGet(reconcile(opCtx.get()));
     ASSERT_EQUALS(0UL, reconcileResult.indexesToRebuild.size());
@@ -418,7 +488,7 @@ public:
     mutable std::unique_ptr<Timestamp> stableTimestamp = std::make_unique<Timestamp>();
 };
 
-class TimestampKVEngineTest : public ServiceContextMongoDTest {
+class TimestampKVEngineTest : public ServiceContextTest {
 public:
     using TimestampType = StorageEngineImpl::TimestampMonitor::TimestampType;
     using TimestampListener = StorageEngineImpl::TimestampMonitor::TimestampListener;
@@ -426,16 +496,28 @@ public:
     /**
      * Create an instance of the KV Storage Engine so that we have a timestamp monitor operating.
      */
-    TimestampKVEngineTest() {
-        StorageEngineOptions options{
-            /*directoryPerDB=*/false, /*directoryForIndexes=*/false, /*forRepair=*/false};
-        _storageEngine = std::make_unique<StorageEngineImpl>(new TimestampMockKVEngine, options);
+    void setUp() {
+        ServiceContextTest::setUp();
+
+        auto opCtx = makeOperationContext();
+
+        auto runner = makePeriodicRunner(getServiceContext());
+        getServiceContext()->setPeriodicRunner(std::move(runner));
+
+        StorageEngineOptions options{/*directoryPerDB=*/false,
+                                     /*directoryForIndexes=*/false,
+                                     /*forRepair=*/false,
+                                     /*lockFileCreatedByUncleanShutdown=*/false};
+        _storageEngine = std::make_unique<StorageEngineImpl>(
+            opCtx.get(), std::make_unique<TimestampMockKVEngine>(), options);
         _storageEngine->finishInit();
     }
 
-    ~TimestampKVEngineTest() {
+    void tearDown() {
         _storageEngine->cleanShutdown();
         _storageEngine.reset();
+
+        ServiceContextTest::tearDown();
     }
 
     std::unique_ptr<StorageEngineImpl> _storageEngine;
@@ -535,18 +617,18 @@ TEST_F(TimestampKVEngineTest, TimestampMonitorNotifiesListeners) {
 
 TEST_F(TimestampKVEngineTest, TimestampAdvancesOnNotification) {
     Timestamp previous = Timestamp();
-    int timesNotified = 0;
+    AtomicWord<int> timesNotified{0};
 
     TimestampListener listener(stable, [&](Timestamp timestamp) {
         ASSERT_TRUE(previous < timestamp);
         previous = timestamp;
-        timesNotified++;
+        timesNotified.fetchAndAdd(1);
     });
     _storageEngine->getTimestampMonitor()->addListener(&listener);
 
     // Let three rounds of notifications happen while ensuring that each new notification produces
     // an increasing timestamp.
-    while (timesNotified < 3) {
+    while (timesNotified.load() < 3) {
         sleepmillis(100);
     }
 

@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/base/init.h"
@@ -36,11 +34,11 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/snapshot_manager.h"
+#include "mongo/db/vector_clock.h"
 
 namespace mongo {
 class CmdMakeSnapshot final : public BasicCommand {
@@ -79,7 +77,8 @@ public:
 
         Lock::GlobalLock lk(opCtx, MODE_IX);
 
-        auto name = LogicalClock::getClusterTimeForReplicaSet(opCtx).asTimestamp();
+        const auto currentTime = VectorClock::get(opCtx)->getTime();
+        const auto name = currentTime.clusterTime().asTimestamp();
         result.append("name", static_cast<long long>(name.asULL()));
 
         return true;

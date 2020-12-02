@@ -79,42 +79,31 @@ assert.soon(
     1000);
 
 reconnect(secondary);
-replSet.stepUpNoAwaitReplication(secondary);
+replSet.stepUp(secondary, {awaitReplicationBeforeStepUp: false, awaitWritablePrimary: false});
 
 // Secondary doesn't allow writes yet.
-var res = secondary.getDB("admin").runCommand({"isMaster": 1});
-assert(!res.ismaster);
-
-assert.commandFailedWithCode(
-    secondary.adminCommand({
-        replSetTest: 1,
-        waitForDrainFinish: 5000,
-    }),
-    ErrorCodes.ExceededTimeLimit,
-    'replSetTest waitForDrainFinish should time out when draining is not allowed to complete');
+var res = secondary.getDB("admin").runCommand({"hello": 1});
+assert(!res.isWritablePrimary);
 
 // Original primary steps up.
 reconnect(primary);
-replSet.stepUpNoAwaitReplication(primary);
+replSet.stepUp(primary, {awaitReplicationBeforeStepUp: false, awaitWritablePrimary: false});
 
 reconnect(secondary);
-replSet.stepUpNoAwaitReplication(secondary);
+replSet.stepUp(secondary, {awaitReplicationBeforeStepUp: false, awaitWritablePrimary: false});
 
 // Disable fail point to allow replication.
 secondaries.forEach(disableFailPoint);
 
-assert.commandWorked(
-    secondary.adminCommand({
-        replSetTest: 1,
-        waitForDrainFinish: replSet.kDefaultTimeoutMS,
-    }),
-    'replSetTest waitForDrainFinish should work when draining is allowed to complete');
+// Wait for draining to complete.
+const newPrimary = replSet.getPrimary();
+assert.eq(secondary, newPrimary);
 
 // Ensure new primary is writable.
 jsTestLog('New primary should be writable after draining is complete');
-assert.commandWorked(secondary.getDB("foo").flag.insert({sentinel: 1}));
+assert.commandWorked(newPrimary.getDB("foo").flag.insert({sentinel: 1}));
 // Check that all writes reached the secondary's op queue prior to
 // stepping down the original primary and got applied.
-assert.eq(secondary.getDB("foo").foo.find().itcount(), numDocuments);
+assert.eq(newPrimary.getDB("foo").foo.find().itcount(), numDocuments);
 replSet.stopSet();
 })();

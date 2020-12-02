@@ -1,9 +1,12 @@
 t = db.geo_s2multi;
 t.drop();
 
-t.ensureIndex({geo: "2dsphere"});
+t.createIndex({geo: "2dsphere"});
 
 // Let's try the examples in the GeoJSON spec.
+// @tags: [
+//   sbe_incompatible,
+// ]
 multiPointA = {
     "type": "MultiPoint",
     "coordinates": [[100.0, 0.0], [101.0, 1.0]]

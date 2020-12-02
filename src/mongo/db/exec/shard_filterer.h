@@ -37,7 +37,8 @@
 namespace mongo {
 
 /**
- * Interface for doing shard filtering, to be used by both the find and agg execution trees.
+ * Interface for doing shard filtering, to be used by both the find and agg execution trees, and
+ * slot-based execution.
  */
 class ShardFilterer {
 public:
@@ -45,9 +46,29 @@ public:
 
     virtual ~ShardFilterer() = default;
 
-    virtual DocumentBelongsResult documentBelongsToMe(const WorkingSetMember& wsm) const = 0;
-    virtual DocumentBelongsResult documentBelongsToMe(const Document& doc) const = 0;
+    virtual std::unique_ptr<ShardFilterer> clone() const = 0;
+
+    /**
+     * Checks if a shard key is owned by the current node according to the filtering metadata of a
+     * sharded collection. This method assumes that the provided shard key is valid (non-empty).
+     */
+    virtual bool keyBelongsToMe(const BSONObj& key) const = 0;
+
+    /**
+     * A higher-level helper that must extract the shard key and then pass the shard key extracted
+     * to keyBelongsToMe.
+     */
+    virtual DocumentBelongsResult documentBelongsToMe(const BSONObj& doc) const = 0;
+
+    /**
+     * This method determines if the collection sharded.
+     */
     virtual bool isCollectionSharded() const = 0;
+
+    /**
+     * Returns a KeyPattern representation of the shard key pattern being used to test membership of
+     * the shard key.
+     */
     virtual const KeyPattern& getKeyPattern() const = 0;
 };
 }  // namespace mongo

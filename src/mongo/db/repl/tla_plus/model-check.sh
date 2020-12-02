@@ -1,5 +1,11 @@
 #!/bin/sh
 
+# Execute TLC, the TLA+ model-checker, on a TLA+ specification and model config. Call like:
+#
+# ./model-check.sh RaftMongo
+#
+# Requires Java 11. You can set the JAVA_BINARY environment variable to the full path to java.
+
 if [ "$#" -ne 1 ]; then
   echo "Usage: $0 SPEC_DIRECTORY" >&2
   exit 1
@@ -23,13 +29,12 @@ if ! [ -f "$1/$TLA_FILE" ]; then
   exit 1
 fi
 
-# Count CPUs. Linux has cpuinfo, Mac has sysctl, otherwise use a default.
-if [ -e "/proc/cpuinfo" ]; then
-  WORKERS=$(grep -c processor /proc/cpuinfo)
-elif ! WORKERS=$(sysctl -n hw.logicalcpu); then
-  WORKERS=8 # default
+if [ -z "$JAVA_BINARY" ]; then
+  JAVA_BINARY=java
+else
+  echo "Using java binary [$JAVA_BINARY]"
 fi
 
 cd "$1"
 # Defer liveness checks to the end with -lncheck, for speed.
-java -XX:+UseParallelGC -cp ../tla2tools.jar tlc2.TLC -lncheck final -workers "$WORKERS" "$TLA_FILE"
+"$JAVA_BINARY" -XX:+UseParallelGC -Dtlc2.tool.fp.FPSet.impl=tlc2.tool.fp.OffHeapDiskFPSet -Dutil.ExecutionStatisticsCollector.id=10f53a1c957c11ea94a033245b683b65 -cp ../tla2tools.jar tlc2.TLC -lncheck final -workers auto "$TLA_FILE"

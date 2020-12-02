@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplicationInitialSync
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationInitialSync
 
 #include "mongo/platform/basic.h"
 
@@ -41,6 +41,8 @@
 #include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/logv2/log.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -61,7 +63,8 @@ CollectionCloner::CollectionCloner(const NamespaceString& sourceNss,
                                    DBClientConnection* client,
                                    StorageInterface* storageInterface,
                                    ThreadPool* dbPool)
-    : BaseCloner("CollectionCloner"_sd, sharedData, source, client, storageInterface, dbPool),
+    : InitialSyncBaseCloner(
+          "CollectionCloner"_sd, sharedData, source, client, storageInterface, dbPool),
       _sourceNss(sourceNss),
       _collectionOptions(collectionOptions),
       _sourceDbAndUuid(NamespaceString("UNINITIALIZED")),
@@ -86,7 +89,7 @@ CollectionCloner::CollectionCloner(const NamespaceString& sourceNss,
               try {
                   work(executor::TaskExecutor::CallbackArgs(nullptr, {}, status, opCtx));
               } catch (const DBException& e) {
-                  setInitialSyncFailedStatus(e.toStatus());
+                  setSyncFailedStatus(e.toStatus());
               }
               return TaskRunner::NextAction::kDisposeOperationContext;
           };
@@ -115,6 +118,24 @@ BaseCloner::ClonerStages CollectionCloner::getStages() {
 void CollectionCloner::preStage() {
     stdx::lock_guard<Latch> lk(_mutex);
     _stats.start = getSharedData()->getClock()->now();
+    BSONObj res;
+    getClient()->runCommand(
+        _sourceNss.db().toString(), BSON("collStats" << _sourceNss.coll().toString()), res);
+    if (auto status = getStatusFromCommandResult(res); status.isOK()) {
+        _stats.bytesToCopy = res.getField("size").safeNumberLong();
+        if (_stats.bytesToCopy > 0) {
+            // The 'avgObjSize' parameter is only available if 'collStats' returns a 'size' field
+            // greater than zero.
+            _stats.avgObjSize = res.getField("avgObjSize").safeNumberLong();
+        }
+    } else {
+        LOGV2_DEBUG(4786302,
+                    1,
+                    "Skipping the recording of some initial sync metrics due to failure in the "
+                    "'collStats' command",
+                    "ns"_attr = _sourceNss.coll().toString(),
+                    "status"_attr = status);
+    }
 }
 
 void CollectionCloner::postStage() {
@@ -144,7 +165,7 @@ BaseCloner::AfterStageBehavior CollectionCloner::CollectionClonerStage::run() {
 BaseCloner::AfterStageBehavior CollectionCloner::countStage() {
     auto count = getClient()->count(_sourceDbAndUuid,
                                     {} /* Query */,
-                                    QueryOption_SlaveOk,
+                                    QueryOption_SecondaryOk,
                                     0 /* limit */,
                                     0 /* skip */,
                                     ReadConcernArgs::kImplicitDefault);
@@ -168,9 +189,9 @@ BaseCloner::AfterStageBehavior CollectionCloner::countStage() {
 }
 
 BaseCloner::AfterStageBehavior CollectionCloner::listIndexesStage() {
-    const bool includeBuildUUIDs = IndexBuildsCoordinator::supportsTwoPhaseIndexBuild();
+    const bool includeBuildUUIDs = true;
     auto indexSpecs =
-        getClient()->getIndexSpecs(_sourceDbAndUuid, includeBuildUUIDs, QueryOption_SlaveOk);
+        getClient()->getIndexSpecs(_sourceDbAndUuid, includeBuildUUIDs, QueryOption_SecondaryOk);
     if (indexSpecs.empty()) {
         LOGV2_WARNING(21143,
                       "No indexes found for collection {namespace} while cloning from {source}",
@@ -207,13 +228,6 @@ BaseCloner::AfterStageBehavior CollectionCloner::listIndexesStage() {
 }
 
 BaseCloner::AfterStageBehavior CollectionCloner::createCollectionStage() {
-    if (!IndexBuildsCoordinator::supportsTwoPhaseIndexBuild()) {
-        // Single phase index builds should have an empty '_unfinishedIndexSpecs' vector because in
-        // the 'listIndexesStage', we only populate '_unfinishedIndexSpecs' if a buildUUID is
-        // present. A buildUUID is only present for two phase index builds.
-        invariant(_unfinishedIndexSpecs.empty());
-    }
-
     auto collectionBulkLoader = getStorageInterface()->createCollectionForBulkLoading(
         _sourceNss, _collectionOptions, _idIndexSpec, _readyIndexSpecs);
     uassertStatusOK(collectionBulkLoader.getStatus());
@@ -231,7 +245,7 @@ BaseCloner::AfterStageBehavior CollectionCloner::queryStage() {
 }
 
 BaseCloner::AfterStageBehavior CollectionCloner::setupIndexBuildersForUnfinishedIndexesStage() {
-    if (!IndexBuildsCoordinator::supportsTwoPhaseIndexBuild() || _unfinishedIndexSpecs.empty()) {
+    if (_unfinishedIndexSpecs.empty()) {
         return kContinueNormally;
     }
 
@@ -314,7 +328,7 @@ void CollectionCloner::runQuery() {
                            _sourceDbAndUuid,
                            query,
                            nullptr /* fieldsToReturn */,
-                           QueryOption_NoCursorTimeout | QueryOption_SlaveOk |
+                           QueryOption_NoCursorTimeout | QueryOption_SecondaryOk |
                                (collectionClonerUsesExhaust ? QueryOption_Exhaust : 0),
                            _collectionClonerBatchSize,
                            ReadConcernArgs::kImplicitDefault);
@@ -360,13 +374,12 @@ void CollectionCloner::runQuery() {
 void CollectionCloner::handleNextBatch(DBClientCursorBatchIterator& iter) {
     {
         stdx::lock_guard<InitialSyncSharedData> lk(*getSharedData());
-        if (!getSharedData()->getInitialSyncStatus(lk).isOK()) {
+        if (!getSharedData()->getStatus(lk).isOK()) {
             static constexpr char message[] =
                 "Collection cloning cancelled due to initial sync failure";
-            LOGV2(21136, message, "error"_attr = getSharedData()->getInitialSyncStatus(lk));
+            LOGV2(21136, message, "error"_attr = getSharedData()->getStatus(lk));
             uasserted(ErrorCodes::CallbackCanceled,
-                      str::stream()
-                          << message << ": " << getSharedData()->getInitialSyncStatus(lk));
+                      str::stream() << message << ": " << getSharedData()->getStatus(lk));
         }
     }
 
@@ -435,6 +448,9 @@ void CollectionCloner::insertDocumentsCallback(const executor::TaskExecutor::Cal
     {
         stdx::lock_guard<Latch> lk(_mutex);
         std::vector<BSONObj> docs;
+        // Increment 'fetchedBatches' even if no documents were inserted to match the number of
+        // 'receivedBatches'.
+        ++_stats.fetchedBatches;
         if (_documentsToInsert.size() == 0) {
             LOGV2_WARNING(21145,
                           "insertDocumentsCallback, but no documents to insert for ns:{namespace}",
@@ -444,7 +460,7 @@ void CollectionCloner::insertDocumentsCallback(const executor::TaskExecutor::Cal
         }
         _documentsToInsert.swap(docs);
         _stats.documentsCopied += docs.size();
-        ++_stats.fetchedBatches;
+        _stats.approxBytesCopied = ((long)_stats.documentsCopied) * _stats.avgObjSize;
         _progressMeter.hit(int(docs.size()));
         invariant(_collLoader);
 
@@ -512,6 +528,10 @@ void CollectionCloner::Stats::append(BSONObjBuilder* builder) const {
     builder->appendNumber(kDocumentsCopiedFieldName, documentsCopied);
     builder->appendNumber("indexes", indexes);
     builder->appendNumber("fetchedBatches", fetchedBatches);
+    builder->appendNumber("bytesToCopy", bytesToCopy);
+    if (bytesToCopy) {
+        builder->appendNumber("approxBytesCopied", approxBytesCopied);
+    }
     if (start != Date_t()) {
         builder->appendDate("start", start);
         if (end != Date_t()) {

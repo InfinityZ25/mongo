@@ -39,10 +39,11 @@
 #include "mongo/client/mongo_uri.h"
 #include "mongo/client/query.h"
 #include "mongo/client/read_preference.h"
+#include "mongo/config.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/logger/log_severity.h"
+#include "mongo/logv2/log_severity.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/rpc/message.h"
@@ -94,7 +95,8 @@ public:
     DBClientConnection(bool _autoReconnect = false,
                        double so_timeout = 0,
                        MongoURI uri = {},
-                       const HandshakeValidationHook& hook = HandshakeValidationHook());
+                       const HandshakeValidationHook& hook = HandshakeValidationHook(),
+                       const ClientAPIVersionParameters* apiParameters = nullptr);
 
     virtual ~DBClientConnection() {
         _numConnections.fetchAndAdd(-1);
@@ -114,12 +116,9 @@ public:
 
     /**
      * Semantically equivalent to the previous connect method, but returns a Status
-     * instead of taking an errmsg out parameter. Also allows optional validation of the reply to
-     * the 'isMaster' command executed during connection.
+     * instead of taking an errmsg out parameter.
      *
      * @param server The server to connect to.
-     * @param a hook to validate the 'isMaster' reply received during connection. If the hook
-     * fails, the connection will be terminated and a non-OK status will be returned.
      */
     virtual Status connect(const HostAndPort& server, StringData applicationName);
 
@@ -131,16 +130,6 @@ public:
      * @param server The server to connect to.
      */
     Status connectSocketOnly(const HostAndPort& server);
-
-    /** Connect to a Mongo database server.  Exception throwing version.
-        Throws a AssertionException if cannot connect.
-
-       If autoReconnect is true, you can try to use the DBClientConnection even when
-       false was returned -- it will try to connect again.
-
-       @param serverHostname host to connect to.  can include port number ( 127.0.0.1 ,
-                               127.0.0.1:5555 )
-    */
 
     /**
      * Logs out the connection for the given database.
@@ -240,7 +229,7 @@ public:
     std::string getServerAddress() const override {
         return _serverAddress.toString();
     }
-    const HostAndPort& getServerHostAndPort() const {
+    virtual const HostAndPort& getServerHostAndPort() const {
         return _serverAddress;
     }
 
@@ -255,7 +244,7 @@ public:
               bool assertOk,
               std::string* actualServer) override;
     ConnectionString::ConnectionType type() const override {
-        return ConnectionString::MASTER;
+        return ConnectionString::ConnectionType::kStandalone;
     }
     void setSoTimeout(double timeout);
     double getSoTimeout() const override {
@@ -300,11 +289,16 @@ public:
         return _isMongos;
     }
 
-    Status authenticateInternalUser() override;
+    Status authenticateInternalUser(
+        auth::StepDownBehavior stepDownBehavior = auth::StepDownBehavior::kKillConnection) override;
 
     bool authenticatedDuringConnect() const override {
         return _authenticatedDuringConnect;
     }
+
+#ifdef MONGO_CONFIG_SSL
+    const SSLConfiguration* getSSLConfiguration() override;
+#endif
 
 protected:
     int _minWireVersion{0};
@@ -338,6 +332,9 @@ protected:
     void _checkConnection();
 
     bool _internalAuthOnReconnect = false;
+
+    auth::StepDownBehavior _internalAuthStepDownBehavior = auth::StepDownBehavior::kKillConnection;
+
     std::map<std::string, BSONObj> authCache;
 
     static AtomicWord<int> _numConnections;
@@ -345,10 +342,10 @@ protected:
 private:
     /**
      * Inspects the contents of 'replyBody' and informs the replica set monitor that the host 'this'
-     * is connected with is no longer the primary if a "not master" error message or error code was
+     * is connected with is no longer the primary if a "not primary" error message or error code was
      * returned.
      */
-    void handleNotMasterResponse(const BSONObj& replyBody, StringData errorMsgFieldName);
+    void handleNotPrimaryResponse(const BSONObj& replyBody, StringData errorMsgFieldName);
     enum FailAction { kSetFlag, kEndSession, kReleaseSession };
     void _markFailed(FailAction action);
 

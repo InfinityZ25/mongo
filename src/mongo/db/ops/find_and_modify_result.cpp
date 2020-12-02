@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kWrite
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kWrite
 
 #include "mongo/platform/basic.h"
 
@@ -50,9 +50,9 @@ void appendValue(const boost::optional<BSONObj>& value, BSONObjBuilder* builder)
 
 }  // namespace
 
-void serializeRemove(size_t n, const boost::optional<BSONObj>& value, BSONObjBuilder* builder) {
+void serializeRemove(const boost::optional<BSONObj>& value, BSONObjBuilder* builder) {
     BSONObjBuilder lastErrorObjBuilder(builder->subobjStart("lastErrorObject"));
-    builder->appendNumber("n", n);
+    builder->appendNumber("n", value ? 1 : 0);
     lastErrorObjBuilder.doneFast();
 
     appendValue(value, builder);
@@ -61,13 +61,13 @@ void serializeRemove(size_t n, const boost::optional<BSONObj>& value, BSONObjBui
 void serializeUpsert(size_t n,
                      const boost::optional<BSONObj>& value,
                      bool updatedExisting,
-                     const BSONObj& objInserted,
+                     BSONElement idInserted,
                      BSONObjBuilder* builder) {
     BSONObjBuilder lastErrorObjBuilder(builder->subobjStart("lastErrorObject"));
     lastErrorObjBuilder.appendNumber("n", n);
     lastErrorObjBuilder.appendBool("updatedExisting", updatedExisting);
-    if (!objInserted.isEmpty()) {
-        lastErrorObjBuilder.appendAs(objInserted["_id"], kUpsertedFieldName);
+    if (idInserted) {
+        lastErrorObjBuilder.appendAs(idInserted, kUpsertedFieldName);
     }
     lastErrorObjBuilder.doneFast();
 

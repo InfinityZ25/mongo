@@ -30,11 +30,10 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/s/balancer/scoped_migration_request.h"
-
 #include "mongo/db/s/balancer/type_migration.h"
+#include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/config_server_test_fixture.h"
 #include "mongo/s/request_types/migration_secondary_throttle_options.h"
 
 namespace mongo {
@@ -56,7 +55,7 @@ public:
      * number of documents returned equals "expectedNumberOfDocuments".
      */
     void checkMigrationsCollectionForDocument(const MigrateInfo& migrateInfo,
-                                              const unsigned long expectedNumberOfDocuments);
+                                              unsigned long expectedNumberOfDocuments);
 
     /**
      * Makes a ScopedMigrationRequest and checks that the migration was written to
@@ -74,7 +73,7 @@ void ScopedMigrationRequestTest::setUp() {
 }
 
 void ScopedMigrationRequestTest::checkMigrationsCollectionForDocument(
-    const MigrateInfo& migrateInfo, const unsigned long expectedNumberOfDocuments) {
+    const MigrateInfo& migrateInfo, unsigned long expectedNumberOfDocuments) {
     auto response = shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
         operationContext(),
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},

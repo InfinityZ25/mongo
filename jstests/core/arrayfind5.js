@@ -1,4 +1,7 @@
 // Test indexed elemmatch of missing field.
+// @tags: [
+//   sbe_incompatible,
+// ]
 
 t = db.jstests_arrayfind5;
 t.drop();
@@ -13,12 +16,12 @@ function check(nullElemMatch) {
 
 t.save({a: [{}, {b: 1}]});
 check(true);
-t.ensureIndex({'a.b': 1});
+t.createIndex({'a.b': 1});
 check(true);
 
 t.drop();
 
 t.save({a: [5, {b: 1}]});
 check(false);
-t.ensureIndex({'a.b': 1});
+t.createIndex({'a.b': 1});
 check(false);

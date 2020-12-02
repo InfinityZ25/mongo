@@ -1,13 +1,14 @@
 // @tags: [
 //   requires_non_retryable_writes,
 //   uses_multiple_connections,
+//   uses_parallel_shell,
 // ]
 
 // Sanity test for removing documents with adjacent index keys.  SERVER-2008
 
 t = db.jstests_removec;
 t.drop();
-t.ensureIndex({a: 1});
+t.createIndex({a: 1});
 
 /** @return an array containing a sequence of numbers from i to i + 10. */
 function runStartingWith(i) {

@@ -47,7 +47,7 @@ assert.commandWorked(mongosConn.adminCommand({addshard: replSet1.getURL()}));
 
 // Enable sharding on test db and its collection foo
 assert.commandWorked(mongosConn.getDB('admin').runCommand({enablesharding: testDBName}));
-testDB[testCollName].ensureIndex({x: 1});
+testDB[testCollName].createIndex({x: 1});
 assert.commandWorked(mongosConn.getDB('admin').runCommand(
     {shardcollection: testDBName + '.' + testCollName, key: {x: 1}}));
 
@@ -62,16 +62,15 @@ for (var i = numDocs; i < 2 * numDocs; i++) {
 }
 assert.commandWorked(bulk.execute({w: replNodes, wtimeout: 30000}));
 
-// Take down two nodes and make sure slaveOk reads still work
-var primary = replSet1._master;
-var secondary1 = replSet1._slaves[0];
-var secondary2 = replSet1._slaves[1];
+// Take down two nodes and make sure secondaryOk reads still work
+var primary = replSet1.getPrimary();
+var [secondary1, secondary2] = replSet1.getSecondaries();
 replSet1.stop(secondary1);
 replSet1.stop(secondary2);
 replSet1.waitForState(primary, ReplSetTest.State.SECONDARY);
 
 testDB.getMongo().adminCommand({setParameter: 1, logLevel: 1});
-testDB.getMongo().setSlaveOk();
+testDB.getMongo().setSecondaryOk();
 print("trying some queries");
 assert.soon(function() {
     try {

@@ -6,7 +6,9 @@
  * until the secondary has installed the new config. Finally, we SIGKILL the secondary and restart
  * it to verify that its config after restart is the same one it previously installed.
  *
- * @tags: [requires_persistence, requires_fcv_44]
+ * @tags: [
+ *   requires_persistence,
+ * ]
  */
 (function() {
 "use strict";
@@ -16,8 +18,8 @@ load("jstests/libs/fail_point_util.js");
 const rst = new ReplSetTest({
     nodes: [{}, {rsConfig: {priority: 0}}],
     nodeOptions: {
-        // Turn up the syncdelay (in seconds) to effectively disable background checkpoints.
-        syncdelay: 600,
+        // Disable background checkpoints: a zero value disables checkpointing.
+        syncdelay: 0,
         setParameter: {logComponentVerbosity: tojson({storage: 2})}
     },
     useBridge: true

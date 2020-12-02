@@ -1,6 +1,7 @@
 // @tags: [
 //   requires_non_retryable_writes,
 //   uses_multiple_connections,
+//   uses_parallel_shell,
 // ]
 
 // Yield and delete test case for query optimizer cursor.  SERVER-4401
@@ -8,8 +9,8 @@
 t = db.jstests_distinct3;
 t.drop();
 
-t.ensureIndex({a: 1});
-t.ensureIndex({b: 1});
+t.createIndex({a: 1});
+t.createIndex({b: 1});
 
 var bulk = t.initializeUnorderedBulkOp();
 for (i = 0; i < 50; ++i) {

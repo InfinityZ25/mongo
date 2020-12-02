@@ -2,11 +2,13 @@
  * Utilities for testing writeConcern.
  */
 
+load("jstests/libs/fail_point_util.js");
+
 // Shards a collection with 'numDocs' documents and creates 2 chunks, one on each of two shards.
 function shardCollectionWithChunks(st, coll, numDocs) {
     var _db = coll.getDB();
     var numberDoc = numDocs || 20;
-    coll.ensureIndex({x: 1}, {unique: true});
+    coll.createIndex({x: 1}, {unique: true});
     st.ensurePrimaryShard(_db.toString(), st.shard0.shardName);
     st.shardColl(
         coll.getName(), {x: 1}, {x: numberDoc / 2}, {x: numberDoc / 2}, _db.toString(), true);
@@ -18,26 +20,21 @@ function shardCollectionWithChunks(st, coll, numDocs) {
 }
 
 // Stops replication on the given server(s).
-function stopServerReplication(conn) {
+function stopServerReplication(conn, retryIntervalMS) {
+    retryIntervalMS = retryIntervalMS || 300;
     if (conn.length) {
         conn.forEach(function(n) {
             stopServerReplication(n);
         });
         return;
     }
-
-    // Clear ramlog so checkLog can't find log messages from previous times this fail point was
-    // enabled.
-    assert.commandWorked(conn.adminCommand({clearLog: 'global'}));
-    var errMsg = 'Failed to enable stopReplProducer failpoint.';
-    assert.commandWorked(
-        conn.adminCommand({configureFailPoint: 'stopReplProducer', mode: 'alwaysOn'}), errMsg);
+    const stopReplProducerFailPoint = configureFailPoint(conn, 'stopReplProducer');
 
     // Wait until the fail point is actually hit. Don't wait if the node is the primary, because
     // the fail point won't be hit until the node transitions from being the primary.
     if (assert.commandWorked(conn.adminCommand('replSetGetStatus')).myState !=
         ReplSetTest.State.PRIMARY) {
-        checkLog.contains(conn, 'bgsync - stopReplProducer fail point enabled');
+        stopReplProducerFailPoint.wait();
     }
 }
 

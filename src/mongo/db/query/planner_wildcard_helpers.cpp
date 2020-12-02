@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -247,12 +247,10 @@ bool validateNumericPathComponents(const MultikeyPaths& multikeyPaths,
     if (arrayIndices.size() > kWildcardMaxArrayIndexTraversalDepth) {
         LOGV2_DEBUG(20955,
                     2,
-                    "Declining to answer query on field '{queryPath_dottedField}' with $** index, "
-                    "as it traverses through more than {kWildcardMaxArrayIndexTraversalDepth} "
-                    "nested array indices.",
-                    "queryPath_dottedField"_attr = queryPath.dottedField(),
-                    "kWildcardMaxArrayIndexTraversalDepth"_attr =
-                        kWildcardMaxArrayIndexTraversalDepth);
+                    "Declining to answer query on a field with $** index, as it traverses through "
+                    "more than the maximum permitted depth of nested array indices",
+                    "field"_attr = queryPath.dottedField(),
+                    "maxNestedArrayIndices"_attr = kWildcardMaxArrayIndexTraversalDepth);
         return false;
     }
 
@@ -399,6 +397,7 @@ void expandWildcardIndexEntry(const IndexEntry& wildcardIndex,
 
         IndexEntry entry(BSON(fieldName << wildcardIndex.keyPattern.firstElement()),
                          IndexType::INDEX_WILDCARD,
+                         IndexDescriptor::kLatestIndexVersion,
                          isMultikey,
                          std::move(multikeyPaths),
                          // Expanded index entries always use the fixed-size multikey paths

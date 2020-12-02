@@ -32,7 +32,7 @@
 #include <memory>
 
 #include "mongo/db/pipeline/pipeline.h"
-#include "mongo/s/catalog_cache.h"
+#include "mongo/s/chunk_manager.h"
 #include "mongo/s/query/cluster_aggregate.h"
 #include "mongo/s/query/cluster_client_cursor_guard.h"
 #include "mongo/s/query/cluster_client_cursor_impl.h"
@@ -62,7 +62,8 @@ ClusterClientCursorGuard buildClusterCursor(OperationContext* opCtx,
  *    collectionless namespace.
  */
 std::pair<BSONObj, boost::optional<UUID>> getCollationAndUUID(
-    const boost::optional<CachedCollectionRoutingInfo>& routingInfo,
+    OperationContext* opCtx,
+    const boost::optional<ChunkManager>& cm,
     const NamespaceString& nss,
     const BSONObj& collation);
 
@@ -78,7 +79,7 @@ struct AggregationTargeter {
         OperationContext* opCtx,
         const NamespaceString& executionNss,
         const std::function<std::unique_ptr<Pipeline, PipelineDeleter>()> buildPipelineFn,
-        boost::optional<CachedCollectionRoutingInfo> routingInfo,
+        boost::optional<ChunkManager> cm,
         stdx::unordered_set<NamespaceString> involvedNamespaces,
         bool hasChangeStream,
         bool allowedToPassthrough);
@@ -90,12 +91,12 @@ struct AggregationTargeter {
     } policy;
 
     std::unique_ptr<Pipeline, PipelineDeleter> pipeline;
-    boost::optional<CachedCollectionRoutingInfo> routingInfo;
+    boost::optional<ChunkManager> cm;
 };
 
 Status runPipelineOnPrimaryShard(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                  const ClusterAggregate::Namespaces& namespaces,
-                                 const CachedDatabaseInfo& dbInfo,
+                                 const ChunkManager& cm,
                                  boost::optional<ExplainOptions::Verbosity> explain,
                                  Document serializedCommand,
                                  const PrivilegeVector& privileges,
@@ -116,7 +117,6 @@ Status runPipelineOnMongoS(const ClusterAggregate::Namespaces& namespaces,
  * necessary on either mongos or a randomly designated shard.
  */
 Status dispatchPipelineAndMerge(OperationContext* opCtx,
-                                std::shared_ptr<executor::TaskExecutor>,
                                 AggregationTargeter targeter,
                                 Document serializedCommand,
                                 long long batchSize,

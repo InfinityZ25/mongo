@@ -66,7 +66,7 @@ public:
         StorageInterface* storageInterface,
         ReplicationProcess* replicationProcess);
     virtual ~ReplicationCoordinatorExternalStateImpl();
-    virtual void startThreads(const ReplSettings& settings) override;
+    virtual void startThreads() override;
     virtual void startSteadyStateReplication(OperationContext* opCtx,
                                              ReplicationCoordinator* replCoord) override;
     virtual void stopDataReplication(OperationContext* opCtx) override;
@@ -78,11 +78,12 @@ public:
     virtual void clearAppliedThroughIfCleanShutdown(OperationContext* opCtx);
 
     virtual executor::TaskExecutor* getTaskExecutor() const override;
+    std::shared_ptr<executor::TaskExecutor> getSharedTaskExecutor() const override;
     virtual ThreadPool* getDbWorkThreadPool() const override;
     virtual Status initializeReplSetStorage(OperationContext* opCtx, const BSONObj& config);
     void onDrainComplete(OperationContext* opCtx) override;
     OpTime onTransitionToPrimary(OperationContext* opCtx) override;
-    virtual void forwardSlaveProgress();
+    virtual void forwardSecondaryProgress();
     virtual bool isSelf(const HostAndPort& host, ServiceContext* service);
     Status createLocalLastVoteCollection(OperationContext* opCtx) final;
     virtual StatusWith<BSONObj> loadLocalConfigDocument(OperationContext* opCtx);
@@ -102,9 +103,9 @@ public:
     virtual void stopProducer();
     virtual void startProducerIfStopped();
     virtual bool tooStale();
-    void dropAllSnapshots() final;
+    void clearCommittedSnapshot() final;
     void updateCommittedSnapshot(const OpTime& newCommitPoint) final;
-    void updateLocalSnapshot(const OpTime& optime) final;
+    void updateLastAppliedSnapshot(const OpTime& optime) final;
     virtual bool snapshotsEnabled() const;
     virtual void notifyOplogMetadataWaiters(const OpTime& committedOpTime);
     boost::optional<OpTime> getEarliestDropPendingOpTime() const final;
@@ -220,7 +221,7 @@ private:
     long long _nextThreadId = 0;
 
     // Task executor used to run replication tasks.
-    std::unique_ptr<executor::TaskExecutor> _taskExecutor;
+    std::shared_ptr<executor::TaskExecutor> _taskExecutor;
 
     // Used by repl::applyOplogBatch() to apply the sync source's operations in parallel.
     // Also used by database and collection cloners to perform storage operations.

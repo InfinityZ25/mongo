@@ -66,10 +66,11 @@ BSONObj InternalSchemaUniqueItemsMatchExpression::getSerializedRightHandSide() c
 }
 
 std::unique_ptr<MatchExpression> InternalSchemaUniqueItemsMatchExpression::shallowClone() const {
-    auto clone = std::make_unique<InternalSchemaUniqueItemsMatchExpression>(path());
+    auto clone =
+        std::make_unique<InternalSchemaUniqueItemsMatchExpression>(path(), _errorAnnotation);
     if (getTag()) {
         clone->setTag(getTag()->clone());
     }
-    return std::move(clone);
+    return clone;
 }
 }  // namespace mongo

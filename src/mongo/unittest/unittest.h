@@ -49,8 +49,7 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
-#include "mongo/logger/logstream_builder.h"
-#include "mongo/logger/message_log_domain.h"
+#include "mongo/logv2/log_debug.h"
 #include "mongo/logv2/log_detail.h"
 #include "mongo/unittest/bson_test_util.h"
 #include "mongo/unittest/unittest_helpers.h"
@@ -281,7 +280,7 @@
 
 #define ASSERT_STRING_SEARCH_REGEX(BIG_STRING, REGEX)                                           \
     if (auto tup_ = std::tuple(std::string(BIG_STRING), std::string(REGEX));                    \
-        pcrecpp::RE(std::get<1>(tup_)).PartialMatch(std::get<0>(tup_))) {                       \
+        ::mongo::unittest::searchRegex(std::get<1>(tup_), std::get<0>(tup_))) {                 \
     } else                                                                                      \
         FAIL(([&] {                                                                             \
             const auto& [haystack, sub] = tup_;                                                 \
@@ -345,6 +344,8 @@
     UnitTest_SuiteName##SUITE_NAME##TestName##TEST_NAME
 
 namespace mongo::unittest {
+
+bool searchRegex(const std::string& pattern, const std::string& string);
 
 class Result;
 
@@ -506,12 +507,22 @@ public:
     /**
      * Called on the test object before running the test.
      */
-    virtual void setUp() {}
+    virtual void setUp() {
+        // React to any tasserts in the unittest framework initialisation, or between tests.
+        checkForTripwireAssertions();
+        // Clear tasserts for the code that's about to be under test.
+        assertionCount.tripwire.store(0);
+    }
 
     /**
      * Called on the test object after running the test.
      */
-    virtual void tearDown() {}
+    virtual void tearDown() {
+        // React to any tasserts in the code that was under test.
+        checkForTripwireAssertions();
+        // Clear tasserts in case of any between tests, or during the unittest framework shutdown.
+        assertionCount.tripwire.store(0);
+    }
 
 protected:
     /**
@@ -575,7 +586,7 @@ protected:
      * the last call to startCapturingLogMessages() in this test.
      */
     const std::vector<std::string>& getCapturedTextFormatLogMessages() const;
-    const std::vector<BSONObj> getCapturedBSONFormatLogMessages() const;
+    std::vector<BSONObj> getCapturedBSONFormatLogMessages() const;
 
     /**
      * Returns the number of collected log lines containing "needle".
@@ -595,7 +606,7 @@ protected:
      * If a BSON Element is undefined, it simply checks for its existence, not its type or value.
      * This allows callers to test for the existence of elements in variable length log lines.
      */
-    int64_t countBSONFormatLogLinesIsSubset(const BSONObj needle);
+    int64_t countBSONFormatLogLinesIsSubset(const BSONObj& needle);
 
     /**
      * Prints the captured log lines.

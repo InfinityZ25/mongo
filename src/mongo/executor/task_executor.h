@@ -40,6 +40,7 @@
 #include "mongo/executor/remote_command_response.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/transport/baton.h"
+#include "mongo/util/cancelation.h"
 #include "mongo/util/future.h"
 #include "mongo/util/out_of_line_executor.h"
 #include "mongo/util/time_support.h"
@@ -71,11 +72,18 @@ struct ConnectionPoolStats;
  * If an event is unsignaled when shutdown is called, the executor will ensure that any threads
  * blocked in waitForEvent() eventually return.
  */
-class TaskExecutor : public OutOfLineExecutor {
+class TaskExecutor : public OutOfLineExecutor, public std::enable_shared_from_this<TaskExecutor> {
     TaskExecutor(const TaskExecutor&) = delete;
     TaskExecutor& operator=(const TaskExecutor&) = delete;
 
 public:
+    /**
+     * Error status that should be used by implementations of TaskExecutor when
+     * a callback is canceled.
+     */
+    static const inline Status kCallbackCanceledErrorStatus{ErrorCodes::CallbackCanceled,
+                                                            "Callback canceled"};
+
     struct CallbackArgs;
     struct RemoteCommandCallbackArgs;
     struct RemoteCommandOnAnyCallbackArgs;
@@ -148,6 +156,11 @@ public:
     virtual SharedSemiFuture<void> joinAsync() = 0;
 
     /**
+     * Returns true if the executor is no longer active (i.e, no longer new tasks can be scheduled).
+     */
+    virtual bool isShuttingDown() const = 0;
+
+    /**
      * Writes diagnostic information into "b".
      */
     virtual void appendDiagnosticBSON(BSONObjBuilder* b) const = 0;
@@ -213,6 +226,10 @@ public:
                                                      Date_t deadline = Date_t::max()) = 0;
 
 
+    /**
+     * Schedules the given Task to run in this executor.
+     * Note that 'func' is implicitly noexcept and should not ever leak exceptions.
+     */
     void schedule(OutOfLineExecutor::Task func) final override;
 
     /**
@@ -224,6 +241,8 @@ public:
      * error, make sure it is an actual CallbackFn, not a lambda or other value that implicitly
      * converts to CallbackFn, since such a value would be moved from and invalidated during
      * conversion with no way to recover it.
+     *
+     * "work" should be considered implicitly 'noexcept' and thus should not throw any exceptions.
      *
      * May be called by client threads or callbacks running in the executor.
      *
@@ -244,12 +263,39 @@ public:
      * converts to CallbackFn, since such a value would be moved from and invalidated during
      * conversion with no way to recover it.
      *
+     * "work" should be considered implicitly 'noexcept' and thus should not throw any exceptions.
+     *
      * May be called by client threads or callbacks running in the executor.
      *
      * Contract: Implementations should guarantee that callback should be called *after* doing any
      * processing related to the callback.
      */
     virtual StatusWith<CallbackHandle> scheduleWorkAt(Date_t when, CallbackFn&& work) = 0;
+
+    /**
+     * Returns an ExecutorFuture that will be resolved with success when the given date is reached.
+     *
+     * If the executor is already shut down when this is called, the resulting future will be set
+     * with ErrorCodes::ShutdownInProgress.
+     *
+     * Otherwise, if the executor shuts down or the token is canceled prior to the deadline being
+     * reached, the resulting ExecutorFuture will be set with ErrorCodes::CallbackCanceled.
+     */
+    ExecutorFuture<void> sleepUntil(Date_t when, const CancelationToken& token);
+
+    /**
+     * Returns an ExecutorFuture that will be resolved with success after the given duration has
+     * passed.
+     *
+     * If the executor is already shut down when this is called, the resulting future will be set
+     * with ErrorCodes::ShutdownInProgress.
+     *
+     * Otherwise, if the executor shuts down or the token is canceled prior to the deadline being
+     * reached, the resulting ExecutorFuture will be set with ErrorCodes::CallbackCanceled.
+     */
+    ExecutorFuture<void> sleepFor(Milliseconds duration, const CancelationToken& token) {
+        return sleepUntil(now() + duration, token);
+    }
 
     /**
      * Schedules "cb" to be run by the executor with the result of executing the remote command
@@ -267,10 +313,31 @@ public:
                                                              const RemoteCommandCallbackFn& cb,
                                                              const BatonHandle& baton = nullptr);
 
+    /**
+     * Schedules the given request to be sent and returns a future containing the response. The
+     * resulting future will be set with an error only if there is a failure to send the request.
+     * Errors from the remote node will be contained in the ResponseStatus object.
+     *
+     * The input CancelationToken may be used to cancel sending the request. There is no guarantee
+     * that this will succeed in canceling the request and the resulting ExecutorFuture may contain
+     * either success or error. If cancelation is successful, the resulting ExecutorFuture will be
+     * set with an error.
+     */
+    ExecutorFuture<TaskExecutor::ResponseStatus> scheduleRemoteCommand(
+        const RemoteCommandRequest& request,
+        const CancelationToken& token,
+        const BatonHandle& baton = nullptr);
+
     virtual StatusWith<CallbackHandle> scheduleRemoteCommandOnAny(
         const RemoteCommandRequestOnAny& request,
         const RemoteCommandOnAnyCallbackFn& cb,
         const BatonHandle& baton = nullptr) = 0;
+
+    ExecutorFuture<TaskExecutor::ResponseOnAnyStatus> scheduleRemoteCommandOnAny(
+        const RemoteCommandRequestOnAny& request,
+        const CancelationToken& token,
+        const BatonHandle& baton = nullptr);
+
 
     /**
      * Schedules "cb" to be run by the executor on each reply recevied from executing the exhaust

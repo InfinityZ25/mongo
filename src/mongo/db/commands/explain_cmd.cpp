@@ -53,6 +53,10 @@ class CmdExplain final : public Command {
 public:
     CmdExplain() : Command("explain") {}
 
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
+
     std::unique_ptr<CommandInvocation> parse(OperationContext* opCtx,
                                              const OpMsgRequest& request) override;
 
@@ -69,6 +73,10 @@ public:
 
     bool adminOnly() const override {
         return false;
+    }
+
+    bool collectsResourceConsumptionMetrics() const override {
+        return true;
     }
 
     std::string help() const override {
@@ -145,6 +153,9 @@ std::unique_ptr<CommandInvocation> CmdExplain::parse(OperationContext* opCtx,
     CommandHelpers::uassertNoDocumentSequences(getName(), request);
     std::string dbname = request.getDatabase().toString();
     const BSONObj& cmdObj = request.body;
+    uassert(ErrorCodes::FailedToParse,
+            "Unrecognized field 'jsonSchema'. This command may be meant for a mongocryptd process.",
+            !cmdObj.hasField("jsonSchema"_sd));
     ExplainOptions::Verbosity verbosity = uassertStatusOK(ExplainOptions::parseCmdBSON(cmdObj));
     uassert(ErrorCodes::BadValue,
             "explain command requires a nested object",

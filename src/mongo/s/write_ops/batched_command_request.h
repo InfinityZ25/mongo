@@ -35,7 +35,8 @@
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/s/chunk_version.h"
-#include "mongo/s/database_version_helpers.h"
+#include "mongo/s/database_version.h"
+#include "mongo/util/visit_helper.h"
 
 namespace mongo {
 
@@ -133,20 +134,12 @@ public:
         return *_dbVersion;
     }
 
-    void setRuntimeConstants(RuntimeConstants runtimeConstants) {
-        invariant(_updateReq);
-        _updateReq->setRuntimeConstants(std::move(runtimeConstants));
-    }
+    void setLegacyRuntimeConstants(LegacyRuntimeConstants runtimeConstants);
 
-    bool hasRuntimeConstants() const {
-        invariant(_updateReq);
-        return _updateReq->getRuntimeConstants().has_value();
-    }
+    bool hasLegacyRuntimeConstants() const;
 
-    const boost::optional<RuntimeConstants>& getRuntimeConstants() const {
-        invariant(_updateReq);
-        return _updateReq->getRuntimeConstants();
-    }
+    const boost::optional<LegacyRuntimeConstants>& getLegacyRuntimeConstants() const;
+    const boost::optional<BSONObj>& getLet() const;
 
     const write_ops::WriteCommandBase& getWriteCommandBase() const;
     void setWriteCommandBase(write_ops::WriteCommandBase writeCommandBase);
@@ -167,6 +160,12 @@ public:
      * Generates a new request, the same as the old, but with insert _ids if required.
      */
     static BatchedCommandRequest cloneInsertWithIds(BatchedCommandRequest origCmdRequest);
+
+    /** These are used to return empty refs from Insert ops that don't carry runtimeConstants
+     * or let parameters in getLet and getLegacyRuntimeConstants.
+     */
+    const static boost::optional<LegacyRuntimeConstants> kEmptyRuntimeConstants;
+    const static boost::optional<BSONObj> kEmptyLet;
 
 private:
     template <typename Req, typename F, typename... As>
@@ -222,13 +221,20 @@ public:
     const auto& getDocument() const {
         return _request.getInsertRequest().getDocuments()[_index];
     }
-
     const auto& getUpdate() const {
         return _request.getUpdateRequest().getUpdates()[_index];
     }
 
     const auto& getDelete() const {
         return _request.getDeleteRequest().getDeletes()[_index];
+    }
+
+    auto& getLet() const {
+        return _request.getLet();
+    }
+
+    auto& getLegacyRuntimeConstants() const {
+        return _request.getLegacyRuntimeConstants();
     }
 
 private:

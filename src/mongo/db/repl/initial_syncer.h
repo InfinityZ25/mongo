@@ -52,6 +52,7 @@
 #include "mongo/db/repl/rollback_checker.h"
 #include "mongo/db/repl/sync_source_selector.h"
 #include "mongo/dbtests/mock/mock_dbclient_connection.h"
+#include "mongo/executor/scoped_task_executor.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/util/concurrency/thread_pool.h"
@@ -81,8 +82,7 @@ struct InitialSyncerOptions {
     using GetMyLastOptimeFn = std::function<OpTime()>;
 
     /** Function to update optime of last operation applied on this node */
-    using SetMyLastOptimeFn = std::function<void(
-        const OpTimeAndWallTime&, ReplicationCoordinator::DataConsistency consistency)>;
+    using SetMyLastOptimeFn = std::function<void(const OpTimeAndWallTime&)>;
 
     /** Function to reset all optimes on this node (e.g. applied & durable). */
     using ResetOptimesFn = std::function<void()>;
@@ -152,23 +152,6 @@ public:
      * Used for testing only.
      */
     using CreateClientFn = std::function<std::unique_ptr<DBClientConnection>()>;
-
-    /**
-     * Type of function to create an OplogFetcher.
-     */
-    using CreateOplogFetcherFn = std::function<std::unique_ptr<OplogFetcher>(
-        executor::TaskExecutor* executor,
-        OpTime lastFetched,
-        HostAndPort source,
-        ReplSetConfig config,
-        std::unique_ptr<OplogFetcher::OplogFetcherRestartDecision> oplogFetcherRestartDecision,
-        int requiredRBID,
-        bool requireFresherSyncSource,
-        DataReplicatorExternalState* dataReplicatorExternalState,
-        OplogFetcher::EnqueueDocumentsFn enqueueDocumentsFn,
-        OplogFetcher::OnShutdownCallbackFn onShutdownCallbackFn,
-        const int batchSize,
-        OplogFetcher::StartingPoint startingPoint)>;
 
     struct InitialSyncAttemptInfo {
         int durationMillis;
@@ -276,7 +259,7 @@ public:
      *
      * For testing only.
      */
-    void setCreateOplogFetcherFn_forTest(const CreateOplogFetcherFn& createOplogFetcherFn);
+    void setCreateOplogFetcherFn_forTest(std::unique_ptr<OplogFetcherFactory> createOplogFetcherFn);
 
     /**
      *
@@ -296,7 +279,7 @@ public:
      *
      * For testing only
      */
-    void setClonerExecutor_forTest(executor::TaskExecutor* clonerExec);
+    void setClonerExecutor_forTest(std::shared_ptr<executor::TaskExecutor> clonerExec);
 
     /**
      *
@@ -711,15 +694,17 @@ private:
     mutable Mutex _mutex = MONGO_MAKE_LATCH("InitialSyncer::_mutex");           // (S)
     const InitialSyncerOptions _opts;                                           // (R)
     std::unique_ptr<DataReplicatorExternalState> _dataReplicatorExternalState;  // (R)
-    executor::TaskExecutor* _exec;                                              // (R)
+    std::shared_ptr<executor::TaskExecutor> _exec;                              // (R)
+    std::unique_ptr<executor::ScopedTaskExecutor> _attemptExec;                 // (X)
     // The executor that the Cloner thread runs on.  In production code this is the same as _exec,
     // but for unit testing, _exec is single-threaded and our NetworkInterfaceMock runs it in
     // lockstep with the unit test code.  If we pause the cloners using failpoints
     // NetworkInterfaceMock is unaware of this and this causes our unit tests to deadlock.
-    executor::TaskExecutor* _clonerExec;      // (R)
-    ThreadPool* _writerPool;                  // (R)
-    StorageInterface* _storage;               // (R)
-    ReplicationProcess* _replicationProcess;  // (S)
+    std::shared_ptr<executor::TaskExecutor> _clonerExec;               // (R)
+    std::unique_ptr<executor::ScopedTaskExecutor> _clonerAttemptExec;  // (X)
+    ThreadPool* _writerPool;                                           // (R)
+    StorageInterface* _storage;                                        // (R)
+    ReplicationProcess* _replicationProcess;                           // (S)
 
     // This is invoked with the final status of the initial sync. If startup() fails, this callback
     // is never invoked. The caller gets the last applied optime when the initial sync completes
@@ -773,7 +758,7 @@ private:
     CreateClientFn _createClientFn;
 
     // Used to create the OplogFetcher for the InitialSyncer.
-    CreateOplogFetcherFn _createOplogFetcherFn;
+    std::unique_ptr<OplogFetcherFactory> _createOplogFetcherFn;
 
     // Contains stats on the current initial sync request (includes all attempts).
     // To access these stats in a user-readable format, use getInitialSyncProgress().
@@ -785,6 +770,9 @@ private:
     // Amount of time an outage is allowed to continue before the initial sync attempt is marked
     // as failed.
     Milliseconds _allowedOutageDuration;  // (M)
+
+    // The initial sync attempt has been canceled
+    bool _attemptCanceled = false;  // (X)
 };
 
 }  // namespace repl

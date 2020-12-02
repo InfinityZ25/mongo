@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -36,10 +36,11 @@
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/service_context.h"
-#include "mongo/logger/log_severity_limiter.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_severity_suppressor.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/scopeguard.h"
@@ -146,6 +147,21 @@ void LogicalSessionCacheImpl::_periodicReap(Client* client) {
 }
 
 Status LogicalSessionCacheImpl::_reap(Client* client) {
+    boost::optional<ServiceContext::UniqueOperationContext> uniqueCtx;
+    auto* const opCtx = [&] {
+        if (client->getOperationContext()) {
+            return client->getOperationContext();
+        }
+
+        uniqueCtx.emplace(client->makeOperationContext());
+        return uniqueCtx->get();
+    }();
+
+    const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    if (replCoord && replCoord->isReplEnabled() && replCoord->getMemberState().arbiter()) {
+        return Status::OK();
+    }
+
     // Take the lock to update some stats.
     {
         stdx::lock_guard<Latch> lk(_mutex);
@@ -158,16 +174,6 @@ Status LogicalSessionCacheImpl::_reap(Client* client) {
         _stats.setLastTransactionReaperJobTimestamp(_service->now());
         _stats.setTransactionReaperJobCount(_stats.getTransactionReaperJobCount() + 1);
     }
-
-    boost::optional<ServiceContext::UniqueOperationContext> uniqueCtx;
-    auto* const opCtx = [&] {
-        if (client->getOperationContext()) {
-            return client->getOperationContext();
-        }
-
-        uniqueCtx.emplace(client->makeOperationContext());
-        return uniqueCtx->get();
-    }();
 
     int numReaped = 0;
 
@@ -216,6 +222,22 @@ Status LogicalSessionCacheImpl::_reap(Client* client) {
 }
 
 void LogicalSessionCacheImpl::_refresh(Client* client) {
+    // get or make an opCtx
+    boost::optional<ServiceContext::UniqueOperationContext> uniqueCtx;
+    auto* const opCtx = [&client, &uniqueCtx] {
+        if (client->getOperationContext()) {
+            return client->getOperationContext();
+        }
+
+        uniqueCtx.emplace(client->makeOperationContext());
+        return uniqueCtx->get();
+    }();
+
+    const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    if (replCoord && replCoord->isReplEnabled() && replCoord->getMemberState().arbiter()) {
+        return;
+    }
+
     // Stats for serverStatus:
     {
         stdx::lock_guard<Latch> lk(_mutex);
@@ -237,17 +259,6 @@ void LogicalSessionCacheImpl::_refresh(Client* client) {
         auto millis = _service->now() - _stats.getLastSessionsCollectionJobTimestamp();
         _stats.setLastSessionsCollectionJobDurationMillis(millis.count());
     });
-
-    // get or make an opCtx
-    boost::optional<ServiceContext::UniqueOperationContext> uniqueCtx;
-    auto* const opCtx = [&client, &uniqueCtx] {
-        if (client->getOperationContext()) {
-            return client->getOperationContext();
-        }
-
-        uniqueCtx.emplace(client->makeOperationContext());
-        return uniqueCtx->get();
-    }();
 
     ON_BLOCK_EXIT([&opCtx] { clearShardingOperationFailedStatus(opCtx); });
 
@@ -386,10 +397,12 @@ Status LogicalSessionCacheImpl::_addToCacheIfNotFull(WithLock, LogicalSessionRec
                              << "Unable to add session ID " << record.getId()
                              << " into the cache because the number of active sessions is too "
                                 "high"};
-        auto severity =
-            MONGO_GET_LIMITED_SEVERITY(ErrorCodes::TooManyLogicalSessions, Seconds{1}, 0, 2);
+        // Returns Info() unless it was called in the past second.
+        // In that case it will return the quieter Debug(2) */
+        static auto& bumpedSeverity = *new logv2::SeveritySuppressor{
+            Seconds{1}, logv2::LogSeverity::Info(), logv2::LogSeverity::Debug(2)};
         LOGV2_DEBUG(20715,
-                    logSeverityV1toV2(severity).toInt(),
+                    bumpedSeverity().toInt(),
                     "Unable to add session {sessionId} into the cache, too many active sessions: "
                     "{sessionCount}, maximum: {maxSessions}",
                     "Unable to add session into the cache, too many active sessions",

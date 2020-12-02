@@ -2,13 +2,12 @@
  * Verify that a force replica set reconfig skips the oplog commitment check. The force reconfig
  * should succeed even though oplog entries committed in the previous config are not committed in
  * the current config.
- *
- * @tags: [requires_fcv_44]
  */
 
 (function() {
 "use strict";
 load("jstests/libs/write_concern_util.js");
+load("jstests/replsets/rslib.js");  // For reconnect.
 
 const dbName = "test";
 const collName = "coll";
@@ -31,6 +30,8 @@ rst.awaitReplication();
 
 // Stop replication on the secondary.
 stopServerReplication(secondary);
+// Avoid closing the connection when the secondary node transitions to REMOVED.
+assert.commandWorked(secondary.adminCommand({hello: 1, hangUpOnStepDown: false}));
 
 // Reconfig down to a 1 node replica set.
 const origConfig = rst.getReplSetConfigFromNode();
@@ -38,6 +39,13 @@ let C1 = Object.assign({}, origConfig);
 C1.members = C1.members.slice(0, 1);  // Remove the second node.
 C1.version++;
 assert.commandWorked(primary.adminCommand({replSetReconfig: C1}));
+
+// Wait for the secondary node to realize it is REMOVED.
+assert.soonNoExcept(function() {
+    let res = secondary.adminCommand({replSetGetStatus: 1});
+    assert.commandFailedWithCode(res, ErrorCodes.InvalidReplicaSetConfig);
+    return true;
+}, () => tojson(secondary.adminCommand({replSetGetStatus: 1})));
 
 jsTestLog("Test that force reconfig skips oplog commitment.");
 let C2 = Object.assign({}, origConfig);
@@ -54,8 +62,6 @@ const C3 = primary.getDB("local").system.replset.findOne();
 // Run another force reconfig to verify the pre-condition check is also skipped
 assert.commandWorked(primary.adminCommand({replSetReconfig: C3, force: true}));
 
-// Make sure we can connect to the secondary after it was REMOVED.
-reconnect(secondary);
 restartServerReplication(secondary);
 rst.awaitNodesAgreeOnConfigVersion();
 

@@ -331,7 +331,7 @@ err:
         __wt_cond_signal(session, S2C(session)->sweep_cond);
 
     if (ret != 0)
-        WT_PANIC_RET(session, ret, "failed to apply or unroll all tracked operations");
+        WT_RET_PANIC(session, ret, "failed to apply or unroll all tracked operations");
     return (saved_ret == 0 ? 0 : saved_ret);
 }
 
@@ -518,10 +518,11 @@ __wt_meta_track_init(WT_SESSION_IMPL *session)
           conn, "metadata-ckpt", false, WT_SESSION_NO_DATA_HANDLES, &conn->meta_ckpt_session));
 
         /*
-         * Sessions default to read-committed isolation, we rely on that for the correctness of
-         * metadata checkpoints.
+         * Set session transaction isolation to read-committed isolation, we rely on that for the
+         * correctness of metadata checkpoints.
          */
-        WT_ASSERT(session, conn->meta_ckpt_session->txn->isolation == WT_ISO_READ_COMMITTED);
+        conn->meta_ckpt_session->isolation = conn->meta_ckpt_session->txn->isolation =
+          WT_ISO_READ_COMMITTED;
     }
 
     return (0);
@@ -536,14 +537,12 @@ __wt_meta_track_destroy(WT_SESSION_IMPL *session)
 {
     WT_CONNECTION_IMPL *conn;
     WT_DECL_RET;
-    WT_SESSION *wt_session;
 
     conn = S2C(session);
 
     /* Close the session used for metadata checkpoints. */
     if (conn->meta_ckpt_session != NULL) {
-        wt_session = &conn->meta_ckpt_session->iface;
-        WT_TRET(wt_session->close(wt_session, NULL));
+        WT_TRET(__wt_session_close_internal(conn->meta_ckpt_session));
         conn->meta_ckpt_session = NULL;
     }
 

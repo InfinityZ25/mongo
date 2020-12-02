@@ -230,7 +230,14 @@ TEST_F(LogicalSessionIdTest, GenWithMultipleAuthedUsers) {
     addSimpleUser(UserName("simple", "test"));
     addSimpleUser(UserName("simple", "test2"));
 
-    ASSERT_THROWS(makeLogicalSessionId(_opCtx.get()), AssertionException);
+    ASSERT_THROWS_WITH_CHECK(makeLogicalSessionId(_opCtx.get()),
+                             AssertionException,
+                             [](const AssertionException& exception) {
+                                 ASSERT_EQ(exception.code(), ErrorCodes::Unauthorized);
+                                 ASSERT_STRING_CONTAINS(
+                                     exception.reason(),
+                                     "docs.mongodb.com/manual/core/authentication");
+                             });
 }
 
 TEST_F(LogicalSessionIdTest, GenWithoutAuthedUser) {
@@ -239,7 +246,7 @@ TEST_F(LogicalSessionIdTest, GenWithoutAuthedUser) {
 
 TEST_F(LogicalSessionIdTest, InitializeOperationSessionInfo_NoSessionIdNoTransactionNumber) {
     addSimpleUser(UserName("simple", "test"));
-    initializeOperationSessionInfo(_opCtx.get(), BSON("TestCmd" << 1), true, true, true, true);
+    initializeOperationSessionInfo(_opCtx.get(), BSON("TestCmd" << 1), true, true, true);
 
     ASSERT(!_opCtx->getLogicalSessionId());
     ASSERT(!_opCtx->getTxnNumber());
@@ -253,7 +260,6 @@ TEST_F(LogicalSessionIdTest, InitializeOperationSessionInfo_SessionIdNoTransacti
     initializeOperationSessionInfo(_opCtx.get(),
                                    BSON("TestCmd" << 1 << "lsid" << lsid.toBSON() << "OtherField"
                                                   << "TestField"),
-                                   true,
                                    true,
                                    true,
                                    true);
@@ -272,7 +278,6 @@ TEST_F(LogicalSessionIdTest, InitializeOperationSessionInfo_MissingSessionIdWith
                                                       << "TestField"),
                                        true,
                                        true,
-                                       true,
                                        true),
         AssertionException,
         ErrorCodes::InvalidOptions);
@@ -287,7 +292,6 @@ TEST_F(LogicalSessionIdTest, InitializeOperationSessionInfo_SessionIdAndTransact
                                    BSON("TestCmd" << 1 << "lsid" << lsid.toBSON() << "txnNumber"
                                                   << 100LL << "OtherField"
                                                   << "TestField"),
-                                   true,
                                    true,
                                    true,
                                    true);
@@ -311,25 +315,6 @@ TEST_F(LogicalSessionIdTest, InitializeOperationSessionInfo_IsReplSetMemberOrMon
                                                       << "TestField"),
                                        true,
                                        true,
-                                       false,
-                                       true),
-        AssertionException,
-        ErrorCodes::IllegalOperation);
-}
-
-TEST_F(LogicalSessionIdTest, InitializeOperationSessionInfo_SupportsDocLockingFalse) {
-    addSimpleUser(UserName("simple", "test"));
-    LogicalSessionFromClient lsid;
-    lsid.setId(UUID::gen());
-
-    ASSERT_THROWS_CODE(
-        initializeOperationSessionInfo(_opCtx.get(),
-                                       BSON("TestCmd" << 1 << "lsid" << lsid.toBSON() << "txnNumber"
-                                                      << 100LL << "OtherField"
-                                                      << "TestField"),
-                                       true,
-                                       true,
-                                       true,
                                        false),
         AssertionException,
         ErrorCodes::IllegalOperation);
@@ -346,7 +331,6 @@ TEST_F(LogicalSessionIdTest, InitializeOperationSessionInfo_IgnoresInfoIfNoCache
         _opCtx.get(),
         BSON("TestCmd" << 1 << "lsid" << lsid.toBSON() << "txnNumber" << 100LL << "OtherField"
                        << "TestField"),
-        true,
         true,
         true,
         true);
@@ -367,7 +351,6 @@ TEST_F(LogicalSessionIdTest, InitializeOperationSessionInfo_IgnoresInfoIfDoNotAt
                        << "TestField"),
         true,
         false,
-        true,
         true);
 
     ASSERT(sessionInfo.getSessionId() == boost::none);
@@ -392,7 +375,6 @@ TEST_F(LogicalSessionIdTest, InitializeOperationSessionInfo_VerifyUIDEvenIfDoNot
                            BSON("TestCmd" << 1 << "lsid" << lsid.toBSON() << "txnNumber" << 100LL),
                            true,
                            false,
-                           true,
                            true),
                        AssertionException,
                        ErrorCodes::Unauthorized);
@@ -413,10 +395,10 @@ TEST_F(LogicalSessionIdTest, InitializeOperationSessionInfo_SendingInfoFailsInDi
                                              << "foo");
         commandBuilder.appendElements(param);
 
-        ASSERT_THROWS_CODE(initializeOperationSessionInfo(
-                               _opCtx.get(), commandBuilder.obj(), true, true, true, true),
-                           AssertionException,
-                           50891);
+        ASSERT_THROWS_CODE(
+            initializeOperationSessionInfo(_opCtx.get(), commandBuilder.obj(), true, true, true),
+            AssertionException,
+            50891);
     }
 
     _opCtx->getClient()->setInDirectClient(false);
@@ -443,7 +425,6 @@ TEST_F(LogicalSessionIdTest, MultipleUsersPerSessionIsNotAllowed) {
     ASSERT_THROWS_CODE(initializeOperationSessionInfo(
                            _opCtx.get(),
                            BSON("TestCmd" << 1 << "lsid" << lsid.toBSON() << "txnNumber" << 100LL),
-                           true,
                            true,
                            true,
                            true),

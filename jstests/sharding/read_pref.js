@@ -1,10 +1,11 @@
 /**
- * Integration test for read preference and tagging. The more comprehensive unit test can be found
- * in dbtests/scanning_replica_set_monitor_test.cpp.
+ * Integration test for read preference and tagging.
  */
 
-// Checking UUID consistency involves talking to a shard node, which in this test is shutdown
+// This test shuts down a shard's node and because of this consistency checking
+// cannot be performed on that node, which causes the consistency checker to fail.
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
+TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 TestData.skipCheckOrphans = true;
 
 (function() {
@@ -127,14 +128,14 @@ var doTest = function(useDollarQuerySyntax) {
         return serverInfo.host + ":" + serverInfo.port.toString();
     };
 
-    // Read pref should work without slaveOk
+    // Read pref should work without secondaryOk
     var explain = getExplain("secondary");
     var explainServer = getExplainServer(explain);
     assert.neq(primaryNode.name, explainServer);
 
-    conn.setSlaveOk();
+    conn.setSecondaryOk();
 
-    // It should also work with slaveOk
+    // It should also work with secondaryOk
     explain = getExplain("secondary");
     explainServer = getExplainServer(explain);
     assert.neq(primaryNode.name, explainServer);

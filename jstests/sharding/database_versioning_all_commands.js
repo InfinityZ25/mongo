@@ -5,7 +5,7 @@
 (function() {
 'use strict';
 
-load('jstests/sharding/libs/last_stable_mongos_commands.js');
+load('jstests/sharding/libs/last_lts_mongos_commands.js');
 
 function getNewDbName(dbName) {
     if (!getNewDbName.counter) {
@@ -451,6 +451,7 @@ let testCases = {
     grantPrivilegesToRole: {skip: "always targets the config server"},
     grantRolesToRole: {skip: "always targets the config server"},
     grantRolesToUser: {skip: "always targets the config server"},
+    hello: {skip: "executes locally on mongos (not sent to any remote node)"},
     hostInfo: {skip: "executes locally on mongos (not sent to any remote node)"},
     insert: {
         run: {
@@ -489,6 +490,7 @@ let testCases = {
     },
     listShards: {skip: "does not forward command to primary shard"},
     logApplicationMessage: {skip: "not on a user database", conditional: true},
+    logMessage: {skip: "not on a user database"},
     logRotate: {skip: "executes locally on mongos (not sent to any remote node)"},
     logout: {skip: "not on a user database"},
     mapReduce: {
@@ -591,10 +593,12 @@ let testCases = {
     },
     replSetGetStatus: {skip: "not supported in mongos"},
     resetError: {skip: "not on a user database"},
+    reshardCollection: {skip: "does not forward command to primary shard"},
     revokePrivilegesFromRole: {skip: "always targets the config server"},
     revokeRolesFromRole: {skip: "always targets the config server"},
     revokeRolesFromUser: {skip: "always targets the config server"},
     rolesInfo: {skip: "always targets the config server"},
+    rotateCertificates: {skip: "executes locally on mongos (not sent to any remote node)"},
     saslContinue: {skip: "not on a user database"},
     saslStart: {skip: "not on a user database"},
     serverStatus: {skip: "executes locally on mongos (not sent to any remote node)"},
@@ -624,6 +628,11 @@ let testCases = {
     startRecordingTraffic: {skip: "executes locally on mongos (not sent to any remote node)"},
     startSession: {skip: "executes locally on mongos (not sent to any remote node)"},
     stopRecordingTraffic: {skip: "executes locally on mongos (not sent to any remote node)"},
+    testDeprecation: {skip: "executes locally on mongos (not sent to any remote node)"},
+    testDeprecationInVersion2: {skip: "executes locally on mongos (not sent to any remote node)"},
+    testRemoval: {skip: "executes locally on mongos (not sent to any remote node)"},
+    testVersion2: {skip: "executes locally on mongos (not sent to any remote node)"},
+    testVersions1And2: {skip: "executes locally on mongos (not sent to any remote node)"},
     update: {
         run: {
             sendsDbVersion: true,
@@ -663,8 +672,8 @@ let testCases = {
     whatsmyuri: {skip: "executes locally on mongos (not sent to any remote node)"},
 };
 
-commandsRemovedFromMongosIn46.forEach(function(cmd) {
-    testCases[cmd] = {skip: "must define test coverage for 4.6 backwards compatibility"};
+commandsRemovedFromMongosSinceLastLTS.forEach(function(cmd) {
+    testCases[cmd] = {skip: "must define test coverage for latest version backwards compatibility"};
 });
 
 const st = new ShardingTest({shards: 2, mongos: 2});
@@ -687,14 +696,15 @@ assert.commandWorked(listCommandsRes);
     // After iterating through all the existing commands, ensure there were no additional test cases
     // that did not correspond to any mongos command.
     for (let key of Object.keys(testCases)) {
-        // We have defined real test cases for commands added in 4.6 so that the test cases are
-        // exercised in the regular suites, but because these test cases can't run in the last
-        // stable suite, we skip processing them here to avoid failing the below assertion.
-        // We have defined "skip" test cases for commands removed in 4.6 so the test case is defined
-        // in last stable suites (in which these commands still exist on the mongos), but these test
-        // cases won't be run in regular suites, so we skip processing them below as well.
-        if (commandsAddedToMongosIn46.includes(key) ||
-            commandsRemovedFromMongosIn46.includes(key)) {
+        // We have defined real test cases for commands added since the last LTS version so that the
+        // test cases are exercised in the regular suites, but because these test cases can't run in
+        // the last stable suite, we skip processing them here to avoid failing the below assertion.
+        // We have defined "skip" test cases for commands removed since the last LTS version so the
+        // test case is defined in last stable suites (in which these commands still exist on the
+        // mongos), but these test cases won't be run in regular suites, so we skip processing them
+        // below as well.
+        if (commandsAddedToMongosSinceLastLTS.includes(key) ||
+            commandsRemovedFromMongosSinceLastLTS.includes(key)) {
             continue;
         }
         assert(testCases[key].validated || testCases[key].conditional,

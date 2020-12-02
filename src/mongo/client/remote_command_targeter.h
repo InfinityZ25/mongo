@@ -29,18 +29,14 @@
 
 #pragma once
 
+#include "mongo/base/status_with.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/client/read_preference.h"
 #include "mongo/util/future.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
-
-class ConnectionString;
-class OperationContext;
-struct ReadPreferenceSetting;
-struct HostAndPort;
-template <typename T>
-class StatusWith;
 
 /**
  * Interface encapsulating the targeting logic for a given replica set or a standalone host.
@@ -85,11 +81,11 @@ public:
         const ReadPreferenceSetting& readPref, Milliseconds maxWait) = 0;
 
     /**
-     * Reports to the targeter that a 'status' indicating a not master error was received when
+     * Reports to the targeter that a 'status' indicating a not primary error was received when
      * communicating with 'host', and so it should update its bookkeeping to avoid giving out the
      * host again on a subsequent request for the primary.
      */
-    virtual void markHostNotMaster(const HostAndPort& host, const Status& status) = 0;
+    virtual void markHostNotPrimary(const HostAndPort& host, const Status& status) = 0;
 
     /**
      * Reports to the targeter that a 'status' indicating a network error was received when trying
@@ -97,6 +93,13 @@ public:
      * host again on a subsequent request for the primary.
      */
     virtual void markHostUnreachable(const HostAndPort& host, const Status& status) = 0;
+
+    /**
+     * Reports to the targeter that a 'status' indicating a shutdown error was received when trying
+     * to communicate with 'host', and so it should update its bookkeeping to avoid giving out the
+     * host again on a subsequent request for the primary.
+     */
+    virtual void markHostShuttingDown(const HostAndPort& host, const Status& status) = 0;
 
 protected:
     RemoteCommandTargeter() = default;

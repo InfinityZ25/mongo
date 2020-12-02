@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -87,8 +87,7 @@ public:
             return true;
         }
 
-        AutoGetCollectionForReadCommand autoColl(opCtx, nss);
-        Collection* const collection = autoColl.getCollection();
+        AutoGetCollectionForReadCommand collection(opCtx, nss);
         if (!collection) {
             errmsg = "ns not found";
             return false;

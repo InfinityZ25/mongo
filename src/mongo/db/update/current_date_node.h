@@ -36,6 +36,8 @@
 
 namespace mongo {
 
+class ServiceContext;
+
 /**
  * Represents the application of a $currentDate to the value at the end of a path.
  */
@@ -55,7 +57,7 @@ public:
 
 protected:
     ModifyResult updateExistingElement(mutablebson::Element* element,
-                                       std::shared_ptr<FieldRef> elementPath) const final;
+                                       const FieldRef& elementPath) const final;
     void setValueForNewElement(mutablebson::Element* element) const final;
 
     bool allowCreation() const final {
@@ -71,6 +73,8 @@ private:
 
     // If true, the current date should be expressed as a Date. If false, a Timestamp.
     bool _typeIsDate;
+
+    ServiceContext* _service;
 };
 
 }  // namespace mongo

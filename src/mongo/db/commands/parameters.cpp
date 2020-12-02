@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -38,11 +38,11 @@
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/config.h"
 #include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/parameters_gen.h"
 #include "mongo/db/commands/parse_log_component_settings.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/idl/command_generic_argument.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/str.h"
 
@@ -360,23 +360,26 @@ public:
                 uassertStatusOK(foundParameter->second->set(parameter));
             } catch (const DBException& ex) {
                 LOGV2(20496,
-                      "error setting parameter {parameterName} to {newValue} errMsg: {ex}",
+                      "Error setting parameter {parameterName} to {newValue} errMsg: {error}",
+                      "Error setting parameter to new value",
                       "parameterName"_attr = parameterName,
                       "newValue"_attr = redact(parameter.toString(false)),
-                      "ex"_attr = redact(ex));
+                      "error"_attr = redact(ex));
                 throw;
             }
 
             if (oldValue) {
                 LOGV2(23435,
-                      "successfully set parameter {parameterName} to {newValue} (was "
+                      "Successfully set parameter {parameterName} to {newValue} (was "
                       "{oldValue})",
+                      "Successfully set parameter to new value",
                       "parameterName"_attr = parameterName,
                       "newValue"_attr = redact(parameter.toString(false)),
                       "oldValue"_attr = redact(oldValue.toString(false)));
             } else {
                 LOGV2(23436,
-                      "successfully set parameter {parameterName} to {newValue}",
+                      "Successfully set parameter {parameterName} to {newValue}",
+                      "Successfully set parameter to new value",
                       "parameterName"_attr = parameterName,
                       "newValue"_attr = redact(parameter.toString(false)));
             }

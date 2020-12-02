@@ -29,7 +29,6 @@
 
 #pragma once
 
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/pipeline/process_interface/stub_mongo_process_interface.h"
@@ -58,8 +57,6 @@ public:
 
     void setUp() {
         CatalogCacheTestFixture::setUp();
-        auto serviceCtx = operationContext()->getServiceContext();
-        LogicalClock::set(serviceCtx, std::make_unique<LogicalClock>(serviceCtx));
         _expCtx = make_intrusive<ExpressionContextForTest>(operationContext(), kTestAggregateNss);
         _expCtx->mongoProcessInterface = std::make_shared<FakeMongoProcessInterface>(executor());
         _expCtx->inMongos = true;
@@ -100,8 +97,7 @@ public:
 
         // Mock the expected config server queries.
         expectGetDatabase(nss);
-        expectGetCollection(nss, epoch, shardKey);
-        expectGetCollection(nss, epoch, shardKey);
+        expectGetCollection(nss, epoch, UUID::gen(), shardKey);
         expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
             std::vector<BSONObj> response;
             for (auto&& chunk : chunkDistribution) {
@@ -110,7 +106,8 @@ public:
             return response;
         }());
 
-        future.default_timed_get().get();
+        const auto cm = future.default_timed_get();
+        ASSERT(cm->isSharded());
     }
 
 protected:

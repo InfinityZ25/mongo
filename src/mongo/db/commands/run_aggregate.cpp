@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -39,10 +39,10 @@
 
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/exec/change_stream_proxy.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/namespace_string.h"
@@ -54,18 +54,21 @@
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/pipeline_d.h"
+#include "mongo/db/pipeline/plan_executor_pipeline.h"
 #include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/get_executor.h"
+#include "mongo/db/query/plan_executor_factory.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/db/read_concern.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/speculative_majority_read_info.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_options.h"
@@ -85,16 +88,6 @@ using std::stringstream;
 using std::unique_ptr;
 
 namespace {
-/**
- * Returns true if this PlanExecutor is for a Pipeline.
- */
-bool isPipelineExecutor(const PlanExecutor* exec) {
-    invariant(exec);
-    auto rootStage = exec->getRootStage();
-    return rootStage->stageType() == StageType::STAGE_PIPELINE_PROXY ||
-        rootStage->stageType() == StageType::STAGE_CHANGE_STREAM_PROXY;
-}
-
 /**
  * If a pipeline is empty (assuming that a $cursor stage hasn't been created yet), it could mean
  * that we were able to absorb all pipeline stages and pull them into a single PlanExecutor. So,
@@ -121,9 +114,11 @@ bool canOptimizeAwayPipeline(const Pipeline* pipeline,
  * and thus will be different from that in 'request'.
  */
 bool handleCursorCommand(OperationContext* opCtx,
+                         boost::intrusive_ptr<ExpressionContext> expCtx,
                          const NamespaceString& nsForCursor,
                          std::vector<ClientCursor*> cursors,
                          const AggregationRequest& request,
+                         const BSONObj& cmdObj,
                          rpc::ReplyBuilderInterface* result) {
     invariant(!cursors.empty());
     long long batchSize = request.getBatchSize();
@@ -162,6 +157,9 @@ bool handleCursorCommand(OperationContext* opCtx,
 
     CursorResponseBuilder::Options options;
     options.isInitialResponse = true;
+    if (!opCtx->inMultiDocumentTransaction()) {
+        options.atClusterTime = repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime();
+    }
     CursorResponseBuilder responseBuilder(result, options);
 
     auto curOp = CurOp::get(opCtx);
@@ -171,53 +169,50 @@ bool handleCursorCommand(OperationContext* opCtx,
     invariant(exec);
 
     bool stashedResult = false;
+    // We are careful to avoid ever calling 'getNext()' on the PlanExecutor when the batchSize is
+    // zero to avoid doing any query execution work.
     for (int objCount = 0; objCount < batchSize; objCount++) {
-        // The initial getNext() on a PipelineProxyStage may be very expensive so we don't
-        // do it when batchSize is 0 since that indicates a desire for a fast return.
         PlanExecutor::ExecState state;
-        Document nextDoc;
+        BSONObj nextDoc;
 
         try {
             state = exec->getNext(&nextDoc, nullptr);
         } catch (const ExceptionFor<ErrorCodes::CloseChangeStream>&) {
-            // This exception is thrown when a $changeStream stage encounters an event
-            // that invalidates the cursor. We should close the cursor and return without
-            // error.
+            // This exception is thrown when a $changeStream stage encounters an event that
+            // invalidates the cursor. We should close the cursor and return without error.
             cursor = nullptr;
             exec = nullptr;
             break;
+        } catch (DBException& exception) {
+            auto&& explainer = exec->getPlanExplainer();
+            auto&& [stats, _] =
+                explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
+            LOGV2_WARNING(23799,
+                          "Aggregate command executor error: {error}, stats: {stats}, cmd: {cmd}",
+                          "Aggregate command executor error",
+                          "error"_attr = exception.toStatus(),
+                          "stats"_attr = redact(stats),
+                          "cmd"_attr = cmdObj);
+
+            exception.addContext("PlanExecutor error during aggregation");
+            throw;
         }
 
         if (state == PlanExecutor::IS_EOF) {
             if (!cursor->isTailable()) {
-                // make it an obvious error to use cursor or executor after this point
+                // Make it an obvious error to use cursor or executor after this point.
                 cursor = nullptr;
                 exec = nullptr;
             }
             break;
         }
 
-        if (PlanExecutor::ADVANCED != state) {
-            // We should always have a valid status member object at this point.
-            auto status = WorkingSetCommon::getMemberObjectStatus(nextDoc);
-            invariant(!status.isOK());
-            LOGV2_WARNING(23799,
-                          "Aggregate command executor error: {PlanExecutor_statestr_state}, "
-                          "status: {status}, stats: {Explain_getWinningPlanStats_exec}",
-                          "PlanExecutor_statestr_state"_attr = PlanExecutor::statestr(state),
-                          "status"_attr = status,
-                          "Explain_getWinningPlanStats_exec"_attr =
-                              redact(Explain::getWinningPlanStats(exec)));
-
-            uassertStatusOK(status.withContext("PlanExecutor error during aggregation"));
-        }
+        invariant(state == PlanExecutor::ADVANCED);
 
         // If adding this object will cause us to exceed the message size limit, then we stash it
         // for later.
 
-        auto* expCtx = exec->getExpCtx().get();
-        BSONObj next = expCtx->needsMerge ? nextDoc.toBsonWithMetaData() : nextDoc.toBson();
-        if (!FindCommon::haveSpaceForNext(next, objCount, responseBuilder.bytesUsed())) {
+        if (!FindCommon::haveSpaceForNext(nextDoc, objCount, responseBuilder.bytesUsed())) {
             exec->enqueue(nextDoc);
             stashedResult = true;
             break;
@@ -225,7 +220,7 @@ bool handleCursorCommand(OperationContext* opCtx,
 
         // If this executor produces a postBatchResumeToken, add it to the cursor response.
         responseBuilder.setPostBatchResumeToken(exec->getPostBatchResumeToken());
-        responseBuilder.append(next);
+        responseBuilder.append(nextDoc);
     }
 
     if (cursor) {
@@ -297,7 +292,7 @@ StatusWith<StringMap<ExpressionContext::ResolvedNamespace>> resolveInvolvedNames
             // views, simply assume that the namespace is a collection.
             resolvedNamespaces[involvedNs.coll()] = {involvedNs, std::vector<BSONObj>{}};
         } else if (!db ||
-                   CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, involvedNs)) {
+                   CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, involvedNs)) {
             // If the aggregation database exists and 'involvedNs' refers to a collection namespace,
             // then we resolve it as an empty pipeline in order to read directly from the underlying
             // collection. If the database doesn't exist, then we still resolve it as an empty
@@ -340,18 +335,20 @@ StatusWith<StringMap<ExpressionContext::ResolvedNamespace>> resolveInvolvedNames
  * 'collator'. Otherwise, returns ErrorCodes::OptionNotSupportedOnView.
  */
 Status collatorCompatibleWithPipeline(OperationContext* opCtx,
-                                      Database* db,
+                                      StringData dbName,
                                       const CollatorInterface* collator,
                                       const LiteParsedPipeline& liteParsedPipeline) {
-    if (!db) {
+    auto viewCatalog = DatabaseHolder::get(opCtx)->getSharedViewCatalog(opCtx, dbName);
+    if (!viewCatalog) {
         return Status::OK();
     }
+    auto catalog = CollectionCatalog::get(opCtx);
     for (auto&& potentialViewNs : liteParsedPipeline.getInvolvedNamespaces()) {
-        if (CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, potentialViewNs)) {
+        if (catalog->lookupCollectionByNamespace(opCtx, potentialViewNs)) {
             continue;
         }
 
-        auto view = ViewCatalog::get(db)->lookup(opCtx, potentialViewNs.ns());
+        auto view = viewCatalog->lookup(opCtx, potentialViewNs.ns());
         if (!view) {
             continue;
         }
@@ -364,11 +361,28 @@ Status collatorCompatibleWithPipeline(OperationContext* opCtx,
     return Status::OK();
 }
 
+// A 4.7+ mongoS issues $mergeCursors pipelines with ChunkVersion::IGNORED. On the shard, this will
+// skip the versioning check but also marks the operation as versioned, so the shard knows that any
+// sub-operations executed by the merging pipeline should also be versioned. We manually set the
+// IGNORED version here if we are running a $mergeCursors pipeline and the operation is not already
+// versioned. This can happen in the case where we are running in a cluster with a 4.4 mongoS, which
+// does not set any shard version on a $mergeCursors pipeline.
+void setIgnoredShardVersionForMergeCursors(OperationContext* opCtx,
+                                           const AggregationRequest& request) {
+    auto isMergeCursors = request.isFromMongos() && request.getPipeline().size() > 0 &&
+        request.getPipeline().front().firstElementFieldNameStringData() == "$mergeCursors"_sd;
+    if (isMergeCursors && !OperationShardingState::isOperationVersioned(opCtx)) {
+        OperationShardingState::get(opCtx).initializeClientRoutingVersions(
+            request.getNamespaceString(), ChunkVersion::IGNORED(), boost::none);
+    }
+}
+
 boost::intrusive_ptr<ExpressionContext> makeExpressionContext(
     OperationContext* opCtx,
     const AggregationRequest& request,
     std::unique_ptr<CollatorInterface> collator,
     boost::optional<UUID> uuid) {
+    setIgnoredShardVersionForMergeCursors(opCtx, request);
     boost::intrusive_ptr<ExpressionContext> expCtx =
         new ExpressionContext(opCtx,
                               request,
@@ -457,31 +471,6 @@ std::vector<std::unique_ptr<Pipeline, PipelineDeleter>> createExchangePipelinesI
 
     return pipelines;
 }
-
-/**
- * Create a PlanExecutor to execute the given 'pipeline'.
- */
-std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> createOuterPipelineProxyExecutor(
-    OperationContext* opCtx,
-    const NamespaceString& nss,
-    std::unique_ptr<Pipeline, PipelineDeleter> pipeline,
-    bool hasChangeStream) {
-    boost::intrusive_ptr<ExpressionContext> expCtx(pipeline->getContext());
-
-    // Transfer ownership of the Pipeline to the PipelineProxyStage.
-    auto ws = std::make_unique<WorkingSet>();
-    auto proxy = hasChangeStream
-        ? std::make_unique<ChangeStreamProxyStage>(expCtx.get(), std::move(pipeline), ws.get())
-        : std::make_unique<PipelineProxyStage>(expCtx.get(), std::move(pipeline), ws.get());
-
-    // This PlanExecutor will simply forward requests to the Pipeline, so does not need
-    // to yield or to be registered with any collection's CursorManager to receive
-    // invalidations. The Pipeline may contain PlanExecutors which *are* yielding
-    // PlanExecutors and which *are* registered with their respective collection's
-    // CursorManager
-    return uassertStatusOK(PlanExecutor::make(
-        std::move(expCtx), std::move(ws), std::move(proxy), nullptr, PlanExecutor::NO_YIELD, nss));
-}
 }  // namespace
 
 Status runAggregate(OperationContext* opCtx,
@@ -513,7 +502,7 @@ Status runAggregate(OperationContext* opCtx,
     // If emplaced, AutoGetCollectionForReadCommand will throw if the sharding version for this
     // connection is out of date. If the namespace is a view, the lock will be released before
     // re-running the expanded aggregation.
-    boost::optional<AutoGetCollectionForReadCommand> ctx;
+    boost::optional<AutoGetCollectionForReadCommandMaybeLockFree> ctx;
 
     std::vector<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> execs;
     boost::intrusive_ptr<ExpressionContext> expCtx;
@@ -533,6 +522,11 @@ Status runAggregate(OperationContext* opCtx,
 
         // If this is a change stream, perform special checks and change the execution namespace.
         if (liteParsedPipeline.hasChangeStream()) {
+            uassert(4928900,
+                    str::stream() << AggregationRequest::kCollectionUUIDName
+                                  << " is not supported for a change stream",
+                    !request.getCollectionUUID());
+
             // Replace the execution namespace with that of the oplog.
             nss = NamespaceString::kRsOplogNamespace;
 
@@ -542,7 +536,7 @@ Status runAggregate(OperationContext* opCtx,
             // AutoGetCollectionForReadCommand will raise an error if 'origNss' is a view. We do not
             // need to check this if we are opening a stream on an entire db or across the cluster.
             if (!origNss.isCollectionlessAggregateNS()) {
-                AutoGetCollectionForReadCommand origNssCtx(opCtx, origNss);
+                AutoGetCollectionForReadCommandMaybeLockFree origNssCtx(opCtx, origNss);
             }
 
             // If the user specified an explicit collation, adopt it; otherwise, use the simple
@@ -552,8 +546,13 @@ Status runAggregate(OperationContext* opCtx,
                 PipelineD::resolveCollator(opCtx, request.getCollation(), nullptr));
 
             // Obtain collection locks on the execution namespace; that is, the oplog.
-            ctx.emplace(opCtx, nss, AutoGetCollection::ViewMode::kViewsForbidden);
+            ctx.emplace(opCtx, nss, AutoGetCollectionViewMode::kViewsForbidden);
         } else if (nss.isCollectionlessAggregateNS() && pipelineInvolvedNamespaces.empty()) {
+            uassert(4928901,
+                    str::stream() << AggregationRequest::kCollectionUUIDName
+                                  << " is not supported for a collectionless aggregation",
+                    !request.getCollectionUUID());
+
             // If this is a collectionless agg with no foreign namespaces, don't acquire any locks.
             statsTracker.emplace(opCtx,
                                  nss,
@@ -564,7 +563,7 @@ Status runAggregate(OperationContext* opCtx,
                 PipelineD::resolveCollator(opCtx, request.getCollation(), nullptr));
         } else {
             // This is a regular aggregation. Lock the collection or view.
-            ctx.emplace(opCtx, nss, AutoGetCollection::ViewMode::kViewsPermitted);
+            ctx.emplace(opCtx, nss, AutoGetCollectionViewMode::kViewsPermitted);
             collatorToUse.emplace(
                 PipelineD::resolveCollator(opCtx, request.getCollation(), ctx->getCollection()));
             if (ctx->getCollection()) {
@@ -572,7 +571,7 @@ Status runAggregate(OperationContext* opCtx,
             }
         }
 
-        Collection* collection = ctx ? ctx->getCollection() : nullptr;
+        const auto& collection = ctx ? ctx->getCollection() : CollectionPtr::null;
 
         // If this is a view, resolve it by finding the underlying collection and stitching view
         // pipelines and this request's pipeline together. We then release our locks before
@@ -582,6 +581,10 @@ Status runAggregate(OperationContext* opCtx,
         if (ctx && ctx->getView() && !liteParsedPipeline.startsWithCollStats()) {
             invariant(nss != NamespaceString::kRsOplogNamespace);
             invariant(!nss.isCollectionlessAggregateNS());
+            uassert(ErrorCodes::OptionNotSupportedOnView,
+                    str::stream() << AggregationRequest::kCollectionUUIDName
+                                  << " is not supported against a view",
+                    !request.getCollectionUUID());
 
             // Check that the default collation of 'view' is compatible with the operation's
             // collation. The check is skipped if the request did not specify a collation.
@@ -594,8 +597,10 @@ Status runAggregate(OperationContext* opCtx,
                 }
             }
 
-            auto resolvedView =
-                uassertStatusOK(ViewCatalog::get(ctx->getDb())->resolveView(opCtx, nss));
+
+            auto resolvedView = uassertStatusOK(DatabaseHolder::get(opCtx)
+                                                    ->getSharedViewCatalog(opCtx, nss.db())
+                                                    ->resolveView(opCtx, nss));
             uassert(std::move(resolvedView),
                     "On sharded systems, resolved views must be executed by mongos",
                     !ShardingState::get(opCtx)->enabled());
@@ -619,6 +624,14 @@ Status runAggregate(OperationContext* opCtx,
             return status;
         }
 
+        if (request.getCollectionUUID()) {
+            // If the namespace is not a view and collectionUUID was provided, verify the collection
+            // exists and has the expected UUID.
+            uassert(ErrorCodes::NamespaceNotFound,
+                    "No collection found with the given namespace and UUID",
+                    uuid && uuid == *request.getCollectionUUID());
+        }
+
         invariant(collatorToUse);
         expCtx = makeExpressionContext(opCtx, request, std::move(*collatorToUse), uuid);
 
@@ -627,9 +640,8 @@ Status runAggregate(OperationContext* opCtx,
         // Check that the view's collation matches the collation of any views involved in the
         // pipeline.
         if (!pipelineInvolvedNamespaces.empty()) {
-            invariant(ctx);
             auto pipelineCollationStatus = collatorCompatibleWithPipeline(
-                opCtx, ctx->getDb(), expCtx->getCollator(), liteParsedPipeline);
+                opCtx, nss.db(), expCtx->getCollator(), liteParsedPipeline);
             if (!pipelineCollationStatus.isOK()) {
                 return pipelineCollationStatus;
             }
@@ -680,8 +692,13 @@ Status runAggregate(OperationContext* opCtx,
             auto pipelines =
                 createExchangePipelinesIfNeeded(opCtx, expCtx, request, std::move(pipeline), uuid);
             for (auto&& pipelineIt : pipelines) {
-                execs.emplace_back(createOuterPipelineProxyExecutor(
-                    opCtx, nss, std::move(pipelineIt), liteParsedPipeline.hasChangeStream()));
+                // There are separate ExpressionContexts for each exchange pipeline, so make sure to
+                // pass the pipeline's ExpressionContext to the plan executor factory.
+                auto pipelineExpCtx = pipelineIt->getContext();
+                execs.emplace_back(
+                    plan_executor_factory::make(std::move(pipelineExpCtx),
+                                                std::move(pipelineIt),
+                                                liteParsedPipeline.hasChangeStream()));
             }
 
             // With the pipelines created, we can relinquish locks as they will manage the locks
@@ -693,7 +710,7 @@ Status runAggregate(OperationContext* opCtx,
         }
 
         {
-            auto planSummary = Explain::getPlanSummary(execs[0].get());
+            auto planSummary = execs[0]->getPlanExplainer().getPlanSummary();
             stdx::lock_guard<Client> lk(*opCtx->getClient());
             curOp->setPlanSummary_inlock(std::move(planSummary));
         }
@@ -714,24 +731,15 @@ Status runAggregate(OperationContext* opCtx,
         }
     });
     for (auto&& exec : execs) {
-        // PlanExecutors for pipelines always have a 'kLocksInternally' policy. If this executor is
-        // not for a pipeline, though, that means the pipeline was optimized away and the
-        // PlanExecutor will answer the query using the query engine only. Without the
-        // DocumentSourceCursor to do its locking, an executor needs a 'kLockExternally' policy.
-        auto lockPolicy = isPipelineExecutor(exec.get())
-            ? ClientCursorParams::LockPolicy::kLocksInternally
-            : ClientCursorParams::LockPolicy::kLockExternally;
-
         ClientCursorParams cursorParams(
             std::move(exec),
             origNss,
             AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
+            APIParameters::get(opCtx),
             opCtx->getWriteConcern(),
             repl::ReadConcernArgs::get(opCtx),
             cmdObj,
-            lockPolicy,
-            privileges,
-            expCtx->needsMerge);
+            privileges);
         if (expCtx->tailableMode == TailableModeEnum::kTailable) {
             cursorParams.setTailable(true);
         } else if (expCtx->tailableMode == TailableModeEnum::kTailableAndAwaitData) {
@@ -740,7 +748,6 @@ Status runAggregate(OperationContext* opCtx,
         }
 
         auto pin = CursorManager::get(opCtx)->registerCursor(opCtx, std::move(cursorParams));
-        invariant(!exec);
 
         cursors.emplace_back(pin.getCursor());
         pins.emplace_back(std::move(pin));
@@ -751,40 +758,42 @@ Status runAggregate(OperationContext* opCtx,
 
     // If both explain and cursor are specified, explain wins.
     if (expCtx->explain) {
-        auto explainExecutor = pins[0].getCursor()->getExecutor();
+        auto explainExecutor = pins[0]->getExecutor();
         auto bodyBuilder = result->getBodyBuilder();
-        if (isPipelineExecutor(explainExecutor)) {
-            Explain::explainPipelineExecutor(explainExecutor, *(expCtx->explain), &bodyBuilder);
+        if (auto pipelineExec = dynamic_cast<PlanExecutorPipeline*>(explainExecutor)) {
+            Explain::explainPipeline(
+                pipelineExec, true /* executePipeline */, *(expCtx->explain), cmdObj, &bodyBuilder);
         } else {
-            invariant(pins[0].getCursor()->lockPolicy() ==
-                      ClientCursorParams::LockPolicy::kLockExternally);
-            invariant(!explainExecutor->isDetached());
             invariant(explainExecutor->getOpCtx() == opCtx);
-            // The explainStages() function for a non-pipeline executor expects to be called with
-            // the appropriate collection lock already held. Make sure it has not been released yet.
+            // The explainStages() function for a non-pipeline executor may need to execute the plan
+            // to collect statistics. If the PlanExecutor uses kLockExternally policy, the
+            // appropriate collection lock must be already held. Make sure it has not been released
+            // yet.
             invariant(ctx);
             Explain::explainStages(explainExecutor,
                                    ctx->getCollection(),
                                    *(expCtx->explain),
                                    BSON("optimizedPipeline" << true),
+                                   cmdObj,
                                    &bodyBuilder);
         }
     } else {
         // Cursor must be specified, if explain is not.
-        const bool keepCursor =
-            handleCursorCommand(opCtx, origNss, std::move(cursors), request, result);
+        const bool keepCursor = handleCursorCommand(
+            opCtx, expCtx, origNss, std::move(cursors), request, cmdObj, result);
         if (keepCursor) {
             cursorFreer.dismiss();
         }
 
         PlanSummaryStats stats;
-        Explain::getSummaryStats(*(pins[0].getCursor()->getExecutor()), &stats);
+        pins[0].getCursor()->getExecutor()->getPlanExplainer().getSummaryStats(&stats);
         curOp->debug().setPlanSummaryMetrics(stats);
         curOp->debug().nreturned = stats.nReturned;
         // For an optimized away pipeline, signal the cache that a query operation has completed.
         // For normal pipelines this is done in DocumentSourceCursor.
         if (ctx && ctx->getCollection()) {
-            CollectionQueryInfo::get(ctx->getCollection()).notifyOfQuery(opCtx, stats);
+            const CollectionPtr& coll = ctx->getCollection();
+            CollectionQueryInfo::get(coll).notifyOfQuery(opCtx, coll, stats);
         }
     }
 

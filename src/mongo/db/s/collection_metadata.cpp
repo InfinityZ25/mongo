@@ -27,13 +27,11 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/s/collection_metadata.h"
-
-#include <memory>
 
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/bson/util/builder.h"
@@ -43,8 +41,99 @@
 
 namespace mongo {
 
-CollectionMetadata::CollectionMetadata(std::shared_ptr<ChunkManager> cm, const ShardId& thisShardId)
+CollectionMetadata::CollectionMetadata(ChunkManager cm, const ShardId& thisShardId)
     : _cm(std::move(cm)), _thisShardId(thisShardId) {}
+
+bool CollectionMetadata::allowMigrations() const {
+    return _cm ? _cm->allowMigrations() : true;
+}
+
+boost::optional<ShardKeyPattern> CollectionMetadata::getReshardingKeyIfShouldForwardOps() const {
+    if (!isSharded())
+        return boost::none;
+
+    const auto& reshardingFields = getReshardingFields();
+
+    // A resharding operation should be taking place, and additionally, the coordinator must
+    // be in the states during which the recipient tails the donor's oplog. In these states, the
+    // donor annotates each of its oplog entries with the appropriate recipients; thus, checking if
+    // the coordinator is within these states is equivalent to checking if the donor should
+    // append the resharding recipients.
+    if (!reshardingFields)
+        return boost::none;
+
+    // Used a switch statement so that the compiler warns anyone who modifies the coordinator
+    // states enum.
+    switch (reshardingFields.get().getState()) {
+        case CoordinatorStateEnum::kUnused:
+        case CoordinatorStateEnum::kInitializing:
+        case CoordinatorStateEnum::kMirroring:
+        case CoordinatorStateEnum::kCommitted:
+        case CoordinatorStateEnum::kRenaming:
+        case CoordinatorStateEnum::kDone:
+        case CoordinatorStateEnum::kError:
+            return boost::none;
+        case CoordinatorStateEnum::kPreparingToDonate:
+        case CoordinatorStateEnum::kCloning:
+        case CoordinatorStateEnum::kApplying:
+            // We will actually return a resharding key for these cases.
+            break;
+    }
+
+    const auto& donorFields = reshardingFields->getDonorFields();
+
+    // If 'reshardingFields' doesn't contain 'donorFields', then it must contain 'recipientFields',
+    // implying that collection represents the target collection in a resharding operation.
+    if (!donorFields)
+        return boost::none;
+
+    return ShardKeyPattern(donorFields->getReshardingKey());
+}
+
+bool CollectionMetadata::writesShouldRunInDistributedTransaction(const OID& originalEpoch,
+                                                                 const OID& reshardingEpoch) const {
+    auto reshardingFields = getReshardingFields();
+    if (!reshardingFields)
+        return false;
+
+    switch (reshardingFields->getState()) {
+        case CoordinatorStateEnum::kUnused:
+        case CoordinatorStateEnum::kInitializing:
+        case CoordinatorStateEnum::kPreparingToDonate:
+        case CoordinatorStateEnum::kCloning:
+        case CoordinatorStateEnum::kApplying:
+            return false;
+        case CoordinatorStateEnum::kMirroring:
+        case CoordinatorStateEnum::kCommitted:
+            return true;
+        case CoordinatorStateEnum::kRenaming:
+            break;
+        case CoordinatorStateEnum::kDone:
+        case CoordinatorStateEnum::kError:
+            return false;
+    }
+
+    // Handle kRenaming:
+    auto chunkVersion = getCollVersion();
+    uassert(ErrorCodes::NamespaceNotSharded,
+            str::stream() << "Collection is not sharded, original epoch: " << originalEpoch,
+            chunkVersion != ChunkVersion::UNSHARDED());
+
+    const auto& collectionCurrentEpoch = chunkVersion.epoch();
+
+    // Renaming has not completed:
+    if (collectionCurrentEpoch == originalEpoch)
+        return true;
+
+    // Else, renaming must have completed, and myEpoch must be equal to reshardingEpoch.
+    uassert(5169400,
+            str::stream() << "Invalid epoch; current epoch " << collectionCurrentEpoch
+                          << " does not match original epoch " << originalEpoch
+                          << " or resharding epoch " << reshardingEpoch,
+            collectionCurrentEpoch == reshardingEpoch);
+
+    return false;
+}
 
 BSONObj CollectionMetadata::extractDocumentKey(const BSONObj& doc) const {
     BSONObj key;
@@ -91,12 +180,12 @@ RangeMap CollectionMetadata::getChunks() const {
 
     RangeMap chunksMap(SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<BSONObj>());
 
-    for (const auto& chunk : _cm->chunks()) {
-        if (chunk.getShardId() != _thisShardId)
-            continue;
+    _cm->forEachChunk([this, &chunksMap](const auto& chunk) {
+        if (chunk.getShardId() == _thisShardId)
+            chunksMap.emplace_hint(chunksMap.end(), chunk.getMin(), chunk.getMax());
 
-        chunksMap.emplace_hint(chunksMap.end(), chunk.getMin(), chunk.getMax());
-    }
+        return true;
+    });
 
     return chunksMap;
 }
@@ -104,13 +193,13 @@ RangeMap CollectionMetadata::getChunks() const {
 bool CollectionMetadata::getNextChunk(const BSONObj& lookupKey, ChunkType* chunk) const {
     invariant(isSharded());
 
-    auto foundIt = _cm->getNextChunkOnShard(lookupKey, _thisShardId);
-    if (foundIt.begin() == foundIt.end())
+    auto nextChunk = _cm->getNextChunkOnShard(lookupKey, _thisShardId);
+    if (!nextChunk)
         return false;
 
-    const auto& nextChunk = *foundIt.begin();
-    chunk->setMin(nextChunk.getMin());
-    chunk->setMax(nextChunk.getMax());
+    chunk->setMin(nextChunk->getMin());
+    chunk->setMax(nextChunk->getMax());
+
     return true;
 }
 
@@ -130,8 +219,9 @@ Status CollectionMetadata::checkChunkIsValid(const ChunkType& chunk) const {
         existingChunk.getMax().woCompare(chunk.getMax())) {
         return {ErrorCodes::StaleShardVersion,
                 str::stream() << "Unable to find chunk with the exact bounds "
-                              << ChunkRange(chunk.getMin(), chunk.getMax()).toString()
-                              << " at collection version " << getCollVersion().toString()};
+                              << chunk.getRange().toString() << " at collection version "
+                              << getCollVersion().toString()
+                              << " found existing chunk: " << existingChunk.toString()};
     }
 
     return Status::OK();
@@ -210,14 +300,16 @@ void CollectionMetadata::toBSONChunks(BSONArrayBuilder* builder) const {
     if (!isSharded())
         return;
 
-    for (const auto& chunk : _cm->chunks()) {
+    _cm->forEachChunk([this, &builder](const auto& chunk) {
         if (chunk.getShardId() == _thisShardId) {
             BSONArrayBuilder chunkBB(builder->subarrayStart());
             chunkBB.append(chunk.getMin());
             chunkBB.append(chunk.getMax());
             chunkBB.done();
         }
-    }
+
+        return true;
+    });
 }
 
 }  // namespace mongo

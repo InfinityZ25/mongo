@@ -6,6 +6,7 @@
 "use strict";
 
 load("jstests/libs/uuid_util.js");
+load("jstests/libs/fail_point_util.js");
 
 const dbName = "test";
 const collName = "foo";
@@ -38,6 +39,10 @@ let st = new ShardingTest({shards: {rs0: {nodes: 3}, rs1: {nodes: 3}}});
 
     suspendRangeDeletionFailpoint.off();
 
+    // The moveChunk should now be unblocked and succeed.
+    assert.commandWorked(
+        st.s.adminCommand({moveChunk: ns, find: {x: 50}, to: st.shard0.shardName}));
+
     st.s.getCollection(ns).drop();
 })();
 
@@ -64,6 +69,10 @@ let st = new ShardingTest({shards: {rs0: {nodes: 3}, rs1: {nodes: 3}}});
         ErrorCodes.MaxTimeMSExpired);
 
     suspendRangeDeletionFailpoint.off();
+
+    // The moveChunk should now be unblocked and succeed.
+    assert.commandWorked(
+        st.s.adminCommand({moveChunk: ns, find: {x: 50}, to: st.shard0.shardName}));
 
     st.s.getCollection(ns).drop();
 })();
@@ -92,6 +101,10 @@ let st = new ShardingTest({shards: {rs0: {nodes: 3}, rs1: {nodes: 3}}});
         ErrorCodes.MaxTimeMSExpired);
 
     suspendRangeDeletionFailpoint.off();
+
+    // The moveChunk should now be unblocked and succeed.
+    assert.commandWorked(
+        st.s.adminCommand({moveChunk: ns, find: {x: 50, y: 50}, to: st.shard0.shardName}));
 
     st.s.getCollection(ns).drop();
 })();

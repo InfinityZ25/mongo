@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
-
 #include "mongo/platform/basic.h"
 
 #include <memory>
@@ -62,8 +60,7 @@
 #include "mongo/db/matcher/expression_text_base.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/query/plan_executor.h"
-#include "mongo/logv2/log.h"
+#include "mongo/db/query/plan_executor_factory.h"
 
 namespace mongo {
 
@@ -151,14 +148,14 @@ public:
         auto expCtx = make_intrusive<ExpressionContext>(
             opCtx, std::unique_ptr<CollatorInterface>(nullptr), nss);
 
-        // Need a context to get the actual Collection*
+        // Need a context to get the actual const CollectionPtr&
         // TODO A write lock is currently taken here to accommodate stages that perform writes
         //      (e.g. DeleteStage).  This should be changed to use a read lock for read-only
         //      execution trees.
         AutoGetCollection autoColl(opCtx, nss, MODE_IX);
 
         // Make sure the collection is valid.
-        Collection* collection = autoColl.getCollection();
+        const auto& collection = autoColl.getCollection();
         uassert(ErrorCodes::NamespaceNotFound,
                 str::stream() << "Couldn't find collection " << nss.ns(),
                 collection);
@@ -182,8 +179,12 @@ public:
         unique_ptr<PlanStage> rootFetch = std::make_unique<FetchStage>(
             expCtx.get(), ws.get(), std::move(userRoot), nullptr, collection);
 
-        auto statusWithPlanExecutor = PlanExecutor::make(
-            expCtx, std::move(ws), std::move(rootFetch), collection, PlanExecutor::YIELD_AUTO);
+        auto statusWithPlanExecutor =
+            plan_executor_factory::make(expCtx,
+                                        std::move(ws),
+                                        std::move(rootFetch),
+                                        &collection,
+                                        PlanYieldPolicy::YieldPolicy::YIELD_AUTO);
         fassert(28536, statusWithPlanExecutor.getStatus());
         auto exec = std::move(statusWithPlanExecutor.getValue());
 
@@ -196,23 +197,11 @@ public:
         }
 
         resultBuilder.done();
-
-        if (PlanExecutor::FAILURE == state) {
-            LOGV2_ERROR(23795,
-                        "Plan executor error during StageDebug command: FAILURE, stats: "
-                        "{Explain_getWinningPlanStats_exec_get}",
-                        "Explain_getWinningPlanStats_exec_get"_attr =
-                            redact(Explain::getWinningPlanStats(exec.get())));
-
-            uassertStatusOK(WorkingSetCommon::getMemberObjectStatus(obj).withContext(
-                "Executor error during StageDebug command"));
-        }
-
         return true;
     }
 
     PlanStage* parseQuery(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                          Collection* collection,
+                          const CollectionPtr& collection,
                           BSONObj obj,
                           WorkingSet* workingSet,
                           const NamespaceString& nss,
@@ -299,9 +288,9 @@ public:
             params.bounds.boundInclusion = IndexBounds::makeBoundInclusionFromBoundBools(
                 nodeArgs["startKeyInclusive"].Bool(), nodeArgs["endKeyInclusive"].Bool());
             params.direction = nodeArgs["direction"].numberInt();
-            params.shouldDedup = desc->isMultikey();
+            params.shouldDedup = desc->getEntry()->isMultikey();
 
-            return new IndexScan(expCtx.get(), params, workingSet, matcher);
+            return new IndexScan(expCtx.get(), collection, params, workingSet, matcher);
         } else if ("andHash" == nodeName) {
             uassert(
                 16921, "Nodes argument must be provided to AND", nodeArgs["nodes"].isABSONObj());
@@ -478,7 +467,7 @@ public:
                 return nullptr;
             }
 
-            return new TextStage(expCtx.get(), params, workingSet, matcher);
+            return new TextStage(expCtx.get(), collection, params, workingSet, matcher);
         } else if ("delete" == nodeName) {
             uassert(18636,
                     "Delete stage doesn't have a filter (put it on the child)",

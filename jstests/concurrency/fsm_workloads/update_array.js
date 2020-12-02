@@ -10,7 +10,7 @@
  * update and the find, because thread ids are unique.
  */
 
-// For isMongod and supportsDocumentLevelConcurrency.
+// For isMongod.
 load('jstests/concurrency/fsm_workload_helpers/server_types.js');
 
 var $config = (function() {
@@ -21,10 +21,8 @@ var $config = (function() {
         function assertUpdateSuccess(db, res, nModifiedPossibilities) {
             assertAlways.eq(0, res.nUpserted, tojson(res));
 
-            if (isMongod(db) && supportsDocumentLevelConcurrency(db)) {
-                // Storage engines which support document-level concurrency will automatically retry
-                // any operations when there are conflicts, so the update should have succeeded if
-                // a matching document existed.
+            if (isMongod(db)) {
+                // The update should have succeeded if a matching document existed.
                 assertWhenOwnColl.contains(1, nModifiedPossibilities, tojson(res));
                 if (db.getMongo().writeMode() === 'commands') {
                     assertWhenOwnColl.contains(res.nModified, nModifiedPossibilities, tojson(res));
@@ -111,7 +109,7 @@ var $config = (function() {
 
     function setup(db, collName, cluster) {
         // index on 'arr', the field being updated
-        assertAlways.commandWorked(db[collName].ensureIndex({arr: 1}));
+        assertAlways.commandWorked(db[collName].createIndex({arr: 1}));
         for (var i = 0; i < this.numDocs; ++i) {
             var res = db[collName].insert({_id: i, arr: []});
             assertWhenOwnColl.commandWorked(res);

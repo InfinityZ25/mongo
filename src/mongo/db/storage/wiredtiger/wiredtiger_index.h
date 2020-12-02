@@ -76,6 +76,7 @@ public:
     static StatusWith<std::string> generateCreateString(const std::string& engineName,
                                                         const std::string& sysIndexConfig,
                                                         const std::string& collIndexConfig,
+                                                        const NamespaceString& collectionNamespace,
                                                         const IndexDescriptor& desc,
                                                         bool isPrefixed);
 
@@ -85,8 +86,14 @@ public:
      */
     static int Create(OperationContext* opCtx, const std::string& uri, const std::string& config);
 
+    /**
+     * Drops the specified WiredTiger table. This should only be used for resuming index builds.
+     */
+    static int Drop(OperationContext* opCtx, const std::string& uri);
+
     WiredTigerIndex(OperationContext* ctx,
                     const std::string& uri,
+                    StringData ident,
                     const IndexDescriptor* desc,
                     KVPrefix prefix,
                     bool readOnly);
@@ -101,7 +108,7 @@ public:
 
     virtual void fullValidate(OperationContext* opCtx,
                               long long* numKeysOut,
-                              ValidateResults* fullResults) const;
+                              IndexValidateResults* fullResults) const;
     virtual bool appendCustomStats(OperationContext* opCtx,
                                    BSONObjBuilder* output,
                                    double scale) const;
@@ -111,9 +118,11 @@ public:
 
     virtual long long getSpaceUsedBytes(OperationContext* opCtx) const;
 
+    virtual long long getFreeStorageBytes(OperationContext* opCtx) const;
+
     virtual Status initAsEmpty(OperationContext* opCtx);
 
-    virtual Status compact(OperationContext* opCtx);
+    Status compact(OperationContext* opCtx) override;
 
     const std::string& uri() const {
         return _uri;
@@ -127,13 +136,11 @@ public:
         return _tableId;
     }
 
-    const NamespaceString& collectionNamespace() const {
-        return _collectionNamespace;
-    }
-
     std::string indexName() const {
         return _indexName;
     }
+
+    NamespaceString getCollectionNamespace(OperationContext* opCtx) const;
 
     const BSONObj& keyPattern() const {
         return _keyPattern;
@@ -158,7 +165,7 @@ protected:
                           bool dupsAllowed) = 0;
 
     void setKey(WT_CURSOR* cursor, const WT_ITEM* item);
-    void getKey(WT_CURSOR* cursor, WT_ITEM* key);
+    void getKey(OperationContext* opCtx, WT_CURSOR* cursor, WT_ITEM* key);
 
     /*
      * Determines the data format version from application metadata and verifies compatibility.
@@ -180,7 +187,7 @@ protected:
     int _dataFormatVersion;
     std::string _uri;
     uint64_t _tableId;
-    const NamespaceString _collectionNamespace;
+    const IndexDescriptor* _desc;
     const std::string _indexName;
     const BSONObj _keyPattern;
     const BSONObj _collation;
@@ -192,6 +199,7 @@ class WiredTigerIndexUnique : public WiredTigerIndex {
 public:
     WiredTigerIndexUnique(OperationContext* ctx,
                           const std::string& uri,
+                          StringData ident,
                           const IndexDescriptor* desc,
                           KVPrefix prefix,
                           bool readOnly = false);
@@ -252,6 +260,7 @@ class WiredTigerIndexStandard : public WiredTigerIndex {
 public:
     WiredTigerIndexStandard(OperationContext* ctx,
                             const std::string& uri,
+                            StringData ident,
                             const IndexDescriptor* desc,
                             KVPrefix prefix,
                             bool readOnly = false);

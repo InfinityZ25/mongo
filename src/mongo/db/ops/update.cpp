@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kWrite
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kWrite
 
 #include "mongo/platform/basic.h"
 
@@ -57,17 +57,17 @@ UpdateResult update(OperationContext* opCtx, Database* db, const UpdateRequest& 
     invariant(db);
 
     // Explain should never use this helper.
-    invariant(!request.isExplain());
+    invariant(!request.explain());
 
     const NamespaceString& nsString = request.getNamespaceString();
     invariant(opCtx->lockState()->isCollectionLockedForMode(nsString, MODE_IX));
 
-    Collection* collection;
+    CollectionPtr collection;
 
     // The update stage does not create its own collection.  As such, if the update is
     // an upsert, create the collection that the update stage inserts into beforehand.
     writeConflictRetry(opCtx, "createCollection", nsString.ns(), [&] {
-        collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nsString);
+        collection = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nsString);
         if (collection || !request.isUpsert()) {
             return;
         }
@@ -93,35 +93,8 @@ UpdateResult update(OperationContext* opCtx, Database* db, const UpdateRequest& 
 
     OpDebug* const nullOpDebug = nullptr;
     auto exec = uassertStatusOK(
-        getExecutorUpdate(nullOpDebug, collection, &parsedUpdate, boost::none /* verbosity */));
+        getExecutorUpdate(nullOpDebug, &collection, &parsedUpdate, boost::none /* verbosity */));
 
-    uassertStatusOK(exec->executePlan());
-
-    const UpdateStats* updateStats = UpdateStage::getUpdateStats(exec.get());
-
-    return UpdateStage::makeUpdateResult(updateStats);
+    return exec->executeUpdate();
 }
-
-BSONObj applyUpdateOperators(OperationContext* opCtx,
-                             const NamespaceString& nss,
-                             const BSONObj& from,
-                             const BSONObj& operators) {
-    auto expCtx =
-        make_intrusive<ExpressionContext>(opCtx, std::unique_ptr<CollatorInterface>(nullptr), nss);
-    UpdateDriver driver(std::move(expCtx));
-    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
-    driver.parse(operators, arrayFilters);
-
-    mutablebson::Document doc(from, mutablebson::Document::kInPlaceDisabled);
-
-    const bool validateForStorage = false;
-    const FieldRefSet emptyImmutablePaths;
-    const bool isInsert = false;
-
-    uassertStatusOK(
-        driver.update(StringData(), &doc, validateForStorage, emptyImmutablePaths, isInsert));
-
-    return doc.getObject();
-}
-
 }  // namespace mongo

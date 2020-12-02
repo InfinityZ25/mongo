@@ -18,13 +18,18 @@ assert.commandWorked(coll.insert({a: 1}));
 
 // Add a secondary node but make it hang before copying databases.
 let secondary = replSet.add({rsConfig: {votes: 0, priority: 0}});
-secondary.setSlaveOk();
+secondary.setSecondaryOk();
 
 assert.commandWorked(secondary.getDB('admin').runCommand(
     {configureFailPoint: 'initialSyncHangBeforeCopyingDatabases', mode: 'alwaysOn'}));
 replSet.reInitiate();
 
-assert.commandWorked(primary.getDB('test').system.views.insert({invalid: NumberLong(1000)}));
+assert.commandWorked(primary.getDB("test").createCollection("system.views"));
+assert.commandWorked(primary.adminCommand({
+    applyOps: [
+        {op: "i", ns: "test.system.views", o: {_id: "invalid_view_def", invalid: NumberLong(1000)}}
+    ]
+}));
 
 assert.commandWorked(secondary.getDB('admin').runCommand(
     {configureFailPoint: 'initialSyncHangBeforeCopyingDatabases', mode: 'off'}));

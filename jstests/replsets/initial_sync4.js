@@ -17,7 +17,7 @@
 
     jsTestLog("2. Insert some data");
     var N = 5000;
-    mc.ensureIndex({x: 1});
+    mc.createIndex({x: 1});
     var bulk = mc.initializeUnorderedBulkOp();
     for (var i = 0; i < N; ++i) {
         bulk.insert({_id: i, x: i, a: {}});
@@ -45,7 +45,7 @@
 
     jsTestLog("5. Wait for new node to start cloning");
 
-    s.setSlaveOk();
+    s.setSecondaryOk();
     var sc = s.getDB("d")["c"];
 
     wait(function() {

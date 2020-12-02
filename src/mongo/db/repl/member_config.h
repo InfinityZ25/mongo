@@ -33,8 +33,8 @@
 #include <vector>
 
 #include "mongo/base/status.h"
+#include "mongo/db/repl/member_config_gen.h"
 #include "mongo/db/repl/member_id.h"
-#include "mongo/db/repl/repl_set_config_gen.h"
 #include "mongo/db/repl/repl_set_tag.h"
 #include "mongo/db/repl/split_horizon.h"
 #include "mongo/util/net/hostandport.h"
@@ -54,7 +54,6 @@ class MemberConfig : private MemberConfigBase {
 public:
     // Expose certain member functions used externally.
     using MemberConfigBase::getId;
-    using MemberConfigBase::setNewlyAdded;
 
     using MemberConfigBase::kArbiterOnlyFieldName;
     using MemberConfigBase::kBuildIndexesFieldName;
@@ -85,6 +84,12 @@ public:
      * tag not previously added to "tagConfig".
      */
     MemberConfig(const BSONObj& mcfg, ReplSetTagConfig* tagConfig);
+
+    /**
+     * Creates a MemberConfig from a BSON object.  Call "addTagInfo", below, afterwards to
+     * finish initializing.
+     */
+    static MemberConfig parseFromBSON(const BSONObj& mcfg);
 
     /**
      * Gets the canonical name of this member, by which other members and clients
@@ -185,19 +190,23 @@ public:
      * Gets the number of replica set tags, including internal '$' tags, for this member.
      */
     size_t getNumTags() const {
+        // All valid MemberConfig objects should have at least one tag, kInternalAllTagName if
+        // nothing else.  So if we're accessing an empty _tags array we're using a MemberConfig
+        // from a MutableReplSetConfig, which is invalid.
+        invariant(!_tags.empty());
         return _tags.size();
     }
 
     /**
-     * Returns true if this MemberConfig has any non-internal tags, using "tagConfig" to
-     * determine the internal property of the tags.
+     * Returns true if this MemberConfig has any non-internal tags.
      */
-    bool hasTags(const ReplSetTagConfig& tagConfig) const;
+    bool hasTags() const;
 
     /**
      * Gets a begin iterator over the tags for this member.
      */
     TagIterator tagsBegin() const {
+        invariant(!_tags.empty());
         return _tags.begin();
     }
 
@@ -205,6 +214,7 @@ public:
      * Gets an end iterator over the tags for this member.
      */
     TagIterator tagsEnd() const {
+        invariant(!_tags.empty());
         return _tags.end();
     }
 
@@ -216,14 +226,39 @@ public:
     }
 
     /**
-     * Returns the member config as a BSONObj, using "tagConfig" to generate the tag subdoc.
+     * Returns the member config as a BSONObj.
      */
-    BSONObj toBSON(const ReplSetTagConfig& tagConfig, bool omitNewlyAddedField) const;
+    BSONObj toBSON(bool omitNewlyAddedField = false) const;
+
+    /*
+     * Adds the tag info for this member to the tagConfig; to be used after an IDL parse.
+     */
+    void addTagInfo(ReplSetTagConfig* tagConfig);
 
 private:
+    // Allow MutableReplSetConfig to modify the newlyAdded field.
+    friend class MutableReplSetConfig;
+
+    friend void setNewlyAdded_ForTest(MemberConfig*, boost::optional<bool>);
+
+    /**
+     * Constructor used by IDL; does not set up tags because we cannot pass TagConfig through IDL.
+     */
+    MemberConfig(const BSONObj& mcfg);
+
     const HostAndPort& _host() const {
         return getHostAndPort(SplitHorizon::kDefaultHorizon);
     }
+
+    /**
+     * Modifiers which potentially affect tags.  Calling them clears the tags array, which
+     * will be rebuilt when addTagInfo is called.  Accessing a cleared tags array is not allowed
+     * and is enforced by invariant.
+     */
+    void setNewlyAdded(boost::optional<bool> newlyAdded);
+    void setArbiterOnly(bool arbiterOnly);
+    void setVotes(int64_t votes);
+    void setPriority(double priority);
 
     std::vector<ReplSetTag> _tags;  // tagging for data center, rack, etc.
     SplitHorizon _splitHorizon;

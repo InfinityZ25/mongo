@@ -83,13 +83,19 @@ public:
     static constexpr StringData kSchemaEncryptKeyword = "encrypt"_sd;
     static constexpr StringData kSchemaEncryptMetadataKeyword = "encryptMetadata"_sd;
 
+    // A name of placeholder used in ExpressionWithPlaceholder expressions.
+    static constexpr StringData kNamePlaceholder = "i"_sd;
+
     /**
      * Converts a JSON schema, represented as BSON, into a semantically equivalent match expression
      * tree. Returns a non-OK status if the schema is invalid or cannot be parsed.
      */
-    static StatusWithMatchExpression parse(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                           BSONObj schema,
-                                           bool ignoreUnknownKeywords = false);
+    static StatusWithMatchExpression parse(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        BSONObj schema,
+        MatchExpressionParser::AllowedFeatureSet allowedFeatures =
+            MatchExpressionParser::kAllowAllSpecialFeatures,
+        bool ignoreUnknownKeywords = false);
 
     /**
      * Builds a set of type aliases from the given type element using 'aliasMapFind'. Returns a

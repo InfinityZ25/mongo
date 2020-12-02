@@ -46,6 +46,8 @@
 
 namespace mongo {
 
+class ClientAPIVersionParameters;
+
 /**
  * Encode a string for embedding in a URI.
  * Replaces reserved bytes with %xx sequences.
@@ -134,7 +136,7 @@ public:
     // whichever map type is used provides that guarantee.
     using OptionsMap = std::map<CaseInsensitiveString, std::string>;
 
-    static StatusWith<MongoURI> parse(const std::string& url);
+    static StatusWith<MongoURI> parse(StringData url);
 
     /*
      * Returns true if str starts with one of the uri schemes (e.g. mongodb:// or mongodb+srv://)
@@ -149,7 +151,8 @@ public:
 
     DBClientBase* connect(StringData applicationName,
                           std::string& errmsg,
-                          boost::optional<double> socketTimeoutSecs = boost::none) const;
+                          boost::optional<double> socketTimeoutSecs = boost::none,
+                          const ClientAPIVersionParameters* apiParameters = nullptr) const;
 
     const std::string& getUser() const {
         return _user;
@@ -205,6 +208,10 @@ public:
         return _connectString.isValid();
     }
 
+    explicit operator bool() const {
+        return isValid();
+    }
+
     const ConnectionString& connectionString() const {
         return _connectString;
     }
@@ -213,8 +220,12 @@ public:
         return _connectString.toString();
     }
 
-    const std::string& getSetName() const {
+    const std::string& getReplicaSetName() const {
         return _connectString.getSetName();
+    }
+
+    const std::string& getSetName() const {
+        return getReplicaSetName();
     }
 
     const std::vector<HostAndPort>& getServers() const {
@@ -235,9 +246,18 @@ public:
         return _sslMode;
     }
 
+    bool isHelloOk() const {
+        return _helloOk.get_value_or(false);
+    }
+
+    void setHelloOk(bool helloOk) {
+        invariant(!_helloOk.has_value());
+        _helloOk.emplace(helloOk);
+    }
+
     // If you are trying to clone a URI (including its options/auth information) for a single
     // server (say a member of a replica-set), you can pass in its HostAndPort information to
-    // get a new URI with the same info, except type() will be MASTER and getServers() will
+    // get a new URI with the same info, except type() will be kStandalone and getServers() will
     // be the single host you pass in.
     MongoURI cloneURIForServer(HostAndPort hostAndPort, StringData applicationName) const {
         auto out = *this;
@@ -272,6 +292,7 @@ private:
              const std::string& database,
              boost::optional<bool> retryWrites,
              transport::ConnectSSLMode sslMode,
+             boost::optional<bool> helloOk,
              OptionsMap options)
         : _connectString(std::move(connectString)),
           _user(user),
@@ -279,9 +300,10 @@ private:
           _database(database),
           _retryWrites(std::move(retryWrites)),
           _sslMode(sslMode),
+          _helloOk(helloOk),
           _options(std::move(options)) {}
 
-    static MongoURI parseImpl(const std::string& url);
+    static MongoURI parseImpl(StringData url);
 
     ConnectionString _connectString;
     std::string _user;
@@ -289,6 +311,7 @@ private:
     std::string _database;
     boost::optional<bool> _retryWrites;
     transport::ConnectSSLMode _sslMode = transport::kGlobalSSLMode;
+    boost::optional<bool> _helloOk;
     OptionsMap _options;
 };
 

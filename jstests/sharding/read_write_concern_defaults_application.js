@@ -23,10 +23,9 @@
  *
  * @tags: [
  *   does_not_support_stepdowns,
- *   requires_fcv_44,
  *   requires_majority_read_concern,
  *   requires_profiling,
- *   uses_transactions,
+ *   uses_transactions
  * ]
  */
 (function() {
@@ -34,6 +33,7 @@
 
 load('jstests/libs/profiler.js');
 load("jstests/libs/logv2_helpers.js");
+load('jstests/sharding/libs/last_lts_mongod_commands.js');
 
 let db = "test";
 let coll = "foo";
@@ -96,10 +96,12 @@ let testCases = {
     _configsvrRemoveShard: {skip: "internal command"},
     _configsvrRemoveShardFromZone: {skip: "internal command"},
     _configsvrRenameCollection: {skip: "internal command"},
+    _configsvrReshardCollection: {skip: "internal command"},
     _configsvrShardCollection: {skip: "internal command"},
     _configsvrUpdateZoneKeyRange: {skip: "internal command"},
     _flushDatabaseCacheUpdates: {skip: "internal command"},
     _flushRoutingTableCacheUpdates: {skip: "internal command"},
+    _flushRoutingTableCacheUpdatesWithWriteConcern: {skip: "internal command"},
     _getNextSessionMods: {skip: "internal command"},
     _getUserCacheGeneration: {skip: "internal command"},
     _hashBSONElement: {skip: "internal command"},
@@ -112,10 +114,13 @@ let testCases = {
     _recvChunkStart: {skip: "internal command"},
     _recvChunkStatus: {skip: "internal command"},
     _shardsvrCloneCatalogData: {skip: "internal command"},
+    _shardsvrDropCollection: {skip: "internal command"},
     _shardsvrMovePrimary: {skip: "internal command"},
     _shardsvrRenameCollection: {skip: "internal command"},
     _shardsvrShardCollection: {skip: "internal command"},
+    _shardsvrDropDatabase: {skip: "internal command"},
     _transferMods: {skip: "internal command"},
+    _vectorClockPersist: {skip: "internal command"},
     abortTransaction: {
         setUp: function(conn) {
             assert.commandWorked(conn.getDB(db).runCommand({create: coll, writeConcern: {w: 1}}));
@@ -289,6 +294,9 @@ let testCases = {
         checkReadConcern: true,
         checkWriteConcern: false,
     },
+    donorForgetMigration: {skip: "does not accept read or write concern"},
+    donorStartMigration: {skip: "does not accept read or write concern"},
+    donorWaitForMigrationToCommit: {skip: "does not accept read or write concern"},
     driverOIDTest: {skip: "internal command"},
     drop: {
         setUp: function(conn) {
@@ -384,18 +392,6 @@ let testCases = {
     forceerror: {skip: "test command"},
     fsync: {skip: "does not accept read or write concern"},
     fsyncUnlock: {skip: "does not accept read or write concern"},
-    geoSearch: {
-        setUp: function(conn) {
-            assert.commandWorked(conn.getDB(db).runCommand({
-                createIndexes: coll,
-                indexes: [{key: {loc: "geoHaystack", foo: 1}, bucketSize: 1, name: "foo"}],
-                writeConcern: {w: 1}
-            }));
-        },
-        command: {geoSearch: coll, search: {}, near: [0, 0], maxDistance: 1},
-        checkReadConcern: true,
-        checkWriteConcern: false,
-    },
     getCmdLineOpts: {skip: "does not accept read or write concern"},
     getDatabaseVersion: {skip: "does not accept read or write concern"},
     getDefaultRWConcern: {skip: "does not accept read or write concern"},
@@ -450,8 +446,11 @@ let testCases = {
         useLogs: true,
     },
     handshake: {skip: "does not accept read or write concern"},
+    hello: {skip: "does not accept read or write concern"},
     hostInfo: {skip: "does not accept read or write concern"},
     httpClientRequest: {skip: "does not accept read or write concern"},
+    exportCollection: {skip: "internal command"},
+    importCollection: {skip: "internal command"},
     insert: {
         setUp: function(conn) {
             assert.commandWorked(conn.getDB(db).runCommand({create: coll, writeConcern: {w: 1}}));
@@ -462,8 +461,8 @@ let testCases = {
     },
     internalRenameIfOptionsAndIndexesMatch: {skip: "internal command"},
     invalidateUserCache: {skip: "does not accept read or write concern"},
-    isMaster: {skip: "does not accept read or write concern"},
     isdbgrid: {skip: "does not accept read or write concern"},
+    isMaster: {skip: "does not accept read or write concern"},
     killAllSessions: {skip: "does not accept read or write concern"},
     killAllSessionsByPattern: {skip: "does not accept read or write concern"},
     killCursors: {skip: "does not accept read or write concern"},
@@ -476,6 +475,7 @@ let testCases = {
     listShards: {skip: "does not accept read or write concern"},
     lockInfo: {skip: "does not accept read or write concern"},
     logApplicationMessage: {skip: "does not accept read or write concern"},
+    logMessage: {skip: "does not accept read or write concern"},
     logRotate: {skip: "does not accept read or write concern"},
     logout: {skip: "does not accept read or write concern"},
     makeSnapshot: {skip: "does not accept read or write concern"},
@@ -497,6 +497,8 @@ let testCases = {
     profile: {skip: "does not accept read or write concern"},
     reIndex: {skip: "does not accept read or write concern"},
     reapLogicalSessionCacheNow: {skip: "does not accept read or write concern"},
+    recipientForgetMigration: {skip: "does not accept read or write concern"},
+    recipientSyncData: {skip: "does not accept read or write concern"},
     refineCollectionShardKey: {skip: "does not accept read or write concern"},
     refreshLogicalSessionCacheNow: {skip: "does not accept read or write concern"},
     refreshSessions: {skip: "does not accept read or write concern"},
@@ -531,6 +533,7 @@ let testCases = {
     replSetTestEgress: {skip: "does not accept read or write concern"},
     replSetUpdatePosition: {skip: "does not accept read or write concern"},
     resetError: {skip: "does not accept read or write concern"},
+    reshardCollection: {skip: "does not accept read or write concern"},
     resync: {skip: "does not accept read or write concern"},
     revokePrivilegesFromRole: {
         setUp: function(conn) {
@@ -585,8 +588,10 @@ let testCases = {
         useLogs: true,
     },
     rolesInfo: {skip: "does not accept read or write concern"},
+    rotateCertificates: {skip: "does not accept read or write concern"},
     saslContinue: {skip: "does not accept read or write concern"},
     saslStart: {skip: "does not accept read or write concern"},
+    sbe: {skip: "internal command"},
     serverStatus: {skip: "does not accept read or write concern"},
     setCommittedSnapshot: {skip: "internal command"},
     setDefaultRWConcern: {skip: "special case (must run after all other commands)"},
@@ -607,6 +612,12 @@ let testCases = {
     startRecordingTraffic: {skip: "does not accept read or write concern"},
     startSession: {skip: "does not accept read or write concern"},
     stopRecordingTraffic: {skip: "does not accept read or write concern"},
+    testDeprecation: {skip: "does not accept read or write concern"},
+    testDeprecationInVersion2: {skip: "does not accept read or write concern"},
+    testRemoval: {skip: "does not accept read or write concern"},
+    testReshardCloneCollection: {skip: "internal command"},
+    testVersions1And2: {skip: "does not accept read or write concern"},
+    testVersion2: {skip: "does not accept read or write concern"},
     top: {skip: "does not accept read or write concern"},
     unsetSharding: {skip: "internal command"},
     update: {
@@ -645,12 +656,17 @@ let testCases = {
     updateZoneKeyRange: {skip: "does not accept read or write concern"},
     usersInfo: {skip: "does not accept read or write concern"},
     validate: {skip: "does not accept read or write concern"},
+    voteCommitImportCollection: {skip: "internal command"},
     voteCommitIndexBuild: {skip: "internal command"},
     waitForFailPoint: {skip: "does not accept read or write concern"},
     waitForOngoingChunkSplits: {skip: "does not accept read or write concern"},
     whatsmysni: {skip: "does not accept read or write concern"},
     whatsmyuri: {skip: "internal command"},
 };
+
+commandsRemovedFromMongodSinceLastLTS.forEach(function(cmd) {
+    testCases[cmd] = {skip: "must define test coverage for 4.4 backwards compatibility"};
+});
 
 // Running setDefaultRWConcern in the middle of a scenario would define defaults when there
 // shouldn't be for subsequently-tested commands. Thus it is special-cased to be run at the end of

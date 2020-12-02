@@ -55,6 +55,7 @@ public:
     }
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final {
+        deps->needRandomGenerator = true;
         return DepsTracker::State::SEE_NEXT;
     }
 
@@ -66,6 +67,9 @@ public:
 
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+    static boost::intrusive_ptr<DocumentSource> create(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx, long long size);
 
 private:
     explicit DocumentSourceSample(const boost::intrusive_ptr<ExpressionContext>& pExpCtx);

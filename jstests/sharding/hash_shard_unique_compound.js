@@ -1,11 +1,9 @@
-// Basic test of sharding with a hashed shard key and other unique index
-// Does 2 things and checks for consistent error:
-//  1.) shard collection on hashed "a", ensure unique index {a:1, b:1}
-//  2.) reverse order
-
-// This test triggers a compiler bug that causes a crash when compiling with optimizations on, see
-// SERVER-36321.
-// @tags: [blacklist_from_rhel_67_s390x]
+/**
+ * Basic test of sharding with a hashed shard key and other unique index. Does 2 things and checks
+ * for consistent error:
+ * 1. shard collection on hashed "a", ensure unique index {a:1, b:1}
+ * 2. reverse order
+ */
 (function() {
 'use strict';
 
@@ -23,7 +21,7 @@ assert.commandWorked(db.adminCommand({enablesharding: dbName}));
 assert.commandWorked(db.adminCommand({shardcollection: ns, key: {a: "hashed"}}));
 
 // Create unique index
-assert.commandWorked(coll.ensureIndex({a: 1, b: 1}, {unique: true}));
+assert.commandWorked(coll.createIndex({a: 1, b: 1}, {unique: true}));
 
 jsTest.log("------ indexes -------");
 jsTest.log(tojson(coll.getIndexes()));
@@ -33,7 +31,7 @@ jsTest.log("------ dropping sharded collection to start part 2 -------");
 coll.drop();
 
 // Create unique index
-assert.commandWorked(coll.ensureIndex({a: 1, b: 1}, {unique: true}));
+assert.commandWorked(coll.createIndex({a: 1, b: 1}, {unique: true}));
 
 // shard a fresh collection using a hashed shard key
 assert.commandWorked(db.adminCommand({shardcollection: ns, key: {a: "hashed"}}),

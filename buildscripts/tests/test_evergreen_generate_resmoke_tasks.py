@@ -154,7 +154,6 @@ class TestAcceptance(unittest.TestCase):
         with TemporaryDirectory() as tmpdir:
             target_directory, source_directory = self._prep_dirs(tmpdir, mock_config)
             suite_path = os.path.join(source_directory, task)
-            mock_config["suite"] = suite_path
             test_list = self._mock_test_files(source_directory, n_tests, 5, evg_api_mock,
                                               suites_config_mock)
             mock_resmoke_config_file(test_list, suite_path + ".yml")
@@ -200,7 +199,6 @@ class TestAcceptance(unittest.TestCase):
         with TemporaryDirectory() as tmpdir:
             target_directory, source_directory = self._prep_dirs(tmpdir, mock_config)
             suite_path = os.path.join(source_directory, task)
-            mock_config["suite"] = suite_path
             test_list = self._mock_test_files(source_directory, n_tests, 15 * 60, evg_api_mock,
                                               suites_config_mock)
             mock_resmoke_config_file(test_list, suite_path + ".yml")
@@ -995,7 +993,8 @@ class GenerateSubSuitesTest(unittest.TestCase):
             self.assertIn(tests_runtimes[2], filtered_list)
             self.assertIn(tests_runtimes[1], filtered_list)
 
-    def test_filter_blacklist_files(self):
+    @patch(ns('_parser.set_run_options'))
+    def test_filter_blacklist_files(self, set_run_options_mock):
         tests_runtimes = [
             TestRuntime(test_name="dir1/file1.js", runtime=20.32),
             TestRuntime(test_name="dir2/file2.js", runtime=24.32),
@@ -1019,7 +1018,8 @@ class GenerateSubSuitesTest(unittest.TestCase):
             self.assertIn(tests_runtimes[2], filtered_list)
             self.assertIn(tests_runtimes[0], filtered_list)
 
-    def test_filter_blacklist_files_for_windows(self):
+    @patch(ns('_parser.set_run_options'))
+    def test_filter_blacklist_files_for_windows(self, set_run_options_mock):
         tests_runtimes = [
             TestRuntime(test_name="dir1/file1.js", runtime=20.32),
             TestRuntime(test_name="dir2/file2.js", runtime=24.32),

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
 
 #include "mongo/platform/basic.h"
 
@@ -37,49 +37,6 @@
 #include "mongo/db/index/index_descriptor.h"
 
 namespace mongo {
-
-const IndexCatalogEntry* IndexCatalogEntryContainer::find(const IndexDescriptor* desc) const {
-    if (desc->_cachedEntry)
-        return desc->_cachedEntry;
-
-    for (const_iterator i = begin(); i != end(); ++i) {
-        const IndexCatalogEntry* e = i->get();
-        if (e->descriptor() == desc)
-            return e;
-    }
-    return nullptr;
-}
-
-IndexCatalogEntry* IndexCatalogEntryContainer::find(const IndexDescriptor* desc) {
-    if (desc->_cachedEntry)
-        return desc->_cachedEntry;
-
-    for (iterator i = begin(); i != end(); ++i) {
-        IndexCatalogEntry* e = i->get();
-        if (e->descriptor() == desc)
-            return e;
-    }
-    return nullptr;
-}
-
-std::shared_ptr<IndexCatalogEntry> IndexCatalogEntryContainer::findShared(
-    const IndexDescriptor* desc) const {
-    for (auto&& entry : _entries) {
-        if (entry->descriptor() == desc) {
-            return entry;
-        }
-    }
-    return {};
-}
-
-IndexCatalogEntry* IndexCatalogEntryContainer::find(const std::string& name) {
-    for (iterator i = begin(); i != end(); ++i) {
-        IndexCatalogEntry* e = i->get();
-        if (e->descriptor()->indexName() == name)
-            return e;
-    }
-    return nullptr;
-}
 
 std::shared_ptr<IndexCatalogEntry> IndexCatalogEntryContainer::release(
     const IndexDescriptor* desc) {

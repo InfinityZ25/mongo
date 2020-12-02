@@ -49,13 +49,14 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/write_ops_exec.h"
+#include "mongo/db/persistent_task_store.h"
+#include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/move_timing_helper.h"
-#include "mongo/db/s/persistent_task_store.h"
 #include "mongo/db/s/range_deletion_task_gen.h"
 #include "mongo/db/s/sharding_runtime_d_params_gen.h"
 #include "mongo/db/s/sharding_statistics.h"
@@ -68,6 +69,7 @@
 #include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/stdx/chrono.h"
@@ -90,6 +92,53 @@ const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
                                                 // in the ReplSetConfig.
                                                 WriteConcernOptions::SyncMode::UNSET,
                                                 -1);
+
+BSONObj makeLocalReadConcernWithAfterClusterTime(Timestamp afterClusterTime) {
+    return BSON(repl::ReadConcernArgs::kReadConcernFieldName
+                << BSON(repl::ReadConcernArgs::kLevelFieldName
+                        << repl::readConcernLevels::kLocalName
+                        << repl::ReadConcernArgs::kAfterClusterTimeFieldName << afterClusterTime));
+}
+
+void checkOutSessionAndVerifyTxnState(OperationContext* opCtx) {
+    MongoDOperationContextSession::checkOut(opCtx);
+    TransactionParticipant::get(opCtx).beginOrContinue(opCtx,
+                                                       *opCtx->getTxnNumber(),
+                                                       boost::none /* autocommit */,
+                                                       boost::none /* startTransaction */);
+}
+
+template <typename Callable>
+constexpr bool returnsVoid() {
+    return std::is_void_v<std::invoke_result_t<Callable>>;
+}
+
+// Yields the checked out session before running the given function. If the function runs without
+// throwing, will reacquire the session and verify it is still valid to proceed with the migration.
+template <typename Callable, std::enable_if_t<!returnsVoid<Callable>(), int> = 0>
+auto runWithoutSession(OperationContext* opCtx, Callable&& callable) {
+    MongoDOperationContextSession::checkIn(opCtx);
+
+    auto retVal = callable();
+
+    // The below code can throw, so it cannot run in a scope guard.
+    opCtx->checkForInterrupt();
+    checkOutSessionAndVerifyTxnState(opCtx);
+
+    return retVal;
+}
+
+// Same as runWithoutSession above but takes a void function.
+template <typename Callable, std::enable_if_t<returnsVoid<Callable>(), int> = 0>
+void runWithoutSession(OperationContext* opCtx, Callable&& callable) {
+    MongoDOperationContextSession::checkIn(opCtx);
+
+    callable();
+
+    // The below code can throw, so it cannot run in a scope guard.
+    opCtx->checkForInterrupt();
+    checkOutSessionAndVerifyTxnState(opCtx);
+}
 
 /**
  * Returns a human-readabale name of the migration manager's state.
@@ -345,23 +394,13 @@ Status MigrationDestinationManager::start(OperationContext* opCtx,
     invariant(!_sessionId);
     invariant(!_scopedReceiveChunk);
 
-    _enableResumableRangeDeleter = !disableResumableRangeDeleter.load();
-
-    uassert(ErrorCodes::IllegalOperation,
-            "Resumable range deleter must be enabled or disabled on both the source and "
-            "destination shards",
-            !cloneRequest.resumableRangeDeleterDisabled() == _enableResumableRangeDeleter);
-
     _state = READY;
     _stateChangedCV.notify_all();
     _errmsg = "";
 
     _migrationId = cloneRequest.getMigrationId();
-
-    if (_enableResumableRangeDeleter) {
-        _lsid = cloneRequest.getLsid();
-        _txnNumber = cloneRequest.getTxnNumber();
-    }
+    _lsid = cloneRequest.getLsid();
+    _txnNumber = cloneRequest.getTxnNumber();
 
     _nss = nss;
     _fromShard = cloneRequest.getFromShardId();
@@ -415,9 +454,14 @@ repl::OpTime MigrationDestinationManager::cloneDocumentsFromDonor(
     repl::OpTime lastOpApplied;
 
     stdx::thread inserterThread{[&] {
-        Client::initKillableThread("chunkInserter", opCtx->getServiceContext());
+        Client::initThread("chunkInserter", opCtx->getServiceContext(), nullptr);
+        auto client = Client::getCurrent();
+        {
+            stdx::lock_guard lk(*client);
+            client->setSystemOperationKillableByStepdown(lk);
+        }
 
-        auto inserterOpCtx = Client::getCurrent()->makeOperationContext();
+        auto inserterOpCtx = client->makeOperationContext();
         auto consumerGuard = makeGuard([&] {
             batches.closeConsumerEnd();
             lastOpApplied = repl::ReplClientInfo::forClient(inserterOpCtx->getClient()).getLastOp();
@@ -543,28 +587,38 @@ Status MigrationDestinationManager::startCommit(const MigrationSessionId& sessio
     return Status::OK();
 }
 
-CollectionOptionsAndIndexes MigrationDestinationManager::getCollectionIndexesAndOptions(
-    OperationContext* opCtx, const NamespaceString& nss, const ShardId& fromShardId) {
+MigrationDestinationManager::IndexesAndIdIndex MigrationDestinationManager::getCollectionIndexes(
+    OperationContext* opCtx,
+    const NamespaceStringOrUUID& nssOrUUID,
+    const ShardId& fromShardId,
+    const boost::optional<ChunkManager>& cm,
+    boost::optional<Timestamp> afterClusterTime) {
     auto fromShard =
         uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, fromShardId));
 
-    DisableDocumentValidation validationDisabler(opCtx);
-
     std::vector<BSONObj> donorIndexSpecs;
     BSONObj donorIdIndexSpec;
-    BSONObj donorOptions;
 
     // Get the collection indexes and options from the donor shard.
 
     // Do not hold any locks while issuing remote calls.
     invariant(!opCtx->lockState()->isLocked());
 
+    auto cmd = nssOrUUID.nss() ? BSON("listIndexes" << nssOrUUID.nss()->coll())
+                               : BSON("listIndexes" << *nssOrUUID.uuid());
+    if (cm) {
+        cmd = appendShardVersion(cmd, cm->getVersion(fromShardId));
+    }
+    if (afterClusterTime) {
+        cmd = cmd.addFields(makeLocalReadConcernWithAfterClusterTime(*afterClusterTime));
+    }
+
     // Get indexes by calling listIndexes against the donor.
     auto indexes = uassertStatusOK(
         fromShard->runExhaustiveCursorCommand(opCtx,
                                               ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                                              nss.db().toString(),
-                                              BSON("listIndexes" << nss.coll().toString()),
+                                              nssOrUUID.db().toString(),
+                                              cmd,
                                               Milliseconds(-1)));
 
     for (auto&& spec : indexes.docs) {
@@ -577,18 +631,42 @@ CollectionOptionsAndIndexes MigrationDestinationManager::getCollectionIndexesAnd
         }
     }
 
-    // Get collection options by calling listCollections against the donor.
-    auto infosRes = uassertStatusOK(fromShard->runExhaustiveCursorCommand(
-        opCtx,
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        nss.db().toString(),
-        BSON("listCollections" << 1 << "filter" << BSON("name" << nss.coll())),
-        Milliseconds(-1)));
+    return {donorIndexSpecs, donorIdIndexSpec};
+}
+
+MigrationDestinationManager::CollectionOptionsAndUUID
+MigrationDestinationManager::getCollectionOptions(OperationContext* opCtx,
+                                                  const NamespaceStringOrUUID& nssOrUUID,
+                                                  const ShardId& fromShardId,
+                                                  const boost::optional<ChunkManager>& cm,
+                                                  boost::optional<Timestamp> afterClusterTime) {
+    auto fromShard =
+        uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, fromShardId));
+
+    BSONObj fromOptions;
+
+    auto cmd = nssOrUUID.nss()
+        ? BSON("listCollections" << 1 << "filter" << BSON("name" << nssOrUUID.nss()->coll()))
+        : BSON("listCollections" << 1 << "filter" << BSON("info.uuid" << *nssOrUUID.uuid()));
+    if (cm) {
+        cmd = appendDbVersionIfPresent(cmd, cm->dbVersion());
+    }
+    if (afterClusterTime) {
+        cmd = cmd.addFields(makeLocalReadConcernWithAfterClusterTime(*afterClusterTime));
+    }
+
+    // Get collection options by calling listCollections against the from shard.
+    auto infosRes = uassertStatusOK(
+        fromShard->runExhaustiveCursorCommand(opCtx,
+                                              ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                                              nssOrUUID.db().toString(),
+                                              cmd,
+                                              Milliseconds(-1)));
 
     auto infos = infosRes.docs;
     uassert(ErrorCodes::NamespaceNotFound,
             str::stream() << "expected listCollections against the primary shard for "
-                          << nss.toString() << " to return 1 entry, but got " << infos.size()
+                          << nssOrUUID.toString() << " to return 1 entry, but got " << infos.size()
                           << " entries",
             infos.size() == 1);
 
@@ -597,10 +675,10 @@ CollectionOptionsAndIndexes MigrationDestinationManager::getCollectionIndexesAnd
 
     // The entire options include both the settable options under the 'options' field in the
     // listCollections response, and the UUID under the 'info' field.
-    BSONObjBuilder donorOptionsBob;
+    BSONObjBuilder fromOptionsBob;
 
     if (entry["options"].isABSONObj()) {
-        donorOptionsBob.appendElements(entry["options"].Obj());
+        fromOptionsBob.appendElements(entry["options"].Obj());
     }
 
     BSONObj info;
@@ -609,25 +687,23 @@ CollectionOptionsAndIndexes MigrationDestinationManager::getCollectionIndexesAnd
     }
 
     uassert(ErrorCodes::InvalidUUID,
-            str::stream() << "The donor shard did not return a UUID for collection " << nss.ns()
-                          << " as part of its listCollections response: " << entry
-                          << ", but this node expects to see a UUID.",
+            str::stream() << "The from shard did not return a UUID for collection "
+                          << nssOrUUID.toString() << " as part of its listCollections response: "
+                          << entry << ", but this node expects to see a UUID.",
             !info["uuid"].eoo());
 
-    auto donorUUID = info["uuid"].uuid();
+    auto fromUUID = info["uuid"].uuid();
 
-    donorOptionsBob.append(info["uuid"]);
-    donorOptions = donorOptionsBob.obj();
+    fromOptionsBob.append(info["uuid"]);
+    fromOptions = fromOptionsBob.obj();
 
-    return {donorUUID, donorIndexSpecs, donorIdIndexSpec, donorOptions};
+    return {fromOptions, fromUUID};
 }
 
-void MigrationDestinationManager::cloneCollectionIndexesAndOptions(
+void MigrationDestinationManager::_dropLocalIndexesIfNecessary(
     OperationContext* opCtx,
     const NamespaceString& nss,
     const CollectionOptionsAndIndexes& collectionOptionsAndIndexes) {
-    // 0. If this shard doesn't own any chunks for the collection to be cloned and the collection
-    // exists locally, we drop its indexes to guarantee that no stale indexes carry over.
     bool dropNonDonorIndexes = [&]() -> bool {
         AutoGetCollection autoColl(opCtx, nss, MODE_IS);
         auto* const css = CollectionShardingRuntime::get(opCtx, nss);
@@ -676,14 +752,19 @@ void MigrationDestinationManager::cloneCollectionIndexesAndOptions(
             }
         }
     }
+}
 
+void MigrationDestinationManager::cloneCollectionIndexesAndOptions(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const CollectionOptionsAndIndexes& collectionOptionsAndIndexes) {
     {
         // 1. Create the collection (if it doesn't already exist) and create any indexes we are
         // missing (auto-heal indexes).
 
         // Checks that the collection's UUID matches the donor's.
-        auto checkUUIDsMatch = [&](const Collection* collection) {
-            uassert(ErrorCodes::NotMaster,
+        auto checkUUIDsMatch = [&](const CollectionPtr& collection) {
+            uassert(ErrorCodes::NotWritablePrimary,
                     str::stream() << "Unable to create collection " << nss.ns()
                                   << " because the node is not primary",
                     repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss));
@@ -702,7 +783,7 @@ void MigrationDestinationManager::cloneCollectionIndexesAndOptions(
 
         // Gets the missing indexes and checks if the collection is empty (auto-healing is
         // possible).
-        auto checkEmptyOrGetMissingIndexesFromDonor = [&](Collection* collection) {
+        auto checkEmptyOrGetMissingIndexesFromDonor = [&](const CollectionPtr& collection) {
             auto indexCatalog = collection->getIndexCatalog();
             auto indexSpecs = indexCatalog->removeExistingIndexesNoChecks(
                 opCtx, collectionOptionsAndIndexes.indexSpecs);
@@ -719,12 +800,12 @@ void MigrationDestinationManager::cloneCollectionIndexesAndOptions(
         };
 
         {
-            AutoGetCollection autoGetCollection(opCtx, nss, MODE_IS);
+            AutoGetCollection collection(opCtx, nss, MODE_IS);
 
-            auto collection = autoGetCollection.getCollection();
             if (collection) {
-                checkUUIDsMatch(collection);
-                auto indexSpecs = checkEmptyOrGetMissingIndexesFromDonor(collection);
+                checkUUIDsMatch(collection.getCollection());
+                auto indexSpecs =
+                    checkEmptyOrGetMissingIndexesFromDonor(collection.getCollection());
                 if (indexSpecs.empty()) {
                     return;
                 }
@@ -736,7 +817,7 @@ void MigrationDestinationManager::cloneCollectionIndexesAndOptions(
         AutoGetOrCreateDb autoCreateDb(opCtx, nss.db(), MODE_X);
         auto db = autoCreateDb.getDb();
 
-        auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
+        auto collection = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss);
         if (collection) {
             checkUUIDsMatch(collection);
         } else {
@@ -753,23 +834,30 @@ void MigrationDestinationManager::cloneCollectionIndexesAndOptions(
                                              createDefaultIndexes,
                                              collectionOptionsAndIndexes.idIndexSpec));
             wuow.commit();
-            collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
+            collection = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss);
         }
 
         auto indexSpecs = checkEmptyOrGetMissingIndexesFromDonor(collection);
         if (!indexSpecs.empty()) {
             WriteUnitOfWork wunit(opCtx);
             auto fromMigrate = true;
+            CollectionWriter collWriter(opCtx, collection->uuid());
             IndexBuildsCoordinator::get(opCtx)->createIndexesOnEmptyCollection(
-                opCtx, collection->uuid(), indexSpecs, fromMigrate);
+                opCtx, collWriter, indexSpecs, fromMigrate);
             wunit.commit();
         }
     }
 }
 
 void MigrationDestinationManager::_migrateThread() {
-    Client::initKillableThread("migrateThread", getGlobalServiceContext());
-    auto uniqueOpCtx = Client::getCurrent()->makeOperationContext();
+    Client::initThread("migrateThread");
+    auto client = Client::getCurrent();
+    {
+        stdx::lock_guard lk(*client);
+        client->setSystemOperationKillableByStepdown(lk);
+    }
+
+    auto uniqueOpCtx = client->makeOperationContext();
     auto opCtx = uniqueOpCtx.get();
 
     if (AuthorizationManager::get(opCtx->getServiceContext())->isAuthEnabled()) {
@@ -781,31 +869,23 @@ void MigrationDestinationManager::_migrateThread() {
         // duration of the recipient's side of the migration. This guarantees that if the
         // donor shard has failed over, then the new donor primary cannot bump the
         // txnNumber on this session while this node is still executing the recipient side
-        //(which is important because otherwise, this node may create orphans after the
-        // range deletion task on this node has been processed).
-        if (_enableResumableRangeDeleter) {
-            opCtx->setLogicalSessionId(_lsid);
-            opCtx->setTxnNumber(_txnNumber);
+        // (which is important because otherwise, this node may create orphans after the
+        // range deletion task on this node has been processed). The recipient will periodically
+        // yield this session, but will verify the txnNumber has not changed before continuing,
+        // preserving the guarantee that orphans cannot be created after the txnNumber is advanced.
+        opCtx->setLogicalSessionId(_lsid);
+        opCtx->setTxnNumber(_txnNumber);
 
-            MongoDOperationContextSession sessionTxnState(opCtx);
+        MongoDOperationContextSession sessionTxnState(opCtx);
 
-            auto txnParticipant = TransactionParticipant::get(opCtx);
-            txnParticipant.beginOrContinue(opCtx,
-                                           *opCtx->getTxnNumber(),
-                                           boost::none /* autocommit */,
-                                           boost::none /* startTransaction */);
-            _migrateDriver(opCtx);
-        } else {
-            _migrateDriver(opCtx);
-        }
+        auto txnParticipant = TransactionParticipant::get(opCtx);
+        txnParticipant.beginOrContinue(opCtx,
+                                       *opCtx->getTxnNumber(),
+                                       boost::none /* autocommit */,
+                                       boost::none /* startTransaction */);
+        _migrateDriver(opCtx);
     } catch (...) {
         _setStateFail(str::stream() << "migrate failed: " << redact(exceptionToStatus()));
-    }
-
-    if (!_enableResumableRangeDeleter) {
-        if (getState() != DONE) {
-            _forgetPending(opCtx, ChunkRange(_min, _max));
-        }
     }
 
     stdx::lock_guard<Latch> lk(_mutex);
@@ -832,7 +912,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
           "fromShard"_attr = _fromShard,
           "epoch"_attr = _epoch,
           "sessionId"_attr = *_sessionId,
-          "migrationId"_attr = *_migrationId);
+          "migrationId"_attr = _migrationId.toBSON());
 
     MoveTimingHelper timing(
         outerOpCtx, "to", _nss.ns(), _min, _max, 6 /* steps */, &_errmsg, _toShard, _fromShard);
@@ -842,14 +922,19 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
     if (initialState == ABORT) {
         LOGV2_ERROR(22013,
                     "Migration abort requested before the migration started",
-                    "migrationId"_attr = *_migrationId);
+                    "migrationId"_attr = _migrationId.toBSON());
         return;
     }
 
     invariant(initialState == READY);
 
-    auto donorCollectionOptionsAndIndexes =
-        getCollectionIndexesAndOptions(outerOpCtx, _nss, _fromShard);
+    auto donorCollectionOptionsAndIndexes = [&]() -> CollectionOptionsAndIndexes {
+        auto [collOptions, uuid] =
+            getCollectionOptions(outerOpCtx, _nss, _fromShard, boost::none, boost::none);
+        auto [indexes, idIndex] =
+            getCollectionIndexes(outerOpCtx, _nss, _fromShard, boost::none, boost::none);
+        return {uuid, indexes, idIndex, collOptions};
+    }();
 
     auto fromShard =
         uassertStatusOK(Grid::get(outerOpCtx)->shardRegistry()->getShard(outerOpCtx, _fromShard));
@@ -859,66 +944,56 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
 
         // 2. Ensure any data which might have been left orphaned in the range being moved has been
         // deleted.
-        if (_enableResumableRangeDeleter) {
-            while (migrationutil::checkForConflictingDeletions(
-                outerOpCtx, range, donorCollectionOptionsAndIndexes.uuid)) {
-                LOGV2(22001,
-                      "Migration paused because the requested range {range} for {namespace} "
-                      "overlaps with a range already scheduled for deletion",
-                      "Migration paused because the requested range overlaps with a range already "
-                      "scheduled for deletion",
-                      "namespace"_attr = _nss.ns(),
-                      "range"_attr = redact(range.toString()),
-                      "migrationId"_attr = *_migrationId);
+        while (migrationutil::checkForConflictingDeletions(
+            outerOpCtx, range, donorCollectionOptionsAndIndexes.uuid)) {
+            uassert(ErrorCodes::ResumableRangeDeleterDisabled,
+                    "Failing migration because the disableResumableRangeDeleter server "
+                    "parameter is set to true on the recipient shard, which contains range "
+                    "deletion tasks overlapping the incoming range.",
+                    !disableResumableRangeDeleter.load());
 
-                auto status = CollectionShardingRuntime::waitForClean(
-                    outerOpCtx, _nss, donorCollectionOptionsAndIndexes.uuid, range);
+            LOGV2(22001,
+                  "Migration paused because the requested range {range} for {namespace} "
+                  "overlaps with a range already scheduled for deletion",
+                  "Migration paused because the requested range overlaps with a range already "
+                  "scheduled for deletion",
+                  "namespace"_attr = _nss.ns(),
+                  "range"_attr = redact(range.toString()),
+                  "migrationId"_attr = _migrationId.toBSON());
 
-                if (!status.isOK()) {
-                    _setStateFail(redact(status.reason()));
-                    return;
-                }
-
-                outerOpCtx->sleepFor(Milliseconds(1000));
-            }
-
-            RangeDeletionTask recipientDeletionTask(*_migrationId,
-                                                    _nss,
-                                                    donorCollectionOptionsAndIndexes.uuid,
-                                                    _fromShard,
-                                                    range,
-                                                    CleanWhenEnum::kNow);
-            recipientDeletionTask.setPending(true);
-
-            migrationutil::persistRangeDeletionTaskLocally(outerOpCtx, recipientDeletionTask);
-        } else {
-            // Synchronously delete any data which might have been left orphaned in the range
-            // being moved, and wait for completion
-
-            // Needed for _forgetPending to make sure the collection has the same UUID at the end of
-            // an aborted migration as at the beginning. Must be set before calling _notePending.
-            _collUuid = donorCollectionOptionsAndIndexes.uuid;
-            auto cleanupCompleteFuture = _notePending(outerOpCtx, range);
-            auto cleanupStatus = cleanupCompleteFuture.getNoThrow(outerOpCtx);
-            // Wait for the range deletion to report back. Swallow
-            // RangeDeletionAbandonedBecauseCollectionWithUUIDDoesNotExist error since the
-            // collection could either never exist or get dropped directly from the shard after the
-            // range deletion task got scheduled.
-            if (!cleanupStatus.isOK() &&
-                cleanupStatus !=
-                    ErrorCodes::RangeDeletionAbandonedBecauseCollectionWithUUIDDoesNotExist) {
-                _setStateFail(redact(cleanupStatus.reason()));
-                return;
-            }
-
-            // Wait for any other, overlapping queued deletions to drain
-            cleanupStatus = CollectionShardingRuntime::waitForClean(
+            auto status = CollectionShardingRuntime::waitForClean(
                 outerOpCtx, _nss, donorCollectionOptionsAndIndexes.uuid, range);
-            if (!cleanupStatus.isOK()) {
-                _setStateFail(redact(cleanupStatus.reason()));
+
+            if (!status.isOK()) {
+                _setStateFail(redact(status.toString()));
                 return;
             }
+
+            outerOpCtx->sleepFor(Milliseconds(1000));
         }
+
+        // Insert a pending range deletion task for the incoming range.
+        RangeDeletionTask recipientDeletionTask(_migrationId,
+                                                _nss,
+                                                donorCollectionOptionsAndIndexes.uuid,
+                                                _fromShard,
+                                                range,
+                                                CleanWhenEnum::kNow);
+        recipientDeletionTask.setPending(true);
+
+        // It is illegal to wait for write concern with a session checked out, so persist the range
+        // deletion task with an immediately satsifiable write concern and then wait for majority
+        // after yielding the session.
+        migrationutil::persistRangeDeletionTaskLocally(
+            outerOpCtx, recipientDeletionTask, WriteConcernOptions());
+
+        runWithoutSession(outerOpCtx, [&] {
+            WriteConcernResult ignoreResult;
+            auto latestOpTime =
+                repl::ReplClientInfo::forClient(outerOpCtx->getClient()).getLastOp();
+            uassertStatusOK(waitForWriteConcern(
+                outerOpCtx, latestOpTime, WriteConcerns::kMajorityWriteConcern, &ignoreResult));
+        });
 
         timing.done(1);
         migrateThreadHangAtStep1.pauseWhileSet();
@@ -934,7 +1009,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
     auto newClient = outerOpCtx->getServiceContext()->makeClient("MigrationCoordinator");
     {
         stdx::lock_guard<Client> lk(*newClient.get());
-        newClient->setSystemOperationKillable(lk);
+        newClient->setSystemOperationKillableByStepdown(lk);
     }
 
     AlternativeClientRegion acr(newClient);
@@ -942,6 +1017,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
     auto opCtx = newOpCtxPtr.get();
 
     {
+        _dropLocalIndexesIfNecessary(opCtx, _nss, donorCollectionOptionsAndIndexes);
         cloneCollectionIndexesAndOptions(opCtx, _nss, donorCollectionOptionsAndIndexes);
 
         timing.done(2);
@@ -961,6 +1037,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
 
         auto assertNotAborted = [&](OperationContext* opCtx) {
             opCtx->checkForInterrupt();
+            outerOpCtx->checkForInterrupt();
             uassert(50748, "Migration aborted while copying documents", getState() != ABORT);
         };
 
@@ -989,7 +1066,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
                     return toInsert;
                 }());
 
-                const WriteResult reply = performInserts(opCtx, insertOp, true);
+                const auto reply = write_ops_exec::performInserts(opCtx, insertOp, true);
 
                 for (unsigned long i = 0; i < reply.results.size(); ++i) {
                     uassertStatusOKWithContext(
@@ -1005,20 +1082,21 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
                     _clonedBytes += batchClonedBytes;
                 }
                 if (_writeConcern.needToWaitForOtherNodes()) {
-                    repl::ReplicationCoordinator::StatusAndDuration replStatus =
-                        repl::ReplicationCoordinator::get(opCtx)->awaitReplication(
-                            opCtx,
-                            repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp(),
-                            _writeConcern);
-                    if (replStatus.status.code() == ErrorCodes::WriteConcernFailed) {
-                        LOGV2_WARNING(22011,
-                                      "secondaryThrottle on, but doc insert timed out; continuing",
-                                      "migrationId"_attr = _enableResumableRangeDeleter
-                                          ? _migrationId->toBSON()
-                                          : BSONObj());
-                    } else {
-                        uassertStatusOK(replStatus.status);
-                    }
+                    runWithoutSession(outerOpCtx, [&] {
+                        repl::ReplicationCoordinator::StatusAndDuration replStatus =
+                            repl::ReplicationCoordinator::get(opCtx)->awaitReplication(
+                                opCtx,
+                                repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp(),
+                                _writeConcern);
+                        if (replStatus.status.code() == ErrorCodes::WriteConcernFailed) {
+                            LOGV2_WARNING(
+                                22011,
+                                "secondaryThrottle on, but doc insert timed out; continuing",
+                                "migrationId"_attr = _migrationId.toBSON());
+                        } else {
+                            uassertStatusOK(replStatus.status);
+                        }
+                    });
                 }
 
                 sleepmillis(migrateCloneInsertionBatchDelayMS.load());
@@ -1087,21 +1165,25 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
             int i;
             for (i = 0; i < maxIterations; i++) {
                 opCtx->checkForInterrupt();
+                outerOpCtx->checkForInterrupt();
 
                 if (getState() == ABORT) {
                     LOGV2(22002,
                           "Migration aborted while waiting for replication at catch up stage",
-                          "migrationId"_attr = *_migrationId);
+                          "migrationId"_attr = _migrationId.toBSON());
                     return;
                 }
 
-                if (opReplicatedEnough(opCtx, lastOpApplied, _writeConcern))
+                if (runWithoutSession(outerOpCtx, [&] {
+                        return opReplicatedEnough(opCtx, lastOpApplied, _writeConcern);
+                    })) {
                     break;
+                }
 
                 if (i > 100) {
                     LOGV2(22003,
                           "secondaries having hard time keeping up with migrate",
-                          "migrationId"_attr = *_migrationId);
+                          "migrationId"_attr = _migrationId.toBSON());
                 }
 
                 sleepmillis(20);
@@ -1123,14 +1205,29 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
 
         LOGV2(22004,
               "Waiting for replication to catch up before entering critical section",
-              "migrationId"_attr = *_migrationId);
+              "migrationId"_attr = _migrationId.toBSON());
+        LOGV2_DEBUG_OPTIONS(4817411,
+                            2,
+                            {logv2::LogComponent::kShardMigrationPerf},
+                            "Starting majority commit wait on recipient",
+                            "migrationId"_attr = _migrationId.toBSON());
 
-        auto awaitReplicationResult = repl::ReplicationCoordinator::get(opCtx)->awaitReplication(
-            opCtx, lastOpApplied, _writeConcern);
-        uassertStatusOKWithContext(awaitReplicationResult.status,
-                                   awaitReplicationResult.status.codeString());
+        runWithoutSession(outerOpCtx, [&] {
+            auto awaitReplicationResult =
+                repl::ReplicationCoordinator::get(opCtx)->awaitReplication(
+                    opCtx, lastOpApplied, _writeConcern);
+            uassertStatusOKWithContext(awaitReplicationResult.status,
+                                       awaitReplicationResult.status.codeString());
+        });
 
-        LOGV2(22005, "Chunk data replicated successfully.", "migrationId"_attr = *_migrationId);
+        LOGV2(22005,
+              "Chunk data replicated successfully.",
+              "migrationId"_attr = _migrationId.toBSON());
+        LOGV2_DEBUG_OPTIONS(4817412,
+                            2,
+                            {logv2::LogComponent::kShardMigrationPerf},
+                            "Finished majority commit wait on recipient",
+                            "migrationId"_attr = _migrationId.toBSON());
     }
 
     {
@@ -1140,6 +1237,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
         bool transferAfterCommit = false;
         while (getState() == STEADY || getState() == COMMIT_START) {
             opCtx->checkForInterrupt();
+            outerOpCtx->checkForInterrupt();
 
             // Make sure we do at least one transfer after recv'ing the commit message. If we
             // aren't sure that at least one transfer happens *after* our state changes to
@@ -1169,7 +1267,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
             if (getState() == ABORT) {
                 LOGV2(22006,
                       "Migration aborted while transferring mods",
-                      "migrationId"_attr = *_migrationId);
+                      "migrationId"_attr = _migrationId.toBSON());
                 return;
             }
 
@@ -1177,7 +1275,8 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
             // 1) The from side has told us that it has locked writes (COMMIT_START)
             // 2) We've checked at least one more time for un-transmitted mods
             if (getState() == COMMIT_START && transferAfterCommit == true) {
-                if (_flushPendingWrites(opCtx, lastOpApplied)) {
+                if (runWithoutSession(outerOpCtx,
+                                      [&] { return _flushPendingWrites(opCtx, lastOpApplied); })) {
                     break;
                 }
             }
@@ -1196,7 +1295,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
         migrateThreadHangAtStep5.pauseWhileSet();
     }
 
-    _sessionMigration->join();
+    runWithoutSession(outerOpCtx, [&] { _sessionMigration->join(); });
     if (_sessionMigration->getState() == SessionCatalogMigrationDestination::State::ErrorOccurred) {
         _setStateFail(redact(_sessionMigration->getErrMsg()));
         return;
@@ -1291,8 +1390,6 @@ bool MigrationDestinationManager::_applyMigrateOp(OperationContext* opCtx,
                                     autoColl.getDb(),
                                     updatedDoc,
                                     &localDoc)) {
-                const auto migrationId = *_migrationId;
-
                 // Exception will abort migration cleanly
                 LOGV2_ERROR_OPTIONS(
                     16977,
@@ -1303,7 +1400,7 @@ bool MigrationDestinationManager::_applyMigrateOp(OperationContext* opCtx,
                     "reloaded remote document",
                     "localDoc"_attr = redact(localDoc),
                     "remoteDoc"_attr = redact(updatedDoc),
-                    "migrationId"_attr = migrationId);
+                    "migrationId"_attr = _migrationId.toBSON());
             }
 
             // We are in write lock here, so sure we aren't killing
@@ -1334,7 +1431,7 @@ bool MigrationDestinationManager::_flushPendingWrites(OperationContext* opCtx,
                   "chunkMin"_attr = redact(_min),
                   "chunkMax"_attr = redact(_max),
                   "lastOpApplied"_attr = op,
-                  "migrationId"_attr = *_migrationId);
+                  "migrationId"_attr = _migrationId.toBSON());
         }
         return false;
     }
@@ -1345,67 +1442,9 @@ bool MigrationDestinationManager::_flushPendingWrites(OperationContext* opCtx,
           "namespace"_attr = _nss.ns(),
           "chunkMin"_attr = redact(_min),
           "chunkMax"_attr = redact(_max),
-          "migrationId"_attr = *_migrationId);
+          "migrationId"_attr = _migrationId.toBSON());
 
     return true;
-}
-
-SharedSemiFuture<void> MigrationDestinationManager::_notePending(OperationContext* opCtx,
-                                                                 ChunkRange const& range) {
-
-    AutoGetCollection autoColl(opCtx, _nss, MODE_X);
-    auto* const css = CollectionShardingRuntime::get(opCtx, _nss);
-    const auto optMetadata = css->getCurrentMetadataIfKnown();
-
-    // This can currently happen because drops and shard key refine operations aren't guaranteed to
-    // be synchronized with in-migrations. The idea for checking this here is that in the future we
-    // shouldn't have this problem.
-    if (!optMetadata || !optMetadata->isSharded() ||
-        optMetadata->getCollVersion().epoch() != _epoch) {
-        return Status{ErrorCodes::StaleShardVersion,
-                      str::stream()
-                          << "Not marking chunk " << redact(range.toString())
-                          << " as pending because the epoch of " << _nss.ns() << " changed"};
-    }
-
-    // Start clearing any leftovers that would be in the new chunk
-    auto cleanupCompleteFuture = css->beginReceive(range);
-    if (cleanupCompleteFuture.isReady() && !cleanupCompleteFuture.getNoThrow(opCtx).isOK()) {
-        return cleanupCompleteFuture.getNoThrow(opCtx).withContext(
-            str::stream() << "Collection " << _nss.ns() << " range " << redact(range.toString())
-                          << " migration aborted");
-    }
-    return cleanupCompleteFuture;
-}
-
-void MigrationDestinationManager::_forgetPending(OperationContext* opCtx, ChunkRange const& range) {
-    if (!_chunkMarkedPending) {  // (no lock needed, only the migrate thread looks at this.)
-        return;  // no documents can have been moved in, so there is nothing to clean up.
-    }
-
-    UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-    AutoGetCollection autoColl(opCtx, _nss, MODE_IX);
-    auto* const css = CollectionShardingRuntime::get(opCtx, _nss);
-    const auto optMetadata = css->getCurrentMetadataIfKnown();
-
-    // This can currently happen because drops aren't synchronized with in-migrations. The idea for
-    // checking this here is that in the future we shouldn't have this problem.
-    //
-    // _collUuid will always be set if _notePending was called, so if it is not set, there is no
-    // need to do anything. If it is set, we use it to ensure that the collection UUID has not
-    // changed since the beginning of migration.
-    if (!optMetadata || !optMetadata->isSharded() ||
-        (_collUuid && !optMetadata->uuidMatches(*_collUuid))) {
-        LOGV2(22009,
-              "No need to forget pending chunk {range} because the UUID for {namespace} changed",
-              "No need to forget pending chunk for the requested range, because the UUID for the "
-              "namespace changed",
-              "range"_attr = redact(range.toString()),
-              "namespace"_attr = _nss.ns());
-        return;
-    }
-
-    css->forgetReceive(range);
 }
 
 }  // namespace mongo

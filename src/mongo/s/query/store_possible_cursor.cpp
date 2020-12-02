@@ -99,7 +99,10 @@ StatusWith<BSONObj> storePossibleCursor(OperationContext* opCtx,
         return cmdResult;
     }
 
-    ClusterClientCursorParams params(incomingCursorResponse.getValue().getNSS());
+    ClusterClientCursorParams params(incomingCursorResponse.getValue().getNSS(),
+                                     APIParameters::get(opCtx),
+                                     boost::none,
+                                     ReadConcernArgs::get(opCtx));
     params.remotes.emplace_back();
     auto& remoteCursor = params.remotes.back();
     remoteCursor.setShardId(shardId.toString());
@@ -136,8 +139,10 @@ StatusWith<BSONObj> storePossibleCursor(OperationContext* opCtx,
 
     CurOp::get(opCtx)->debug().cursorid = clusterCursorId.getValue();
 
-    CursorResponse outgoingCursorResponse(
-        requestedNss, clusterCursorId.getValue(), incomingCursorResponse.getValue().getBatch());
+    CursorResponse outgoingCursorResponse(requestedNss,
+                                          clusterCursorId.getValue(),
+                                          incomingCursorResponse.getValue().getBatch(),
+                                          incomingCursorResponse.getValue().getAtClusterTime());
     return outgoingCursorResponse.toBSON(CursorResponse::ResponseType::InitialResponse);
 }
 

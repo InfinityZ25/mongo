@@ -128,7 +128,7 @@ expected = {
     documentKey: {_id: 3},
     ns: {db: "test", coll: "t1"},
     operationType: "update",
-    updateDescription: {removedFields: [], updatedFields: {b: 3}},
+    updateDescription: {removedFields: [], updatedFields: {b: 3}, truncatedArrays: []},
 };
 cst.assertNextChangesEqual({cursor: cursor, expectedChanges: [expected]});
 
@@ -142,13 +142,13 @@ expected = [
         documentKey: {_id: 4},
         ns: {db: "test", coll: "t1"},
         operationType: "update",
-        updateDescription: {removedFields: [], updatedFields: {b: 2}}
+        updateDescription: {removedFields: [], updatedFields: {b: 2}, truncatedArrays: []}
     },
     {
         documentKey: {_id: 5},
         ns: {db: "test", coll: "t1"},
         operationType: "update",
-        updateDescription: {removedFields: [], updatedFields: {b: 2}}
+        updateDescription: {removedFields: [], updatedFields: {b: 2}, truncatedArrays: []}
     }
 ];
 cst.assertNextChangesEqual({cursor: cursor, expectedChanges: expected});
@@ -180,7 +180,7 @@ expected = [
         operationType: "delete",
     }
 ];
-cst.assertNextChangesEqualUnordered(cursor, expected);
+cst.assertNextChangesEqualUnordered({cursor: cursor, expectedChanges: expected});
 
 jsTestLog("Testing intervening write on another collection");
 cursor = cst.startWatchingChanges({pipeline: [{$changeStream: {}}], collection: db.t1});

@@ -34,8 +34,6 @@
 #error This file assumes a UNICODE WIN32 build
 #endif
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
-
 #include "mongo/platform/basic.h"
 
 #include <string>

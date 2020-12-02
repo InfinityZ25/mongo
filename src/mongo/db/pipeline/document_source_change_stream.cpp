@@ -27,14 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/db/pipeline/document_source_change_stream.h"
 
 #include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/db/bson/bson_helper.h"
 #include "mongo/db/commands/feature_compatibility_version_documentation.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/pipeline/change_stream_constants.h"
 #include "mongo/db/pipeline/document_path_support.h"
 #include "mongo/db/pipeline/document_source_change_stream_close_cursor.h"
@@ -52,8 +51,7 @@
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/oplog_entry_gen.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/s/catalog_cache.h"
-#include "mongo/s/grid.h"
+#include "mongo/db/vector_clock.h"
 
 namespace mongo {
 
@@ -296,7 +294,7 @@ BSONObj DocumentSourceChangeStream::buildMatchFilter(
 
     // TODO SERVER-44039: we continue to generate 'kNewShardDetected' events for compatibility
     // with 4.2, even though we no longer rely on them to detect new shards. We may wish to remove
-    // this mechanism in 4.6, or retain it for future cases where a change stream is targeted to a
+    // this mechanism in 4.7+, or retain it for future cases where a change stream is targeted to a
     // subset of shards. See SERVER-44039 for details.
 
     // 2.2) A chunk gets migrated to a new shard that doesn't have any chunks.
@@ -384,7 +382,7 @@ list<intrusive_ptr<DocumentSource>> buildPipeline(const intrusive_ptr<Expression
         // to a specific event; we thus only need to check (1), similar to 'startAtOperationTime'.
         startFrom = tokenData.clusterTime;
         if (expCtx->needsMerge || ResumeToken::isHighWaterMarkToken(tokenData)) {
-            resumeStage = DocumentSourceShardCheckResumability::create(expCtx, tokenData);
+            resumeStage = DocumentSourceCheckResumability::create(expCtx, tokenData);
         } else {
             resumeStage = DocumentSourceEnsureResumeTokenPresent::create(expCtx, tokenData);
         }
@@ -396,7 +394,7 @@ list<intrusive_ptr<DocumentSource>> buildPipeline(const intrusive_ptr<Expression
                 "Only one type of resume option is allowed, but multiple were found.",
                 !resumeStage);
         startFrom = *startAtOperationTime;
-        resumeStage = DocumentSourceShardCheckResumability::create(expCtx, *startFrom);
+        resumeStage = DocumentSourceCheckResumability::create(expCtx, *startFrom);
     }
 
     // We can only run on a replica set, or through mongoS. Confirm that this is the case.
@@ -415,7 +413,10 @@ list<intrusive_ptr<DocumentSource>> buildPipeline(const intrusive_ptr<Expression
     if (!startFrom) {
         const auto currentTime = !expCtx->inMongos
             ? LogicalTime{replCoord->getMyLastAppliedOpTime().getTimestamp()}
-            : LogicalClock::get(expCtx->opCtx)->getClusterTime();
+            : [&] {
+                  const auto currentTime = VectorClock::get(expCtx->opCtx)->getTime();
+                  return currentTime.clusterTime();
+              }();
         startFrom = currentTime.addTicks(1).asTimestamp();
     }
 

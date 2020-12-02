@@ -7,11 +7,11 @@ import time
 import pymongo
 import pymongo.errors
 
-from . import interface
-from ... import config
-from ... import core
-from ... import errors
-from ... import utils
+from buildscripts.resmokelib import config
+from buildscripts.resmokelib import core
+from buildscripts.resmokelib import errors
+from buildscripts.resmokelib import utils
+from buildscripts.resmokelib.testing.fixtures import interface
 
 
 class MongoDFixture(interface.Fixture):
@@ -158,6 +158,11 @@ class MongoDFixture(interface.Fixture):
     def get_dbpath_prefix(self):
         """Return the _dbpath, as this is the root of the data directory."""
         return self._dbpath
+
+    def get_node_info(self):
+        """Return a list of NodeInfo objects."""
+        info = interface.NodeInfo(name=self.logger.name, port=self.port, pid=self.mongod.pid)
+        return [info]
 
     def get_internal_connection_string(self):
         """Return the internal connection string."""

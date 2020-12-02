@@ -125,7 +125,7 @@ public:
      * Uses a forward collection scan stage to get the docs, and populates 'out' with
      * the results.
      */
-    void getCollContents(Collection* collection, vector<BSONObj>* out) {
+    void getCollContents(const CollectionPtr& collection, vector<BSONObj>* out) {
         WorkingSet ws;
 
         CollectionScanParams params;
@@ -145,7 +145,7 @@ public:
         }
     }
 
-    void getRecordIds(Collection* collection,
+    void getRecordIds(const CollectionPtr& collection,
                       CollectionScanParams::Direction direction,
                       vector<RecordId>* out) {
         WorkingSet ws;
@@ -204,7 +204,7 @@ public:
             CurOp& curOp = *CurOp::get(_opCtx);
             OpDebug* opDebug = &curOp.debug();
             UpdateDriver driver(_expCtx);
-            Collection* collection = ctx.getCollection();
+            CollectionPtr collection = ctx.getCollection();
             ASSERT(collection);
 
             // Collection should be empty.
@@ -219,7 +219,8 @@ public:
 
             request.setUpsert();
             request.setQuery(query);
-            request.setUpdateModification(updates);
+            request.setUpdateModification(
+                write_ops::UpdateModification::parseFromClassicUpdate(updates));
 
             const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
             const auto constants = boost::none;
@@ -243,11 +244,10 @@ public:
 
         // Verify the contents of the resulting collection.
         {
-            AutoGetCollectionForReadCommand ctx(&_opCtx, nss);
-            Collection* collection = ctx.getCollection();
+            AutoGetCollectionForReadCommand collection(&_opCtx, nss);
 
             vector<BSONObj> objs;
-            getCollContents(collection, &objs);
+            getCollContents(collection.getCollection(), &objs);
 
             // Expect a single document, {_id: 0, x: 1, y: 2}.
             ASSERT_EQUALS(1U, objs.size());
@@ -275,8 +275,8 @@ public:
             CurOp& curOp = *CurOp::get(_opCtx);
             OpDebug* opDebug = &curOp.debug();
             UpdateDriver driver(_expCtx);
-            Collection* coll =
-                CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(&_opCtx, nss);
+            CollectionPtr coll =
+                CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss);
             ASSERT(coll);
 
             // Get the RecordIds that would be returned by an in-order scan.
@@ -293,7 +293,8 @@ public:
 
             request.setMulti();
             request.setQuery(query);
-            request.setUpdateModification(updates);
+            request.setUpdateModification(
+                write_ops::UpdateModification::parseFromClassicUpdate(updates));
 
             const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
             const auto constants = boost::none;
@@ -334,7 +335,7 @@ public:
             BSONObj targetDoc = coll->docFor(&_opCtx, recordIds[targetDocIndex]).value();
             ASSERT(!targetDoc.isEmpty());
             remove(targetDoc);
-            static_cast<PlanStage*>(updateStage.get())->restoreState();
+            static_cast<PlanStage*>(updateStage.get())->restoreState(&coll);
 
             // Do the remaining updates.
             while (!updateStage->isEOF()) {
@@ -350,11 +351,10 @@ public:
 
         // Check the contents of the collection.
         {
-            AutoGetCollectionForReadCommand ctx(&_opCtx, nss);
-            Collection* collection = ctx.getCollection();
+            AutoGetCollectionForReadCommand collection(&_opCtx, nss);
 
             vector<BSONObj> objs;
-            getCollContents(collection, &objs);
+            getCollContents(collection.getCollection(), &objs);
 
             // Verify that the collection now has 9 docs (one was deleted).
             ASSERT_EQUALS(9U, objs.size());
@@ -386,7 +386,7 @@ public:
         // Various variables we'll need.
         dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
         OpDebug* opDebug = &CurOp::get(_opCtx)->debug();
-        Collection* coll = ctx.getCollection();
+        const CollectionPtr& coll = ctx.getCollection();
         ASSERT(coll);
         auto request = UpdateRequest();
         request.setNamespaceString(nss);
@@ -402,7 +402,8 @@ public:
 
         // Populate the request.
         request.setQuery(query);
-        request.setUpdateModification(fromjson("{$set: {x: 0}}"));
+        request.setUpdateModification(
+            write_ops::UpdateModification::parseFromClassicUpdate(fromjson("{$set: {x: 0}}")));
         request.setSort(BSONObj());
         request.setMulti(false);
         request.setReturnDocs(UpdateRequest::RETURN_OLD);
@@ -478,7 +479,7 @@ public:
         // Various variables we'll need.
         dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
         OpDebug* opDebug = &CurOp::get(_opCtx)->debug();
-        Collection* coll = ctx.getCollection();
+        const CollectionPtr& coll = ctx.getCollection();
         ASSERT(coll);
         auto request = UpdateRequest();
         request.setNamespaceString(nss);
@@ -494,7 +495,8 @@ public:
 
         // Populate the request.
         request.setQuery(query);
-        request.setUpdateModification(fromjson("{$set: {x: 0}}"));
+        request.setUpdateModification(
+            write_ops::UpdateModification::parseFromClassicUpdate(fromjson("{$set: {x: 0}}")));
         request.setSort(BSONObj());
         request.setMulti(false);
         request.setReturnDocs(UpdateRequest::RETURN_NEW);

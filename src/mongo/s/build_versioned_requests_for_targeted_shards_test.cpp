@@ -35,7 +35,7 @@
 #include "mongo/s/async_requests_sender.h"
 #include "mongo/s/catalog_cache_test_fixture.h"
 #include "mongo/s/cluster_commands_helpers.h"
-#include "mongo/s/database_version_helpers.h"
+#include "mongo/s/database_version.h"
 
 namespace mongo {
 namespace {
@@ -51,7 +51,7 @@ protected:
      * the expected vector.
      */
     void runBuildVersionedRequestsExpect(
-        const CachedCollectionRoutingInfo& routingInfo,
+        const ChunkManager& cm,
         const std::set<ShardId>& shardsToSkip,
         const BSONObj& cmdObj,
         const BSONObj& query,
@@ -59,7 +59,7 @@ protected:
         const std::vector<AsyncRequestsSender::Request>& expectedRequests) {
 
         const auto actualRequests = buildVersionedRequestsForTargetedShards(
-            operationContext(), kNss, routingInfo, shardsToSkip, cmdObj, query, collation);
+            operationContext(), kNss, cm, shardsToSkip, cmdObj, query, collation);
 
         ASSERT_EQ(expectedRequests.size(), actualRequests.size());
         _assertShardIdsMatch(expectedRequests, actualRequests);
@@ -73,14 +73,12 @@ protected:
 
     void expectGetDatabaseUnsharded() {
         expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
-            DatabaseType db(kNss.db().toString(), {"0"}, false, databaseVersion::makeNew());
+            DatabaseType db(kNss.db().toString(), {"0"}, false, DatabaseVersion(UUID::gen()));
             return std::vector<BSONObj>{db.toBSON()};
         }());
     }
 
-    // TODO SERVER-34061 Remove this call once loading an unsharded database doesn't require
-    // attempting to load sharded collections.
-    void expectGetNoCollectionsFromDatabase() {
+    void expectGetCollectionUnsharded() {
         expectFindSendBSONObjVector(kConfigHostAndPort, [&]() { return std::vector<BSONObj>{}; }());
     }
 
@@ -112,12 +110,12 @@ TEST_F(BuildVersionedRequestsForTargetedShardsTest, ReturnPrimaryShardForUnshard
     auto future = scheduleRoutingInfoUnforcedRefresh(kNss);
 
     expectGetDatabaseUnsharded();
-    expectGetNoCollectionsFromDatabase();
+    expectGetCollectionUnsharded();
 
-    auto routingInfo = future.default_timed_get();
+    auto cm = future.default_timed_get();
 
     AsyncRequestsSender::Request expectedRequest{ShardId(_shards[0].getName()), {}};
-    runBuildVersionedRequestsExpect(*routingInfo, {}, {}, {}, {}, {expectedRequest});
+    runBuildVersionedRequestsExpect(*cm, {}, {}, {}, {}, {expectedRequest});
 }
 
 TEST_F(BuildVersionedRequestsForTargetedShardsTest,
@@ -125,11 +123,11 @@ TEST_F(BuildVersionedRequestsForTargetedShardsTest,
     auto future = scheduleRoutingInfoUnforcedRefresh(kNss);
 
     expectGetDatabaseUnsharded();
-    expectGetNoCollectionsFromDatabase();
+    expectGetCollectionUnsharded();
 
-    auto routingInfo = future.default_timed_get();
+    auto cm = future.default_timed_get();
 
-    runBuildVersionedRequestsExpect(*routingInfo, {ShardId(_shards[0].getName())}, {}, {}, {}, {});
+    runBuildVersionedRequestsExpect(*cm, {ShardId(_shards[0].getName())}, {}, {}, {}, {});
 }
 
 }  // namespace mongo

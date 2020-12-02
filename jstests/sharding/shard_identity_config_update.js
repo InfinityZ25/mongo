@@ -63,7 +63,7 @@ assert.soon(function() {
 });
 
 var secConn = st.rs0.getSecondary();
-secConn.setSlaveOk(true);
+secConn.setSecondaryOk();
 assert.soon(function() {
     return checkConfigStrUpdated(secConn, expectedConfigStr);
 });
@@ -88,7 +88,7 @@ reconfig(st.configRS, replConfig);
 st.rs0.restart(0, {shardsvr: ''});
 st.rs0.restart(1, {shardsvr: ''});
 
-st.rs0.waitForMaster();
+st.rs0.waitForPrimary();
 st.rs0.awaitSecondaryNodes();
 
 assert.soon(function() {
@@ -96,7 +96,7 @@ assert.soon(function() {
 });
 
 secConn = st.rs0.getSecondary();
-secConn.setSlaveOk(true);
+secConn.setSecondaryOk();
 assert.soon(function() {
     return checkConfigStrUpdated(secConn, origConfigConnStr);
 });

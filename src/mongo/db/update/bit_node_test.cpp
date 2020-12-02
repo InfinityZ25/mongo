@@ -163,7 +163,8 @@ TEST_F(BitNodeTest, ApplyAndLogEmptyDocumentAnd) {
     ASSERT_FALSE(result.noop);
     ASSERT_EQUALS(fromjson("{a: 0}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {a: 0}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$set: {a: 0}}"), fromjson("{$v: 2, diff: {i: {a: 0}}}"));
 }
 
 TEST_F(BitNodeTest, ApplyAndLogEmptyDocumentOr) {
@@ -178,7 +179,8 @@ TEST_F(BitNodeTest, ApplyAndLogEmptyDocumentOr) {
     ASSERT_FALSE(result.noop);
     ASSERT_EQUALS(fromjson("{a: 1}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {a: 1}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$set: {a: 1}}"), fromjson("{$v: 2, diff: {i: {a: 1}}}"));
 }
 
 TEST_F(BitNodeTest, ApplyAndLogEmptyDocumentXor) {
@@ -193,7 +195,8 @@ TEST_F(BitNodeTest, ApplyAndLogEmptyDocumentXor) {
     ASSERT_FALSE(result.noop);
     ASSERT_EQUALS(fromjson("{a: 1}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {a: 1}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$set: {a: 1}}"), fromjson("{$v: 2, diff: {i: {a: 1}}}"));
 }
 
 TEST_F(BitNodeTest, ApplyAndLogSimpleDocumentAnd) {
@@ -203,12 +206,14 @@ TEST_F(BitNodeTest, ApplyAndLogSimpleDocumentAnd) {
     ASSERT_OK(node.init(update["$bit"]["a"], expCtx));
 
     mutablebson::Document doc(BSON("a" << 0b0101));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_EQUALS(BSON("a" << 0b0100), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(BSON("$set" << BSON("a" << 0b0100)), getLogDoc());
+
+    assertOplogEntry(BSON("$set" << BSON("a" << 0b0100)),
+                     BSON("$v" << 2 << "diff" << BSON("u" << BSON("a" << 0b0100))));
 }
 
 TEST_F(BitNodeTest, ApplyAndLogSimpleDocumentOr) {
@@ -218,12 +223,14 @@ TEST_F(BitNodeTest, ApplyAndLogSimpleDocumentOr) {
     ASSERT_OK(node.init(update["$bit"]["a"], expCtx));
 
     mutablebson::Document doc(BSON("a" << 0b0101));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_EQUALS(BSON("a" << 0b0111), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(BSON("$set" << BSON("a" << 0b0111)), getLogDoc());
+
+    assertOplogEntry(BSON("$set" << BSON("a" << 0b0111)),
+                     BSON("$v" << 2 << "diff" << BSON("u" << BSON("a" << 0b0111))));
 }
 
 TEST_F(BitNodeTest, ApplyAndLogSimpleDocumentXor) {
@@ -233,12 +240,14 @@ TEST_F(BitNodeTest, ApplyAndLogSimpleDocumentXor) {
     ASSERT_OK(node.init(update["$bit"]["a"], expCtx));
 
     mutablebson::Document doc(BSON("a" << 0b0101));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_EQUALS(BSON("a" << 0b0011), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(BSON("$set" << BSON("a" << 0b0011)), getLogDoc());
+
+    assertOplogEntry(BSON("$set" << BSON("a" << 0b0011)),
+                     BSON("$v" << 2 << "diff" << BSON("u" << BSON("a" << 0b0011))));
 }
 
 TEST_F(BitNodeTest, ApplyShouldReportNoOp) {
@@ -248,12 +257,13 @@ TEST_F(BitNodeTest, ApplyShouldReportNoOp) {
     ASSERT_OK(node.init(update["$bit"]["a"], expCtx));
 
     mutablebson::Document doc(BSON("a" << 1));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
     ASSERT_EQUALS(BSON("a" << static_cast<int>(1)), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+
+    assertOplogEntryIsNoop();
 }
 
 TEST_F(BitNodeTest, ApplyMultipleBitOps) {
@@ -268,12 +278,14 @@ TEST_F(BitNodeTest, ApplyMultipleBitOps) {
     ASSERT_OK(node.init(update["$bit"]["a"], expCtx));
 
     mutablebson::Document doc(BSON("a" << 0b1111111100000000));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_EQUALS(BSON("a" << 0b0101011001100110), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(BSON("$set" << BSON("a" << 0b0101011001100110)), getLogDoc());
+
+    assertOplogEntry(BSON("$set" << BSON("a" << 0b0101011001100110)),
+                     BSON("$v" << 2 << "diff" << BSON("u" << BSON("a" << 0b0101011001100110))));
 }
 
 TEST_F(BitNodeTest, ApplyRepeatedBitOps) {
@@ -283,12 +295,14 @@ TEST_F(BitNodeTest, ApplyRepeatedBitOps) {
     ASSERT_OK(node.init(update["$bit"]["a"], expCtx));
 
     mutablebson::Document doc(BSON("a" << 0b11110000));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_EQUALS(BSON("a" << 0b10010110), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(BSON("$set" << BSON("a" << 0b10010110)), getLogDoc());
+
+    assertOplogEntry(BSON("$set" << BSON("a" << 0b10010110)),
+                     BSON("$v" << 2 << "diff" << BSON("u" << BSON("a" << 0b10010110))));
 }
 
 }  // namespace

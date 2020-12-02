@@ -8,7 +8,6 @@
 
 (function() {
 "use strict";
-load("jstests/aggregation/extras/utils.js");
 
 const dbName = "test";
 const collName = "coll";
@@ -26,7 +25,7 @@ const collNss = primaryColl.getFullName();
 jsTestLog("Do an insert");
 const time =
     assert.commandWorked(primaryColl.runCommand('insert', {documents: [{_id: 0}]})).operationTime;
-jsTestLog("Inserted with time " + time);
+jsTestLog("Inserted with time " + tojson(time));
 assert.commandWorked(primaryColl.insert({_id: 1}));
 
 rst.awaitReplication();
@@ -52,8 +51,8 @@ rst.awaitReplication();
 
 // Make sure that the secondary succesfully applies the applyOps oplog entry despite the command
 // specifying an invalid inner "ts" field.
-arrayEq(primaryColl.find({_id: 3}).toArray(), [{_id: 3}]);
-arrayEq(secondary.getDB(dbName)[collName].find({_id: 3}).toArray(), [{_id: 3}]);
+assert.sameMembers(primaryColl.find({_id: 3}).toArray(), [{_id: 3}]);
+assert.sameMembers(secondary.getDB(dbName)[collName].find({_id: 3}).toArray(), [{_id: 3}]);
 
 rst.stopSet();
 })();

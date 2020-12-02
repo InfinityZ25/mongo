@@ -1,5 +1,8 @@
 /**
  * Tests for the $$REMOVE system variable.
+ * @tags: [
+ *   sbe_incompatible,
+ * ]
  */
 (function() {
 "use strict";
@@ -60,7 +63,7 @@ assert.commandFailedWithCode(db.runCommand({
         {$project: {_id: 0, a: {$let: {vars: {"REMOVE": 3}, in : {b: "$$REMOVE", c: 2}}}}}
     ]
 }),
-                             16867);
+                             ErrorCodes.FailedToParse);
 
 // Test that $$REMOVE, $$CURRENT, $$ROOT, and user-defined variables can all be used together.
 assert.eq(

@@ -45,11 +45,14 @@ namespace mongo {
  */
 class ArrayMatchingMatchExpression : public PathMatchExpression {
 public:
-    ArrayMatchingMatchExpression(MatchType matchType, StringData path)
+    ArrayMatchingMatchExpression(MatchType matchType,
+                                 StringData path,
+                                 clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : PathMatchExpression(matchType,
                               path,
                               ElementPath::LeafArrayBehavior::kNoTraversal,
-                              ElementPath::NonLeafArrayBehavior::kTraverse) {}
+                              ElementPath::NonLeafArrayBehavior::kTraverse,
+                              std::move(annotation)) {}
 
     virtual ~ArrayMatchingMatchExpression() {}
 
@@ -71,18 +74,20 @@ public:
 
 class ElemMatchObjectMatchExpression : public ArrayMatchingMatchExpression {
 public:
-    ElemMatchObjectMatchExpression(StringData path, MatchExpression* sub);
+    ElemMatchObjectMatchExpression(StringData path,
+                                   MatchExpression* sub,
+                                   clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
     bool matchesArray(const BSONObj& anArray, MatchDetails* details) const;
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<ElemMatchObjectMatchExpression> e =
-            std::make_unique<ElemMatchObjectMatchExpression>(path(),
-                                                             _sub->shallowClone().release());
+            std::make_unique<ElemMatchObjectMatchExpression>(
+                path(), _sub->shallowClone().release(), _errorAnnotation);
         if (getTag()) {
             e->setTag(getTag()->clone());
         }
-        return std::move(e);
+        return e;
     }
 
     virtual void debugString(StringBuilder& debug, int indentationLevel) const;
@@ -109,6 +114,14 @@ public:
         _sub = std::move(newChild);
     }
 
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
 private:
     ExpressionOptimizerFunc getOptimizer() const final;
 
@@ -120,8 +133,11 @@ public:
     /**
      * This constructor takes ownership of 'sub.'
      */
-    ElemMatchValueMatchExpression(StringData path, MatchExpression* sub);
-    explicit ElemMatchValueMatchExpression(StringData path);
+    ElemMatchValueMatchExpression(StringData path,
+                                  MatchExpression* sub,
+                                  clonable_ptr<ErrorAnnotation> annotation = nullptr);
+    explicit ElemMatchValueMatchExpression(StringData path,
+                                           clonable_ptr<ErrorAnnotation> annotation = nullptr);
     virtual ~ElemMatchValueMatchExpression();
 
     void add(MatchExpression* sub);
@@ -130,14 +146,14 @@ public:
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<ElemMatchValueMatchExpression> e =
-            std::make_unique<ElemMatchValueMatchExpression>(path());
+            std::make_unique<ElemMatchValueMatchExpression>(path(), _errorAnnotation);
         for (size_t i = 0; i < _subs.size(); ++i) {
             e->add(_subs[i]->shallowClone().release());
         }
         if (getTag()) {
             e->setTag(getTag()->clone());
         }
-        return std::move(e);
+        return e;
     }
 
     virtual void debugString(StringBuilder& debug, int indentationLevel) const;
@@ -156,6 +172,14 @@ public:
         return _subs[i];
     }
 
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
 private:
     ExpressionOptimizerFunc getOptimizer() const final;
 
@@ -166,15 +190,17 @@ private:
 
 class SizeMatchExpression : public ArrayMatchingMatchExpression {
 public:
-    SizeMatchExpression(StringData path, int size);
+    SizeMatchExpression(StringData path,
+                        int size,
+                        clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<SizeMatchExpression> e =
-            std::make_unique<SizeMatchExpression>(path(), _size);
+            std::make_unique<SizeMatchExpression>(path(), _size, _errorAnnotation);
         if (getTag()) {
             e->setTag(getTag()->clone());
         }
-        return std::move(e);
+        return e;
     }
 
     size_t numChildren() const override {
@@ -199,6 +225,14 @@ public:
 
     int getData() const {
         return _size;
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
     }
 
 private:

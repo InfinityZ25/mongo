@@ -55,9 +55,11 @@ else
   end
 end
 
-if os[:arch] == 'x86_64' and os[:name] != 'amazon' and
+if os[:arch] == 'x86_64' and 
   ((os[:name] == 'ubuntu' and os[:release].split('.')[0].to_i > 12) or 
-    (os[:family] == 'redhat' and os[:release].split('.')[0].to_i >= 7))
+    (os[:family] == 'redhat' and os[:release].split('.')[0].to_i >= 7) or 
+    (os[:name] == 'debian' and os[:release].split('.')[0].to_i >= 10) or
+    os[:name] == 'amazon')
   describe command("install_compass") do
     its('exit_status') { should eq 0 }
   end
@@ -151,7 +153,8 @@ if deb
     # account shells
     its('shell') {
       if ((os[:name] == 'debian' and os[:release].split('.')[0] == '10') or
-          (os[:name] == 'ubuntu' and os[:release] == '18.04'))
+          (os[:name] == 'ubuntu' and os[:release] == '18.04') or
+          (os[:name] == 'ubuntu' and os[:release] == '20.04'))
         should eq '/usr/sbin/nologin'
       else
         should eq '/bin/false'

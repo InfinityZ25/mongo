@@ -4,6 +4,8 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
 (function() {
 "use strict";
 
+const SIGTERM = 15;
+
 var shellVersion = version;
 
 // Record the exit codes of mongod and mongos processes that crashed during startup keyed by
@@ -108,10 +110,10 @@ function pathJoin(...parts) {
 let _hangAnalyzerEnabled = true;
 
 /**
- * Run `./buildscripts/hang_analyzer.py`.
+ * Run `./buildscripts/resmoke.py hang-analyzer`.
  *
  * @param {Number[]} pids
- *     optional pids of processes to pass to hang_analyzer.py.
+ *     optional pids of processes to pass to the hang analyzer.
  *     If not specified will use `TestData.peerPids` (pids of
  *     "fixture" processes started and passed in by resmoke)
  *     plus `MongoRunner.runningChildPids()` which includes all
@@ -133,11 +135,6 @@ function runHangAnalyzer(pids) {
         return;
     }
 
-    if (TestData.isAsanBuild) {
-        print('Skipping runHangAnalyzer: ASAN build');
-        return;
-    }
-
     if (typeof pids === 'undefined') {
         pids = getPids();
     }
@@ -148,9 +145,18 @@ function runHangAnalyzer(pids) {
     // Result of runningChildPids may be NumberLong(), so
     // add 0 to convert to Number.
     pids = pids.map(p => p + 0).join(',');
-    print(`Running hang_analyzer.py for pids [${pids}]`);
-    const scriptPath = pathJoin('.', 'buildscripts', 'hang_analyzer.py');
-    return runProgram('python', scriptPath, '-c', '-d', pids);
+    print(`Running hang analyzer for pids [${pids}]`);
+
+    const scriptPath = pathJoin('.', 'buildscripts', 'resmoke.py');
+    const args =
+        ['python', scriptPath, 'hang-analyzer', '-k', '-o', 'file', '-o', 'stdout', '-d', pids];
+
+    // Enable core dumps if not an ASAN build.
+    if (!_isAddressSanitizerActive()) {
+        args.push('-c');
+    }
+
+    return runProgram(...args);
 }
 
 MongoRunner.runHangAnalyzer = runHangAnalyzer;
@@ -204,7 +210,9 @@ MongoRunner.binVersionSubs = [
     new MongoRunner.VersionSub(extractMajorVersionFromVersionString(shellVersion()),
                                shellVersion()),
     // To-be-updated when we branch for the next release.
-    new MongoRunner.VersionSub("last-stable", "4.4")
+    new MongoRunner.VersionSub("last-continuous", "4.8"),
+    // To be updated when we branch for the next LTS release.
+    new MongoRunner.VersionSub("last-lts", "4.4")
 ];
 
 MongoRunner.getBinVersionFor = function(version) {
@@ -321,6 +329,7 @@ MongoRunner.logicalOptions = {
     waitForConnect: true,
     bridgeOptions: true,
     skipValidation: true,
+    backupOnRestartDir: true,
 };
 
 MongoRunner.toRealPath = function(path, pathOpts) {
@@ -442,7 +451,7 @@ MongoRunner.arrOptions = function(binaryName, args) {
 
             fullArgs.push("--" + k);
 
-            if (v != "") {
+            if (v !== "") {
                 fullArgs.push("" + v);
             }
         };
@@ -626,14 +635,17 @@ var _isMongodVersionEqualOrAfter = function(version1, version2) {
     return false;
 };
 
-// Removes a setParameter parameter from mongods running a version that won't recognize them.
-var _removeSetParameterIfBeforeVersion = function(opts, parameterName, requiredVersion) {
+// Removes a setParameter parameter from mongods or mongoses running a version that won't recognize
+// them.
+var _removeSetParameterIfBeforeVersion = function(
+    opts, parameterName, requiredVersion, isMongos = false) {
+    var processString = isMongos ? "mongos" : "mongod";
     var versionCompatible = (opts.binVersion === "" || opts.binVersion === undefined ||
                              _isMongodVersionEqualOrAfter(requiredVersion, opts.binVersion));
     if (!versionCompatible && opts.setParameter && opts.setParameter[parameterName] != undefined) {
         print("Removing '" + parameterName + "' setParameter with value " +
-              opts.setParameter[parameterName] +
-              " because it isn't compatibile with mongod running version " + opts.binVersion);
+              opts.setParameter[parameterName] + " because it isn't compatible with " +
+              processString + " running version " + opts.binVersion);
         delete opts.setParameter[parameterName];
     }
 };
@@ -676,6 +688,9 @@ MongoRunner.mongodOptions = function(opts = {}) {
     _removeSetParameterIfBeforeVersion(opts, "numInitialSyncAttempts", "3.3.12");
     _removeSetParameterIfBeforeVersion(opts, "numInitialSyncConnectAttempts", "3.3.12");
     _removeSetParameterIfBeforeVersion(opts, "migrationLockAcquisitionMaxWaitMS", "4.1.7");
+    _removeSetParameterIfBeforeVersion(opts, "shutdownTimeoutMillisForSignaledShutdown", "4.5.0");
+    _removeSetParameterIfBeforeVersion(
+        opts, "failpoint.PrimaryOnlyServiceSkipRebuildingInstances", "4.8.0");
 
     if (!opts.logFile && opts.useLogFiles) {
         opts.logFile = opts.dbpath + "/mongod.log";
@@ -708,6 +723,18 @@ MongoRunner.mongodOptions = function(opts = {}) {
                             "specified");
         }
         opts.enableEncryption = "";
+    }
+
+    if (opts.hasOwnProperty("encryptionCipherMode")) {
+        if (typeof opts.encryptionCipherMode !== "string") {
+            // opts.encryptionCipherMode, if set, must be a string
+            throw new Error("The encryptionCipherMode option must be a string if it is specified");
+        }
+    } else if (jsTestOptions().encryptionCipherMode !== undefined) {
+        if (typeof jsTestOptions().encryptionCipherMode !== "string") {
+            throw new Error("The encryptionCipherMode option must be a string if it is specified");
+        }
+        opts.encryptionCipherMode = jsTestOptions().encryptionCipherMode;
     }
 
     if (opts.hasOwnProperty("encryptionKeyFile")) {
@@ -792,6 +819,9 @@ MongoRunner.mongosOptions = function(opts) {
         opts.binVersion = MongoRunner.getBinVersionFor(testOptions.mongosBinVersion);
     }
 
+    _removeSetParameterIfBeforeVersion(
+        opts, "mongosShutdownTimeoutMillisForSignaledShutdown", "4.5.0", true);
+
     // If the mongos is being restarted with a newer version, make sure we remove any options
     // that no longer exist in the newer version.
     if (opts.restart && MongoRunner.areBinVersionsTheSame('latest', opts.binVersion)) {
@@ -852,11 +882,26 @@ MongoRunner.runMongod = function(opts) {
         runId = opts.runId;
         waitForConnect = opts.waitForConnect;
 
+        let backupOnRestartDir = jsTest.options()["backupOnRestartDir"] || false;
+
         if (opts.forceLock)
             removeFile(opts.dbpath + "/mongod.lock");
-        if ((opts.cleanData || opts.startClean) || (!opts.restart && !opts.noCleanData)) {
+        if ((opts.cleanData || opts.startClean) || (!opts.restart && !opts.noCleanData) ||
+            !pathExists(opts.dbpath)) {
             print("Resetting db path '" + opts.dbpath + "'");
             resetDbpath(opts.dbpath);
+        } else {
+            if (backupOnRestartDir) {
+                let pathOpts = {"backupDir": backupOnRestartDir, "dbpath": opts.dbpath};
+                let backupDir = MongoRunner.toRealDir("$backupDir/$dbpath", pathOpts);
+                // `toRealDir` assumes the patterned directory should be under
+                // `MongoRunner.dataPath`. In this case, preserve the user input as is.
+                backupDir = backupDir.substring(MongoRunner.dataPath.length);
+
+                print("Backing up data files. DBPath: " + opts.dbpath +
+                      " Backing up under: " + backupDir);
+                copyDbpath(opts.dbpath, backupDir);
+            }
         }
 
         var mongodProgram = MongoRunner.mongodPath;
@@ -928,7 +973,8 @@ MongoRunner.StopError.prototype = Object.create(Error.prototype);
 MongoRunner.StopError.prototype.constructor = MongoRunner.StopError;
 
 // Constants for exit codes of MongoDB processes
-MongoRunner.EXIT_ABORT = -6;
+// On Windows, std::abort causes the process to exit with return code 14.
+MongoRunner.EXIT_ABORT = _isWindows() ? 14 : -6;
 MongoRunner.EXIT_CLEAN = 0;
 MongoRunner.EXIT_BADOPTIONS = 2;
 MongoRunner.EXIT_REPLICATION_ERROR = 3;
@@ -973,7 +1019,7 @@ MongoRunner.validateCollectionsCallback = function(port) {};
  * Note: The auth option is required in a authenticated mongod running in Windows since
  *  it uses the shutdown command, which requires admin credentials.
  */
-MongoRunner.stopMongod = function(conn, signal, opts, waitpid) {
+var stopMongoProgram = function(conn, signal, opts, waitpid) {
     if (!conn.pid) {
         throw new Error("first arg must have a `pid` property; " +
                         "it is usually the object returned from MongoRunner.runMongod/s");
@@ -988,10 +1034,15 @@ MongoRunner.stopMongod = function(conn, signal, opts, waitpid) {
     opts = opts || {};
     waitpid = (waitpid === undefined) ? true : waitpid;
 
-    var allowedExitCode = MongoRunner.EXIT_CLEAN;
+    // If we are executing an unclean shutdown, we want to avoid checking collection counts during
+    // validation, since the counts may be inaccurate.
+    if (signal !== SIGTERM && typeof TestData !== 'undefined') {
+        TestData.skipEnforceFastCountOnValidate = true;
+    }
 
-    if (opts.allowedExitCode) {
-        allowedExitCode = opts.allowedExitCode;
+    const allowedExitCode = opts.allowedExitCode ? opts.allowedExitCode : MongoRunner.EXIT_CLEAN;
+    if (!waitpid && allowedExitCode !== MongoRunner.EXIT_CLEAN) {
+        throw new Error('Must wait for process to exit if it is expected to exit uncleanly');
     }
 
     var port = parseInt(conn.port);
@@ -1022,7 +1073,7 @@ MongoRunner.stopMongod = function(conn, signal, opts, waitpid) {
 
     // If we are not waiting for shutdown, then there is no exit code to check.
     if (!waitpid) {
-        return 0;
+        returnCode = 0;
     }
     if (allowedExitCode !== returnCode) {
         throw new MongoRunner.StopError(returnCode);
@@ -1031,10 +1082,15 @@ MongoRunner.stopMongod = function(conn, signal, opts, waitpid) {
               returnCode);
     }
 
+    if (conn.undoLiveRecordPid) {
+        _stopUndoLiveRecord(conn.undoLiveRecordPid);
+    }
+
     return returnCode;
 };
 
-MongoRunner.stopMongos = MongoRunner.stopMongod;
+MongoRunner.stopMongod = stopMongoProgram;
+MongoRunner.stopMongos = stopMongoProgram;
 
 // Given a test name figures out a directory for that test to use for dump files and makes sure
 // that directory exists and is empty.
@@ -1091,16 +1147,27 @@ function appendSetParameterArgs(argArray) {
     }
 
     let [baseProgramName, programVersion] = programName.split("-");
-    let programMajorMinorVersion = 0;
+
+    // Setting programMajorMinorVersion to the maximum value for the latest binary version
+    // simplifies version checks below.
+    const lastestMajorMinorVersion = Number.MAX_SAFE_INTEGER;
+    let programMajorMinorVersion = lastestMajorMinorVersion;
     if (programVersion) {
         let [major, minor, point] = programVersion.split(".");
-        programMajorMinorVersion = parseInt(major) * 100 + parseInt(minor);
+        programMajorMinorVersion = parseInt(major) * 100 + parseInt(minor) * 10;
     }
 
     if (baseProgramName === 'mongod' || baseProgramName === 'mongos') {
         if (jsTest.options().enableTestCommands) {
             argArray.push(...['--setParameter', "enableTestCommands=1"]);
         }
+
+        if (programMajorMinorVersion >= 440) {
+            if (jsTest.options().testingDiagnosticsEnabled) {
+                argArray.push(...['--setParameter', "testingDiagnosticsEnabled=1"]);
+            }
+        }
+
         if (jsTest.options().authMechanism && jsTest.options().authMechanism != "SCRAM-SHA-1") {
             if (!argArrayContainsSetParameterValue('authenticationMechanisms=')) {
                 argArray.push(...['--setParameter',
@@ -1112,13 +1179,7 @@ function appendSetParameterArgs(argArray) {
         }
 
         // New options in 3.5.x
-        if (!programMajorMinorVersion || programMajorMinorVersion >= 305) {
-            if (jsTest.options().serviceExecutor) {
-                if (!argArrayContains("--serviceExecutor")) {
-                    argArray.push(...["--serviceExecutor", jsTest.options().serviceExecutor]);
-                }
-            }
-
+        if (programMajorMinorVersion >= 350) {
             if (jsTest.options().transportLayer) {
                 if (!argArrayContains("--transportLayer")) {
                     argArray.push(...["--transportLayer", jsTest.options().transportLayer]);
@@ -1131,7 +1192,7 @@ function appendSetParameterArgs(argArray) {
 
         // Since options may not be backward compatible, mongos options are not
         // set on older versions, e.g., mongos-3.0.
-        if (programName.endsWith('mongos')) {
+        if (baseProgramName === 'mongos' && programMajorMinorVersion == lastestMajorMinorVersion) {
             // apply setParameters for mongos
             if (jsTest.options().setParametersMongos) {
                 let params = jsTest.options().setParametersMongos;
@@ -1162,15 +1223,45 @@ function appendSetParameterArgs(argArray) {
             }
 
             // Set storageEngine for mongod. There was no storageEngine parameter before 3.0.
-            if (jsTest.options().storageEngine &&
-                (!programVersion || programMajorMinorVersion >= 300)) {
+            if (jsTest.options().storageEngine && (programMajorMinorVersion >= 300)) {
                 if (!argArrayContains("--storageEngine")) {
                     argArray.push(...['--storageEngine', jsTest.options().storageEngine]);
                 }
             }
 
-            // New mongod-specific option in 4.3.x.
-            if (!programMajorMinorVersion || programMajorMinorVersion >= 430) {
+            // New mongod-specific option in 4.5.x.
+            if (programMajorMinorVersion >= 450) {
+                // Allow the parameter to be overridden if set explicitly via TestData.
+                const parameters = jsTest.options().setParameters;
+
+                if ((parameters === undefined ||
+                     parameters['coordinateCommitReturnImmediatelyAfterPersistingDecision'] ===
+                         undefined) &&
+                    !argArrayContainsSetParameterValue(
+                        'coordinateCommitReturnImmediatelyAfterPersistingDecision=')) {
+                    argArray.push(
+                        ...['--setParameter',
+                            "coordinateCommitReturnImmediatelyAfterPersistingDecision=false"]);
+                }
+            }
+
+            // New mongod-specific option in 4.4.
+            if (programMajorMinorVersion >= 440) {
+                if (jsTest.options().setParameters &&
+                    jsTest.options().setParameters['enableIndexBuildCommitQuorum'] !== undefined) {
+                    if (!argArrayContainsSetParameterValue('enableIndexBuildCommitQuorum=')) {
+                        argArray.push(...['--setParameter',
+                                          "enableIndexBuildCommitQuorum=" +
+                                              jsTest.options()
+                                                  .setParameters['enableIndexBuildCommitQuorum']]);
+                    }
+                }
+            }
+
+            // TODO (SERVER-49407): Enable this parameter for 4.4 nodes after SERVER-21700 has been
+            // backported to v4.4.
+            // New mongod-specific option in 4.5.
+            if (programMajorMinorVersion >= 450) {
                 // Allow the parameter to be overridden if set explicitly via TestData.
                 if ((jsTest.options().setParameters === undefined ||
                      jsTest.options()
@@ -1191,7 +1282,7 @@ function appendSetParameterArgs(argArray) {
             }
 
             // New mongod-specific options in 4.0.x
-            if (!programMajorMinorVersion || programMajorMinorVersion >= 400) {
+            if (programMajorMinorVersion >= 400) {
                 if (jsTest.options().transactionLifetimeLimitSeconds !== undefined) {
                     if (!argArrayContainsSetParameterValue("transactionLifetimeLimitSeconds=")) {
                         argArray.push(...["--setParameter",
@@ -1202,26 +1293,24 @@ function appendSetParameterArgs(argArray) {
             }
 
             // TODO: Make this unconditional in 3.8.
-            if (!programMajorMinorVersion || programMajorMinorVersion > 304) {
+            if (programMajorMinorVersion > 340) {
                 if (!argArrayContainsSetParameterValue('orphanCleanupDelaySecs=')) {
                     argArray.push(...['--setParameter', 'orphanCleanupDelaySecs=1']);
                 }
             }
 
-            if (!programMajorMinorVersion || programMajorMinorVersion >= 306) {
-                if (jsTest.options().storageEngine === "wiredTiger" ||
-                    !jsTest.options().storageEngine) {
-                    if (jsTest.options().enableMajorityReadConcern !== undefined &&
-                        !argArrayContains("--enableMajorityReadConcern")) {
-                        argArray.push(...['--enableMajorityReadConcern',
-                                          jsTest.options().enableMajorityReadConcern.toString()]);
-                    }
+            if (programMajorMinorVersion >= 360) {
+                if (jsTest.options().enableMajorityReadConcern !== undefined &&
+                    !argArrayContains("--enableMajorityReadConcern")) {
+                    argArray.push(...['--enableMajorityReadConcern',
+                                      jsTest.options().enableMajorityReadConcern.toString()]);
                 }
             }
 
             // Since options may not be backward compatible, mongod options are not
             // set on older versions, e.g., mongod-3.0.
-            if (programName.endsWith('mongod')) {
+            if (baseProgramName === 'mongod' &&
+                programMajorMinorVersion == lastestMajorMinorVersion) {
                 if (jsTest.options().storageEngine === "wiredTiger" ||
                     !jsTest.options().storageEngine) {
                     if (jsTest.options().storageEngineCacheSizeGB &&
@@ -1272,6 +1361,11 @@ function appendSetParameterArgs(argArray) {
                             continue;
                         }
 
+                        if (paramName === 'enableIndexBuildCommitQuorum' &&
+                            argArrayContains("enableIndexBuildCommitQuorum")) {
+                            continue;
+                        }
+
                         const paramVal = ((param) => {
                             if (typeof param === "object") {
                                 return JSON.stringify(param);
@@ -1293,20 +1387,22 @@ function appendSetParameterArgs(argArray) {
 /**
  * Continuously tries to establish a connection to the server on the specified port.
  *
- * If a connection cannot be established within a time limit, an exception will be thrown. If the
- * process for the given 'pid' is found to no longer be running, this function will terminate and
- * return null.
+ * If a connection cannot be established within a time limit, an exception will be thrown. If
+ * the process for the given 'pid' is found to no longer be running, this function will
+ * terminate and return null.
  *
  * @param {int} [pid] the process id of the node to connect to.
  * @param {int} [port] the port of the node to connect to.
+ * @param {int} [undoLiveRecordPid=null] the process id of the `live-record` process.
  * @returns a new Mongo connection object, or null if the process is not running.
  */
-MongoRunner.awaitConnection = function(pid, port) {
+MongoRunner.awaitConnection = function({pid, port, undoLiveRecordPid = null} = {}) {
     var conn = null;
     assert.soon(function() {
         try {
             conn = new Mongo("127.0.0.1:" + port);
             conn.pid = pid;
+            conn.undoLiveRecordPid = undoLiveRecordPid;
             return true;
         } catch (e) {
             var res = checkProgram(pid);
@@ -1314,12 +1410,30 @@ MongoRunner.awaitConnection = function(pid, port) {
                 print("mongo program was not running at " + port +
                       ", process ended with exit code: " + res.exitCode);
                 serverExitCodeMap[port] = res.exitCode;
+                if (undoLiveRecordPid) {
+                    _stopUndoLiveRecord(undoLiveRecordPid);
+                }
                 return true;
             }
         }
         return false;
     }, "unable to connect to mongo program on port " + port, 600 * 1000);
     return conn;
+};
+
+var _runUndoLiveRecord = function(pid) {
+    var argArray = [jsTestOptions().undoRecorderPath, "-p", pid];
+    return _startMongoProgram.apply(null, argArray);
+};
+
+var _stopUndoLiveRecord = function(undoLiveRecordPid) {
+    print("Saving the UndoDB recording; it may take a few minutes...");
+    var undoReturnCode = waitProgram(undoLiveRecordPid);
+    if (undoReturnCode !== 0) {
+        throw new Error(
+            "Undo live-record failed to terminate correctly. This is likely a bug in Undo. " +
+            "Please record any logs and send them to the #server-tig Slack channel");
+    }
 };
 
 /**
@@ -1341,16 +1455,22 @@ MongoRunner._startWithArgs = function(argArray, env, waitForConnect) {
         pid = _startMongoProgram({args: argArray, env: env});
     }
 
+    let undoLiveRecordPid = null;
+    if (jsTestOptions().undoRecorderPath) {
+        undoLiveRecordPid = _runUndoLiveRecord(pid);
+    }
+
     delete serverExitCodeMap[port];
     if (!waitForConnect) {
         print("Skip waiting to connect to node with pid=" + pid + ", port=" + port);
         return {
             pid: pid,
             port: port,
+            undoLiveRecordPid: undoLiveRecordPid,
         };
     }
 
-    return MongoRunner.awaitConnection(pid, port);
+    return MongoRunner.awaitConnection({pid, port, undoLiveRecordPid});
 };
 
 /**

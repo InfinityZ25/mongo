@@ -28,10 +28,8 @@
  */
 #include "mongo/client/sdam/topology_description.h"
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
 #include "mongo/client/sdam/server_description.h"
 #include "mongo/db/wire_version.h"
-#include "mongo/logv2/log.h"
 #include "mongo/util/fail_point.h"
 
 namespace mongo::sdam {
@@ -48,6 +46,19 @@ TopologyDescription::TopologyDescription(SdamConfiguration config)
             _servers.push_back(std::make_shared<ServerDescription>(address));
         }
     }
+}
+
+TopologyDescriptionPtr TopologyDescription::create(SdamConfiguration config) {
+    auto result = std::make_shared<TopologyDescription>(config);
+    TopologyDescription::associateServerDescriptions(result);
+    return result;
+}
+
+TopologyDescriptionPtr TopologyDescription::clone(TopologyDescriptionPtr source) {
+    invariant(source);
+    auto result = std::make_shared<TopologyDescription>(*source);
+    TopologyDescription::associateServerDescriptions(result);
+    return result;
 }
 
 const UUID& TopologyDescription::getId() const {
@@ -90,7 +101,7 @@ void TopologyDescription::setType(TopologyType type) {
     _type = type;
 }
 
-bool TopologyDescription::containsServerAddress(const ServerAddress& address) const {
+bool TopologyDescription::containsServerAddress(const HostAndPort& address) const {
     return findServerByAddress(address) != boost::none;
 }
 
@@ -102,7 +113,7 @@ std::vector<ServerDescriptionPtr> TopologyDescription::findServers(
 }
 
 const boost::optional<ServerDescriptionPtr> TopologyDescription::findServerByAddress(
-    ServerAddress address) const {
+    HostAndPort address) const {
     auto results = findServers([address](const ServerDescriptionPtr& serverDescription) {
         return serverDescription->getAddress() == address;
     });
@@ -111,11 +122,6 @@ const boost::optional<ServerDescriptionPtr> TopologyDescription::findServerByAdd
 
 boost::optional<ServerDescriptionPtr> TopologyDescription::installServerDescription(
     const ServerDescriptionPtr& newServerDescription) {
-    LOGV2_DEBUG(4333202,
-                2,
-                "install server description {description}",
-                "description"_attr = newServerDescription->toString());
-
     boost::optional<ServerDescriptionPtr> previousDescription;
     if (getType() == TopologyType::kSingle) {
         // For Single, there is always one ServerDescription in TopologyDescription.servers;
@@ -123,21 +129,22 @@ boost::optional<ServerDescriptionPtr> TopologyDescription::installServerDescript
         // ServerDescription if the new topologyVersion is >= the old.
         invariant(_servers.size() == 1);
         previousDescription = _servers[0];
-        _servers[0] = std::shared_ptr<ServerDescription>(newServerDescription);
+        _servers[0] = newServerDescription;
     } else {
         for (auto it = _servers.begin(); it != _servers.end(); ++it) {
             const auto& currentDescription = *it;
             if (currentDescription->getAddress() == newServerDescription->getAddress()) {
                 previousDescription = *it;
-                *it = std::shared_ptr<ServerDescription>(newServerDescription);
+                *it = newServerDescription;
                 break;
             }
         }
 
         if (!previousDescription) {
-            _servers.push_back(std::shared_ptr<ServerDescription>(newServerDescription));
+            _servers.push_back(newServerDescription);
         }
     }
+
     newServerDescription->_topologyDescription = shared_from_this();
     checkWireCompatibilityVersions();
     calculateLogicalSessionTimeout();
@@ -146,10 +153,10 @@ boost::optional<ServerDescriptionPtr> TopologyDescription::installServerDescript
     return previousDescription;
 }
 
-void TopologyDescription::removeServerDescription(const ServerAddress& serverAddress) {
+void TopologyDescription::removeServerDescription(const HostAndPort& HostAndPort) {
     auto it = std::find_if(
-        _servers.begin(), _servers.end(), [serverAddress](const ServerDescriptionPtr& description) {
-            return description->getAddress() == serverAddress;
+        _servers.begin(), _servers.end(), [HostAndPort](const ServerDescriptionPtr& description) {
+            return description->getAddress() == HostAndPort;
         });
     if (it != _servers.end()) {
         _servers.erase(it);
@@ -245,7 +252,7 @@ BSONObj TopologyDescription::toBSON() {
 
     BSONObjBuilder bsonServers;
     for (auto server : this->getServers()) {
-        bsonServers << server->getAddress() << server->toBson();
+        bsonServers << server->getAddress().toString() << server->toBson();
     }
     bson.append("servers", bsonServers.obj());
 
@@ -279,6 +286,13 @@ std::string TopologyDescription::toString() {
     return toBSON().toString();
 }
 
+void TopologyDescription::associateServerDescriptions(
+    const TopologyDescriptionPtr& topologyDescription) {
+    auto& servers = topologyDescription->_servers;
+    for (auto& server : servers) {
+        server->_topologyDescription = topologyDescription;
+    }
+}
 
 boost::optional<ServerDescriptionPtr> TopologyDescription::getPrimary() {
     if (getType() != TopologyType::kReplicaSetWithPrimary) {

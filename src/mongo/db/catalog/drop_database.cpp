@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -35,7 +35,6 @@
 
 #include <algorithm>
 
-#include "mongo/db/background.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
@@ -46,6 +45,7 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/timeseries/bucket_catalog.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/duration.h"
@@ -72,7 +72,7 @@ Status _checkNssAndReplState(OperationContext* opCtx, Database* db, const std::s
         opCtx->writesAreReplicated() && !replCoord->canAcceptWritesForDatabase(opCtx, dbName);
 
     if (userInitiatedWritesAndNotPrimary) {
-        return Status(ErrorCodes::NotMaster,
+        return Status(ErrorCodes::NotWritablePrimary,
                       str::stream() << "Not primary while dropping database " << dbName);
     }
 
@@ -97,7 +97,6 @@ void _finishDropDatabase(OperationContext* opCtx,
     auto dropPendingGuard = makeGuard([db, opCtx] { db->setDropPending(opCtx, false); });
 
     if (!abortIndexBuilds) {
-        BackgroundOperation::assertNoBgOpInProgForDb(dbName);
         IndexBuildsCoordinator::get(opCtx)->assertNoBgOpInProgForDb(dbName);
     }
 
@@ -108,7 +107,7 @@ void _finishDropDatabase(OperationContext* opCtx,
     });
 
     if (MONGO_unlikely(dropDatabaseHangBeforeInMemoryDrop.shouldFail())) {
-        LOGV2(20334, "dropDatabase - fail point dropDatabaseHangBeforeInMemoryDrop enabled.");
+        LOGV2(20334, "dropDatabase - fail point dropDatabaseHangBeforeInMemoryDrop enabled");
         dropDatabaseHangBeforeInMemoryDrop.pauseWhileSet();
     }
 
@@ -116,12 +115,13 @@ void _finishDropDatabase(OperationContext* opCtx,
     databaseHolder->dropDb(opCtx, db);
     dropPendingGuard.dismiss();
 
-    LOGV2(20335,
-          "dropDatabase {dbName} - dropped {numCollections} collection(s)",
+    BucketCatalog::get(opCtx).clear(dbName);
+
+    LOGV2(20336,
+          "dropDatabase {dbName} - finished, dropped {numCollections} collection(s)",
           "dropDatabase",
           "db"_attr = dbName,
           "numCollectionsDropped"_attr = numCollections);
-    LOGV2(20336, "dropDatabase {dbName} - finished", "dropDatabase - finished", "db"_attr = dbName);
 }
 
 Status _dropDatabase(OperationContext* opCtx, const std::string& dbName, bool abortIndexBuilds) {
@@ -202,7 +202,7 @@ Status _dropDatabase(OperationContext* opCtx, const std::string& dbName, bool ab
                 if (MONGO_unlikely(dropDatabaseHangAfterWaitingForIndexBuilds.shouldFail())) {
                     LOGV2(4612300,
                           "dropDatabase - fail point dropDatabaseHangAfterWaitingForIndexBuilds "
-                          "enabled.");
+                          "enabled");
                     dropDatabaseHangAfterWaitingForIndexBuilds.pauseWhileSet();
                 }
 
@@ -224,7 +224,9 @@ Status _dropDatabase(OperationContext* opCtx, const std::string& dbName, bool ab
         }
 
         std::vector<NamespaceString> collectionsToDrop;
-        for (auto collIt = db->begin(opCtx); collIt != db->end(opCtx); ++collIt) {
+        auto catalog = CollectionCatalog::get(opCtx);
+        for (auto collIt = catalog->begin(opCtx, db->name()); collIt != catalog->end(opCtx);
+             ++collIt) {
             auto collection = *collIt;
             if (!collection) {
                 break;
@@ -269,9 +271,8 @@ Status _dropDatabase(OperationContext* opCtx, const std::string& dbName, bool ab
             }
 
             if (!abortIndexBuilds) {
-                BackgroundOperation::assertNoBgOpInProgForNs(nss.ns());
                 IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(
-                    CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss)->uuid());
+                    catalog->lookupCollectionByNamespace(opCtx, nss)->uuid());
             }
 
             writeConflictRetry(opCtx, "dropDatabase_collection", nss.ns(), [&] {
@@ -389,7 +390,7 @@ Status _dropDatabase(OperationContext* opCtx, const std::string& dbName, bool ab
     if (MONGO_unlikely(dropDatabaseHangAfterAllCollectionsDrop.shouldFail())) {
         LOGV2(20343,
               "dropDatabase - fail point dropDatabaseHangAfterAllCollectionsDrop enabled. "
-              "Blocking until fail point is disabled. ");
+              "Blocking until fail point is disabled");
         dropDatabaseHangAfterAllCollectionsDrop.pauseWhileSet();
     }
 
@@ -425,18 +426,7 @@ Status _dropDatabase(OperationContext* opCtx, const std::string& dbName, bool ab
 }  // namespace
 
 Status dropDatabase(OperationContext* opCtx, const std::string& dbName) {
-    // Only allow aborting index builds if two-phase index builds are enabled.
-    bool abortIndexBuilds = true;
-    auto indexBuildsCoord = IndexBuildsCoordinator::get(opCtx);
-    if (!indexBuildsCoord->supportsTwoPhaseIndexBuild()) {
-        LOGV2_DEBUG(4612301,
-                    2,
-                    "dropDatabase - not aborting in-progress index builds because two phase index "
-                    "builds are disabled",
-                    "dbName"_attr = dbName);
-        abortIndexBuilds = false;
-    }
-
+    const bool abortIndexBuilds = true;
     return _dropDatabase(opCtx, dbName, abortIndexBuilds);
 }
 

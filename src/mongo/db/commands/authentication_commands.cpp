@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
 
 #include "mongo/platform/basic.h"
 
@@ -44,6 +44,7 @@
 #include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/config.h"
 #include "mongo/db/audit.h"
+#include "mongo/db/auth/authentication_session.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/sasl_options.h"
@@ -57,10 +58,10 @@
 #include "mongo/logv2/log.h"
 #include "mongo/platform/random.h"
 #include "mongo/rpc/metadata/client_metadata.h"
-#include "mongo/rpc/metadata/client_metadata_ismaster.h"
 #include "mongo/transport/session.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/net/ssl_manager.h"
+#include "mongo/util/net/ssl_peer_info.h"
 #include "mongo/util/net/ssl_types.h"
 #include "mongo/util/text.h"
 
@@ -72,7 +73,7 @@ static constexpr auto kX509AuthenticationDisabledMessage = "x.509 authentication
 
 #ifdef MONGO_CONFIG_SSL
 Status _authenticateX509(OperationContext* opCtx, const UserName& user, const BSONObj& cmdObj) {
-    if (!getSSLManager()) {
+    if (!opCtx->getClient()->session()->getSSLManager()) {
         return Status(ErrorCodes::ProtocolError,
                       "SSL support is required for the MONGODB-X509 mechanism.");
     }
@@ -88,7 +89,9 @@ Status _authenticateX509(OperationContext* opCtx, const UserName& user, const BS
             "No verified subject name available from client",
             !clientName.empty());
 
-    if (!getSSLManager()->getSSLConfiguration().hasCA) {
+    auto sslConfiguration = opCtx->getClient()->session()->getSSLConfiguration();
+
+    if (!sslConfiguration->hasCA) {
         return Status(ErrorCodes::AuthenticationFailed,
                       "Unable to verify x.509 certificate, as no CA has been provided.");
     } else if (user.getUser() != clientName.toString()) {
@@ -96,7 +99,11 @@ Status _authenticateX509(OperationContext* opCtx, const UserName& user, const BS
                       "There is no x.509 client certificate matching the user.");
     } else {
         // Handle internal cluster member auth, only applies to server-server connections
-        if (getSSLManager()->getSSLConfiguration().isClusterMember(clientName)) {
+        if (sslConfiguration->isClusterMember(clientName)) {
+            Status status = authCounter.incClusterAuthenticateReceived("MONGODB-X509");
+            if (!status.isOK()) {
+                return status;
+            }
             int clusterAuthMode = serverGlobalParams.clusterAuthMode.load();
             if (clusterAuthMode == ServerGlobalParams::ClusterAuthMode_undefined ||
                 clusterAuthMode == ServerGlobalParams::ClusterAuthMode_keyFile) {
@@ -106,9 +113,7 @@ Status _authenticateX509(OperationContext* opCtx, const UserName& user, const BS
                               "authentication. The current configuration does not allow "
                               "x.509 cluster authentication, check the --clusterAuthMode flag");
             }
-            auto& clientMetadata =
-                ClientMetadataIsMasterState::get(opCtx->getClient()).getClientMetadata();
-            if (clientMetadata) {
+            if (auto clientMetadata = ClientMetadata::get(opCtx->getClient())) {
                 auto clientMetadataDoc = clientMetadata->getDocument();
                 auto driverName = clientMetadataDoc.getObjectField("driver"_sd)
                                       .getField("name"_sd)
@@ -119,6 +124,10 @@ Status _authenticateX509(OperationContext* opCtx, const UserName& user, const BS
                     LOGV2_WARNING(20430,
                                   "Client isn't a mongod or mongos, but is connecting with a "
                                   "certificate with cluster membership");
+                }
+                status = authCounter.incClusterAuthenticateSuccessful("MONGODB-X509");
+                if (!status.isOK()) {
+                    return status;
                 }
             }
 
@@ -141,6 +150,10 @@ Status _authenticateX509(OperationContext* opCtx, const UserName& user, const BS
 
 class CmdAuthenticate : public BasicCommand {
 public:
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
+
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
@@ -258,9 +271,10 @@ bool CmdAuthenticate::run(OperationContext* opCtx,
     if (!serverGlobalParams.quiet.load()) {
         mutablebson::Document cmdToLog(cmdObj, mutablebson::Document::kInPlaceDisabled);
         LOGV2(20427,
-              " authenticate db: {dbname} {cmdToLog}",
-              "dbname"_attr = dbname,
-              "cmdToLog"_attr = cmdToLog);
+              "Authenticate db: {db} {command}",
+              "Authenticate",
+              "db"_attr = dbname,
+              "command"_attr = cmdToLog);
     }
     std::string mechanism = cmdObj.getStringField("mechanism");
     if (mechanism.empty()) {
@@ -284,47 +298,40 @@ bool CmdAuthenticate::run(OperationContext* opCtx,
         user = internalSecurity.user->getName();
     }
 
-    Status status = authCounter.incAuthenticateReceived(mechanism);
-    if (status.isOK()) {
-        status = _authenticate(opCtx, mechanism, user, cmdObj);
-    }
-    audit::logAuthentication(Client::getCurrent(), mechanism, user, status.code());
+    try {
+        uassertStatusOK(authCounter.incAuthenticateReceived(mechanism));
 
-    if (!status.isOK()) {
+        uassertStatusOK(_authenticate(opCtx, mechanism, user, cmdObj));
+        audit::logAuthentication(opCtx->getClient(), mechanism, user, ErrorCodes::OK);
+
         if (!serverGlobalParams.quiet.load()) {
-            auto const client = opCtx->getClient();
+            LOGV2(20429,
+                  "Successfully authenticated as principal {user} on {db} from client {client}",
+                  "Successfully authenticated",
+                  "user"_attr = user.getUser(),
+                  "db"_attr = user.getDB(),
+                  "remote"_attr = opCtx->getClient()->session()->remote());
+        }
+
+        uassertStatusOK(authCounter.incAuthenticateSuccessful(mechanism));
+
+        result.append("dbname", user.getDB());
+        result.append("user", user.getUser());
+        return true;
+    } catch (const AssertionException& ex) {
+        auto status = ex.toStatus();
+        auto const client = opCtx->getClient();
+        audit::logAuthentication(client, mechanism, user, status.code());
+        if (!serverGlobalParams.quiet.load()) {
             LOGV2(20428,
-                  "Failed to authenticate {user} from client {client} with mechanism "
-                  "{mechanism}: {status}",
+                  "Failed to authenticate",
                   "user"_attr = user,
                   "client"_attr = client->getRemote(),
                   "mechanism"_attr = mechanism,
-                  "status"_attr = status);
+                  "error"_attr = status);
         }
-        sleepmillis(saslGlobalParams.authFailedDelay.load());
-        if (status.code() == ErrorCodes::AuthenticationFailed) {
-            // Statuses with code AuthenticationFailed may contain messages we do not wish to
-            // reveal to the user, so we return a status with the message "auth failed".
-            uasserted(ErrorCodes::AuthenticationFailed, "auth failed");
-        } else {
-            uassertStatusOK(status);
-        }
-        return false;
+        throw;
     }
-
-    if (!serverGlobalParams.quiet.load()) {
-        LOGV2(20429,
-              "Successfully authenticated as principal {principalName} on {DB} from client "
-              "{client}",
-              "principalName"_attr = user.getUser(),
-              "DB"_attr = user.getDB(),
-              "client"_attr = opCtx->getClient()->session()->remote());
-    }
-
-    uassertStatusOK(authCounter.incAuthenticateSuccessful(mechanism));
-    result.append("dbname", user.getDB());
-    result.append("user", user.getUser());
-    return true;
 }
 
 Status CmdAuthenticate::_authenticate(OperationContext* opCtx,

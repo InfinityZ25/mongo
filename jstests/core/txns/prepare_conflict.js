@@ -1,7 +1,11 @@
 /**
  * Tests that prepare conflicts for prepared transactions are retried.
  *
- * @tags: [uses_transactions, uses_prepare_transaction, requires_fcv_44]
+ * @tags: [
+ *   uses_prepare_transaction,
+ *   uses_transactions,
+ *   uses_parallel_shell
+ * ]
  */
 (function() {
 "use strict";
@@ -64,7 +68,11 @@ const otherDoc = {
 assert.commandWorked(testColl.insert(otherDoc, {writeConcern: {w: "majority"}}));
 
 // Create an index on 'y' to avoid conflicts on the field.
-assert.commandWorked(testColl.createIndex({y: 1}));
+assert.commandWorked(testColl.runCommand({
+    createIndexes: collName,
+    indexes: [{key: {"y": 1}, name: "y_1"}],
+    writeConcern: {w: "majority"}
+}));
 
 // Enable the profiler to log slow queries. We expect a 'find' to hang until the prepare
 // conflict is resolved.

@@ -4,7 +4,7 @@
 
 // 5-node replica set
 // Start replica set. Ensure that node 0 becomes primary.
-// Stop the replication for some nodes and have the primary write something.
+// Stop replication for some nodes and have the primary write something.
 // Stop replication for an up-to-date node and have the primary write something.
 // Now the primary is most-up-to-date and another node is more up-to-date than others.
 // Make a lagged node the next primary.
@@ -24,12 +24,12 @@ var config = replSet.getReplSetConfig();
 config.settings = {
     chainingAllowed: false
 };
-replSet.initiate(config);
+replSet.initiateWithHighElectionTimeout(config);
 replSet.awaitReplication();
 
 // Write something so that nodes 0 and 1 are ahead.
 stopServerReplication(nodes.slice(2, 5));
-var primary = replSet.getPrimary();
+const primary = replSet.getPrimary();
 var writeConcern = {writeConcern: {w: 2, wtimeout: replSet.kDefaultTimeoutMS}};
 assert.commandWorked(primary.getDB(name).bar.insert({x: 100}, writeConcern));
 
@@ -52,9 +52,9 @@ assert.eq(ReplSetTest.State.PRIMARY,
 jsTestLog('node 2 is now primary, but cannot accept writes');
 
 // Make sure that node 2 cannot write anything. Because it is lagged and replication
-// has been stopped, it shouldn't be able to become master.
+// has been stopped, it shouldn't be able to become primary.
 assert.commandFailedWithCode(nodes[2].getDB(name).bar.insert({z: 100}, writeConcern),
-                             ErrorCodes.NotMaster);
+                             ErrorCodes.NotWritablePrimary);
 
 // Confirm that the most up-to-date node becomes primary after the default catchup delay.
 replSet.waitForState(0, ReplSetTest.State.PRIMARY, 60 * 1000);

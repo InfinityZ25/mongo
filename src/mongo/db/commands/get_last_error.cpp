@@ -27,12 +27,11 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/client.h"
-#include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/field_parser.h"
@@ -41,6 +40,7 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/write_concern.h"
+#include "mongo/idl/command_generic_argument.h"
 #include "mongo/logv2/log.h"
 
 namespace mongo {
@@ -265,10 +265,10 @@ public:
                 if (electionId != repl::ReplicationCoordinator::get(opCtx)->getElectionId()) {
                     LOGV2_DEBUG(20476,
                                 3,
-                                "oid passed in is {electionId}, but our id is "
-                                "{repl_ReplicationCoordinator_get_opCtx_getElectionId}",
-                                "electionId"_attr = electionId,
-                                "repl_ReplicationCoordinator_get_opCtx_getElectionId"_attr =
+                                "OID passed in is {passedOID}, but our id is {ourOID}",
+                                "OID mismatch during election",
+                                "passedOID"_attr = electionId,
+                                "ourOID"_attr =
                                     repl::ReplicationCoordinator::get(opCtx)->getElectionId());
                     errmsg = "election occurred after write";
                     result.append("code", ErrorCodes::WriteConcernFailed);
@@ -304,7 +304,7 @@ public:
         if (wcResult.wTimedOut) {
             dassert(!wcResult.err.empty());  // so we always report err
             dassert(!status.isOK());
-            result.append("errmsg", "timed out waiting for slaves");
+            result.append("errmsg", "timed out waiting for secondaries");
             result.append("code", status.code());
             result.append("codeName", ErrorCodes::errorString(status.code()));
             return true;

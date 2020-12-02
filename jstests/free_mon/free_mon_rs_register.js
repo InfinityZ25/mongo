@@ -30,6 +30,7 @@ mock_web.waitRegisters(2);
 
 WaitForRegistration(rst.getPrimary());
 WaitForRegistration(rst.getSecondary());
+ValidateFreeMonReplicaSet(rst);
 
 const last_register = mock_web.query("last_register");
 print(tojson(last_register));
@@ -39,7 +40,7 @@ assert.eq(last_register.payload.buildInfo.bits, 64);
 assert.eq(last_register.payload.buildInfo.ok, 1);
 assert.eq(last_register.payload.storageEngine.readOnly, false);
 assert.eq(last_register.payload.isMaster.ok, 1);
-assert.eq(last_register.payload.replSetGetConfig.config.version, 2);
+assert.gte(last_register.payload.replSetGetConfig.config.version, 2);
 
 function isUUID(val) {
     // Mock webserver gives us back unpacked BinData/UUID in the form:
@@ -56,7 +57,7 @@ function isUUID(val) {
 assert.eq(isUUID(last_register.payload.uuid['local.oplog.rs']), true);
 
 // Restart the secondary
-var s1 = rst._slaves[0];
+var s1 = rst.getSecondary();
 var s1Id = rst.getNodeId(s1);
 
 rst.stop(s1Id);
@@ -76,7 +77,7 @@ WaitForFreeMonServerStatusState(rst.getPrimary(), 'disabled');
 WaitForFreeMonServerStatusState(rst.getSecondary(), 'disabled');
 
 // Restart the secondary with it disabled
-var s1 = rst._slaves[0];
+var s1 = rst.getSecondary();
 var s1Id = rst.getNodeId(s1);
 
 rst.stop(s1Id);

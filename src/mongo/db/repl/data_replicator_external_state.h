@@ -37,6 +37,7 @@
 #include "mongo/db/repl/optime_with.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_consistency_markers.h"
+#include "mongo/db/repl/sync_source_selector.h"
 #include "mongo/rpc/metadata/oplog_query_metadata.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/util/concurrency/thread_pool.h"
@@ -77,6 +78,7 @@ public:
      * Returns task executor for scheduling tasks to be run asynchronously.
      */
     virtual executor::TaskExecutor* getTaskExecutor() const = 0;
+    virtual std::shared_ptr<executor::TaskExecutor> getSharedTaskExecutor() const = 0;
 
     /**
      * Returns the current term and last committed optime.
@@ -95,10 +97,11 @@ public:
      * sync source (from metadata); and whether this sync source has a sync source (also from
      * metadata).
      */
-    virtual bool shouldStopFetching(const HostAndPort& source,
-                                    const rpc::ReplSetMetadata& replMetadata,
-                                    const rpc::OplogQueryMetadata& oqMetadata,
-                                    const OpTime& lastOpTimeFetched) = 0;
+    virtual ChangeSyncSourceAction shouldStopFetching(const HostAndPort& source,
+                                                      const rpc::ReplSetMetadata& replMetadata,
+                                                      const rpc::OplogQueryMetadata& oqMetadata,
+                                                      const OpTime& previousOpTimeFetched,
+                                                      const OpTime& lastOpTimeFetched) = 0;
 
     /**
      * This function creates an oplog buffer of the type specified at server startup.

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -213,6 +213,26 @@ void yieldLocksForPreparedTransactions(OperationContext* opCtx) {
                                            "sessionId"_attr = session.getSessionId().getId(),
                                            "txnNumber"_attr = txnParticipant.getActiveTxnNumber());
                                txnParticipant.refreshLocksForPreparedTransaction(killerOpCtx, true);
+                           }
+                       },
+                       ErrorCodes::InterruptedDueToReplStateChange);
+}
+
+void invalidateSessionsForStepdown(OperationContext* opCtx) {
+    // It is illegal to invalidate the sessions if the operation has a session checked out.
+    invariant(!OperationContextSession::get(opCtx));
+
+    SessionKiller::Matcher matcherAllSessions(
+        KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)});
+    killSessionsAction(opCtx,
+                       matcherAllSessions,
+                       [](const ObservableSession& session) {
+                           return !TransactionParticipant::get(session).transactionIsPrepared();
+                       },
+                       [](OperationContext* killerOpCtx, const SessionToKill& session) {
+                           auto txnParticipant = TransactionParticipant::get(session);
+                           if (!txnParticipant.transactionIsPrepared()) {
+                               txnParticipant.invalidate(killerOpCtx);
                            }
                        },
                        ErrorCodes::InterruptedDueToReplStateChange);

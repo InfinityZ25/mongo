@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kASIO
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kASIO
 
 #include "mongo/platform/basic.h"
 
@@ -131,6 +131,23 @@ transport::ConnectSSLMode TLConnection::getSslMode() const {
 
 bool TLConnection::isHealthy() {
     return _client->isStillConnected();
+}
+
+bool TLConnection::maybeHealthy() {
+    // The connection has been successfully used after the last time we checked for its health, so
+    // we may assume it's still healthy.
+    if (auto lastUsedWithTimeout = getLastUsed() + kIsHealthyCacheTimeout;
+        lastUsedWithTimeout > _isHealthyExpiresAt) {
+        _isHealthyExpiresAt = lastUsedWithTimeout;
+        // We may reset `_isHealthyCache` below if `now()` has already passed `_isHealthyExpiresAt`.
+        _isHealthyCache = true;
+    }
+
+    if (auto currentTime = now(); !_isHealthyCache || currentTime >= _isHealthyExpiresAt) {
+        _isHealthyCache = isHealthy();
+        _isHealthyExpiresAt = currentTime + kIsHealthyCacheTimeout;
+    }
+    return _isHealthyCache;
 }
 
 AsyncDBClient* TLConnection::client() {
@@ -254,7 +271,8 @@ void TLConnection::setup(Milliseconds timeout, SetupCallback cb) {
 
     auto isMasterHook = std::make_shared<TLConnectionSetupHook>(_onConnectHook);
 
-    AsyncDBClient::connect(_peer, _sslMode, _serviceContext, _reactor, timeout)
+    AsyncDBClient::connect(
+        _peer, _sslMode, _serviceContext, _reactor, timeout, _transientSSLContext)
         .thenRunOn(_reactor)
         .onError([](StatusWith<AsyncDBClient::Handle> swc) -> StatusWith<AsyncDBClient::Handle> {
             return Status(ErrorCodes::HostUnreachable, swc.getStatus().reason());
@@ -382,7 +400,8 @@ std::shared_ptr<ConnectionPool::ConnectionInterface> TLTypeFactory::makeConnecti
                                                sslMode,
                                                generation,
                                                _onConnectHook.get(),
-                                               _connPoolOptions.skipAuthentication);
+                                               _connPoolOptions.skipAuthentication,
+                                               _transientSSLContext);
     fasten(conn.get());
     return conn;
 }

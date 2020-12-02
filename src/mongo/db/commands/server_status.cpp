@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -145,7 +145,10 @@ public:
         timeBuilder.appendNumber("at end", durationCount<Milliseconds>(runElapsed));
         if (runElapsed > Milliseconds(1000)) {
             BSONObj t = timeBuilder.obj();
-            LOGV2(20499, "serverStatus was very slow: {t}", "t"_attr = t);
+            LOGV2(20499,
+                  "serverStatus was very slow: {timeStats}",
+                  "serverStatus was very slow",
+                  "timeStats"_attr = t);
 
             bool include_timing = true;
             const auto& elem = cmdObj[kTimingSection];
@@ -250,6 +253,7 @@ public:
         asserts.append("warning", assertionCount.warning.loadRelaxed());
         asserts.append("msg", assertionCount.msg.loadRelaxed());
         asserts.append("user", assertionCount.user.loadRelaxed());
+        asserts.append("tripwire", assertionCount.tripwire.loadRelaxed());
         asserts.append("rollovers", assertionCount.rollovers.loadRelaxed());
         return asserts.obj();
     }

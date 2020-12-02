@@ -49,15 +49,4 @@ class UpdateDriver;
  */
 UpdateResult update(OperationContext* opCtx, Database* db, const UpdateRequest& request);
 
-/**
- * Takes the 'from' document and returns a new document after applying 'operators'. arrayFilters are
- * not supported.
- * e.g.
- *   applyUpdateOperators( BSON( "x" << 1 ) , BSON( "$inc" << BSON( "x" << 1 ) ) );
- *   returns: { x : 2 }
- */
-BSONObj applyUpdateOperators(OperationContext* opCtx,
-                             const NamespaceString& ns,
-                             const BSONObj& from,
-                             const BSONObj& operators);
 }  // namespace mongo

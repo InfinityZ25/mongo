@@ -57,8 +57,17 @@ public:
         return _impl->get().isSharded();
     }
 
+    bool writesShouldRunInDistributedTransaction(const OID& originalEpoch,
+                                                 const OID& reshardingEpoch) const {
+        return _impl->get().writesShouldRunInDistributedTransaction(originalEpoch, reshardingEpoch);
+    }
+
     bool isValidKey(const BSONObj& key) const {
         return _impl->get().isValidKey(key);
+    }
+
+    boost::optional<ShardKeyPattern> getReshardingKeyIfShouldForwardOps() const {
+        return _impl->get().getReshardingKeyIfShouldForwardOps();
     }
 
     const BSONObj& getKeyPattern() const {
@@ -83,6 +92,10 @@ public:
 
     bool uuidMatches(UUID uuid) const {
         return _impl->get().uuidMatches(uuid);
+    }
+
+    const boost::optional<TypeCollectionReshardingFields>& getReshardingFields() const {
+        return _impl->get().getReshardingFields();
     }
 
 protected:

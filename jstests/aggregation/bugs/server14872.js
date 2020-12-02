@@ -1,10 +1,10 @@
 // SERVER-14872: Aggregation expression to concatenate multiple arrays into one
 
-// For assertErrorCode.
-load('jstests/aggregation/extras/utils.js');
-
 (function() {
 'use strict';
+
+load('jstests/aggregation/extras/utils.js');        // For assertErrorCode.
+load("jstests/libs/sbe_assert_error_override.js");  // Override error-code-checking APIs.
 
 var coll = db.agg_concat_arrays_expr;
 coll.drop();

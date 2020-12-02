@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -50,9 +50,9 @@ using CallbackHandle = TaskExecutor::CallbackHandle;
 using ResponseStatus = TaskExecutor::ResponseStatus;
 
 NetworkInterfaceMock::NetworkInterfaceMock()
-    : _waitingToRunMask(0),
+    : _clkSource(std::make_unique<ClockSourceMock>()),
+      _waitingToRunMask(0),
       _currentlyRunning(kNoThread),
-      _now(fassert(18653, dateFromISOString("2014-08-01T00:00:00Z"))),
       _hasStarted(false),
       _inShutdown(false),
       _executorNextWakeupDate(Date_t::max()) {}
@@ -416,8 +416,11 @@ Date_t NetworkInterfaceMock::runUntil(Date_t until) {
         if (until < newNow) {
             newNow = until;
         }
-        invariant(_now_inlock() <= newNow);
-        _now = newNow;
+
+        auto duration = newNow - _now_inlock();
+        invariant(duration >= Milliseconds{0});
+        _clkSource->advance(duration);
+
         _waitingToRunMask |= kExecutorThread;
     }
     _runReadyNetworkOperations_inlock(&lk);
@@ -427,8 +430,10 @@ Date_t NetworkInterfaceMock::runUntil(Date_t until) {
 void NetworkInterfaceMock::advanceTime(Date_t newTime) {
     stdx::unique_lock<stdx::mutex> lk(_mutex);
     invariant(_currentlyRunning == kNetworkThread);
-    invariant(newTime > _now_inlock());
-    _now = newTime;
+
+    auto duration = newTime - _now_inlock();
+    invariant(duration > Milliseconds{0});
+    _clkSource->advance(duration);
 
     _waitingToRunMask |= kExecutorThread;
     _runReadyNetworkOperations_inlock(&lk);
@@ -473,17 +478,14 @@ void NetworkInterfaceMock::_enqueueOperation_inlock(
 
     if (timeout != RemoteCommandRequest::kNoTimeout) {
         invariant(timeout >= Milliseconds(0));
-        ResponseStatus rs(
-            ErrorCodes::NetworkInterfaceExceededTimeLimit, "Network timeout", Milliseconds(0));
-        std::vector<NetworkOperationList*> queuesToCheck{&_unscheduled, &_blackHoled, &_scheduled};
-        _alarms.emplace(cbh,
-                        _now_inlock() + timeout,
-                        [this,
-                         cbh = std::move(cbh),
-                         queuesToCheck = std::move(queuesToCheck),
-                         rs = std::move(rs)](Status) {
-                            _interruptWithResponse_inlock(cbh, queuesToCheck, rs);
-                        });
+        _alarms.emplace(cbh, _now_inlock() + timeout, [this, cbh](Status) {
+            _interruptWithResponse_inlock(
+                cbh,
+                {&_unscheduled, &_blackHoled, &_scheduled},
+                ResponseStatus(ErrorCodes::NetworkInterfaceExceededTimeLimit,
+                               "Network timeout",
+                               Milliseconds(0)));
+        });
     }
 }
 
@@ -615,6 +617,18 @@ void NetworkInterfaceMock::_runReadyNetworkOperations_inlock(stdx::unique_lock<s
     _waitingToRunMask &= ~kNetworkThread;
 }
 
+bool NetworkInterfaceMock::hasReadyNetworkOperations() {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    invariant(_currentlyRunning == kNetworkThread);
+    if (!_alarms.empty() && _now_inlock() >= _alarms.top().when) {
+        return true;
+    }
+    if (!_scheduled.empty() && _scheduled.front().getResponseDate() <= _now_inlock()) {
+        return true;
+    }
+    return false;
+}
+
 void NetworkInterfaceMock::_waitForWork_inlock(stdx::unique_lock<stdx::mutex>* lk) {
     if (_waitingToRunMask & kExecutorThread) {
         _waitingToRunMask &= ~kExecutorThread;
@@ -718,11 +732,6 @@ NetworkInterfaceMock::InNetworkGuard::~InNetworkGuard() {
 
 NetworkInterfaceMock* NetworkInterfaceMock::InNetworkGuard::operator->() const {
     return _net;
-}
-
-NetworkInterfaceMockClockSource::NetworkInterfaceMockClockSource(NetworkInterfaceMock* net)
-    : _net(net) {
-    _tracksSystemClock = false;
 }
 
 }  // namespace executor

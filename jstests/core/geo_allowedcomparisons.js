@@ -1,4 +1,7 @@
 // A test for what geometries can interact with what other geometries.
+// @tags: [
+//   sbe_incompatible,
+// ]
 t = db.geo_allowedcomparisons;
 
 // Any GeoJSON object can intersect with any geojson object.
@@ -30,7 +33,7 @@ oldPolygon = [[-5, -5], [-5, 5], [5, 5], [5, -5], [-5, -5]];
 oldCenter = [[0, 0], 1];
 
 t.drop();
-t.ensureIndex({geo: "2d"});
+t.createIndex({geo: "2d"});
 // 2d doesn't know what to do w/this
 assert.writeError(t.insert({geo: geojsonPoint}));
 // Old points are OK.
@@ -99,7 +102,7 @@ t.dropIndex({geo: "2d"});
 runTests();
 
 // 2dsphere index now.
-assert.commandWorked(t.ensureIndex({geo: "2dsphere"}));
+assert.commandWorked(t.createIndex({geo: "2dsphere"}));
 // 2dsphere does not support arrays of points.
 assert.writeError(t.insert({geo: [geojsonPoint2, geojsonPoint]}));
 runTests();

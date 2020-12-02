@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -50,6 +50,7 @@
 #include "mongo/transport/asio_utils.h"
 #include "mongo/transport/service_entry_point.h"
 #include "mongo/transport/transport_options_gen.h"
+#include "mongo/util/errno_util.h"
 #include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/net/sockaddr.h"
@@ -99,6 +100,10 @@ boost::optional<Status> maybeTcpFastOpenStatus;
 
 MONGO_FAIL_POINT_DEFINE(transportLayerASIOasyncConnectTimesOut);
 
+#ifdef MONGO_CONFIG_SSL
+SSLConnectionContext::~SSLConnectionContext() = default;
+#endif
+
 class ASIOReactorTimer final : public ReactorTimer {
 public:
     explicit ASIOReactorTimer(asio::io_context& ctx)
@@ -140,7 +145,11 @@ private:
             armTimer();
             return _timer->async_wait(UseFuture{}).tapError([timer = _timer](const Status& status) {
                 if (status != ErrorCodes::CallbackCanceled) {
-                    LOGV2_DEBUG(23011, 2, "Timer received error: {status}", "status"_attr = status);
+                    LOGV2_DEBUG(23011,
+                                2,
+                                "Timer received error: {error}",
+                                "Timer received error",
+                                "error"_attr = status);
                 }
             });
 
@@ -254,17 +263,14 @@ TransportLayerASIO::Options::Options(const ServerGlobalParams* params)
 }
 
 TransportLayerASIO::TransportLayerASIO(const TransportLayerASIO::Options& opts,
-                                       ServiceEntryPoint* sep)
-    : _ingressReactor(std::make_shared<ASIOReactor>()),
+                                       ServiceEntryPoint* sep,
+                                       const WireSpec& wireSpec)
+    : TransportLayer(wireSpec),
+      _ingressReactor(std::make_shared<ASIOReactor>()),
       _egressReactor(std::make_shared<ASIOReactor>()),
       _acceptorReactor(std::make_shared<ASIOReactor>()),
-#ifdef MONGO_CONFIG_SSL
-      _ingressSSLContext(nullptr),
-      _egressSSLContext(nullptr),
-#endif
       _sep(sep),
-      _listenerOptions(opts) {
-}
+      _listenerOptions(opts) {}
 
 TransportLayerASIO::~TransportLayerASIO() = default;
 
@@ -563,10 +569,12 @@ StatusWith<TransportLayerASIO::ASIOSessionHandle> TransportLayerASIO::_doSyncCon
     }
 }
 
-Future<SessionHandle> TransportLayerASIO::asyncConnect(HostAndPort peer,
-                                                       ConnectSSLMode sslMode,
-                                                       const ReactorHandle& reactor,
-                                                       Milliseconds timeout) {
+Future<SessionHandle> TransportLayerASIO::asyncConnect(
+    HostAndPort peer,
+    ConnectSSLMode sslMode,
+    const ReactorHandle& reactor,
+    Milliseconds timeout,
+    std::shared_ptr<const SSLConnectionContext> transientSSLContext) {
 
     struct AsyncConnectState {
         AsyncConnectState(HostAndPort peer,
@@ -634,10 +642,10 @@ Future<SessionHandle> TransportLayerASIO::asyncConnect(HostAndPort peer,
                 Date_t timeAfter = Date_t::now();
                 if (timeAfter - timeBefore > kSlowOperationThreshold) {
                     LOGV2_WARNING(23019,
-                                  "DNS resolution while connecting to {connector_peer} took "
-                                  "{timeAfter_timeBefore}",
-                                  "connector_peer"_attr = connector->peer,
-                                  "timeAfter_timeBefore"_attr = timeAfter - timeBefore);
+                                  "DNS resolution while connecting to {peer} took {duration}",
+                                  "DNS resolution while connecting to peer was slow",
+                                  "peer"_attr = connector->peer,
+                                  "duration"_attr = timeAfter - timeBefore);
                     networkCounter.incrementNumSlowDNSOperations();
                 }
 
@@ -659,10 +667,13 @@ Future<SessionHandle> TransportLayerASIO::asyncConnect(HostAndPort peer,
 #endif
             return connector->socket.async_connect(*connector->resolvedEndpoint, UseFuture{});
         })
-        .then([this, connector, sslMode]() -> Future<void> {
+        .then([this, connector, sslMode, transientSSLContext]() -> Future<void> {
             stdx::unique_lock<Latch> lk(connector->mutex);
-            connector->session = std::make_shared<ASIOSession>(
-                this, std::move(connector->socket), false, *connector->resolvedEndpoint);
+            connector->session = std::make_shared<ASIOSession>(this,
+                                                               std::move(connector->socket),
+                                                               false,
+                                                               *connector->resolvedEndpoint,
+                                                               transientSSLContext);
             connector->session->ensureAsync();
 
 #ifndef MONGO_CONFIG_SSL
@@ -722,6 +733,11 @@ namespace {
  */
 bool trySetSockOpt(int level, int opt, int val) {
     auto sock = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == -1) {
+        int ec = errno;
+        LOGV2_WARNING(5128700, "socket() failed", "error"_attr = errnoWithDescription(ec));
+        return false;
+    }
 
 #ifdef _WIN32
     char* pval = reinterpret_cast<char*>(&val);
@@ -829,16 +845,16 @@ Status validateFastOpenOnce() noexcept {
                                       kPrefixString,
                                       "reason"_attr = maybeTcpFastOpenStatus->reason());
             } else {
-                LOGV2_INFO(4648601,
-                           "Implicit TCP FastOpen unavailable. "
-                           "If TCP FastOpen is required, set tcpFastOpenServer, tcpFastOpenClient, "
-                           "and tcpFastOpenQueueSize.");
+                LOGV2(4648601,
+                      "Implicit TCP FastOpen unavailable. "
+                      "If TCP FastOpen is required, set tcpFastOpenServer, tcpFastOpenClient, "
+                      "and tcpFastOpenQueueSize.");
             }
 
             maybeTcpFastOpenStatus->addContext(kPrefixString);
         } else {
             if (!tcpFastOpenIsConfigured) {
-                LOGV2_INFO(4648602, "Implicit TCP FastOpen in use.");
+                LOGV2(4648602, "Implicit TCP FastOpen in use.");
             }
         }
     }
@@ -894,8 +910,9 @@ Status TransportLayerASIO::setup() {
             resolver.resolve(HostAndPort(ip, _listenerPort), _listenerOptions.enableIPv6);
         if (!swAddrs.isOK()) {
             LOGV2_WARNING(23021,
-                          "Found no addresses for {swAddrs_getStatus}",
-                          "swAddrs_getStatus"_attr = swAddrs.getStatus());
+                          "Found no addresses for {peer}",
+                          "Found no addresses for peer",
+                          "peer"_attr = swAddrs.getStatus());
             continue;
         }
         auto& addrs = swAddrs.getValue();
@@ -906,11 +923,11 @@ Status TransportLayerASIO::setup() {
 #ifndef _WIN32
         if (addr.family() == AF_UNIX) {
             if (::unlink(addr.toString().c_str()) == -1 && errno != ENOENT) {
-                LOGV2_ERROR(
-                    23024,
-                    "Failed to unlink socket file {addr_c_str} {errnoWithDescription_errno}",
-                    "addr_c_str"_attr = addr.toString().c_str(),
-                    "errnoWithDescription_errno"_attr = errnoWithDescription(errno));
+                LOGV2_ERROR(23024,
+                            "Failed to unlink socket file {path} {error}",
+                            "Failed to unlink socket file",
+                            "path"_attr = addr.toString().c_str(),
+                            "error"_attr = errnoWithDescription(errno));
                 fassertFailedNoTrace(40486);
             }
         }
@@ -930,8 +947,9 @@ Status TransportLayerASIO::setup() {
             if (errno == EAFNOSUPPORT && _listenerOptions.enableIPv6 && addr.family() == AF_INET6 &&
                 addr.toString() == bindAllIPv6Addr) {
                 LOGV2_WARNING(4206501,
-                              "Failed to bind to {bind_addr} as the platform does not support ipv6",
-                              "bind_addr"_attr = addr.toString());
+                              "Failed to bind to address as the platform does not support ipv6",
+                              "Failed to bind to {address} as the platform does not support ipv6",
+                              "address"_attr = addr.toString());
                 continue;
             }
 
@@ -967,9 +985,10 @@ Status TransportLayerASIO::setup() {
         if (addr.family() == AF_UNIX) {
             if (::chmod(addr.toString().c_str(), serverGlobalParams.unixSocketPermissions) == -1) {
                 LOGV2_ERROR(23026,
-                            "Failed to chmod socket file {addr_c_str} {errnoWithDescription_errno}",
-                            "addr_c_str"_attr = addr.toString().c_str(),
-                            "errnoWithDescription_errno"_attr = errnoWithDescription(errno));
+                            "Failed to chmod socket file {path} {error}",
+                            "Failed to chmod socket file",
+                            "path"_attr = addr.toString().c_str(),
+                            "error"_attr = errnoWithDescription(errno));
                 fassertFailedNoTrace(40487);
             }
         }
@@ -996,37 +1015,11 @@ Status TransportLayerASIO::setup() {
     }
 
 #ifdef MONGO_CONFIG_SSL
-    const auto& sslParams = getSSLGlobalParams();
-
-    if (_sslMode() != SSLParams::SSLMode_disabled && _listenerOptions.isIngress()) {
-        _ingressSSLContext = std::make_unique<asio::ssl::context>(asio::ssl::context::sslv23);
-
-        Status status =
-            getSSLManager()->initSSLContext(_ingressSSLContext->native_handle(),
-                                            sslParams,
-                                            SSLManagerInterface::ConnectionDirection::kIncoming);
-        if (!status.isOK()) {
-            return status;
-        }
-
-        auto resp = getSSLManager()->stapleOCSPResponse(_ingressSSLContext->native_handle());
-        if (!resp.isOK()) {
-            return Status(ErrorCodes::InvalidSSLConfiguration,
-                          str::stream()
-                              << "Can not staple OCSP Response. Reason: " << resp.reason());
-        }
+    std::shared_ptr<SSLManagerInterface> manager = nullptr;
+    if (SSLManagerCoordinator::get()) {
+        manager = SSLManagerCoordinator::get()->getSSLManager();
     }
-
-    if (_listenerOptions.isEgress() && getSSLManager()) {
-        _egressSSLContext = std::make_unique<asio::ssl::context>(asio::ssl::context::sslv23);
-        Status status =
-            getSSLManager()->initSSLContext(_egressSSLContext->native_handle(),
-                                            sslParams,
-                                            SSLManagerInterface::ConnectionDirection::kOutgoing);
-        if (!status.isOK()) {
-            return status;
-        }
-    }
+    return rotateCertificates(manager, true);
 #endif
 
     return Status::OK();
@@ -1045,9 +1038,10 @@ void TransportLayerASIO::_runListener() noexcept {
         acceptor.second.listen(serverGlobalParams.listenBacklog, ec);
         if (ec) {
             LOGV2_FATAL(31339,
-                        "Error listening for new connections on {acceptor_first}: {ec_message}",
-                        "acceptor_first"_attr = acceptor.first,
-                        "ec_message"_attr = ec.message());
+                        "Error listening for new connections on {listenAddress}: {error}",
+                        "Error listening for new connections on listen address",
+                        "listenAddrs"_attr = acceptor.first,
+                        "error"_attr = ec.message());
         }
 
         _acceptConnection(acceptor.second);
@@ -1082,13 +1076,15 @@ void TransportLayerASIO::_runListener() noexcept {
         auto& addr = acceptor.first;
         if (addr.getType() == AF_UNIX && !addr.isAnonymousUNIXSocket()) {
             auto path = addr.getAddr();
-            LOGV2(23017, "removing socket file: {path}", "path"_attr = path);
+            LOGV2(
+                23017, "removing socket file: {path}", "removing socket file", "path"_attr = path);
             if (::unlink(path.c_str()) != 0) {
                 const auto ewd = errnoWithDescription();
                 LOGV2_WARNING(23022,
-                              "Unable to remove UNIX socket {path}: {ewd}",
+                              "Unable to remove UNIX socket {path}: {error}",
+                              "Unable to remove UNIX socket",
                               "path"_attr = path,
-                              "ewd"_attr = ewd);
+                              "error"_attr = ewd);
             }
         }
     }
@@ -1162,11 +1158,10 @@ void TransportLayerASIO::_acceptConnection(GenericAcceptor& acceptor) {
 
         if (ec) {
             LOGV2(23018,
-                  "Error accepting new connection on "
-                  "{endpointToHostAndPort_acceptor_local_endpoint}: {ec_message}",
-                  "endpointToHostAndPort_acceptor_local_endpoint"_attr =
-                      endpointToHostAndPort(acceptor.local_endpoint()),
-                  "ec_message"_attr = ec.message());
+                  "Error accepting new connection on {localEndpoint}: {error}",
+                  "Error accepting new connection on local endpoint",
+                  "localEndpoint"_attr = endpointToHostAndPort(acceptor.local_endpoint()),
+                  "error"_attr = ec.message());
             _acceptConnection(acceptor);
             return;
         }
@@ -1185,7 +1180,10 @@ void TransportLayerASIO::_acceptConnection(GenericAcceptor& acceptor) {
                 new ASIOSession(this, std::move(peerSocket), true));
             _sep->startSession(std::move(session));
         } catch (const DBException& e) {
-            LOGV2_WARNING(23023, "Error accepting new connection {e}", "e"_attr = e);
+            LOGV2_WARNING(23023,
+                          "Error accepting new connection: {error}",
+                          "Error accepting new connection",
+                          "error"_attr = e);
         }
 
         _acceptConnection(acceptor);
@@ -1198,6 +1196,83 @@ void TransportLayerASIO::_acceptConnection(GenericAcceptor& acceptor) {
 SSLParams::SSLModes TransportLayerASIO::_sslMode() const {
     return static_cast<SSLParams::SSLModes>(getSSLGlobalParams().sslMode.load());
 }
+
+Status TransportLayerASIO::rotateCertificates(std::shared_ptr<SSLManagerInterface> manager,
+                                              bool asyncOCSPStaple) {
+
+    auto contextOrStatus =
+        _createSSLContext(manager, _sslMode(), TransientSSLParams(), asyncOCSPStaple);
+    if (!contextOrStatus.isOK()) {
+        return contextOrStatus.getStatus();
+    }
+    _sslContext = std::move(contextOrStatus.getValue());
+    return Status::OK();
+}
+
+StatusWith<std::shared_ptr<const transport::SSLConnectionContext>>
+TransportLayerASIO::_createSSLContext(std::shared_ptr<SSLManagerInterface>& manager,
+                                      SSLParams::SSLModes sslMode,
+                                      TransientSSLParams transientEgressSSLParams,
+                                      bool asyncOCSPStaple) const {
+
+    std::shared_ptr<SSLConnectionContext> newSSLContext = std::make_shared<SSLConnectionContext>();
+    newSSLContext->manager = manager;
+    const auto& sslParams = getSSLGlobalParams();
+
+    if (sslMode != SSLParams::SSLMode_disabled && _listenerOptions.isIngress()) {
+        newSSLContext->ingress = std::make_unique<asio::ssl::context>(asio::ssl::context::sslv23);
+
+        Status status = newSSLContext->manager->initSSLContext(
+            newSSLContext->ingress->native_handle(),
+            sslParams,
+            TransientSSLParams(),  // Ingress is not using transient params, they are egress.
+            SSLManagerInterface::ConnectionDirection::kIncoming);
+        if (!status.isOK()) {
+            return status;
+        }
+
+        auto resp = newSSLContext->manager->stapleOCSPResponse(
+            newSSLContext->ingress->native_handle(), asyncOCSPStaple);
+
+        if (!resp.isOK()) {
+            return Status(ErrorCodes::InvalidSSLConfiguration,
+                          str::stream()
+                              << "Can not staple OCSP Response. Reason: " << resp.reason());
+        }
+    }
+
+    if (_listenerOptions.isEgress() && newSSLContext->manager) {
+        newSSLContext->egress = std::make_unique<asio::ssl::context>(asio::ssl::context::sslv23);
+        Status status = newSSLContext->manager->initSSLContext(
+            newSSLContext->egress->native_handle(),
+            sslParams,
+            transientEgressSSLParams,
+            SSLManagerInterface::ConnectionDirection::kOutgoing);
+        if (!status.isOK()) {
+            return status;
+        }
+        if (!transientEgressSSLParams.sslClusterPEMPayload.empty()) {
+            if (transientEgressSSLParams.targetedClusterConnectionString) {
+                newSSLContext->targetClusterURI =
+                    transientEgressSSLParams.targetedClusterConnectionString.toString();
+            }
+        }
+    }
+    return newSSLContext;
+}
+
+StatusWith<std::shared_ptr<const transport::SSLConnectionContext>>
+TransportLayerASIO::createTransientSSLContext(const TransientSSLParams& transientSSLParams,
+                                              const SSLManagerInterface* optionalManager) {
+
+    auto manager = getSSLManager();
+    if (!manager) {
+        return Status(ErrorCodes::InvalidSSLConfiguration, "TransportLayerASIO has no SSL manager");
+    }
+
+    return _createSSLContext(manager, _sslMode(), transientSSLParams, true /* asyncOCSPStaple */);
+}
+
 #endif
 
 #ifdef __linux__

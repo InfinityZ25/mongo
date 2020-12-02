@@ -36,7 +36,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/auth/authz_manager_external_state_local.h"
-#include "mongo/db/auth/role_graph.h"
+#include "mongo/db/auth/builtin_roles.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 
@@ -61,16 +61,21 @@ public:
     std::unique_ptr<AuthzSessionExternalState> makeAuthzSessionExternalState(
         AuthorizationManager* authzManager) override;
 
-    virtual Status findOne(OperationContext* opCtx,
-                           const NamespaceString& collectionName,
-                           const BSONObj& query,
-                           BSONObj* result);
+    Status findOne(OperationContext* opCtx,
+                   const NamespaceString& collectionName,
+                   const BSONObj& query,
+                   BSONObj* result) override;
 
-    virtual Status query(OperationContext* opCtx,
-                         const NamespaceString& collectionName,
-                         const BSONObj& query,
-                         const BSONObj& projection,  // Currently unused in mock
-                         const std::function<void(const BSONObj&)>& resultProcessor);
+    bool hasOne(OperationContext* opCtx,
+                const NamespaceString& collectionName,
+                const BSONObj& query) override;
+
+
+    Status query(OperationContext* opCtx,
+                 const NamespaceString& collectionName,
+                 const BSONObj& query,
+                 const BSONObj& projection,  // Currently unused in mock
+                 const std::function<void(const BSONObj&)>& resultProcessor) override;
 
     /**
      * Inserts the given user object into the "admin" database.
@@ -108,6 +113,11 @@ public:
                           int* numRemoved);
 
     std::vector<BSONObj> getCollectionContents(const NamespaceString& collectionName);
+
+protected:
+    RolesLocks _lockRoles(OperationContext* opCtx) override {
+        return RolesLocks();
+    }
 
 private:
     typedef std::vector<BSONObj> BSONObjCollection;

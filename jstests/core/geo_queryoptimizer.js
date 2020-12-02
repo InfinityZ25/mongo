@@ -1,7 +1,12 @@
+/**
+ * @tags: [
+ *   sbe_incompatible,
+ * ]
+ */
 t = db.geo_qo1;
 t.drop();
 
-t.ensureIndex({loc: "2d"});
+t.createIndex({loc: "2d"});
 
 t.insert({'issue': 0});
 t.insert({'issue': 1});

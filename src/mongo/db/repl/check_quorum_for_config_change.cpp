@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -93,6 +93,8 @@ std::vector<RemoteCommandRequest> QuorumChecker::getRequests() const {
     if (isInitialConfig) {
         hbArgs.setCheckEmpty();
     }
+    // hbArgs allows (but doesn't require) us to pass the current primary id as an optimization,
+    // but it is not readily available within QuorumChecker.
     hbArgs.setSenderHost(myConfig.getHostAndPort());
     hbArgs.setSenderId(myConfig.getId().getData());
     hbArgs.setTerm(_term);
@@ -189,9 +191,10 @@ void QuorumChecker::_tabulateHeartbeatResponse(const RemoteCommandRequest& reque
     ++_numResponses;
     if (!response.isOK()) {
         LOGV2_WARNING(23722,
-                      "Failed to complete heartbeat request to {request_target}; {response_status}",
-                      "request_target"_attr = request.target,
-                      "response_status"_attr = response.status);
+                      "Failed to complete heartbeat request to {requestTarget}; {responseStatus}",
+                      "Failed to complete heartbeat request to target",
+                      "requestTarget"_attr = request.target,
+                      "responseStatus"_attr = response.status);
         _badResponses.push_back(std::make_pair(request.target, response.status));
         return;
     }
@@ -201,34 +204,27 @@ void QuorumChecker::_tabulateHeartbeatResponse(const RemoteCommandRequest& reque
     Status hbStatus = hbResp.initialize(resBSON, 0);
 
     if (hbStatus.code() == ErrorCodes::InconsistentReplicaSetNames) {
-        std::string message = str::stream()
-            << "Our set name did not match that of " << request.target.toString();
-        _vetoStatus = Status(ErrorCodes::NewReplicaSetConfigurationIncompatible, message);
-        LOGV2_WARNING(23723, "{message}", "message"_attr = message);
+        static constexpr char message[] = "Our set name did not match that of the request target";
+        _vetoStatus =
+            Status(ErrorCodes::NewReplicaSetConfigurationIncompatible,
+                   str::stream() << message << ", requestTarget:" << request.target.toString());
+        LOGV2_WARNING(23723,
+                      "Our set name did not match that of {requestTarget}",
+                      message,
+                      "requestTarget"_attr = request.target.toString());
         return;
     }
 
     if (!hbStatus.isOK() && hbStatus != ErrorCodes::InvalidReplicaSetConfig) {
         LOGV2_WARNING(
             23724,
-            "Got error ({hbStatus}) response on heartbeat request to {request_target}; {hbResp}",
+            "Got error ({hbStatus}) response on heartbeat request to {requestTarget}; {hbResp}",
+            "Got error response on heartbeat request",
             "hbStatus"_attr = hbStatus,
-            "request_target"_attr = request.target,
+            "requestTarget"_attr = request.target,
             "hbResp"_attr = hbResp);
         _badResponses.push_back(std::make_pair(request.target, hbStatus));
         return;
-    }
-
-    if (!hbResp.getReplicaSetName().empty()) {
-        if (hbResp.getConfigVersion() >= _rsConfig->getConfigVersion()) {
-            std::string message = str::stream()
-                << "Our config version of " << _rsConfig->getConfigVersion()
-                << " is no larger than the version on " << request.target.toString()
-                << ", which is " << hbResp.getConfigVersion();
-            _vetoStatus = Status(ErrorCodes::NewReplicaSetConfigurationIncompatible, message);
-            LOGV2_WARNING(23725, "{message}", "message"_attr = message);
-            return;
-        }
     }
 
     if (_rsConfig->hasReplicaSetId()) {
@@ -236,12 +232,22 @@ void QuorumChecker::_tabulateHeartbeatResponse(const RemoteCommandRequest& reque
             rpc::ReplSetMetadata::readFromMetadata(response.data);
         if (replMetadata.isOK() && replMetadata.getValue().getReplicaSetId().isSet() &&
             _rsConfig->getReplicaSetId() != replMetadata.getValue().getReplicaSetId()) {
-            std::string message = str::stream()
-                << "Our replica set ID of " << _rsConfig->getReplicaSetId()
-                << " did not match that of " << request.target.toString() << ", which is "
-                << replMetadata.getValue().getReplicaSetId();
-            _vetoStatus = Status(ErrorCodes::NewReplicaSetConfigurationIncompatible, message);
-            LOGV2_WARNING(23726, "{message}", "message"_attr = message);
+            static constexpr char message[] =
+                "Our replica set ID did not match that of our request target";
+            _vetoStatus =
+                Status(ErrorCodes::NewReplicaSetConfigurationIncompatible,
+                       str::stream() << message << ", replSetId: " << _rsConfig->getReplicaSetId()
+                                     << ", requestTarget: " << request.target.toString()
+                                     << ", requestTargetReplSetId: "
+                                     << replMetadata.getValue().getReplicaSetId());
+            LOGV2_WARNING(23726,
+                          "Our replica set ID of {replSetId} did not match that of "
+                          "{requestTarget}, which is {requestTargetId}",
+                          message,
+                          "replSetId"_attr = _rsConfig->getReplicaSetId(),
+                          "requestTarget"_attr = request.target.toString(),
+                          "requestTargetReplSetId"_attr =
+                              replMetadata.getValue().getReplicaSetId());
         }
     }
 
@@ -266,22 +272,8 @@ bool QuorumChecker::hasReceivedSufficientResponses() const {
         // Vetoed or everybody has responded.  All done.
         return true;
     }
-    if (_rsConfig->getConfigVersion() == 1) {
-        // Have not received responses from every member, and the proposed config
-        // version is 1 (initial configuration).  Keep waiting.
-        return false;
-    }
-    if (_numElectable == 0) {
-        // Have not heard from at least one electable node.  Keep waiting.
-        return false;
-    }
-    if (int(_voters.size()) < _rsConfig->getMajorityVoteCount()) {
-        // Have not heard from a majority of voters.  Keep waiting.
-        return false;
-    }
 
-    // Have heard from a majority of voters and one electable node.  All done.
-    return true;
+    return false;
 }
 
 Status checkQuorumGeneral(executor::TaskExecutor* executor,

@@ -1,3 +1,25 @@
+# Copyright 2020 MongoDB Inc.
+#
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
+#
+# The above copyright notice and this permission notice shall be included
+# in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+# KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+# WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+# WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#
+
 """Pseudo-builders for building and registering libfuzzer tests.
 """
 from SCons.Script import Action
@@ -19,7 +41,7 @@ def build_cpp_libfuzzer_test(env, target, source, **kwargs):
     if not myenv.IsSanitizerEnabled("fuzzer"):
         return []
 
-    libdeps = kwargs.get("LIBDEPS", [])
+    libdeps = kwargs.get("LIBDEPS", myenv.get("LIBDEPS", [])).copy()
     kwargs["LIBDEPS"] = libdeps
     kwargs["INSTALL_ALIAS"] = ["tests"]
     sanitizer_option = "-fsanitize=fuzzer"
@@ -36,16 +58,11 @@ def build_cpp_libfuzzer_test(env, target, source, **kwargs):
             libfuzzer_test_components
         )
 
-    kwargs["AIB_COMPONENTS_EXTRA"] = libfuzzer_test_components
+    kwargs["AIB_COMPONENTS_EXTRA"] =  list(libfuzzer_test_components)
 
     result = myenv.Program(target, source, **kwargs)
     myenv.RegisterTest("$LIBFUZZER_TEST_LIST", result[0])
     myenv.Alias("$LIBFUZZER_TEST_ALIAS", result)
-
-    # TODO: remove when hygienic is default
-    hygienic = myenv.GetOption("install-mode") == "hygienic"
-    if not hygienic:
-        myenv.Install("#/build/libfuzzer_tests/", result[0])
 
     return result
 

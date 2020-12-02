@@ -32,7 +32,7 @@
 #include "mongo/base/status.h"
 #include "mongo/db/matcher/expression_with_placeholder.h"
 #include "mongo/db/query/collation/collator_interface.h"
-#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_yield_policy.h"
 #include "mongo/db/update/update_driver.h"
 
 namespace mongo {
@@ -60,14 +60,6 @@ class ParsedUpdate {
     ParsedUpdate& operator=(const ParsedUpdate&) = delete;
 
 public:
-    /**
-     * Parses the array filters portion of the update request.
-     */
-    static StatusWith<std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>>>
-    parseArrayFilters(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                      const std::vector<BSONObj>& rawArrayFiltersIn,
-                      const NamespaceString& nss);
-
     /**
      * Constructs a parsed update.
      *
@@ -105,7 +97,7 @@ public:
     /**
      * Get the YieldPolicy, adjusted for GodMode.
      */
-    PlanExecutor::YieldPolicy yieldPolicy() const;
+    PlanYieldPolicy::YieldPolicy yieldPolicy() const;
 
     /**
      * As an optimization, we don't create a canonical query for updates with simple _id

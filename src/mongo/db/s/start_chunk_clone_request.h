@@ -72,8 +72,7 @@ public:
                                 const BSONObj& chunkMinKey,
                                 const BSONObj& chunkMaxKey,
                                 const BSONObj& shardKeyPattern,
-                                const MigrationSecondaryThrottleOptions& secondaryThrottle,
-                                bool resumableRangeDeleterDisabled);
+                                const MigrationSecondaryThrottleOptions& secondaryThrottle);
 
     const NamespaceString& getNss() const {
         return _nss;
@@ -87,8 +86,13 @@ public:
         return _fromShardCS;
     }
 
+    bool hasMigrationId() const {
+        return _migrationId.is_initialized();
+    }
+
     const UUID& getMigrationId() const {
-        return _migrationId;
+        invariant(_migrationId);
+        return *_migrationId;
     }
 
     const LogicalSessionId& getLsid() const {
@@ -123,22 +127,17 @@ public:
         return _secondaryThrottle;
     }
 
-    bool resumableRangeDeleterDisabled() const {
-        return _resumableRangeDeleterDisabled;
-    }
-
 private:
     StartChunkCloneRequest(NamespaceString nss,
-                           UUID migrationId,
                            MigrationSessionId sessionId,
                            MigrationSecondaryThrottleOptions secondaryThrottle);
 
     // The collection for which this request applies
     NamespaceString _nss;
 
-    UUID _migrationId;
+    boost::optional<UUID> _migrationId;
     LogicalSessionId _lsid;
-    TxnNumber _txnNumber;
+    TxnNumber _txnNumber{kUninitializedTxnNumber};
 
     // The session id of this migration
     MigrationSessionId _sessionId;
@@ -159,8 +158,6 @@ private:
 
     // The parsed secondary throttle options
     MigrationSecondaryThrottleOptions _secondaryThrottle;
-
-    bool _resumableRangeDeleterDisabled{false};
 };
 
 }  // namespace mongo

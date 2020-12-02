@@ -66,6 +66,7 @@ namespace mongo::logv2 {
     X(kSharding,               , "sharding"              , "SHARDING", kDefault) \
     X(kShardingCatalogRefresh, , "shardingCatalogRefresh", "SH_REFR" , kSharding) \
     X(kShardingMigration,      , "migration"             , "MIGRATE" , kSharding) \
+    X(kShardMigrationPerf,     , "migrationPerf"         , "MIG_PERF", kSharding) \
     X(kStorage,                , "storage"               , "STORAGE" , kDefault) \
     X(kStorageRecovery,        , "recovery"              , "RECOVERY", kStorage) \
     X(kJournal,                , "journal"               , "JOURNAL" , kStorage) \
@@ -75,6 +76,7 @@ namespace mongo::logv2 {
     X(kBridge,                 , "bridge"                , "BRIDGE"  , kNetwork) \
     X(kTracking,               , "tracking"              , "TRACKING", kDefault) \
     X(kTransaction,            , "transaction"           , "TXN"     , kDefault) \
+    X(kTenantMigration,        , "tenantMigration"       , "TENANT_M", kDefault) \
     X(kConnectionPool,         , "connectionPool"        , "CONNPOOL", kNetwork) \
     X(kTest,                   , "test"                  , "TEST"    , kDefault) \
     X(kNumLogComponents,       , "total"                 , "TOTAL"   , kNumLogComponents) \
@@ -144,8 +146,3 @@ private:
 std::ostream& operator<<(std::ostream& os, LogComponent component);
 
 }  // namespace mongo::logv2
-
-// Legacy alias
-namespace mongo::logger {
-using logv2::LogComponent;
-}  // namespace mongo::logger

@@ -31,7 +31,7 @@
  * Connect to a Mongo database as a database, from C++.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -45,14 +45,15 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/client/authenticate.h"
+#include "mongo/client/client_api_version_parameters_gen.h"
 #include "mongo/client/constants.h"
 #include "mongo/client/dbclient_cursor.h"
 #include "mongo/config.h"
-#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/api_parameters_gen.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/json.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/query/killcursors_request.h"
+#include "mongo/db/query/kill_cursors_gen.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/remote_command_response.h"
@@ -94,8 +95,9 @@ bool DBClientBase::isOk(const BSONObj& o) {
     return o["ok"].trueValue();
 }
 
-bool DBClientBase::isNotMasterErrorString(const BSONElement& e) {
-    return e.type() == String && str::contains(e.valuestr(), "not master");
+bool DBClientBase::isNotPrimaryErrorString(const BSONElement& e) {
+    return e.type() == String &&
+        (str::contains(e.valuestr(), "not primary") || str::contains(e.valuestr(), "not master"));
 }
 
 
@@ -195,6 +197,43 @@ DBClientBase* DBClientBase::runFireAndForgetCommand(OpMsgRequest request) {
     return this;
 }
 
+namespace {
+void appendAPIVersionParameters(BSONObjBuilder& bob,
+                                const ClientAPIVersionParameters& apiParameters) {
+    if (!apiParameters.getVersion()) {
+        return;
+    }
+
+    bool hasVersion = false, hasStrict = false, hasDeprecationErrors = false;
+    BSONObjIterator i = bob.iterator();
+    while (i.more()) {
+        auto elem = i.next();
+        if (elem.fieldNameStringData() == APIParametersFromClient::kApiVersionFieldName) {
+            hasVersion = true;
+        } else if (elem.fieldNameStringData() == APIParametersFromClient::kApiStrictFieldName) {
+            hasStrict = true;
+        } else if (elem.fieldNameStringData() ==
+                   APIParametersFromClient::kApiDeprecationErrorsFieldName) {
+            hasDeprecationErrors = true;
+        }
+    }
+
+    if (!hasVersion) {
+        bob.append(APIParametersFromClient::kApiVersionFieldName, *apiParameters.getVersion());
+    }
+
+    // Include apiStrict/apiDeprecationErrors if they are not boost::none.
+    if (!hasStrict && apiParameters.getStrict()) {
+        bob.append(APIParametersFromClient::kApiStrictFieldName, *apiParameters.getStrict());
+    }
+
+    if (!hasDeprecationErrors && apiParameters.getDeprecationErrors()) {
+        bob.append(APIParametersFromClient::kApiDeprecationErrorsFieldName,
+                   *apiParameters.getDeprecationErrors());
+    }
+}
+}  // namespace
+
 std::pair<rpc::UniqueReply, DBClientBase*> DBClientBase::runCommandWithTarget(
     OpMsgRequest request) {
     // Make sure to reconnect if needed before building our request, since the request depends on
@@ -205,9 +244,13 @@ std::pair<rpc::UniqueReply, DBClientBase*> DBClientBase::runCommandWithTarget(
     auto host = getServerAddress();
 
     auto opCtx = haveClient() ? cc().getOperationContext() : nullptr;
-    if (_metadataWriter) {
+
+    if (_metadataWriter || _apiParameters.getVersion()) {
         BSONObjBuilder metadataBob(std::move(request.body));
-        uassertStatusOK(_metadataWriter(opCtx, &metadataBob));
+        if (_metadataWriter) {
+            uassertStatusOK(_metadataWriter(opCtx, &metadataBob));
+        }
+        appendAPIVersionParameters(metadataBob, _apiParameters);
         request.body = metadataBob.obj();
     }
 
@@ -462,8 +505,9 @@ void DBClientBase::_auth(const BSONObj& params) {
     // We will only have a client name if SSL is enabled
     std::string clientName = "";
 #ifdef MONGO_CONFIG_SSL
-    if (getSSLManager() != nullptr) {
-        clientName = getSSLManager()->getSSLConfiguration().clientSubjectName.toString();
+    auto sslConfiguration = getSSLConfiguration();
+    if (sslConfiguration) {
+        clientName = sslConfiguration->clientSubjectName.toString();
     }
 #endif
 
@@ -476,7 +520,7 @@ void DBClientBase::_auth(const BSONObj& params) {
         .get();
 }
 
-Status DBClientBase::authenticateInternalUser() {
+Status DBClientBase::authenticateInternalUser(auth::StepDownBehavior stepDownBehavior) {
     ScopedMetadataWriterRemover remover{this};
     if (!auth::isInternalAuthSet()) {
         if (!serverGlobalParams.quiet.load()) {
@@ -489,14 +533,15 @@ Status DBClientBase::authenticateInternalUser() {
     // We will only have a client name if SSL is enabled
     std::string clientName = "";
 #ifdef MONGO_CONFIG_SSL
-    if (getSSLManager() != nullptr) {
-        clientName = getSSLManager()->getSSLConfiguration().clientSubjectName.toString();
+    auto sslConfiguration = getSSLConfiguration();
+    if (sslConfiguration) {
+        clientName = sslConfiguration->clientSubjectName.toString();
     }
 #endif
 
-    auto status =
-        auth::authenticateInternalClient(clientName, boost::none, _makeAuthRunCommandHook())
-            .getNoThrow();
+    auto status = auth::authenticateInternalClient(
+                      clientName, boost::none, stepDownBehavior, _makeAuthRunCommandHook())
+                      .getNoThrow();
     if (status.isOK()) {
         return status;
     }
@@ -538,18 +583,18 @@ void DBClientBase::logout(const string& dbname, BSONObj& info) {
     runCommand(dbname, BSON("logout" << 1), info);
 }
 
-bool DBClientBase::isMaster(bool& isMaster, BSONObj* info) {
+bool DBClientBase::isPrimary(bool& isPrimary, BSONObj* info) {
     BSONObjBuilder bob;
     bob.append("ismaster", 1);
-    if (WireSpec::instance().isInternalClient) {
-        WireSpec::appendInternalClientWireVersion(WireSpec::instance().outgoing, &bob);
+    if (auto wireSpec = WireSpec::instance().get(); wireSpec->isInternalClient) {
+        WireSpec::appendInternalClientWireVersion(wireSpec->outgoing, &bob);
     }
 
     BSONObj o;
     if (info == nullptr)
         info = &o;
     bool ok = runCommand("admin", bob.obj(), *info);
-    isMaster = info->getField("ismaster").trueValue();
+    isPrimary = info->getField("ismaster").trueValue();
     return ok;
 }
 
@@ -585,13 +630,17 @@ list<BSONObj> DBClientBase::getCollectionInfos(const string& db, const BSONObj& 
     if (runCommand(db,
                    BSON("listCollections" << 1 << "filter" << filter << "cursor" << BSONObj()),
                    res,
-                   QueryOption_SlaveOk)) {
+                   QueryOption_SecondaryOk)) {
         BSONObj cursorObj = res["cursor"].Obj();
         BSONObj collections = cursorObj["firstBatch"].Obj();
         BSONObjIterator it(collections);
         while (it.more()) {
             BSONElement e = it.next();
             infos.push_back(e.Obj().getOwned());
+        }
+
+        if (res.hasField(LogicalTime::kOperationTimeFieldName)) {
+            setOperationTime(LogicalTime::fromOperationTime(res).asTimestamp());
         }
 
         const long long id = cursorObj["id"].Long();
@@ -601,6 +650,10 @@ list<BSONObj> DBClientBase::getCollectionInfos(const string& db, const BSONObj& 
             unique_ptr<DBClientCursor> cursor = getMore(ns, id, 0, 0);
             while (cursor->more()) {
                 infos.push_back(cursor->nextSafe().getOwned());
+            }
+
+            if (cursor->getOperationTime()) {
+                setOperationTime(*(cursor->getOperationTime()));
             }
         }
 
@@ -631,12 +684,16 @@ vector<BSONObj> DBClientBase::getDatabaseInfos(const BSONObj& filter,
     BSONObj cmd = bob.done();
 
     BSONObj res;
-    if (runCommand("admin", cmd, res, QueryOption_SlaveOk)) {
+    if (runCommand("admin", cmd, res, QueryOption_SecondaryOk)) {
         BSONObj dbs = res["databases"].Obj();
         BSONObjIterator it(dbs);
         while (it.more()) {
             BSONElement e = it.next();
             infos.push_back(e.Obj().getOwned());
+        }
+
+        if (res.hasField(LogicalTime::kOperationTimeFieldName)) {
+            setOperationTime(LogicalTime::fromOperationTime(res).asTimestamp());
         }
 
         return infos;
@@ -682,11 +739,9 @@ void DBClientBase::findN(vector<BSONObj>& out,
                           << " ns: " << ns << " query: " << query.toString(),
             c.get());
 
-    if (c->hasResultFlag(ResultFlag_ShardConfigStale)) {
-        BSONObj error;
-        c->peekError(&error);
-        uasserted(StaleConfigInfo::parseFromCommandError(error), "findN stale config");
-    }
+    tassert(5262100,
+            "Deprecated ShardConfigStale flag encountered in query result",
+            !c->hasResultFlag(ResultFlag_ShardConfigStaleDeprecated));
 
     for (int i = 0; i < nToReturn; i++) {
         if (!c->more())
@@ -724,7 +779,7 @@ std::pair<BSONObj, NamespaceString> DBClientBase::findOneByUUID(
 
     BSONObj cmd = cmdBuilder.obj();
 
-    if (runCommand(db, cmd, res, QueryOption_SlaveOk)) {
+    if (runCommand(db, cmd, res, QueryOption_SecondaryOk)) {
         BSONObj cursorObj = res.getObjectField("cursor");
         BSONObj docs = cursorObj.getObjectField("firstBatch");
         BSONObjIterator it(docs);
@@ -811,7 +866,7 @@ unsigned long long DBClientBase::query(std::function<void(DBClientCursorBatchIte
                                        int batchSize,
                                        boost::optional<BSONObj> readConcernObj) {
     // mask options
-    queryOptions &= (int)(QueryOption_NoCursorTimeout | QueryOption_SlaveOk);
+    queryOptions &= (int)(QueryOption_NoCursorTimeout | QueryOption_SecondaryOk);
 
     unique_ptr<DBClientCursor> c(this->query(
         nsOrUuid, query, 0, 0, fieldsToReturn, queryOptions, batchSize, readConcernObj));
@@ -907,7 +962,7 @@ void DBClientBase::update(const string& ns,
 
 void DBClientBase::killCursor(const NamespaceString& ns, long long cursorId) {
     runFireAndForgetCommand(
-        OpMsgRequest::fromDBAndBody(ns.db(), KillCursorsRequest(ns, {cursorId}).toBSON()));
+        OpMsgRequest::fromDBAndBody(ns.db(), KillCursorsRequest(ns, {cursorId}).toBSON(BSONObj{})));
 }
 
 namespace {
@@ -952,6 +1007,10 @@ std::list<BSONObj> DBClientBase::_getIndexSpecs(const NamespaceStringOrUUID& nsO
             specs.push_back(i.next().Obj().getOwned());
         }
 
+        if (res.hasField(LogicalTime::kOperationTimeFieldName)) {
+            setOperationTime(LogicalTime::fromOperationTime(res).asTimestamp());
+        }
+
         const long long id = cursorObj["id"].Long();
 
         if (id != 0) {
@@ -962,6 +1021,10 @@ std::list<BSONObj> DBClientBase::_getIndexSpecs(const NamespaceStringOrUUID& nsO
             unique_ptr<DBClientCursor> cursor = getMore(cursorNs, id, 0, 0);
             while (cursor->more()) {
                 specs.push_back(cursor->nextSafe().getOwned());
+            }
+
+            if (cursor->getOperationTime()) {
+                setOperationTime(*(cursor->getOperationTime()));
             }
         }
 
@@ -998,7 +1061,7 @@ void DBClientBase::dropIndex(const string& ns,
     BSONObj info;
     if (!runCommand(nsToDatabase(ns), cmdBuilder.obj(), info)) {
         LOGV2_DEBUG(20118,
-                    logSeverityV1toV2(_logLevel).toInt(),
+                    _logLevel.toInt(),
                     "dropIndex failed: {info}",
                     "dropIndex failed",
                     "info"_attr = info);
@@ -1120,5 +1183,12 @@ string nsGetCollection(const string& ns) {
     return ns.substr(pos + 1);
 }
 
+Timestamp DBClientBase::getOperationTime() {
+    return _lastOperationTime;
+}
+
+void DBClientBase::setOperationTime(Timestamp operationTime) {
+    _lastOperationTime = operationTime;
+}
 
 }  // namespace mongo

@@ -16,7 +16,7 @@ import buildscripts.evergreen_gen_multiversion_tests as gen_multiversion
 import buildscripts.evergreen_generate_resmoke_tasks as gen_resmoke
 from buildscripts.burn_in_tests import GenerateConfig, DEFAULT_PROJECT, CONFIG_FILE, _configure_logging, RepeatConfig, \
     _get_evg_api, EVERGREEN_FILE, DEFAULT_REPO_LOCATIONS, _set_resmoke_cmd, create_tests_by_task, \
-    run_tests
+    find_changed_tests, run_tests
 from buildscripts.ciconfig.evergreen import parse_evergreen_file
 from buildscripts.patch_builds.task_generation import validate_task_generation_limit
 from buildscripts.resmokelib.suitesconfig import get_named_suites_with_root_level_key
@@ -74,16 +74,10 @@ def create_multiversion_generate_tasks_config(tests_by_task: Dict, evg_api: Ever
                 evg_api, gen_resmoke.ConfigOptions(config_options))
             test_list = tests_by_task[suite["origin"]]["tests"]
             for test in test_list:
-                # Exclude files that should be blacklisted from multiversion testing.
-                files_to_exclude = gen_multiversion.get_exclude_files(suite["multiversion_name"],
-                                                                      TASK_PATH_SUFFIX)
-                LOGGER.debug("Files to exclude", files_to_exclude=files_to_exclude, test=test,
-                             suite=suite["multiversion_name"])
-                if test not in files_to_exclude:
-                    # Generate the multiversion tasks for each test.
-                    sub_tasks = config_generator.get_burn_in_tasks(test, idx)
-                    tasks = tasks.union(sub_tasks)
-                    idx += 1
+                # Generate the multiversion tasks for each test.
+                sub_tasks = config_generator.get_burn_in_tasks(test, idx)
+                tasks = tasks.union(sub_tasks)
+                idx += 1
 
     existing_tasks = {ExistingTask(f"{BURN_IN_MULTIVERSION_TASK}_gen")}
     build_variant.display_task(BURN_IN_MULTIVERSION_TASK, tasks,
@@ -166,7 +160,8 @@ def main(build_variant, run_build_variant, distro, project, generate_tasks_file,
 
     resmoke_cmd = _set_resmoke_cmd(repeat_config, list(resmoke_args))
 
-    tests_by_task = create_tests_by_task(generate_config.build_variant, repos, evg_conf)
+    changed_tests = find_changed_tests(repos, evg_api=evg_api, task_id=task_id)
+    tests_by_task = create_tests_by_task(generate_config.build_variant, evg_conf, changed_tests)
     LOGGER.debug("tests and tasks found", tests_by_task=tests_by_task)
 
     if generate_tasks_file:

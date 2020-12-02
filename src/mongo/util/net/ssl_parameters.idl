@@ -72,12 +72,34 @@ server_parameters:
     cpp_varname: "tlsOCSPCacheSize"
     validator:
       gt: 0
-  ocspValidationRefreshPeriodSecs:
+  ocspStaplingRefreshPeriodSecs:
     description: "Interval at which the OCSP response will be refreshed"
+    set_at: startup
+    cpp_vartype: long long
+    deprecated_name: ocspValidationRefreshPeriodSecs
+    default: -1
+    cpp_varname: "kOCSPStaplingRefreshPeriodSecs"
+    validator:
+      gte: 1
+  tlsOCSPVerifyTimeoutSecs:
+    description: >-
+        How long the http client should wait before timing out
+        when fetching OCSP Responses for peer certificate
+    set_at: startup
+    cpp_vartype: int
+    default: 5
+    cpp_varname: "gTLSOCSPVerifyTimeoutSecs"
+    validator:
+      gte: 1
+  tlsOCSPStaplingTimeoutSecs:
+    description: >-
+        How long the http client should wait before timing out
+        when fetching OCSP Responses for stapling. If not set,
+        value is taken  from tlsClientOCSPTimeoutSecs
     set_at: startup
     cpp_vartype: int
     default: -1
-    cpp_varname: "kOCSPValidationRefreshPeriodSecs"
+    cpp_varname: "gTLSOCSPStaplingTimeoutSecs"
     validator:
       gte: 1
 
@@ -87,6 +109,11 @@ server_parameters:
     cpp_varname: "sslGlobalParams.sslCipherConfig"
     validator:
       callback: "validateOpensslCipherConfig"
+
+  opensslCipherSuiteConfig:
+    description: "Cipher configuration string for OpenSSL based connections that use TLS 1.3 or newer ONLY"
+    set_at: startup
+    cpp_varname: "sslGlobalParams.sslCipherSuiteConfig"
 
   disableNonTLSConnectionLogging:
     deprecated_name: "disableNonSSLConnectionLogging"

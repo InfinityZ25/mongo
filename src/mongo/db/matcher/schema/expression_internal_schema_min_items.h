@@ -40,9 +40,14 @@ namespace mongo {
 class InternalSchemaMinItemsMatchExpression final
     : public InternalSchemaNumArrayItemsMatchExpression {
 public:
-    InternalSchemaMinItemsMatchExpression(StringData path, long long numItems)
-        : InternalSchemaNumArrayItemsMatchExpression(
-              INTERNAL_SCHEMA_MIN_ITEMS, path, numItems, "$_internalSchemaMinItems"_sd) {}
+    InternalSchemaMinItemsMatchExpression(StringData path,
+                                          long long numItems,
+                                          clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : InternalSchemaNumArrayItemsMatchExpression(INTERNAL_SCHEMA_MIN_ITEMS,
+                                                     path,
+                                                     numItems,
+                                                     "$_internalSchemaMinItems"_sd,
+                                                     std::move(annotation)) {}
 
     bool matchesArray(const BSONObj& anArray, MatchDetails* details) const final {
         return (anArray.nFields() >= numItems());
@@ -50,11 +55,20 @@ public:
 
     std::unique_ptr<MatchExpression> shallowClone() const final {
         std::unique_ptr<InternalSchemaMinItemsMatchExpression> minItems =
-            std::make_unique<InternalSchemaMinItemsMatchExpression>(path(), numItems());
+            std::make_unique<InternalSchemaMinItemsMatchExpression>(
+                path(), numItems(), _errorAnnotation);
         if (getTag()) {
             minItems->setTag(getTag()->clone());
         }
-        return std::move(minItems);
+        return minItems;
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
     }
 };
 }  // namespace mongo

@@ -2,6 +2,7 @@
 
 load("jstests/replsets/rslib.js");
 load('jstests/replsets/libs/election_metrics.js');
+load("jstests/libs/write_concern_util.js");
 
 (function() {
 "use strict";
@@ -24,14 +25,12 @@ assert.eq(primary, rst.getPrimary());
 
 // Step up the secondary, but it's not eligible to be primary.
 // Enable fail point on secondary.
-assert.commandWorked(
-    secondary.getDB('admin').runCommand({configureFailPoint: 'rsSyncApplyStop', mode: 'alwaysOn'}));
+stopServerReplication(secondary);
 
 assert.commandWorked(primary.getDB("test").bar.insert({x: 2}, {writeConcern: {w: 1}}));
 res = secondary.adminCommand({replSetStepUp: 1});
 assert.commandFailedWithCode(res, ErrorCodes.CommandFailed);
-assert.commandWorked(
-    secondary.getDB('admin').runCommand({configureFailPoint: 'rsSyncApplyStop', mode: 'off'}));
+restartServerReplication(secondary);
 
 // Wait for the secondary to catch up by replicating a doc to both nodes.
 assert.commandWorked(primary.getDB("test").bar.insert({x: 3}, {writeConcern: {w: "majority"}}));
@@ -55,7 +54,8 @@ const newSecondaryStatus = assert.commandWorked(secondary.adminCommand({serverSt
 verifyServerStatusElectionReasonCounterChange(initialSecondaryStatus.electionMetrics,
                                               newSecondaryStatus.electionMetrics,
                                               "stepUpCmd",
-                                              numStepUpCmds);
+                                              numStepUpCmds, /* expectedNumCalled */
+                                              1 /* expectedNumSuccessful */);
 verifyServerStatusElectionReasonCounterChange(initialSecondaryStatus.electionMetrics,
                                               newSecondaryStatus.electionMetrics,
                                               "priorityTakeover",

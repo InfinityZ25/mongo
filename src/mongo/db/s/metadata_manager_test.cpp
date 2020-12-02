@@ -37,6 +37,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/s/metadata_manager.h"
+#include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/s/sharding_runtime_d_params_gen.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
@@ -44,7 +45,6 @@
 #include "mongo/executor/task_executor.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/shard_server_test_fixture.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
@@ -85,11 +85,15 @@ protected:
             nullptr,
             false,
             epoch,
+            boost::none,
+            true,
             {ChunkType{kNss, range, ChunkVersion(1, 0, epoch), kOtherShard}});
 
-        std::shared_ptr<ChunkManager> cm = std::make_shared<ChunkManager>(rt, boost::none);
-
-        return CollectionMetadata(cm, kThisShard);
+        return CollectionMetadata(ChunkManager(kThisShard,
+                                               DatabaseVersion(UUID::gen()),
+                                               makeStandaloneRoutingTableHistory(std::move(rt)),
+                                               boost::none),
+                                  kThisShard);
     }
 
     /**
@@ -129,9 +133,13 @@ protected:
         splitChunks.emplace_back(
             kNss, ChunkRange(maxKey, chunkToSplit.getMax()), chunkVersion, kOtherShard);
 
-        auto rt = cm->getRoutingHistory()->makeUpdated(splitChunks);
+        auto rt = cm->getRoutingTableHistory_ForTest().makeUpdated(boost::none, true, splitChunks);
 
-        return CollectionMetadata(std::make_shared<ChunkManager>(rt, boost::none), kThisShard);
+        return CollectionMetadata(ChunkManager(cm->dbPrimary(),
+                                               cm->dbVersion(),
+                                               makeStandaloneRoutingTableHistory(std::move(rt)),
+                                               boost::none),
+                                  kThisShard);
     }
 
     static CollectionMetadata cloneMetadataMinusChunk(const CollectionMetadata& metadata,
@@ -149,91 +157,20 @@ protected:
         auto chunkVersion = cm->getVersion();
         chunkVersion.incMajor();
 
-        auto rt = cm->getRoutingHistory()->makeUpdated(
+        auto rt = cm->getRoutingTableHistory_ForTest().makeUpdated(
+            boost::none,
+            true,
             {ChunkType(kNss, ChunkRange(minKey, maxKey), chunkVersion, kOtherShard)});
 
-        return CollectionMetadata(std::make_shared<ChunkManager>(rt, boost::none), kThisShard);
+        return CollectionMetadata(ChunkManager(cm->dbPrimary(),
+                                               cm->dbVersion(),
+                                               makeStandaloneRoutingTableHistory(std::move(rt)),
+                                               boost::none),
+                                  kThisShard);
     }
 
     std::shared_ptr<MetadataManager> _manager;
 };
-
-TEST_F(MetadataManagerTest, CleanUpForMigrateIn) {
-    _manager->setFilteringMetadata(makeEmptyMetadata());
-
-    // Sanity checks
-    ASSERT(_manager->getActiveMetadata(boost::none)->get().isSharded());
-    ASSERT_EQ(0UL, _manager->getActiveMetadata(boost::none)->get().getChunks().size());
-
-    ChunkRange range1(BSON("key" << 0), BSON("key" << 10));
-    ChunkRange range2(BSON("key" << 10), BSON("key" << 20));
-
-    auto notif1 = _manager->beginReceive(range1);
-    ASSERT(!notif1.isReady());
-
-    auto notif2 = _manager->beginReceive(range2);
-    ASSERT(!notif2.isReady());
-
-    ASSERT_EQ(2UL, _manager->numberOfRangesToClean());
-    ASSERT_EQ(0UL, _manager->numberOfRangesToCleanStillInUse());
-}
-
-TEST_F(MetadataManagerTest,
-       ChunkInReceivingChunksListIsRemovedAfterShardKeyRefineIfMigrationSucceeded) {
-    _manager->setFilteringMetadata(makeEmptyMetadata());
-
-    // Simulate receiving a range. This will add an item to _receivingChunks.
-    ChunkRange range(BSON("key" << 0), BSON("key" << 10));
-    auto notif1 = _manager->beginReceive(range);
-
-    ASSERT_EQ(_manager->numberOfReceivingChunks(), 1);
-
-    // Simulate a situation in which the migration completes, and then the shard key is refined,
-    // before this shard discovers the updated metadata.
-    auto uuid = _manager->getActiveMetadata(boost::none)->get().getChunkManager()->getUUID().get();
-    ChunkRange refinedRange(BSON("key" << 0 << "other" << MINKEY),
-                            BSON("key" << 10 << "other" << MINKEY));
-    auto refinedMetadata = makeEmptyMetadata(BSON(kPattern << 1 << "other" << 1),
-                                             ChunkRange(BSON("key" << MINKEY << "other" << MINKEY),
-                                                        BSON("key" << MAXKEY << "other" << MAXKEY)),
-                                             uuid);
-
-    // Set the updated chunk map on the MetadataManager.
-    _manager->setFilteringMetadata(cloneMetadataPlusChunk(refinedMetadata, refinedRange));
-    // Because the refined range overlaps with the received range (pre-refine), this should remove
-    // the item in _receivingChunks.
-    ASSERT_EQ(_manager->numberOfReceivingChunks(), 0);
-}
-
-TEST_F(MetadataManagerTest,
-       ChunkInReceivingChunksListIsNotRemovedAfterShardKeyRefineIfNonOverlappingRangeIsReceived) {
-    _manager->setFilteringMetadata(makeEmptyMetadata());
-
-    // Simulate receiving a range. This will add an item to _receivingChunks.
-    ChunkRange range(BSON("key" << 0), BSON("key" << 10));
-    auto notif1 = _manager->beginReceive(range);
-    ASSERT_EQ(_manager->numberOfReceivingChunks(), 1);
-
-    // Simulate a situation in which the shard key is refined and this shard discovers
-    // updated metadata where it owns some range that does not overlap with the range being migrated
-    // in.
-    auto uuid = _manager->getActiveMetadata(boost::none)->get().getChunkManager()->getUUID().get();
-    ChunkRange refinedNonOverlappingRange(BSON("key" << -10 << "other" << MINKEY),
-                                          BSON("key" << 0 << "other" << MINKEY));
-
-    auto refinedMetadata = makeEmptyMetadata(BSON(kPattern << 1 << "other" << 1),
-                                             ChunkRange(BSON("key" << MINKEY << "other" << MINKEY),
-                                                        BSON("key" << MAXKEY << "other" << MAXKEY)),
-                                             uuid);
-
-    // Set the updated chunk map on the MetadataManager.
-    _manager->setFilteringMetadata(
-        cloneMetadataPlusChunk(refinedMetadata, refinedNonOverlappingRange));
-
-    // Because the refined range does not overlap with the received range (pre-refine), this should
-    // NOT remove the item in _receivingChunks.
-    ASSERT_EQ(_manager->numberOfReceivingChunks(), 1);
-}
 
 TEST_F(MetadataManagerTest, TrackOrphanedDataCleanupBlocksOnScheduledRangeDeletions) {
     ChunkRange cr1(BSON("key" << 0), BSON("key" << 10));

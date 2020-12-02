@@ -26,7 +26,7 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -40,6 +40,9 @@
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/ops/write_ops_exec.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/util/assert_util.h"
 
@@ -52,7 +55,6 @@ const StringData kDefaultOplogCollectionNamespace = "local.temp_oplog_buffer"_sd
 const StringData kOplogEntryFieldName = "entry"_sd;
 const StringData kIdFieldName = "_id"_sd;
 const StringData kTimestampFieldName = "ts"_sd;
-const StringData kSentinelFieldName = "s"_sd;
 const StringData kIdIdxName = "_id_"_sd;
 
 }  // namespace
@@ -61,21 +63,12 @@ NamespaceString OplogBufferCollection::getDefaultNamespace() {
     return NamespaceString(kDefaultOplogCollectionNamespace);
 }
 
-std::tuple<BSONObj, Timestamp, std::size_t> OplogBufferCollection::addIdToDocument(
-    const BSONObj& orig, const Timestamp& lastTimestamp, std::size_t sentinelCount) {
-    if (orig.isEmpty()) {
-        return std::make_tuple(
-            BSON(kIdFieldName << BSON(kTimestampFieldName
-                                      << lastTimestamp << kSentinelFieldName
-                                      << static_cast<long long>(sentinelCount + 1))),
-            lastTimestamp,
-            sentinelCount + 1);
-    }
+std::tuple<BSONObj, Timestamp> OplogBufferCollection::addIdToDocument(const BSONObj& orig) {
+    invariant(!orig.isEmpty());
     const auto ts = orig[kTimestampFieldName].timestamp();
     invariant(!ts.isNull());
-    auto doc = BSON(kIdFieldName << BSON(kTimestampFieldName << ts << kSentinelFieldName << 0)
-                                 << kOplogEntryFieldName << orig);
-    return std::make_tuple(doc, ts, 0);
+    auto doc = BSON(_keyForTimestamp(ts).firstElement() << kOplogEntryFieldName << orig);
+    return std::make_tuple(doc, ts);
 }
 
 BSONObj OplogBufferCollection::extractEmbeddedOplogDocument(const BSONObj& orig) {
@@ -105,12 +98,16 @@ void OplogBufferCollection::startup(OperationContext* opCtx) {
         return;
     }
 
+    // If the collection doesn't already exist, create it.
+    _createCollection(opCtx);
+
     stdx::lock_guard<Latch> lk(_mutex);
     // If we are starting from an existing collection, we must populate the in memory state of the
     // buffer.
     auto sizeResult = _storageInterface->getCollectionSize(opCtx, _nss);
     fassert(40403, sizeResult);
     _size = sizeResult.getValue();
+    _sizeIsValid = true;
 
     auto countResult = _storageInterface->getCollectionCount(opCtx, _nss);
     fassert(40404, countResult);
@@ -124,7 +121,6 @@ void OplogBufferCollection::startup(OperationContext* opCtx) {
     _peekCache = std::queue<BSONObj>();
 
     if (_count == 0) {
-        _sentinelCount = 0;
         _lastPushedTimestamp = {};
         return;
     }
@@ -135,13 +131,8 @@ void OplogBufferCollection::startup(OperationContext* opCtx) {
         fassert(
             40405,
             bsonExtractTimestampField(lastPushedId, kTimestampFieldName, &_lastPushedTimestamp));
-        long long countAtTimestamp = 0;
-        fassert(40406,
-                bsonExtractIntegerField(lastPushedId, kSentinelFieldName, &countAtTimestamp));
-        _sentinelCount = countAtTimestamp--;
     } else {
         _lastPushedTimestamp = {};
-        _sentinelCount = 0;
     }
 }
 
@@ -151,7 +142,6 @@ void OplogBufferCollection::shutdown(OperationContext* opCtx) {
         _dropCollection(opCtx);
         _size = 0;
         _count = 0;
-        _sentinelCount = 0;
         _lastPushedTimestamp = {};
         _lastPoppedKey = {};
         _peekCache = std::queue<BSONObj>();
@@ -165,27 +155,50 @@ void OplogBufferCollection::push(OperationContext* opCtx,
         return;
     }
     size_t numDocs = std::distance(begin, end);
-    std::vector<InsertStatement> docsToInsert(numDocs);
+    std::vector<BSONObj> docsToInsert(numDocs);
     stdx::lock_guard<Latch> lk(_mutex);
     auto ts = _lastPushedTimestamp;
-    auto sentinelCount = _sentinelCount;
-    std::transform(begin, end, docsToInsert.begin(), [&sentinelCount, &ts](const Value& value) {
+    std::transform(begin, end, docsToInsert.begin(), [&ts](const Value& value) {
         BSONObj doc;
         auto previousTimestamp = ts;
-        std::tie(doc, ts, sentinelCount) = addIdToDocument(value, ts, sentinelCount);
-        invariant(value.isEmpty() ? ts == previousTimestamp : ts > previousTimestamp);
-        return InsertStatement(doc);
+        std::tie(doc, ts) = addIdToDocument(value);
+        invariant(!value.isEmpty());
+        invariant(ts > previousTimestamp,
+                  str::stream() << "ts: " << ts.toString()
+                                << ", previous: " << previousTimestamp.toString());
+        return doc;
     });
 
-    auto status = _storageInterface->insertDocuments(opCtx, _nss, docsToInsert);
-    fassert(40161, status);
+    // Disabling internal document validation because the oplog buffer document inserts
+    // can violate max data size limit (which is BSONObjMaxUserSize 16MB) check. Since, the max
+    // user document size is 16MB, the oplog generated for those writes can exceed 16MB
+    // (16MB user data  + additional bytes for oplog fields like ’’op”, “ns”, “ui”).
+    DisableDocumentValidation documentValidationDisabler(
+        opCtx,
+        DocumentValidationSettings::kDisableSchemaValidation |
+            DocumentValidationSettings::kDisableInternalValidation);
+
+    write_ops::Insert insertOp(_nss);
+    insertOp.setDocuments(std::move(docsToInsert));
+    insertOp.setWriteCommandBase([] {
+        write_ops::WriteCommandBase wcb;
+        wcb.setOrdered(true);
+        return wcb;
+    }());
+
+    auto writeResult = write_ops_exec::performInserts(opCtx, insertOp);
+    invariant(!writeResult.results.empty());
+    // Since the writes are ordered, it's ok to check just the last writeOp result.
+    fassert(40161, writeResult.results.back());
+
 
     _lastPushedTimestamp = ts;
-    _sentinelCount = sentinelCount;
     _count += numDocs;
-    _size += std::accumulate(begin, end, 0U, [](const size_t& docSize, const Value& value) {
-        return docSize + size_t(value.objsize());
-    });
+    if (_sizeIsValid) {
+        _size += std::accumulate(begin, end, 0U, [](const size_t& docSize, const Value& value) {
+            return docSize + size_t(value.objsize());
+        });
+    }
     _cvNoLongerEmpty.notify_all();
 }
 
@@ -202,6 +215,7 @@ std::size_t OplogBufferCollection::getMaxSize() const {
 
 std::size_t OplogBufferCollection::getSize() const {
     stdx::lock_guard<Latch> lk(_mutex);
+    uassert(4940100, "getSize() called on OplogBufferCollection after seek", _sizeIsValid);
     return _size;
 }
 
@@ -215,8 +229,8 @@ void OplogBufferCollection::clear(OperationContext* opCtx) {
     _dropCollection(opCtx);
     _createCollection(opCtx);
     _size = 0;
+    _sizeIsValid = true;
     _count = 0;
-    _sentinelCount = 0;
     _lastPushedTimestamp = {};
     _lastPoppedKey = {};
     _peekCache = std::queue<BSONObj>();
@@ -260,6 +274,60 @@ boost::optional<OplogBuffer::Value> OplogBufferCollection::lastObjectPushed(
     return boost::none;
 }
 
+/* static */
+BSONObj OplogBufferCollection::_keyForTimestamp(const Timestamp& ts) {
+    return BSON(kIdFieldName << BSON(kTimestampFieldName << ts));
+}
+
+StatusWith<BSONObj> OplogBufferCollection::_getDocumentWithTimestamp(OperationContext* opCtx,
+                                                                     const Timestamp& ts) {
+    return _storageInterface->findById(opCtx, _nss, _keyForTimestamp(ts).firstElement());
+}
+
+StatusWith<OplogBuffer::Value> OplogBufferCollection::findByTimestamp(OperationContext* opCtx,
+                                                                      const Timestamp& ts) {
+    auto docWithStatus = _getDocumentWithTimestamp(opCtx, ts);
+    if (!docWithStatus.isOK()) {
+        return docWithStatus.getStatus();
+    }
+    return extractEmbeddedOplogDocument(docWithStatus.getValue()).getOwned();
+}
+
+Status OplogBufferCollection::seekToTimestamp(OperationContext* opCtx,
+                                              const Timestamp& ts,
+                                              SeekStrategy exact) {
+    stdx::lock_guard<Latch> lk(_mutex);
+    BSONObj docWithTimestamp;
+    auto docWithStatus = _getDocumentWithTimestamp(opCtx, ts);
+    if (docWithStatus.isOK()) {
+        docWithTimestamp = std::move(docWithStatus.getValue());
+    } else if (exact == SeekStrategy::kExact) {
+        return docWithStatus.getStatus();
+    }
+    _peekCache = std::queue<BSONObj>();
+    auto key = _keyForTimestamp(ts);
+    if (docWithTimestamp.isEmpty()) {
+        // The document with the requested timestamp was not found.  Set _lastPoppedKey to
+        // the key for that document, so next time we pop we will read the next document after
+        // the requested timestamp.
+        _lastPoppedKey = key;
+    } else {
+        // The document with the requested timestamp was found.  _lastPoppedKey will be set to that
+        // document's timestamp once the document is popped from the peek cache in _pop_inlock().
+        _lastPoppedKey = {};
+        _peekCache.push(docWithTimestamp);
+    }
+    // Unfortunately StorageInterface and InternalPlanner don't support count-by-index, so we're
+    // stuck with DBDirectClient.
+    DBDirectClient client(opCtx);
+    auto query = BSON(kIdFieldName << BSON("$gte" << key[kIdFieldName]));
+    _count = client.count(_nss, query);
+
+    // We have no way of accurately determining the size remaining after the seek
+    _sizeIsValid = false;
+    return Status::OK();
+}
+
 boost::optional<OplogBuffer::Value> OplogBufferCollection::_lastDocumentPushed_inlock(
     OperationContext* opCtx) const {
     if (_count == 0) {
@@ -289,9 +357,11 @@ bool OplogBufferCollection::_pop_inlock(OperationContext* opCtx, Value* value) {
     _peekCache.pop();
 
     invariant(_count > 0);
-    invariant(_size >= std::size_t(value->objsize()));
+    if (_sizeIsValid) {
+        invariant(_size >= std::size_t(value->objsize()));
+        _size -= value->objsize();
+    }
     _count--;
-    _size -= value->objsize();
     return true;
 }
 
@@ -344,9 +414,12 @@ BSONObj OplogBufferCollection::_peek_inlock(OperationContext* opCtx, PeekMode pe
 
 void OplogBufferCollection::_createCollection(OperationContext* opCtx) {
     CollectionOptions options;
-    options.temp = true;
+    options.temp = _options.useTemporaryCollection;
     UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-    fassert(40154, _storageInterface->createCollection(opCtx, _nss, options));
+    auto status = _storageInterface->createCollection(opCtx, _nss, options);
+    if (status.code() == ErrorCodes::NamespaceExists)
+        return;
+    fassert(40154, status);
 }
 
 void OplogBufferCollection::_dropCollection(OperationContext* opCtx) {
@@ -354,12 +427,7 @@ void OplogBufferCollection::_dropCollection(OperationContext* opCtx) {
     fassert(40155, _storageInterface->dropCollection(opCtx, _nss));
 }
 
-std::size_t OplogBufferCollection::getSentinelCount_forTest() const {
-    stdx::lock_guard<Latch> lk(_mutex);
-    return _sentinelCount;
-}
-
-Timestamp OplogBufferCollection::getLastPushedTimestamp_forTest() const {
+Timestamp OplogBufferCollection::getLastPushedTimestamp() const {
     stdx::lock_guard<Latch> lk(_mutex);
     return _lastPushedTimestamp;
 }

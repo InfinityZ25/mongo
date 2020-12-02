@@ -35,8 +35,9 @@
 #include "mongo/bson/bsonobj_comparator_interface.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/s/catalog_cache.h"
+#include "mongo/s/chunk_manager.h"
 #include "mongo/s/ns_targeter.h"
+#include "mongo/s/write_ops/batched_command_request.h"
 
 namespace mongo {
 
@@ -75,11 +76,11 @@ public:
 
     ShardEndpoint targetInsert(OperationContext* opCtx, const BSONObj& doc) const override;
 
-    std::vector<ShardEndpoint> targetUpdate(
-        OperationContext* opCtx, const write_ops::UpdateOpEntry& updateOp) const override;
+    std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
+                                            const BatchItemRef& itemRef) const override;
 
-    std::vector<ShardEndpoint> targetDelete(
-        OperationContext* opCtx, const write_ops::DeleteOpEntry& deleteOp) const override;
+    std::vector<ShardEndpoint> targetDelete(OperationContext* opCtx,
+                                            const BatchItemRef& itemRef) const override;
 
     std::vector<ShardEndpoint> targetAllShards(OperationContext* opCtx) const override;
 
@@ -126,9 +127,10 @@ private:
      *
      * If 'collation' is empty, we use the collection default collation for targeting.
      */
-    StatusWith<std::vector<ShardEndpoint>> _targetQuery(OperationContext* opCtx,
-                                                        const BSONObj& query,
-                                                        const BSONObj& collation) const;
+    StatusWith<std::vector<ShardEndpoint>> _targetQuery(
+        boost::intrusive_ptr<ExpressionContext> expCtx,
+        const BSONObj& query,
+        const BSONObj& collation) const;
 
     /**
      * Returns a ShardEndpoint for an exact shard key query.
@@ -149,7 +151,7 @@ private:
     bool _needsTargetingRefresh;
 
     // The latest loaded routing cache entry
-    boost::optional<CachedCollectionRoutingInfo> _routingInfo;
+    boost::optional<ChunkManager> _cm;
 
     // Set to the epoch of the namespace we are targeting. If we ever refresh the catalog cache and
     // find a new epoch, we immediately throw a StaleEpoch exception.

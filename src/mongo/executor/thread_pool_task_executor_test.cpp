@@ -51,7 +51,7 @@ namespace {
 
 MONGO_INITIALIZER(ThreadPoolExecutorCommonTests)(InitializerContext*) {
     addTestsForExecutor("ThreadPoolExecutorCommon", [](std::unique_ptr<NetworkInterfaceMock> net) {
-        return makeThreadPoolTestExecutor(std::move(net));
+        return makeSharedThreadPoolTestExecutor(std::move(net));
     });
     return Status::OK();
 }
@@ -87,6 +87,9 @@ TEST_F(ThreadPoolExecutorTest, Schedule) {
     });
     barrier.countDownAndWait();
     ASSERT_OK(status1);
+    // Wait for the executor to stop to ensure the scheduled job does not outlive current scope.
+    executor.shutdown();
+    executor.join();
 }
 
 TEST_F(ThreadPoolExecutorTest, ScheduleAfterShutdown) {
@@ -109,10 +112,13 @@ TEST_F(ThreadPoolExecutorTest, OnEvent) {
     };
     ASSERT_OK(executor.onEvent(event, std::move(cb)).getStatus());
     // Callback was moved from.
-    ASSERT(!cb);
+    ASSERT(!cb);  // NOLINT(bugprone-use-after-move)
     executor.signalEvent(event);
     barrier.countDownAndWait();
     ASSERT_OK(status1);
+    // Wait for the executor to stop to ensure the scheduled job does not outlive current scope.
+    executor.shutdown();
+    executor.join();
 }
 
 TEST_F(ThreadPoolExecutorTest, OnEventAfterShutdown) {
@@ -127,7 +133,7 @@ TEST_F(ThreadPoolExecutorTest, OnEventAfterShutdown) {
                   executor.onEvent(event, std::move(cb)).getStatus());
 
     // Callback was not moved from, it is still valid and we can call it to set status1.
-    ASSERT(static_cast<bool>(cb));
+    ASSERT(cb);  // NOLINT(bugprone-use-after-move)
     TaskExecutor::CallbackArgs args(&executor, {}, Status::OK());
     cb(args);
     ASSERT_OK(status1);

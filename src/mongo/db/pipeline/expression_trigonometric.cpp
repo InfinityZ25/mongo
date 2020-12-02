@@ -33,208 +33,35 @@
 
 namespace mongo {
 
-/* ----------------------- Inclusive Bounded Trigonometric Functions ---------------------------- */
-
-#define CREATE_BOUNDED_TRIGONOMETRIC_CLASS(className, funcName, boundType, lowerBound, upperBound) \
-    class Expression##className final                                                              \
-        : public ExpressionBoundedTrigonometric<Expression##className, boundType> {                \
-    public:                                                                                        \
-        explicit Expression##className(const boost::intrusive_ptr<ExpressionContext>& expCtx)      \
-            : ExpressionBoundedTrigonometric(expCtx) {}                                            \
-        double getLowerBound() const final {                                                       \
-            return lowerBound;                                                                     \
-        }                                                                                          \
-                                                                                                   \
-        double getUpperBound() const final {                                                       \
-            return upperBound;                                                                     \
-        }                                                                                          \
-                                                                                                   \
-        double doubleFunc(double arg) const final {                                                \
-            return std::funcName(arg);                                                             \
-        }                                                                                          \
-                                                                                                   \
-        Decimal128 decimalFunc(Decimal128 arg) const final {                                       \
-            return arg.funcName();                                                                 \
-        }                                                                                          \
-                                                                                                   \
-        const char* getOpName() const final {                                                      \
-            return "$" #funcName;                                                                  \
-        }                                                                                          \
-                                                                                                   \
-        void acceptVisitor(ExpressionVisitor* visitor) final {                                     \
-            return visitor->visit(this);                                                           \
-        }                                                                                          \
-    };                                                                                             \
-    REGISTER_EXPRESSION(funcName, Expression##className::parse);
-
+// The parse methods of the expressions are registered here in the .cpp file to prevent multiple
+// definition errors.
 
 /**
  * Inclusive Bounds
  */
-CREATE_BOUNDED_TRIGONOMETRIC_CLASS(ArcCosine, acos, InclusiveBoundType, -1.0, 1.0);
-
-CREATE_BOUNDED_TRIGONOMETRIC_CLASS(ArcSine, asin, InclusiveBoundType, -1.0, 1.0);
-
-CREATE_BOUNDED_TRIGONOMETRIC_CLASS(HyperbolicArcTangent, atanh, InclusiveBoundType, -1.0, 1.0);
-
-CREATE_BOUNDED_TRIGONOMETRIC_CLASS(
-    HyperbolicArcCosine, acosh, InclusiveBoundType, 1.0, std::numeric_limits<double>::infinity());
+REGISTER_EXPRESSION(acos, ExpressionArcCosine::parse);
+REGISTER_EXPRESSION(asin, ExpressionArcSine::parse);
+REGISTER_EXPRESSION(atanh, ExpressionHyperbolicArcTangent::parse);
+REGISTER_EXPRESSION(acosh, ExpressionHyperbolicArcCosine::parse);
 
 /**
  * Exclusive Bounds
  */
-CREATE_BOUNDED_TRIGONOMETRIC_CLASS(Cosine,
-                                   cos,
-                                   ExclusiveBoundType,
-                                   -std::numeric_limits<double>::infinity(),
-                                   std::numeric_limits<double>::infinity());
+REGISTER_EXPRESSION(cos, ExpressionCosine::parse);
+REGISTER_EXPRESSION(sin, ExpressionSine::parse);
+REGISTER_EXPRESSION(tan, ExpressionTangent::parse);
 
-CREATE_BOUNDED_TRIGONOMETRIC_CLASS(Sine,
-                                   sin,
-                                   ExclusiveBoundType,
-                                   -std::numeric_limits<double>::infinity(),
-                                   std::numeric_limits<double>::infinity());
+/**
+ * Unbounded
+ */
+REGISTER_EXPRESSION(atan, ExpressionArcTangent::parse);
+REGISTER_EXPRESSION(asinh, ExpressionHyperbolicArcSine::parse);
+REGISTER_EXPRESSION(cosh, ExpressionHyperbolicCosine::parse);
+REGISTER_EXPRESSION(sinh, ExpressionHyperbolicSine::parse);
+REGISTER_EXPRESSION(tanh, ExpressionHyperbolicTangent::parse);
 
-CREATE_BOUNDED_TRIGONOMETRIC_CLASS(Tangent,
-                                   tan,
-                                   ExclusiveBoundType,
-                                   -std::numeric_limits<double>::infinity(),
-                                   std::numeric_limits<double>::infinity());
-
-#undef CREATE_BOUNDED_TRIGONOMETRIC_CLASS
-
-/* ----------------------- Unbounded Trigonometric Functions ---------------------------- */
-
-
-#define CREATE_TRIGONOMETRIC_CLASS(className, funcName)                                       \
-    class Expression##className final                                                         \
-        : public ExpressionUnboundedTrigonometric<Expression##className> {                    \
-    public:                                                                                   \
-        explicit Expression##className(const boost::intrusive_ptr<ExpressionContext>& expCtx) \
-            : ExpressionUnboundedTrigonometric(expCtx) {}                                     \
-                                                                                              \
-        double doubleFunc(double arg) const final {                                           \
-            return std::funcName(arg);                                                        \
-        }                                                                                     \
-                                                                                              \
-        Decimal128 decimalFunc(Decimal128 arg) const final {                                  \
-            return arg.funcName();                                                            \
-        }                                                                                     \
-                                                                                              \
-        const char* getOpName() const final {                                                 \
-            return "$" #funcName;                                                             \
-        }                                                                                     \
-                                                                                              \
-        void acceptVisitor(ExpressionVisitor* visitor) final {                                \
-            return visitor->visit(this);                                                      \
-        }                                                                                     \
-    };                                                                                        \
-    REGISTER_EXPRESSION(funcName, Expression##className::parse);
-
-CREATE_TRIGONOMETRIC_CLASS(ArcTangent, atan);
-CREATE_TRIGONOMETRIC_CLASS(HyperbolicArcSine, asinh);
-CREATE_TRIGONOMETRIC_CLASS(HyperbolicCosine, cosh);
-CREATE_TRIGONOMETRIC_CLASS(HyperbolicSine, sinh);
-CREATE_TRIGONOMETRIC_CLASS(HyperbolicTangent, tanh);
-
-#undef CREATE_TRIGONOMETRIC_CLASS
-
-
-/* ----------------------- ExpressionArcTangent2 ---------------------------- */
-
-class ExpressionArcTangent2 final : public ExpressionTwoNumericArgs<ExpressionArcTangent2> {
-public:
-    explicit ExpressionArcTangent2(const boost::intrusive_ptr<ExpressionContext>& expCtx)
-        : ExpressionTwoNumericArgs(expCtx) {}
-
-    Value evaluateNumericArgs(const Value& numericArg1, const Value& numericArg2) const final {
-        auto totalType = BSONType::NumberDouble;
-        // If the type of either argument is NumberDecimal, we promote to Decimal128.
-        if (numericArg1.getType() == BSONType::NumberDecimal ||
-            numericArg2.getType() == BSONType::NumberDecimal) {
-            totalType = BSONType::NumberDecimal;
-        }
-        switch (totalType) {
-            case BSONType::NumberDecimal: {
-                auto dec = numericArg1.coerceToDecimal();
-                return Value(dec.atan2(numericArg2.coerceToDecimal()));
-            }
-            case BSONType::NumberDouble: {
-                return Value(
-                    std::atan2(numericArg1.coerceToDouble(), numericArg2.coerceToDouble()));
-            }
-            default:
-                MONGO_UNREACHABLE;
-        }
-    }
-
-    const char* getOpName() const final {
-        return "$atan2";
-    }
-
-    void acceptVisitor(ExpressionVisitor* visitor) final {
-        return visitor->visit(this);
-    }
-};
 REGISTER_EXPRESSION(atan2, ExpressionArcTangent2::parse);
 
-
-/* ----------------------- ExpressionDegreesToRadians and ExpressionRadiansToDegrees ---- */
-
-static constexpr double kDoublePi = 3.141592653589793;
-static constexpr double kDoublePiOver180 = kDoublePi / 180.0;
-static constexpr double kDouble180OverPi = 180.0 / kDoublePi;
-
-static Value doDegreeRadiansConversion(const Value& numericArg,
-                                       Decimal128 decimalFactor,
-                                       double doubleFactor) {
-    switch (numericArg.getType()) {
-        case BSONType::NumberDecimal:
-            return Value(numericArg.getDecimal().multiply(decimalFactor));
-        default:
-            return Value(numericArg.coerceToDouble() * doubleFactor);
-    }
-}
-
-class ExpressionDegreesToRadians final
-    : public ExpressionSingleNumericArg<ExpressionDegreesToRadians> {
-public:
-    explicit ExpressionDegreesToRadians(const boost::intrusive_ptr<ExpressionContext>& expCtx)
-        : ExpressionSingleNumericArg(expCtx) {}
-
-    Value evaluateNumericArg(const Value& numericArg) const final {
-        return doDegreeRadiansConversion(numericArg, Decimal128::kPiOver180, kDoublePiOver180);
-    }
-
-    const char* getOpName() const final {
-        return "$degreesToRadians";
-    }
-
-    void acceptVisitor(ExpressionVisitor* visitor) final {
-        return visitor->visit(this);
-    }
-};
-
 REGISTER_EXPRESSION(degreesToRadians, ExpressionDegreesToRadians::parse);
-
-class ExpressionRadiansToDegrees final
-    : public ExpressionSingleNumericArg<ExpressionRadiansToDegrees> {
-public:
-    explicit ExpressionRadiansToDegrees(const boost::intrusive_ptr<ExpressionContext>& expCtx)
-        : ExpressionSingleNumericArg(expCtx) {}
-
-    Value evaluateNumericArg(const Value& numericArg) const final {
-        return doDegreeRadiansConversion(numericArg, Decimal128::k180OverPi, kDouble180OverPi);
-    }
-
-    const char* getOpName() const final {
-        return "$radiansToDegrees";
-    }
-
-    void acceptVisitor(ExpressionVisitor* visitor) final {
-        return visitor->visit(this);
-    }
-};
-
 REGISTER_EXPRESSION(radiansToDegrees, ExpressionRadiansToDegrees::parse);
 }  // namespace mongo

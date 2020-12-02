@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -60,10 +60,11 @@ namespace mongo {
 const char* IndexScan::kStageType = "IXSCAN";
 
 IndexScan::IndexScan(ExpressionContext* expCtx,
+                     const CollectionPtr& collection,
                      IndexScanParams params,
                      WorkingSet* workingSet,
                      const MatchExpression* filter)
-    : RequiresIndexStage(kStageType, expCtx, params.indexDescriptor, workingSet),
+    : RequiresIndexStage(kStageType, expCtx, collection, params.indexDescriptor, workingSet),
       _workingSet(workingSet),
       _keyPattern(params.keyPattern.getOwned()),
       _bounds(std::move(params.bounds)),

@@ -12,7 +12,6 @@ selector:
   - jstests/sharding/query/*[aA]uth*.js
   - jstests/sharding/change_streams/*[aA]uth*.js
 
-  - jstests/sharding/cleanup_orphaned_auth.js
   - jstests/sharding/localhostAuthBypass.js
   - jstests/sharding/kill_sessions.js
   - jstests/sharding/mongos_rs_auth_shard_failure_tolerance.js
@@ -35,7 +34,7 @@ selector:
   - jstests/sharding/disable_autosplit.js
   - jstests/sharding/drop_sharded_db.js
   - jstests/sharding/findandmodify1.js
-  - jstests/sharding/findandmodify2.js
+  - jstests/sharding/findandmodify_autosplit.js
   - jstests/sharding/query/geo_near_sharded.js
   - jstests/sharding/hash_basic.js
   - jstests/sharding/hash_shard1.js
@@ -108,6 +107,7 @@ selector:
   - jstests/sharding/move_chunk_insert_with_write_retryability.js
   - jstests/sharding/move_chunk_remove_with_write_retryability.js
   - jstests/sharding/move_chunk_update_with_write_retryability.js
+  - jstests/sharding/refine_collection_shard_key_atomic.js  # sets a failpoint on the config primary
   - jstests/sharding/restart_transactions.js
   - jstests/sharding/txn_two_phase_commit_commands_basic_requirements.js
   - jstests/sharding/txn_two_phase_commit_coordinator_shutdown_and_restart.js
@@ -138,14 +138,13 @@ selector:
   - jstests/sharding/mongos_no_replica_set_refresh.js
   - jstests/sharding/movechunk_interrupt_at_primary_stepdown.js
   - jstests/sharding/primary_config_server_blackholed_from_mongos.js
+  - jstests/sharding/refine_collection_shard_key_abort_on_stepup.js
   # Nothing is affected by config server step down
   - jstests/sharding/basic_sharding_params.js
   # ShardingTest is never used, so continuous step down thread never starts
   - jstests/sharding/config_rs_change.js
   - jstests/sharding/empty_cluster_init.js
   # Temporarily blacklisted until more robust
-  - jstests/sharding/cleanup_orphaned_cmd_during_movechunk_hashed.js
-  - jstests/sharding/cleanup_orphaned_cmd_during_movechunk.js
   # Expects same secondaries for entire test
   - jstests/sharding/commands_that_write_accept_wc_configRS.js
   - jstests/sharding/commands_that_write_accept_wc_shards.js
@@ -157,9 +156,6 @@ selector:
   - jstests/sharding/migration_ignore_interrupts_1.js
   - jstests/sharding/migration_sets_fromMigrate_flag.js
   - jstests/sharding/migration_waits_for_majority_commit.js
-  # Stepping down the config can cause moveChunks stopped on shards via killOp to be restarted.
-  - jstests/sharding/migration_ignore_interrupts_3.js
-  - jstests/sharding/migration_ignore_interrupts_4.js
   # listCollections is not retryable
   - jstests/sharding/sessions_collection_auto_healing.js
   # shardCollection is not retryable
@@ -195,7 +191,7 @@ selector:
   # Moves a chunk before continuing a transaction, which can lead to snapshot errors if the
   # CSRS failovers are sufficiently slow.
   - jstests/sharding/transactions_reject_writes_for_moved_chunks.js
-  - jstests/sharding/transactions_target_at_point_in_time.js
+  - jstests/sharding/snapshot_reads_target_at_point_in_time.js
   # Tests that rely on shards becoming aware of collection drops regardless of config stepdowns.
   # (SERVER-34760)
   - jstests/sharding/merge_requires_unique_index.js
@@ -221,6 +217,29 @@ selector:
   # Runs commands on mongos which target the primary configsvr, and then checks the outcome using
   # profiling/logging (on the configsvr primary), so cannot tolerate the configsvr primary changing.
   - jstests/sharding/read_write_concern_defaults_application.js
+
+  # SERVER-48537 addShard is not idempotent for retries
+  - jstests/sharding/conversion_of_replica_set_to_sharded_cluster.js
+  - jstests/sharding/move_primary_with_writes.js
+
+  # Expects same CSRS primary and shard primary throughout the test
+  - jstests/sharding/api_params_nontransaction_sharded.js
+  - jstests/sharding/api_params_nontransaction_unsharded.js
+  - jstests/sharding/api_params_transaction_sharded.js
+  - jstests/sharding/api_params_transaction_unsharded.js
+
+  # SERVER-51495 reenable after resharding M3
+  - jstests/sharding/reshard_collection_basic.js
+
+  # TODO SERVER-50584: Re-enable after reshardCollection command errors when one of the recipient
+  # shards error.
+  - jstests/sharding/resharding_clones_duplicate_key.js
+
+  # SERVER-51805 splitChunk op is not idempotent
+  - jstests/sharding/mongos_get_shard_version.js
+
+  # SERVER-52620 test writes directly to CSRS primary
+  - jstests/sharding/resharding_replicate_updates_as_insert_delete.js
 
 executor:
   config:

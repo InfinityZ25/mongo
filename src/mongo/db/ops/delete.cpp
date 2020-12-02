@@ -41,7 +41,7 @@
 namespace mongo {
 
 long long deleteObjects(OperationContext* opCtx,
-                        Collection* collection,
+                        const CollectionPtr& collection,
                         const NamespaceString& ns,
                         BSONObj pattern,
                         bool justOne,
@@ -58,11 +58,9 @@ long long deleteObjects(OperationContext* opCtx,
     uassertStatusOK(parsedDelete.parseRequest());
 
     auto exec = uassertStatusOK(getExecutorDelete(
-        &CurOp::get(opCtx)->debug(), collection, &parsedDelete, boost::none /* verbosity */));
+        &CurOp::get(opCtx)->debug(), &collection, &parsedDelete, boost::none /* verbosity */));
 
-    uassertStatusOK(exec->executePlan());
-
-    return DeleteStage::getNumDeleted(*exec);
+    return exec->executeDelete();
 }
 
 }  // namespace mongo

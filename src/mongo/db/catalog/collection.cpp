@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -41,7 +41,7 @@ namespace mongo {
 // CappedInsertNotifier
 //
 
-void CappedInsertNotifier::notifyAll() {
+void CappedInsertNotifier::notifyAll() const {
     stdx::lock_guard<Latch> lk(_mutex);
     ++_version;
     _notifier.notify_all();
@@ -65,6 +65,42 @@ void CappedInsertNotifier::kill() {
 bool CappedInsertNotifier::isDead() {
     stdx::lock_guard<Latch> lk(_mutex);
     return _dead;
+}
+
+CollectionPtr CollectionPtr::null;
+
+CollectionPtr::CollectionPtr() : _collection(nullptr), _opCtx(nullptr) {}
+CollectionPtr::CollectionPtr(OperationContext* opCtx,
+                             const Collection* collection,
+                             RestoreFn restoreFn)
+    : _collection(collection), _opCtx(opCtx), _restoreFn(std::move(restoreFn)) {}
+CollectionPtr::CollectionPtr(const Collection* collection, NoYieldTag)
+    : CollectionPtr(nullptr, collection, nullptr) {}
+CollectionPtr::CollectionPtr(Collection* collection) : CollectionPtr(collection, NoYieldTag{}) {}
+CollectionPtr::CollectionPtr(CollectionPtr&&) = default;
+CollectionPtr::~CollectionPtr() {}
+CollectionPtr& CollectionPtr::operator=(CollectionPtr&&) = default;
+
+bool CollectionPtr::_canYield() const {
+    // We only set the opCtx when we use a constructor that allows yielding.
+    return _opCtx;
+}
+
+void CollectionPtr::yield() const {
+    // Yield if we are yieldable and have a valid collection
+    if (_canYield() && _collection) {
+        _yieldedUUID = _collection->uuid();
+        _collection = nullptr;
+    }
+}
+void CollectionPtr::restore() const {
+    // Restore from yield if we are yieldable and if uuid was set in a previous yield.
+    if (_canYield() && _yieldedUUID) {
+        // We may only do yield restore when we were holding locks that was yielded so we need to
+        // refresh from the catalog to make sure we have a valid collection pointer.
+        _collection = _restoreFn(_opCtx, *_yieldedUUID);
+        _yieldedUUID.reset();
+    }
 }
 
 // ----

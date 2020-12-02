@@ -81,10 +81,12 @@ class UpdateStage : public RequiresMutableCollectionStage {
     UpdateStage& operator=(const UpdateStage&) = delete;
 
 public:
+    static constexpr StringData kStageType = "UPDATE"_sd;
+
     UpdateStage(ExpressionContext* expCtx,
                 const UpdateStageParams& params,
                 WorkingSet* ws,
-                Collection* collection,
+                const CollectionPtr& collection,
                 PlanStage* child);
 
     bool isEOF() override;
@@ -98,38 +100,11 @@ public:
 
     const SpecificStats* getSpecificStats() const final;
 
-    static const char* kStageType;
-
-    /**
-     * Gets a pointer to the UpdateStats inside 'exec'.
-     *
-     * The 'exec' must have an UPDATE stage as its root stage, and the plan must be EOF before
-     * calling this method.
-     */
-    static const UpdateStats* getUpdateStats(const PlanExecutor* exec);
-
-    /**
-     * Populate 'opDebug' with stats from 'updateStats' describing the execution of this update.
-     */
-    static void recordUpdateStatsInOpDebug(const UpdateStats* updateStats, OpDebug* opDebug);
-
-    /**
-     * Converts 'updateStats' into an UpdateResult.
-     */
-    static UpdateResult makeUpdateResult(const UpdateStats* updateStats);
-
-    /**
-     * Returns true if an update failure due to a given DuplicateKey error is eligible for retry.
-     * Requires that parsedUpdate.hasParsedQuery() is true.
-     */
-    static bool shouldRetryDuplicateKeyException(const ParsedUpdate& parsedUpdate,
-                                                 const DuplicateKeyErrorInfo& errorInfo);
-
 protected:
     UpdateStage(ExpressionContext* expCtx,
                 const UpdateStageParams& params,
                 WorkingSet* ws,
-                Collection* collection);
+                const CollectionPtr& collection);
 
     void doSaveStateRequiresCollection() final {}
 
@@ -147,25 +122,15 @@ protected:
     // Stats
     UpdateStats _specificStats;
 
-    // True if the request should be checked for an update to the shard key.
-    bool _shouldCheckForShardKeyUpdate;
-
-    // True if updated documents should be validated with storage_validation::storageValid().
-    bool _enforceOkForStorage;
+    // A user-initiated write is one which is not caused by oplog application and is not part of a
+    // chunk migration
+    bool _isUserInitiatedWrite;
 
     // These get reused for each update.
     mutablebson::Document& _doc;
     mutablebson::DamageVector _damages;
 
 private:
-    static const UpdateStats kEmptyUpdateStats;
-
-    /**
-     * Returns whether a given MatchExpression contains is a MatchType::EQ or a MatchType::AND node
-     * with only MatchType::EQ children.
-     */
-    static bool matchContainsOnlyAndedEqualityNodes(const MatchExpression& root);
-
     /**
      * Computes the result of applying mods to the document 'oldObj' at RecordId 'recordId' in
      * memory, then commits these changes to the database. Returns a possibly unowned copy
@@ -180,6 +145,17 @@ private:
     StageState prepareToRetryWSM(WorkingSetID idToRetry, WorkingSetID* out);
 
     /**
+     * Returns true if the owning shard under the current key pattern would change as a result of
+     * the update, or if the destined recipient under the new shard key pattern from resharding
+     * would change as a result of the update, and returns false otherwise.
+     *
+     * Accepting a 'newObjCopy' parameter is a performance enhancement for updates which weren't
+     * performed in-place to avoid rendering a full copy of the updated document multiple times.
+     */
+    bool checkUpdateChangesShardKeyFields(const boost::optional<BSONObj>& newObjCopy,
+                                          const Snapshotted<BSONObj>& oldObj);
+
+    /**
      * Checks that the updated doc has all required shard key fields and throws if it does not.
      *
      * Also checks if the updated doc still belongs to this node and throws if it does not. If the
@@ -190,8 +166,14 @@ private:
      * If the update changes shard key fields but the new shard key remains on the same node,
      * returns true. If the update does not change shard key fields, returns false.
      */
-    bool checkUpdateChangesShardKeyFields(ScopedCollectionDescription collDesc,
-                                          const Snapshotted<BSONObj>& oldObj);
+    bool wasExistingShardKeyUpdated(CollectionShardingState* css,
+                                    const ScopedCollectionDescription& collDesc,
+                                    const BSONObj& newObj,
+                                    const Snapshotted<BSONObj>& oldObj);
+
+    bool wasReshardingKeyUpdated(const ScopedCollectionDescription& collDesc,
+                                 const BSONObj& newObj,
+                                 const Snapshotted<BSONObj>& oldObj);
 
     // If not WorkingSet::INVALID_ID, we use this rather than asking our child what to do next.
     WorkingSetID _idRetrying;

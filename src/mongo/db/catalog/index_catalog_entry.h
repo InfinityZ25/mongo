@@ -38,6 +38,7 @@
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/storage/key_string.h"
 #include "mongo/db/storage/kv/kv_prefix.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/mutex.h"
@@ -45,14 +46,17 @@
 
 namespace mongo {
 class CollatorInterface;
+class Collection;
+class CollectionPtr;
 class CollectionCatalogEntry;
+class Ident;
 class IndexAccessMethod;
 class IndexBuildInterceptor;
 class IndexDescriptor;
 class MatchExpression;
 class OperationContext;
 
-class IndexCatalogEntry {
+class IndexCatalogEntry : public std::enable_shared_from_this<IndexCatalogEntry> {
 public:
     IndexCatalogEntry() = default;
     virtual ~IndexCatalogEntry() = default;
@@ -60,11 +64,10 @@ public:
     inline IndexCatalogEntry(IndexCatalogEntry&&) = delete;
     inline IndexCatalogEntry& operator=(IndexCatalogEntry&&) = delete;
 
-    virtual const NamespaceString& ns() const = 0;
-
     virtual void init(std::unique_ptr<IndexAccessMethod> accessMethod) = 0;
 
     virtual const std::string& getIdent() const = 0;
+    virtual std::shared_ptr<Ident> getSharedIdent() const = 0;
 
     virtual IndexDescriptor* descriptor() = 0;
 
@@ -76,9 +79,7 @@ public:
 
     virtual bool isHybridBuilding() const = 0;
 
-    virtual IndexBuildInterceptor* indexBuildInterceptor() = 0;
-
-    virtual const IndexBuildInterceptor* indexBuildInterceptor() const = 0;
+    virtual IndexBuildInterceptor* indexBuildInterceptor() const = 0;
 
     virtual void setIndexBuildInterceptor(IndexBuildInterceptor* interceptor) = 0;
 
@@ -87,6 +88,11 @@ public:
     virtual const MatchExpression* getFilterExpression() const = 0;
 
     virtual const CollatorInterface* getCollator() const = 0;
+
+    /**
+     *  Looks up the namespace name in the durable catalog. May do I/O.
+     */
+    virtual NamespaceString getNSSFromCatalog(OperationContext* opCtx) const = 0;
 
     /// ---------------------
 
@@ -128,10 +134,29 @@ public:
      * namespace, index name, and multikey paths on the OperationContext rather than set the index
      * as multikey here.
      */
-    virtual void setMultikey(OperationContext* const opCtx, const MultikeyPaths& multikeyPaths) = 0;
+    virtual void setMultikey(OperationContext* const opCtx,
+                             const CollectionPtr& coll,
+                             const KeyStringSet& multikeyMetadataKeys,
+                             const MultikeyPaths& multikeyPaths) = 0;
 
-    // if this ready is ready for queries
+    /**
+     * Returns whether this index is ready for queries. This is potentially unsafe in that it does
+     * not consider whether the index is visible or ready in the current storage snapshot. For
+     * that, use isReadyInMySnapshot() or isPresentInMySnapshot().
+     */
     virtual bool isReady(OperationContext* const opCtx) const = 0;
+
+    /**
+     * Safely check whether this index is visible in the durable catalog in the current storage
+     * snapshot.
+     */
+    virtual bool isPresentInMySnapshot(OperationContext* opCtx) const = 0;
+
+    /**
+     * Check whether this index is ready in the durable catalog in the current storage snapshot. It
+     * is unsafe to call this if isPresentInMySnapshot() has not also been checked.
+     */
+    virtual bool isReadyInMySnapshot(OperationContext* opCtx) const = 0;
 
     /**
      * Returns true if this index is not ready, and it is not currently in the process of being
@@ -145,7 +170,7 @@ public:
      * If return value is not boost::none, reads with majority read concern using an older snapshot
      * must treat this index as unfinished.
      */
-    virtual boost::optional<Timestamp> getMinimumVisibleSnapshot() = 0;
+    virtual boost::optional<Timestamp> getMinimumVisibleSnapshot() const = 0;
 
     virtual void setMinimumVisibleSnapshot(const Timestamp name) = 0;
 };
@@ -170,19 +195,6 @@ public:
     iterator end() {
         return _entries.end();
     }
-
-    // TODO: these have to be SUPER SUPER FAST
-    // maybe even some pointer trickery is in order
-    const IndexCatalogEntry* find(const IndexDescriptor* desc) const;
-    IndexCatalogEntry* find(const IndexDescriptor* desc);
-
-    IndexCatalogEntry* find(const std::string& name);
-
-    /**
-     * Returns a pointer to the IndexCatalogEntry corresponding to 'desc', where the caller assumes
-     * shared ownership of the catalog object. Returns null if the entry does not exist.
-     */
-    std::shared_ptr<IndexCatalogEntry> findShared(const IndexDescriptor* desc) const;
 
     unsigned size() const {
         return _entries.size();

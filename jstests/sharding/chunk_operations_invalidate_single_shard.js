@@ -1,7 +1,6 @@
 /**
  * Test that chunk operations don't cause the mongos to refresh unless an affected chunk is
  * targeted.
- * @tags: [requires_fcv_44]
  */
 
 (function() {
@@ -10,7 +9,11 @@
 load("jstests/sharding/libs/shard_versioning_util.js");
 load('jstests/sharding/libs/sharded_transactions_helpers.js');
 
-let st = new ShardingTest({mongos: 1, shards: 3});
+let st = new ShardingTest({
+    mongos: 1,
+    shards: 3,
+    other: {mongosOptions: {setParameter: {enableFinerGrainedCatalogCacheRefresh: true}}}
+});
 const dbName = "test";
 const collName = "foo";
 const ns = dbName + "." + collName;
@@ -49,6 +52,7 @@ let testSplit = () => {
     const mongosCollectionVersion = getMongosCollVersion(ns);
 
     assert.commandWorked(st.s.adminCommand({split: ns, middle: {x: -500}}));
+    assert.eq(mongosCollectionVersion, getMongosCollVersion(ns));
 
     testColl.findOne({x: 0});
     testColl.findOne({x: 1000});

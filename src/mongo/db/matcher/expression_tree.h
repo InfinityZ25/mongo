@@ -41,13 +41,19 @@ namespace mongo {
 
 class ListOfMatchExpression : public MatchExpression {
 public:
-    explicit ListOfMatchExpression(MatchType type) : MatchExpression(type) {}
+    explicit ListOfMatchExpression(MatchType type,
+                                   clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : MatchExpression(type, std::move(annotation)) {}
     virtual ~ListOfMatchExpression();
 
     /**
      * @param e - I take ownership
      */
     void add(MatchExpression* e);
+
+    void add(std::unique_ptr<MatchExpression> e) {
+        add(e.release());
+    }
 
     /**
      * clears all the thingsd we own, and does NOT delete
@@ -108,7 +114,8 @@ class AndMatchExpression : public ListOfMatchExpression {
 public:
     static constexpr StringData kName = "$and"_sd;
 
-    AndMatchExpression() : ListOfMatchExpression(AND) {}
+    AndMatchExpression(clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : ListOfMatchExpression(AND, std::move(annotation)) {}
     virtual ~AndMatchExpression() {}
 
     virtual bool matches(const MatchableDocument* doc, MatchDetails* details = nullptr) const;
@@ -116,14 +123,15 @@ public:
     bool matchesSingleElement(const BSONElement&, MatchDetails* details = nullptr) const final;
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
-        std::unique_ptr<AndMatchExpression> self = std::make_unique<AndMatchExpression>();
+        std::unique_ptr<AndMatchExpression> self =
+            std::make_unique<AndMatchExpression>(_errorAnnotation);
         for (size_t i = 0; i < numChildren(); ++i) {
             self->add(getChild(i)->shallowClone().release());
         }
         if (getTag()) {
             self->setTag(getTag()->clone());
         }
-        return std::move(self);
+        return self;
     }
 
     virtual void debugString(StringBuilder& debug, int indentationLevel = 0) const;
@@ -131,13 +139,22 @@ public:
     virtual void serialize(BSONObjBuilder* out, bool includePath) const;
 
     bool isTriviallyTrue() const final;
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
 };
 
 class OrMatchExpression : public ListOfMatchExpression {
 public:
     static constexpr StringData kName = "$or"_sd;
 
-    OrMatchExpression() : ListOfMatchExpression(OR) {}
+    OrMatchExpression(clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : ListOfMatchExpression(OR, std::move(annotation)) {}
     virtual ~OrMatchExpression() {}
 
     virtual bool matches(const MatchableDocument* doc, MatchDetails* details = nullptr) const;
@@ -145,14 +162,15 @@ public:
     bool matchesSingleElement(const BSONElement&, MatchDetails* details = nullptr) const final;
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
-        std::unique_ptr<OrMatchExpression> self = std::make_unique<OrMatchExpression>();
+        std::unique_ptr<OrMatchExpression> self =
+            std::make_unique<OrMatchExpression>(_errorAnnotation);
         for (size_t i = 0; i < numChildren(); ++i) {
             self->add(getChild(i)->shallowClone().release());
         }
         if (getTag()) {
             self->setTag(getTag()->clone());
         }
-        return std::move(self);
+        return self;
     }
 
     virtual void debugString(StringBuilder& debug, int indentationLevel = 0) const;
@@ -160,13 +178,22 @@ public:
     virtual void serialize(BSONObjBuilder* out, bool includePath) const;
 
     bool isTriviallyFalse() const final;
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
 };
 
 class NorMatchExpression : public ListOfMatchExpression {
 public:
     static constexpr StringData kName = "$nor"_sd;
 
-    NorMatchExpression() : ListOfMatchExpression(NOR) {}
+    NorMatchExpression(clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : ListOfMatchExpression(NOR, std::move(annotation)) {}
     virtual ~NorMatchExpression() {}
 
     virtual bool matches(const MatchableDocument* doc, MatchDetails* details = nullptr) const;
@@ -174,32 +201,47 @@ public:
     bool matchesSingleElement(const BSONElement&, MatchDetails* details = nullptr) const final;
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
-        std::unique_ptr<NorMatchExpression> self = std::make_unique<NorMatchExpression>();
+        std::unique_ptr<NorMatchExpression> self =
+            std::make_unique<NorMatchExpression>(_errorAnnotation);
         for (size_t i = 0; i < numChildren(); ++i) {
             self->add(getChild(i)->shallowClone().release());
         }
         if (getTag()) {
             self->setTag(getTag()->clone());
         }
-        return std::move(self);
+        return self;
     }
 
     virtual void debugString(StringBuilder& debug, int indentationLevel = 0) const;
 
     virtual void serialize(BSONObjBuilder* out, bool includePath) const;
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
 };
 
 class NotMatchExpression final : public MatchExpression {
 public:
-    explicit NotMatchExpression(MatchExpression* e) : MatchExpression(NOT), _exp(e) {}
+    explicit NotMatchExpression(MatchExpression* e,
+                                clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : MatchExpression(NOT, std::move(annotation)), _exp(e) {}
+
+    explicit NotMatchExpression(std::unique_ptr<MatchExpression> expr,
+                                clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : MatchExpression(NOT, std::move(annotation)), _exp(std::move(expr)) {}
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<NotMatchExpression> self =
-            std::make_unique<NotMatchExpression>(_exp->shallowClone().release());
+            std::make_unique<NotMatchExpression>(_exp->shallowClone().release(), _errorAnnotation);
         if (getTag()) {
             self->setTag(getTag()->clone());
         }
-        return std::move(self);
+        return self;
     }
 
     virtual bool matches(const MatchableDocument* doc, MatchDetails* details = nullptr) const {
@@ -238,6 +280,14 @@ public:
 
     MatchCategory getCategory() const final {
         return MatchCategory::kLogical;
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
     }
 
 private:

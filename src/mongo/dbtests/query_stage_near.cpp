@@ -67,14 +67,24 @@ public:
         ASSERT_OK(dbtests::createIndex(_opCtx, kTestNamespace, kTestKeyPattern));
 
         _autoColl.emplace(_opCtx, NamespaceString{kTestNamespace});
-        auto* coll = _autoColl->getCollection();
+        const auto& coll = _autoColl->getCollection();
         ASSERT(coll);
-        _mockGeoIndex = coll->getIndexCatalog()->findIndexByKeyPatternAndCollationSpec(
-            _opCtx, kTestKeyPattern, BSONObj{});
+        _mockGeoIndex = coll->getIndexCatalog()->findIndexByKeyPatternAndOptions(
+            _opCtx, kTestKeyPattern, _makeMinimalIndexSpec(kTestKeyPattern));
         ASSERT(_mockGeoIndex);
     }
 
+    const CollectionPtr& getCollection() const {
+        return _autoColl->getCollection();
+    }
+
 protected:
+    BSONObj _makeMinimalIndexSpec(BSONObj keyPattern) {
+        return BSON(IndexDescriptor::kKeyPatternFieldName
+                    << keyPattern << IndexDescriptor::kIndexVersionFieldName
+                    << IndexDescriptor::getDefaultIndexVersion());
+    }
+
     const ServiceContext::UniqueOperationContext _uniqOpCtx = cc().makeOperationContext();
     OperationContext* const _opCtx = _uniqOpCtx.get();
     DBDirectClient directClient{_opCtx};
@@ -102,11 +112,13 @@ public:
 
     MockNearStage(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                   WorkingSet* workingSet,
+                  const CollectionPtr& coll,
                   const IndexDescriptor* indexDescriptor)
         : NearStage(expCtx.get(),
                     "MOCK_DISTANCE_SEARCH_STAGE",
                     STAGE_UNKNOWN,
                     workingSet,
+                    coll,
                     indexDescriptor),
           _pos(0) {}
 
@@ -114,11 +126,11 @@ public:
         _intervals.push_back(std::make_unique<MockInterval>(data, min, max));
     }
 
-    virtual StatusWith<CoveredInterval*> nextInterval(OperationContext* opCtx,
-                                                      WorkingSet* workingSet,
-                                                      const Collection* collection) {
+    std::unique_ptr<CoveredInterval> nextInterval(OperationContext* opCtx,
+                                                  WorkingSet* workingSet,
+                                                  const CollectionPtr& collection) final {
         if (_pos == static_cast<int>(_intervals.size()))
-            return StatusWith<CoveredInterval*>(nullptr);
+            return nullptr;
 
         const MockInterval& interval = *_intervals[_pos++];
 
@@ -136,13 +148,13 @@ public:
         }
 
         _children.push_back(std::move(queuedStage));
-        return StatusWith<CoveredInterval*>(
-            new CoveredInterval(_children.back().get(), interval.min, interval.max, lastInterval));
+        return std::make_unique<CoveredInterval>(
+            _children.back().get(), interval.min, interval.max, lastInterval);
     }
 
-    StatusWith<double> computeDistance(WorkingSetMember* member) final {
+    double computeDistance(WorkingSetMember* member) final {
         ASSERT(member->hasObj());
-        return StatusWith<double>(member->doc.value()["distance"].getDouble());
+        return member->doc.value()["distance"].getDouble();
     }
 
     virtual StageState initialize(OperationContext* opCtx,
@@ -186,7 +198,7 @@ TEST_F(QueryStageNearTest, Basic) {
     vector<BSONObj> mockData;
     WorkingSet workingSet;
 
-    MockNearStage nearStage(_expCtx.get(), &workingSet, _mockGeoIndex);
+    MockNearStage nearStage(_expCtx.get(), &workingSet, getCollection(), _mockGeoIndex);
 
     // First set of results
     mockData.clear();
@@ -222,10 +234,10 @@ TEST_F(QueryStageNearTest, EmptyResults) {
     WorkingSet workingSet;
 
     AutoGetCollectionForRead autoColl(_opCtx, NamespaceString{kTestNamespace});
-    auto* coll = autoColl.getCollection();
+    const auto& coll = autoColl.getCollection();
     ASSERT(coll);
 
-    MockNearStage nearStage(_expCtx.get(), &workingSet, _mockGeoIndex);
+    MockNearStage nearStage(_expCtx.get(), &workingSet, coll, _mockGeoIndex);
 
     // Empty set of results
     mockData.clear();

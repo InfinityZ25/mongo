@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -47,22 +47,20 @@ WiredTigerCursor::WiredTigerCursor(const std::string& uri,
     _ru = WiredTigerRecoveryUnit::get(opCtx);
     _session = _ru->getSession();
     _readOnce = _ru->getReadOnce();
-    _isCheckpoint =
-        (_ru->getTimestampReadSource() == WiredTigerRecoveryUnit::ReadSource::kCheckpoint);
 
+    // Attempt to retrieve the cursor from the cache. Cursors using the 'read_once' option will
+    // not be in the cache.
+    if (!_readOnce) {
+        _cursor = _session->getCachedCursor(uri, tableID);
+        if (_cursor) {
+            return;
+        }
+    }
+
+    // Construct a new cursor with the provided options.
     str::stream builder;
     if (_readOnce) {
         builder << "read_once=true,";
-    }
-    if (_isCheckpoint) {
-        // Type can be "lsm" or "file".
-        std::string type, sourceURI;
-        WiredTigerUtil::fetchTypeAndSourceURI(opCtx, uri, &type, &sourceURI);
-        uassert(ErrorCodes::InvalidOptions,
-                str::stream() << "LSM does not support opening cursors by checkpoint",
-                type != "lsm");
-
-        builder << "checkpoint=WiredTigerCheckpoint,";
     }
     // Add this option last to avoid needing a trailing comma. This enables an optimization in
     // WiredTiger to skip parsing the config string. See SERVER-43232 for details.
@@ -72,30 +70,18 @@ WiredTigerCursor::WiredTigerCursor(const std::string& uri,
 
     const std::string config = builder;
     try {
-        if (_readOnce || _isCheckpoint) {
-            _cursor = _session->getNewCursor(uri, config.c_str());
-        } else {
-            _cursor = _session->getCachedCursor(uri, tableID, config.c_str());
-        }
+        _cursor = _session->getNewCursor(uri, config.c_str());
     } catch (const ExceptionFor<ErrorCodes::CursorNotFound>& ex) {
-        // A WiredTiger table will not be available in the latest checkpoint if the checkpoint
-        // thread hasn't ran after the initial WiredTiger table was created.
-        if (!_isCheckpoint) {
-            LOGV2_ERROR(23719, "{ex}", "ex"_attr = ex);
-            fassertFailedNoTrace(50883);
-        }
-        throw;
+        LOGV2_FATAL_NOTRACE(50883, "{ex}", "Cursor not found", "error"_attr = ex);
     }
 }
 
 WiredTigerCursor::~WiredTigerCursor() {
     dassert(_ru->getReadOnce() == _readOnce);
-    dassert(_isCheckpoint ==
-            (_ru->getTimestampReadSource() == WiredTigerRecoveryUnit::ReadSource::kCheckpoint));
 
-    // Read-once and checkpoint cursors will never take cursors from the cursor cache, and
-    // should never release cursors into the cursor cache.
-    if (_readOnce || _isCheckpoint) {
+    // Read-once cursors will never take cursors from the cursor cache, and should never release
+    // cursors into the cursor cache.
+    if (_readOnce) {
         _session->closeCursor(_cursor);
     } else {
         _session->releaseCursor(_tableID, _cursor);

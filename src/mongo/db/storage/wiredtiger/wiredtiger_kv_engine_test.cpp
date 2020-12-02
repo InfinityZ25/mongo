@@ -43,16 +43,14 @@
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_test_fixture.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
+#include "mongo/db/storage/checkpointer.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
-#include "mongo/logger/logger.h"
 #include "mongo/logv2/log.h"
 #include "mongo/unittest/log_test.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
-#include "mongo/util/log_global_settings.h"
 
 namespace mongo {
 namespace {
@@ -60,18 +58,17 @@ namespace {
 class WiredTigerKVHarnessHelper : public KVHarnessHelper, public ScopedGlobalServiceContextForTest {
 public:
     WiredTigerKVHarnessHelper(bool forRepair = false)
-        : _dbpath("wt-kv-harness"), _forRepair(forRepair) {
-        invariant(hasGlobalServiceContext());
-        _engine.reset(makeEngine());
+        : _dbpath("wt-kv-harness"), _forRepair(forRepair), _engine(makeEngine()) {
+        auto context = getGlobalServiceContext();
         repl::ReplicationCoordinator::set(
-            getGlobalServiceContext(),
-            std::unique_ptr<repl::ReplicationCoordinator>(new repl::ReplicationCoordinatorMock(
-                getGlobalServiceContext(), repl::ReplSettings())));
+            context,
+            std::make_unique<repl::ReplicationCoordinatorMock>(context, repl::ReplSettings()));
+        _engine->notifyStartupComplete();
     }
 
     virtual KVEngine* restartEngine() override {
         _engine.reset(nullptr);
-        _engine.reset(makeEngine());
+        _engine = makeEngine();
         return _engine.get();
     }
 
@@ -84,26 +81,23 @@ public:
     }
 
 private:
-    WiredTigerKVEngine* makeEngine() {
-        auto engine = new WiredTigerKVEngine(kWiredTigerEngineName,
-                                             _dbpath.path(),
-                                             _cs.get(),
-                                             "",
-                                             1,
-                                             0,
-                                             false,
-                                             false,
-                                             _forRepair,
-                                             false);
-        // There are unit tests expecting checkpoints to occur asynchronously.
-        engine->startAsyncThreads();
-        return engine;
+    std::unique_ptr<WiredTigerKVEngine> makeEngine() {
+        return std::make_unique<WiredTigerKVEngine>(kWiredTigerEngineName,
+                                                    _dbpath.path(),
+                                                    _cs.get(),
+                                                    "",
+                                                    1,
+                                                    0,
+                                                    false,
+                                                    false,
+                                                    _forRepair,
+                                                    false);
     }
 
     const std::unique_ptr<ClockSource> _cs = std::make_unique<ClockSourceMock>();
     unittest::TempDir _dbpath;
-    std::unique_ptr<WiredTigerKVEngine> _engine;
     bool _forRepair;
+    std::unique_ptr<WiredTigerKVEngine> _engine;
 };
 
 class WiredTigerKVEngineTest : public unittest::Test, public ScopedGlobalServiceContextForTest {
@@ -170,7 +164,7 @@ TEST_F(WiredTigerKVEngineRepairTest, OrphanedDataFilesCanBeRecovered) {
     boost::filesystem::rename(*dataFilePath, tmpFile, err);
     ASSERT(!err) << err.message();
 
-    ASSERT_OK(_engine->dropIdent(opCtxPtr.get(), opCtxPtr.get()->recoveryUnit(), ident));
+    ASSERT_OK(_engine->dropIdent(opCtxPtr.get()->recoveryUnit(), ident));
 
     // The data file is moved back in place so that it becomes an "orphan" of the storage
     // engine and the restoration process can be tested.
@@ -213,7 +207,7 @@ TEST_F(WiredTigerKVEngineRepairTest, UnrecoverableOrphanedDataFilesAreRebuilt) {
 
     ASSERT(boost::filesystem::exists(*dataFilePath));
 
-    ASSERT_OK(_engine->dropIdent(opCtxPtr.get(), opCtxPtr.get()->recoveryUnit(), ident));
+    ASSERT_OK(_engine->dropIdent(opCtxPtr.get()->recoveryUnit(), ident));
 
 #ifdef _WIN32
     auto status =
@@ -249,12 +243,29 @@ TEST_F(WiredTigerKVEngineRepairTest, UnrecoverableOrphanedDataFilesAreRebuilt) {
 }
 
 TEST_F(WiredTigerKVEngineTest, TestOplogTruncation) {
+    std::unique_ptr<Checkpointer> checkpointer = std::make_unique<Checkpointer>(_engine);
+    checkpointer->go();
+
     auto opCtxPtr = makeOperationContext();
     // The initial data timestamp has to be set to take stable checkpoints. The first stable
     // timestamp greater than this will also trigger a checkpoint. The following loop of the
     // CheckpointThread will observe the new `checkpointDelaySecs` value.
     _engine->setInitialDataTimestamp(Timestamp(1, 1));
-    wiredTigerGlobalOptions.checkpointDelaySecs = 1;
+
+
+    // Ignore data race on this variable when running with TSAN, this is only an issue in this
+    // unittest and not in mongod
+    []()
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+        __attribute__((no_sanitize("thread")))
+#endif
+#endif
+    {
+        storageGlobalParams.checkpointDelaySecs = 1;
+    }
+    ();
+
 
     // To diagnose any intermittent failures, maximize logging from WiredTigerKVEngine and friends.
     auto severityGuard = unittest::MinimumLoggedSeverityGuard{logv2::LogComponent::kStorage,
@@ -330,6 +341,54 @@ TEST_F(WiredTigerKVEngineTest, TestOplogTruncation) {
     _engine->setStableTimestamp(Timestamp(30, 1), false);
     callbackShouldFail.store(false);
     assertPinnedMovesSoon(Timestamp(40, 1));
+
+    checkpointer->shutdown({ErrorCodes::ShutdownInProgress, "Test finished"});
+}
+
+TEST_F(WiredTigerKVEngineTest, IdentDrop) {
+#ifdef _WIN32
+    // TODO SERVER-51595: to re-enable this test on Windows.
+    return;
+#endif
+
+    auto opCtxPtr = makeOperationContext();
+
+    NamespaceString nss("a.b");
+    std::string ident = "collection-1234";
+    CollectionOptions defaultCollectionOptions;
+
+    std::unique_ptr<RecordStore> rs;
+    ASSERT_OK(
+        _engine->createRecordStore(opCtxPtr.get(), nss.ns(), ident, defaultCollectionOptions));
+
+    const boost::optional<boost::filesystem::path> dataFilePath =
+        _engine->getDataFilePathForIdent(ident);
+    ASSERT(dataFilePath);
+    ASSERT(boost::filesystem::exists(*dataFilePath));
+
+    _engine->dropIdentForImport(opCtxPtr.get(), ident);
+    ASSERT(boost::filesystem::exists(*dataFilePath));
+
+    // Because the underlying file was not removed, it will be renamed out of the way by WiredTiger
+    // when creating a new table with the same ident.
+    ASSERT_OK(
+        _engine->createRecordStore(opCtxPtr.get(), nss.ns(), ident, defaultCollectionOptions));
+
+    const boost::filesystem::path renamedFilePath = dataFilePath->generic_string() + ".1";
+    ASSERT(boost::filesystem::exists(*dataFilePath));
+    ASSERT(boost::filesystem::exists(renamedFilePath));
+
+    ASSERT_OK(_engine->dropIdent(opCtxPtr.get()->recoveryUnit(), ident));
+
+    // WiredTiger drops files asynchronously.
+    for (size_t check = 0; check < 30; check++) {
+        if (!boost::filesystem::exists(*dataFilePath))
+            break;
+        sleepsecs(1);
+    }
+
+    ASSERT(!boost::filesystem::exists(*dataFilePath));
+    ASSERT(boost::filesystem::exists(renamedFilePath));
 }
 
 std::unique_ptr<KVHarnessHelper> makeHelper() {

@@ -8,20 +8,23 @@ env.Library(
     target='update_common',
     source=[
         'field_checker.cpp',
-        'log_builder.cpp',
         'path_support.cpp',
         'storage_validation.cpp',
+        'v1_log_builder.cpp',
+        'v2_log_builder.cpp',
+        'update_oplog_entry_serialization.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/bson/mutable/mutable_bson',
         '$BUILD_DIR/mongo/db/common',
         '$BUILD_DIR/mongo/db/matcher/expressions',
+        'update_document_diff',
     ],
 )
 
 env.Library(
-    target='update',
+    target='update_nodes',
     source=[
         'addtoset_node.cpp',
         'arithmetic_node.cpp',
@@ -31,8 +34,6 @@ env.Library(
         'current_date_node.cpp',
         'modifier_node.cpp',
         'modifier_table.cpp',
-        'object_replace_executor.cpp',
-        'pipeline_executor.cpp',
         'pop_node.cpp',
         'pull_node.cpp',
         'pullall_node.cpp',
@@ -47,10 +48,24 @@ env.Library(
         'update_object_node.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/db/logical_clock',
-        '$BUILD_DIR/mongo/db/pipeline/pipeline',
         '$BUILD_DIR/mongo/db/update_index_data',
+        '$BUILD_DIR/mongo/db/vector_clock_mutable',
         'update_common',
+    ],
+)
+
+env.Library(
+    target='update',
+    source=[
+        'delta_executor.cpp',
+        'object_replace_executor.cpp',
+        'pipeline_executor.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/pipeline/pipeline',
+        'update_common',
+        'update_document_diff',
+        'update_nodes',
     ],
 )
 
@@ -63,9 +78,34 @@ env.Library(
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/common',
         '$BUILD_DIR/mongo/db/ops/write_ops_parsers',
-        '$BUILD_DIR/mongo/db/query/query_planner',
+        '$BUILD_DIR/mongo/db/query/canonical_query',
         '$BUILD_DIR/mongo/db/server_options_core',
         'update',
+    ],
+)
+
+env.Library(
+    target='update_test_helpers',
+    source=[
+        'document_diff_test_helpers.cpp',
+    ],
+    LIBDEPS=[
+        'update',
+    ],
+)
+
+env.Library(
+    target='update_document_diff',
+    source=[
+        'document_diff_calculator.cpp',
+        'document_diff_applier.cpp',
+        'document_diff_serialization.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/bson/mutable/mutable_bson',
+        '$BUILD_DIR/mongo/db/common',
+        '$BUILD_DIR/mongo/db/update_index_data',
     ],
 )
 
@@ -77,8 +117,12 @@ env.CppUnitTest(
         'bit_node_test.cpp',
         'compare_node_test.cpp',
         'current_date_node_test.cpp',
+        'delta_executor_test.cpp',
+        'document_diff_calculator_test.cpp',
+        'document_diff_serialization_test.cpp',
+        'document_diff_applier_test.cpp',
+        'document_diff_test.cpp',
         'field_checker_test.cpp',
-        'log_builder_test.cpp',
         'modifier_table_test.cpp',
         'object_replace_executor_test.cpp',
         'path_support_test.cpp',
@@ -95,19 +139,22 @@ env.CppUnitTest(
         'update_driver_test.cpp',
         'update_object_node_test.cpp',
         'update_serialization_test.cpp',
+        'v1_log_builder_test.cpp',
+        'v2_log_builder_test.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/bson/mutable/mutable_bson',
         '$BUILD_DIR/mongo/bson/mutable/mutable_bson_test_utils',
         '$BUILD_DIR/mongo/db/exec/document_value/document_value_test_util',
-        '$BUILD_DIR/mongo/db/logical_clock',
         '$BUILD_DIR/mongo/db/matcher/expressions',
         '$BUILD_DIR/mongo/db/query/collation/collator_interface_mock',
         '$BUILD_DIR/mongo/db/query/query_planner',
         '$BUILD_DIR/mongo/db/query/query_test_service_context',
         '$BUILD_DIR/mongo/db/service_context_test_fixture',
+        '$BUILD_DIR/mongo/db/vector_clock_trivial',
         'update',
         'update_common',
         'update_driver',
+        'update_test_helpers',
     ],
 )

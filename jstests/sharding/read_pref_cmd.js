@@ -3,7 +3,6 @@
  * of 5MB across all sharding tests in wiredTiger.
  * @tags: [
  *   resource_intensive,
- *   requires_fcv_44,
  * ]
  */
 (function() {
@@ -100,9 +99,9 @@ let getNumNodesCmdRanOn = function(rsNodes, {dbName, profileQuery, expectedNode,
 
         if (result != null) {
             if (secOk && expectedNode == "secondary") {
-                assert(profileDB.adminCommand({isMaster: 1}).secondary);
+                assert(profileDB.adminCommand({hello: 1}).secondary);
             } else if (expectedNode == "primary") {
-                assert(profileDB.adminCommand({isMaster: 1}).ismaster);
+                assert(profileDB.adminCommand({hello: 1}).isWritablePrimary);
             }
             numNodesCmdRanOn += 1;
         }
@@ -166,7 +165,7 @@ let testConnReadPreference = function(conn, isMongos, rsNodes, {readPref, expect
 
     let testDB = conn.getDB(kDbName);
     let shardedColl = conn.getCollection(kShardedNs);
-    conn.setSlaveOk(false);  // purely rely on readPref
+    conn.setSecondaryOk(false);  // purely rely on readPref
     conn.setReadPref(readPref.mode, readPref.tagSets, readPref.hedge);
 
     /**
@@ -308,29 +307,9 @@ let testConnReadPreference = function(conn, isMongos, rsNodes, {readPref, expect
     cmdTest(
         {dbStats: 1}, allowedOnSecondary.kAlways, true, formatProfileQuery(kDbName, {dbStats: 1}));
 
-    assert.commandWorked(shardedColl.ensureIndex({loc: '2d'}));
-    assert.commandWorked(
-        shardedColl.ensureIndex({position: 'geoHaystack', type: 1}, {bucketSize: 10}));
+    assert.commandWorked(shardedColl.createIndex({loc: '2d'}));
 
-    // TODO: SERVER-38961 Remove when simultaneous index builds complete.
-    // Run a no-op command and wait for it to be applied on secondaries. Due to the asynchronous
-    // completion nature of indexes on secondaries, we can guarantee an index build is complete
-    // on all secondaries once all secondaries have applied this collMod command.
-    assert.commandWorked(testDB.runCommand({collMod: kShardedCollName}));
     assert.commandWorked(testDB.runCommand({getLastError: 1, w: nodeCount}));
-
-    // Mongos doesn't implement geoSearch; test it only with ReplicaSetConnection.
-    if (!isMongos) {
-        cmdTest({
-            geoSearch: kShardedCollName,
-            near: [1, 1],
-            search: {type: 'restaurant'},
-            maxDistance: 10
-        },
-                allowedOnSecondary.kAlways,
-                true,
-                formatProfileQuery(kShardedNs, {geoSearch: kShardedCollName}));
-    }
 
     // Test on sharded
     cmdTest({aggregate: kShardedCollName, pipeline: [{$project: {x: 1}}], cursor: {}},
@@ -388,7 +367,7 @@ let testCursorReadPreference = function(conn, isMongos, rsNodes, {readPref, expe
         tojson(readPref.tagSets)}, hedge ${tojson(readPref.hedge)}`);
 
     let testColl = conn.getCollection(kShardedNs);
-    conn.setSlaveOk(false);  // purely rely on readPref
+    conn.setSecondaryOk(false);  // purely rely on readPref
 
     let bulk = testColl.initializeUnorderedBulkOp();
     for (let i = 0; i < kNumDocs; ++i) {
@@ -633,10 +612,11 @@ jsTest.log('Starting test for mongos connection');
 const replicaSetMonitorProtocol =
     assert.commandWorked(st.s.adminCommand({getParameter: 1, replicaSetMonitorProtocol: 1}))
         .replicaSetMonitorProtocol;
-let failPoint = configureFailPoint(st.s,
-                                   replicaSetMonitorProtocol === "scanning"
-                                       ? "scanningServerSelectorIgnoreLatencyWindow"
-                                       : "sdamServerSelectorIgnoreLatencyWindow");
+
+assert(replicaSetMonitorProtocol === "streamable" || replicaSetMonitorProtocol === "sdam");
+
+let failPoint = configureFailPoint(st.s, "sdamServerSelectorIgnoreLatencyWindow");
+
 testAllModes(st.s, st.rs0.nodes, true);
 failPoint.off();
 

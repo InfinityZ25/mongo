@@ -50,16 +50,13 @@ const char kToShardId[] = "toShardName";
 const char kChunkMinKey[] = "min";
 const char kChunkMaxKey[] = "max";
 const char kShardKeyPattern[] = "shardKeyPattern";
-const char kResumableRangeDeleterDisabled[] = "resumableRangeDeleterDisabled";
 
 }  // namespace
 
 StartChunkCloneRequest::StartChunkCloneRequest(NamespaceString nss,
-                                               UUID migrationId,
                                                MigrationSessionId sessionId,
                                                MigrationSecondaryThrottleOptions secondaryThrottle)
     : _nss(std::move(nss)),
-      _migrationId(std::move(migrationId)),
       _sessionId(std::move(sessionId)),
       _secondaryThrottle(std::move(secondaryThrottle)) {}
 
@@ -75,13 +72,7 @@ StatusWith<StartChunkCloneRequest> StartChunkCloneRequest::createFromCommand(Nam
         return sessionIdStatus.getStatus();
     }
 
-    auto migrationIdStatus = UUID::parse(obj.getField("uuid"));
-    if (!migrationIdStatus.isOK()) {
-        return migrationIdStatus.getStatus();
-    }
-
     StartChunkCloneRequest request(std::move(nss),
-                                   std::move(migrationIdStatus.getValue()),
                                    std::move(sessionIdStatus.getValue()),
                                    std::move(secondaryThrottleStatus.getValue()));
 
@@ -161,19 +152,10 @@ StatusWith<StartChunkCloneRequest> StartChunkCloneRequest::createFromCommand(Nam
         }
     }
 
-    {
-        Status status = bsonExtractBooleanField(
-            obj, kResumableRangeDeleterDisabled, &request._resumableRangeDeleterDisabled);
-        if (!status.isOK()) {
-            return status;
-        }
-    }
-
-    if (!request._resumableRangeDeleterDisabled) {
-        request._lsid = LogicalSessionId::parse(IDLParserErrorContext("StartChunkCloneRequest"),
-                                                obj[kLsid].Obj());
-        request._txnNumber = obj.getField(kTxnNumber).Long();
-    }
+    request._migrationId = UUID::parse(obj);
+    request._lsid =
+        LogicalSessionId::parse(IDLParserErrorContext("StartChunkCloneRequest"), obj[kLsid].Obj());
+    request._txnNumber = obj.getField(kTxnNumber).Long();
 
     return request;
 }
@@ -191,19 +173,16 @@ void StartChunkCloneRequest::appendAsCommand(
     const BSONObj& chunkMinKey,
     const BSONObj& chunkMaxKey,
     const BSONObj& shardKeyPattern,
-    const MigrationSecondaryThrottleOptions& secondaryThrottle,
-    bool resumableRangeDeleterDisabled) {
+    const MigrationSecondaryThrottleOptions& secondaryThrottle) {
     invariant(builder->asTempObj().isEmpty());
     invariant(nss.isValid());
     invariant(fromShardConnectionString.isValid());
 
     builder->append(kRecvChunkStart, nss.ns());
-    migrationId.appendToBuilder(builder, kMigrationId);
 
-    if (!resumableRangeDeleterDisabled) {
-        builder->append(kLsid, lsid.toBSON());
-        builder->append(kTxnNumber, txnNumber);
-    }
+    migrationId.appendToBuilder(builder, kMigrationId);
+    builder->append(kLsid, lsid.toBSON());
+    builder->append(kTxnNumber, txnNumber);
 
     sessionId.append(builder);
     builder->append(kFromShardConnectionString, fromShardConnectionString.toString());
@@ -213,7 +192,6 @@ void StartChunkCloneRequest::appendAsCommand(
     builder->append(kChunkMaxKey, chunkMaxKey);
     builder->append(kShardKeyPattern, shardKeyPattern);
     secondaryThrottle.append(builder);
-    builder->append(kResumableRangeDeleterDisabled, resumableRangeDeleterDisabled);
 }
 
 }  // namespace mongo

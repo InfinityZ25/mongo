@@ -27,12 +27,11 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/s/chunk_splitter.h"
 
 namespace mongo {
@@ -83,12 +82,6 @@ public:
     }
 };
 
-MONGO_INITIALIZER(RegisterWaitForOngoingChunkSplitsCommand)(InitializerContext* context) {
-    if (getTestCommandsEnabled()) {
-        // Leaked intentionally: a Command registers itself when constructed.
-        new WaitForOngoingChunksSplitsCommand();
-    }
-    return Status::OK();
-}
+MONGO_REGISTER_TEST_COMMAND(WaitForOngoingChunksSplitsCommand);
 }  // namespace
 }  // namespace mongo

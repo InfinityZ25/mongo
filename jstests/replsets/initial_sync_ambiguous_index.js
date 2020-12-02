@@ -32,7 +32,7 @@ rst.initiate();
 const primaryColl = rst.getPrimary().getDB(dbName).getCollection(collectionName);
 
 // Create the index.
-primaryColl.ensureIndex({"a.0": 1});
+primaryColl.createIndex({"a.0": 1});
 
 // Insert the initial document set.
 for (let i = 0; i < initialDocs; ++i) {
@@ -44,7 +44,7 @@ const secondary = rst.add({
     rsConfig: {votes: 0, priority: 0},
     setParameter: {"numInitialSyncAttempts": 1, 'collectionClonerBatchSize': clonerBatchSize}
 });
-secondary.setSlaveOk();
+secondary.setSecondaryOk();
 const secondaryColl = secondary.getDB(dbName).getCollection(collectionName);
 
 // We set the collectionClonerBatchSize low above, so we will definitely hit

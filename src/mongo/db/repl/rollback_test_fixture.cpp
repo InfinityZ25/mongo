@@ -103,7 +103,6 @@ void RollbackTest::setUp() {
     _coordinator = new ReplicationCoordinatorRollbackMock(serviceContext);
     ReplicationCoordinator::set(serviceContext,
                                 std::unique_ptr<ReplicationCoordinator>(_coordinator));
-    setOplogCollectionName(serviceContext);
 
     _opCtx = makeOperationContext();
     _replicationProcess->getConsistencyMarkers()->clearAppliedThrough(_opCtx.get(), {});
@@ -233,17 +232,20 @@ void RollbackTest::_insertDocument(OperationContext* opCtx,
                                    const NamespaceString& nss,
                                    const BSONObj& doc) {
 
-    AutoGetCollection autoColl(opCtx, nss, MODE_X);
-    auto collection = autoColl.getCollection();
-    if (!collection) {
+    auto insertDoc = [opCtx, &doc](const CollectionPtr& collection) {
+        WriteUnitOfWork wuow(opCtx);
+        OpDebug* const opDebug = nullptr;
+        ASSERT_OK(collection->insertDocument(opCtx, InsertStatement(doc), opDebug));
+        wuow.commit();
+    };
+    AutoGetCollection collection(opCtx, nss, MODE_X);
+    if (collection) {
+        insertDoc(collection.getCollection());
+    } else {
         CollectionOptions options;
         options.uuid = UUID::gen();
-        collection = _createCollection(opCtx, nss, options);
+        insertDoc(_createCollection(opCtx, nss, options));
     }
-    WriteUnitOfWork wuow(opCtx);
-    OpDebug* const opDebug = nullptr;
-    ASSERT_OK(collection->insertDocument(opCtx, InsertStatement(doc), opDebug));
-    wuow.commit();
 }
 
 Status RollbackTest::_insertOplogEntry(const BSONObj& doc) {

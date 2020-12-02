@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -37,14 +37,16 @@
 
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/ops/write_ops.h"
+#include "mongo/db/s/type_shard_collection.h"
+#include "mongo/db/s/type_shard_database.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/unique_message.h"
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/s/catalog/type_shard_collection.h"
-#include "mongo/s/catalog/type_shard_database.h"
+#include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/chunk_version.h"
+#include "mongo/s/sharded_collections_ddl_parameters_gen.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 
 namespace mongo {
@@ -158,7 +160,7 @@ StatusWith<ShardCollectionType> readShardCollectionsEntry(OperationContext* opCt
         }
 
         BSONObj document = cursor->nextSafe();
-        return ShardCollectionType::fromBSON(document);
+        return ShardCollectionType(document);
     } catch (const DBException& ex) {
         return ex.toStatus(str::stream() << "Failed to read the '" << nss.ns()
                                          << "' entry locally from config.collections");
@@ -228,7 +230,7 @@ Status updateShardCollectionsEntry(OperationContext* opCtx,
             updateOp.setUpdates({[&] {
                 write_ops::UpdateOpEntry entry;
                 entry.setQ(query);
-                entry.setU(builder.obj());
+                entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(builder.obj()));
                 entry.setUpsert(upsert);
                 return entry;
             }()});
@@ -271,7 +273,7 @@ Status updateShardDatabasesEntry(OperationContext* opCtx,
             updateOp.setUpdates({[&] {
                 write_ops::UpdateOpEntry entry;
                 entry.setQ(query);
-                entry.setU(builder.obj());
+                entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(builder.obj()));
                 entry.setUpsert(upsert);
                 return entry;
             }()});
@@ -482,6 +484,38 @@ Status deleteDatabasesEntry(OperationContext* opCtx, StringData dbName) {
     } catch (const DBException& ex) {
         return ex.toStatus();
     }
+}
+
+void downgradeShardConfigCollectionEntriesToPre49(OperationContext* opCtx) {
+    // Clear the 'allowMigrations' and 'timestamp' fields from config.cache.collections
+    LOGV2(5189100, "Starting downgrade of config.cache.collections");
+    write_ops::Update clearFields(NamespaceString::kShardConfigCollectionsNamespace, [] {
+        BSONObj unsetFields =
+            BSON(ShardCollectionType::kPre50CompatibleAllowMigrationsFieldName << "");
+        if (feature_flags::gShardingFullDDLSupport.isEnabledAndIgnoreFCV()) {
+            unsetFields = unsetFields.addFields(BSON(CollectionType::kTimestampFieldName << ""));
+        }
+
+        write_ops::UpdateOpEntry u;
+        u.setQ({});
+        u.setU(
+            write_ops::UpdateModification::parseFromClassicUpdate(BSON("$unset" << unsetFields)));
+        u.setMulti(true);
+        return std::vector{u};
+    }());
+
+    clearFields.setWriteCommandBase([] {
+        write_ops::WriteCommandBase base;
+        base.setOrdered(false);
+        return base;
+    }());
+
+    DBDirectClient client(opCtx);
+    const auto commandResult = client.runCommand(clearFields.serialize({}));
+
+    uassertStatusOK(getStatusFromWriteCommandResponse(commandResult->getCommandReply()));
+
+    LOGV2(5189101, "Successfully downgraded config.cache.collections");
 }
 
 }  // namespace shardmetadatautil

@@ -12,10 +12,10 @@ env.AppendUnique(
     CPPPATH=["$BUILD_DIR/mongo/embedded"],
 )
 
-# Inject this before we call the framework directory SConscripts so that
+# Inject this before we call the SDK directory SConscripts so that
 # they can both use it.
 
-frameworksEnv = env.Clone()
+sdkEnv = env.Clone()
 
 def mongo_export_file_generator(target, source, env, for_signature):
     if env.ToolchainIs('msvc'):
@@ -29,23 +29,13 @@ def mongo_export_file_generator(target, source, env, for_signature):
         return script.get_csig() if for_signature else "-Wl,--version-script," + str(script)
     else:
         pass
-frameworksEnv['MONGO_EXPORT_FILE_SHLINKFLAGS'] = mongo_export_file_generator
 
-# We need to set our bundle version in the plist file, but the format
-# is contrained to major.minor.patch. So trim off any '-pre' or '-rc'
-# information from the MONGO_VERSION and rename it to
-# MONGO_BUNDLE_VERSION.
-frameworksEnv['PLIST_MONGO_BUNDLE_VERSION'] = env['MONGO_VERSION'].split('-')[0]
-
-# Similarly, we need to derive a MinimumOSVersion based on the
-# -mXXX-version-minimum flag. Really, we should pull this out into an
-# SCons flag like OSX_DEPLOYMENT_TARGET so we don't need to grub
-# around in the flags.
-frameworksEnv['PLIST_MINIMUM_OS_VERSION'] = "0.0"
-for flag in frameworksEnv['CCFLAGS']:
-    if re.search('-m[a-z]+-version-min', flag):
-        frameworksEnv['PLIST_MINIMUM_OS_VERSION'] = flag.split('=')[1]
-        break
+# We really only want to use the mapfile if we are doing an SDK build. In an ordinary
+# dynamic build, we would end up building the normal library with an export map
+# but many of its symbols should in fact be coming from other libraries, and we
+# get odd ODR-esque violations. UBSAN caught this. Thanks UBSAN!
+if get_option('link-model') == 'dynamic-sdk':
+    sdkEnv['MONGO_EXPORT_FILE_SHLINKFLAGS'] = mongo_export_file_generator
 
 env.SConscript(
     dirs=[
@@ -54,7 +44,7 @@ env.SConscript(
         'stitch_support',
     ],
     exports={
-        'env' : frameworksEnv,
+        'env' : sdkEnv,
     },
 )
 
@@ -81,7 +71,7 @@ env.Library(
         'transaction_coordinator_factory_embedded.cpp',
         'transaction_coordinator_worker_curop_repository_embedded.cpp',
         'transaction_coordinator_curop_embedded.cpp',
-        env.Idlc('embedded_options.idl')[0],
+        'embedded_options.idl',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -95,13 +85,13 @@ env.Library(
         '$BUILD_DIR/mongo/db/commands/mongod_fcv',
         '$BUILD_DIR/mongo/db/commands/standalone',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
+        '$BUILD_DIR/mongo/db/fcv_op_observer',
         '$BUILD_DIR/mongo/db/index/index_access_methods',
         '$BUILD_DIR/mongo/db/index_builds_coordinator_interface',
         '$BUILD_DIR/mongo/db/logical_session_cache',
         '$BUILD_DIR/mongo/db/logical_session_cache_impl',
         '$BUILD_DIR/mongo/db/op_observer_impl',
         '$BUILD_DIR/mongo/db/pipeline/process_interface/mongod_process_interfaces',
-        '$BUILD_DIR/mongo/db/repair_database_and_check_version',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         '$BUILD_DIR/mongo/db/repl/replica_set_messages',
         '$BUILD_DIR/mongo/db/repl/storage_interface_impl',
@@ -114,28 +104,19 @@ env.Library(
         '$BUILD_DIR/mongo/db/service_entry_point_common',
         '$BUILD_DIR/mongo/db/service_liaison_mongod',
         '$BUILD_DIR/mongo/db/sessions_collection_standalone',
-        '$BUILD_DIR/mongo/db/storage/wiredtiger/storage_wiredtiger' if wiredtiger else [],
+        '$BUILD_DIR/mongo/db/startup_recovery',
         '$BUILD_DIR/mongo/db/storage/storage_control',
         '$BUILD_DIR/mongo/db/storage/storage_engine_common',
         '$BUILD_DIR/mongo/db/storage/storage_engine_lock_file',
         '$BUILD_DIR/mongo/db/storage/storage_engine_metadata',
         '$BUILD_DIR/mongo/db/storage/storage_init_d',
         '$BUILD_DIR/mongo/db/storage/storage_options',
+        '$BUILD_DIR/mongo/db/storage/wiredtiger/storage_wiredtiger' if wiredtiger else [],
+        '$BUILD_DIR/mongo/db/vector_clock_trivial',
         '$BUILD_DIR/mongo/db/wire_version',
         '$BUILD_DIR/mongo/rpc/client_metadata',
         '$BUILD_DIR/mongo/util/latch_analyzer' if get_option('use-diagnostic-latches') == 'on' else [],
         '$BUILD_DIR/mongo/util/options_parser/options_parser',
         '$BUILD_DIR/mongo/util/version_impl',
     ]
-)
-
-env.Library(
-    target='embedded_integration_helpers',
-    source=[
-        'embedded_options_helpers.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/util/options_parser/options_parser',
-    ],
 )

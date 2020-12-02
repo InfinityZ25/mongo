@@ -34,6 +34,7 @@
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_mock.h"
 #include "mongo/db/catalog_raii.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/kv/kv_engine.h"
@@ -49,7 +50,11 @@ public:
         : ServiceContextMongoDTest("ephemeralForTest", repair),
           _storageEngine(getServiceContext()->getStorageEngine()) {}
 
-    StorageEngineTest() : StorageEngineTest(RepairAction::kNoRepair) {}
+    StorageEngineTest() : StorageEngineTest(RepairAction::kNoRepair) {
+        auto serviceCtx = getServiceContext();
+        repl::ReplicationCoordinator::set(
+            serviceCtx, std::make_unique<repl::ReplicationCoordinatorMock>(serviceCtx));
+    }
 
     StatusWith<DurableCatalog::Entry> createCollection(OperationContext* opCtx,
                                                        NamespaceString ns) {
@@ -58,11 +63,16 @@ public:
         options.uuid = UUID::gen();
         RecordId catalogId;
         std::unique_ptr<RecordStore> rs;
-        std::tie(catalogId, rs) = unittest::assertGet(
-            _storageEngine->getCatalog()->createCollection(opCtx, ns, options, true));
-
-        std::unique_ptr<Collection> coll = std::make_unique<CollectionMock>(ns, catalogId);
-        CollectionCatalog::get(opCtx).registerCollection(options.uuid.get(), &coll);
+        {
+            WriteUnitOfWork wuow(opCtx);
+            std::tie(catalogId, rs) = unittest::assertGet(
+                _storageEngine->getCatalog()->createCollection(opCtx, ns, options, true));
+            wuow.commit();
+        }
+        std::shared_ptr<Collection> coll = std::make_shared<CollectionMock>(ns, catalogId);
+        CollectionCatalog::write(opCtx, [&](CollectionCatalog& catalog) {
+            catalog.registerCollection(options.uuid.get(), std::move(coll));
+        });
 
         return {{_storageEngine->getCatalog()->getEntry(catalogId)}};
     }
@@ -82,18 +92,25 @@ public:
 
     Status dropIndexTable(OperationContext* opCtx, NamespaceString nss, std::string indexName) {
         RecordId catalogId =
-            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss)->getCatalogId();
+            CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss)->getCatalogId();
         std::string indexIdent =
             _storageEngine->getCatalog()->getIndexIdent(opCtx, catalogId, indexName);
-        return dropIdent(opCtx, opCtx->recoveryUnit(), indexIdent);
+        return dropIdent(opCtx->recoveryUnit(), indexIdent);
     }
 
-    Status dropIdent(OperationContext* opCtx, RecoveryUnit* ru, StringData ident) {
-        return _storageEngine->getEngine()->dropIdent(opCtx, ru, ident);
+    Status dropIdent(RecoveryUnit* ru, StringData ident) {
+        return _storageEngine->getEngine()->dropIdent(ru, ident);
     }
 
     StatusWith<StorageEngine::ReconcileResult> reconcile(OperationContext* opCtx) {
-        return _storageEngine->reconcileCatalogAndIdents(opCtx);
+        return _storageEngine->reconcileCatalogAndIdents(
+            opCtx, StorageEngine::InternalIdentReconcilePolicy::kRetain);
+    }
+
+    StatusWith<StorageEngine::ReconcileResult> reconcileAfterUncleanShutdown(
+        OperationContext* opCtx) {
+        return _storageEngine->reconcileCatalogAndIdents(
+            opCtx, StorageEngine::InternalIdentReconcilePolicy::kDrop);
     }
 
     std::vector<std::string> getAllKVEngineIdents(OperationContext* opCtx) {
@@ -142,10 +159,9 @@ public:
         }
         BSONObj spec = builder.append("name", key).append("v", 2).done();
 
-        Collection* collection =
-            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, collNs);
-        auto descriptor =
-            std::make_unique<IndexDescriptor>(collection, IndexNames::findPluginName(spec), spec);
+        CollectionPtr collection =
+            CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, collNs);
+        auto descriptor = std::make_unique<IndexDescriptor>(IndexNames::findPluginName(spec), spec);
 
         auto ret = DurableCatalog::get(opCtx)->prepareForIndexBuild(opCtx,
                                                                     collection->getCatalogId(),
@@ -156,13 +172,13 @@ public:
     }
 
     void indexBuildSuccess(OperationContext* opCtx, NamespaceString collNs, std::string key) {
-        Collection* collection =
-            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, collNs);
+        CollectionPtr collection =
+            CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, collNs);
         DurableCatalog::get(opCtx)->indexBuildSuccess(opCtx, collection->getCatalogId(), key);
     }
 
     Status removeEntry(OperationContext* opCtx, StringData collNs, DurableCatalog* catalog) {
-        Collection* collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
+        CollectionPtr collection = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
             opCtx, NamespaceString(collNs));
         return dynamic_cast<DurableCatalogImpl*>(catalog)->_removeEntry(opCtx,
                                                                         collection->getCatalogId());

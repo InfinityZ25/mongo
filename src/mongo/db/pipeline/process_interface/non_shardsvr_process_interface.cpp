@@ -39,6 +39,7 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index_builds_coordinator.h"
+#include "mongo/db/pipeline/document_source_cursor.h"
 
 namespace mongo {
 
@@ -70,7 +71,7 @@ Status NonShardServerProcessInterface::insert(const boost::intrusive_ptr<Express
                                               std::vector<BSONObj>&& objs,
                                               const WriteConcernOptions& wc,
                                               boost::optional<OID> targetEpoch) {
-    auto writeResults = performInserts(
+    auto writeResults = write_ops_exec::performInserts(
         expCtx->opCtx, buildInsertOp(ns, std::move(objs), expCtx->bypassDocumentValidation));
 
     // Need to check each result in the batch since the writes are unordered.
@@ -90,8 +91,8 @@ StatusWith<MongoProcessInterface::UpdateResult> NonShardServerProcessInterface::
     UpsertType upsert,
     bool multi,
     boost::optional<OID> targetEpoch) {
-    auto writeResults =
-        performUpdates(expCtx->opCtx, buildUpdateOp(expCtx, ns, std::move(batch), upsert, multi));
+    auto writeResults = write_ops_exec::performUpdates(
+        expCtx->opCtx, buildUpdateOp(expCtx, ns, std::move(batch), upsert, multi));
 
     // Need to check each result in the batch since the writes are unordered.
     UpdateResult updateResult;
@@ -109,18 +110,18 @@ StatusWith<MongoProcessInterface::UpdateResult> NonShardServerProcessInterface::
 void NonShardServerProcessInterface::createIndexesOnEmptyCollection(
     OperationContext* opCtx, const NamespaceString& ns, const std::vector<BSONObj>& indexSpecs) {
     AutoGetCollection autoColl(opCtx, ns, MODE_X);
+    CollectionWriter collection(autoColl);
     writeConflictRetry(
         opCtx, "CommonMongodProcessInterface::createIndexesOnEmptyCollection", ns.ns(), [&] {
             uassert(ErrorCodes::DatabaseDropPending,
                     str::stream() << "The database is in the process of being dropped " << ns.db(),
                     autoColl.getDb() && !autoColl.getDb()->isDropPending(opCtx));
 
-            auto collection = autoColl.getCollection();
             uassert(ErrorCodes::NamespaceNotFound,
                     str::stream() << "Failed to create indexes for aggregation because collection "
                                      "does not exist: "
                                   << ns << ": " << BSON("indexes" << indexSpecs),
-                    collection);
+                    collection.get());
 
             invariant(0U == collection->numRecords(opCtx),
                       str::stream() << "Expected empty collection for index creation: " << ns
@@ -138,7 +139,7 @@ void NonShardServerProcessInterface::createIndexesOnEmptyCollection(
 
             WriteUnitOfWork wuow(opCtx);
             IndexBuildsCoordinator::get(opCtx)->createIndexesOnEmptyCollection(
-                opCtx, collection->uuid(), filteredIndexes, false  // fromMigrate
+                opCtx, collection, filteredIndexes, false  // fromMigrate
             );
             wuow.commit();
         });
@@ -171,11 +172,29 @@ void NonShardServerProcessInterface::dropCollection(OperationContext* opCtx,
         opCtx, ns, {}, DropCollectionSystemCollectionMode::kDisallowSystemCollectionDrops));
 }
 
-BSONObj NonShardServerProcessInterface::attachCursorSourceAndExplain(
+BSONObj NonShardServerProcessInterface::preparePipelineAndExplain(
     Pipeline* ownedPipeline, ExplainOptions::Verbosity verbosity) {
-    auto pipelineWithCursor = attachCursorSourceToPipelineForLocalRead(ownedPipeline);
+    std::vector<Value> pipelineVec;
+    auto firstStage = ownedPipeline->peekFront();
+    // If the pipeline already has a cursor explain with that one, otherwise attach a new one like
+    // we would for a normal execution and explain that.
+    if (firstStage && typeid(*firstStage) == typeid(DocumentSourceCursor)) {
+        // Managed pipeline goes out of scope at the end of this else block, but we've already
+        // extracted the necessary information and won't need it again.
+        std::unique_ptr<Pipeline, PipelineDeleter> managedPipeline(
+            ownedPipeline, PipelineDeleter(ownedPipeline->getContext()->opCtx));
+        pipelineVec = managedPipeline->writeExplainOps(verbosity);
+        ownedPipeline = nullptr;
+    } else {
+        auto pipelineWithCursor = attachCursorSourceToPipelineForLocalRead(ownedPipeline);
+        // If we need execution stats, this runs the plan in order to gather the stats.
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
+            while (pipelineWithCursor->getNext()) {
+            }
+        }
+        pipelineVec = pipelineWithCursor->writeExplainOps(verbosity);
+    }
     BSONArrayBuilder bab;
-    auto pipelineVec = pipelineWithCursor->writeExplainOps(verbosity);
     for (auto&& stage : pipelineVec) {
         bab << stage;
     }

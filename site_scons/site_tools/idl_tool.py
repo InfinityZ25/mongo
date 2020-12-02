@@ -1,18 +1,25 @@
-#!/usr/bin/env python3
-# Copyright (C) 2017 MongoDB Inc.
+# Copyright 2020 MongoDB Inc.
 #
-# This program is free software: you can redistribute it and/or  modify
-# it under the terms of the GNU Affero General Public License, version 3,
-# as published by the Free Software Foundation.
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
 #
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU Affero General Public License for more details.
+# The above copyright notice and this permission notice shall be included
+# in all copies or substantial portions of the Software.
 #
-# You should have received a copy of the GNU Affero General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+# KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+# WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+# WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #
+
 """IDL Compiler Scons Tool."""
 
 import os.path
@@ -62,9 +69,16 @@ def idl_scanner(node, env, path):
 
     nodes_deps_list = IDL_GLOBAL_DEPS[:]
 
+    # Compute the include paths to use based on the include flags in IDLCFLAGS
+    flags = env["IDLCFLAGS"]
+    include_paths = []
+    for i in range(len(flags)):
+        if flags[i] == "--include":
+            include_paths.append(flags[i + 1])
+
     with open(str(node), encoding="utf-8") as file_stream:
         parsed_doc = idlc.parser.parse(
-            file_stream, str(node), idlc.CompilerImportResolver(["src"])
+            file_stream, str(node), idlc.CompilerImportResolver(include_paths)
         )
 
     if not parsed_doc.errors and parsed_doc.spec.imports is not None:
@@ -82,7 +96,7 @@ idl_scanner = SCons.Scanner.Scanner(function=idl_scanner, skeys=[".idl"])
 IDLCBuilder = SCons.Builder.Builder(
     action=IDLCAction,
     emitter=idlc_emitter,
-    srcsuffx=".idl",
+    src_suffix=".idl",
     suffix=".cpp",
     source_scanner=idl_scanner,
 )
@@ -102,15 +116,19 @@ def generate(env):
     idlc = idlc_mod
 
     env["IDLC"] = "$PYTHON buildscripts/idl/idlc.py"
-    base_dir = env.Dir("$BUILD_ROOT/$VARIANT_DIR").path
+    base_dir = env.Dir("$BUILD_DIR").path
     env["IDLCFLAGS"] = [
         "--include", "src",
         "--base_dir", base_dir,
         "--target_arch", "$TARGET_ARCH",
     ]
     env["IDLCCOM"] = "$IDLC $IDLCFLAGS --header ${TARGETS[1]} --output ${TARGETS[0]} $SOURCES"
+    env["IDLCCOMSTR"] = ("Generating ${TARGETS[0]}"
+        if not env.get("VERBOSE", "").lower() in ['true', '1']
+        else None)
     env["IDLCSUFFIX"] = ".idl"
 
+    global IDL_GLOBAL_DEPS
     IDL_GLOBAL_DEPS = env.Glob("#buildscripts/idl/*.py") + env.Glob(
         "#buildscripts/idl/idl/*.py"
     )

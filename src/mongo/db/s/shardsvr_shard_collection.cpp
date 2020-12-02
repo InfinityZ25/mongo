@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -38,10 +38,10 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/hasher.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/s/active_shard_collection_registry.h"
@@ -64,12 +64,12 @@
 #include "mongo/s/request_types/clone_collection_options_from_primary_shard_gen.h"
 #include "mongo/s/request_types/shard_collection_gen.h"
 #include "mongo/s/shard_util.h"
+#include "mongo/s/sharded_collections_ddl_parameters_gen.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
-
 namespace {
 
 MONGO_FAIL_POINT_DEFINE(pauseShardCollectionBeforeCriticalSection);
@@ -100,6 +100,43 @@ void uassertStatusOKWithWarning(const Status& status) {
     }
 }
 
+/**
+ * Throws an exception if the collection is already sharded with different options.
+ *
+ * If the collection is already sharded with the same options, returns the existing collection's
+ * full spec, else returns boost::none.
+ */
+boost::optional<CollectionType> checkIfCollectionAlreadyShardedWithSameOptions(
+    OperationContext* opCtx, const ShardsvrShardCollectionRequest& request) {
+    auto const catalogClient = Grid::get(opCtx)->catalogClient();
+
+    CollectionType existingColl;
+    try {
+        existingColl = catalogClient->getCollection(opCtx,
+                                                    *request.get_shardsvrShardCollection(),
+                                                    repl::ReadConcernLevel::kMajorityReadConcern);
+    } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+        // Not currently sharded.
+        return boost::none;
+    }
+
+    CollectionType newColl(
+        *request.get_shardsvrShardCollection(), OID::gen(), Date_t::now(), UUID::gen());
+    newColl.setKeyPattern(KeyPattern(request.getKey()));
+    newColl.setDefaultCollation(*request.getCollation());
+    newColl.setUnique(request.getUnique());
+
+    // If the collection is already sharded, fail if the deduced options in this request do not
+    // match the options the collection was originally sharded with.
+    uassert(ErrorCodes::AlreadyInitialized,
+            str::stream() << "sharding already enabled for collection "
+                          << *request.get_shardsvrShardCollection() << " with options "
+                          << existingColl.toString(),
+            newColl.hasSameOptions(existingColl));
+
+    return existingColl;
+}
+
 void checkForExistingChunks(OperationContext* opCtx, const NamespaceString& nss) {
     BSONObjBuilder countBuilder;
     countBuilder.append("count", ChunkType::ConfigNS.coll());
@@ -108,11 +145,8 @@ void checkForExistingChunks(OperationContext* opCtx, const NamespaceString& nss)
     // OK to use limit=1, since if any chunks exist, we will fail.
     countBuilder.append("limit", 1);
 
-    // Use readConcern local to guarantee we see any chunks that have been written and may
-    // become committed; readConcern majority will not see the chunks if they have not made it
-    // to the majority snapshot.
-    repl::ReadConcernArgs readConcern(Grid::get(opCtx)->configOpTime(),
-                                      repl::ReadConcernLevel::kMajorityReadConcern);
+    auto readConcern =
+        Grid::get(opCtx)->readConcernWithConfigTime(repl::ReadConcernLevel::kMajorityReadConcern);
     readConcern.appendInfo(&countBuilder);
 
     auto cmdResponse = uassertStatusOK(
@@ -133,6 +167,45 @@ void checkForExistingChunks(OperationContext* opCtx, const NamespaceString& nss)
                              "manually delete the partially written chunks for collection "
                           << nss.ns() << " from config.chunks",
             numChunks == 0);
+}
+
+void checkCollation(OperationContext* opCtx, const ShardsvrShardCollectionRequest& request) {
+    // Ensure the collation is valid. Currently we only allow the simple collation.
+    std::unique_ptr<CollatorInterface> requestedCollator;
+
+    const auto& collation = *request.getCollation();
+    if (!collation.isEmpty())
+        requestedCollator = uassertStatusOK(
+            CollatorFactoryInterface::get(opCtx->getServiceContext())->makeFromBSON(collation));
+
+    AutoGetCollection autoColl(opCtx,
+                               *request.get_shardsvrShardCollection(),
+                               MODE_IS,
+                               AutoGetCollectionViewMode::kViewsForbidden);
+
+    const auto actualCollator = [&]() -> const CollatorInterface* {
+        const auto& coll = autoColl.getCollection();
+        if (coll) {
+            uassert(
+                ErrorCodes::InvalidOptions, "can't shard a capped collection", !coll->isCapped());
+            return coll->getDefaultCollator();
+        }
+
+        return nullptr;
+    }();
+
+    if (!requestedCollator && !actualCollator)
+        return;
+
+    // TODO (SERVER-48639): If this check fails, this means the collation changed between the time
+    // '_configsvrShardCollection' was called and the request got to the shard. Report the message
+    // as if it failed on the config server in the first place.
+    uassert(ErrorCodes::BadValue,
+            str::stream()
+                << "Collection has default collation: "
+                << (actualCollator ? actualCollator : requestedCollator.get())->getSpec().toBSON()
+                << ". Must specify collation {locale: 'simple'}.",
+            CollatorInterface::collatorsMatch(requestedCollator.get(), actualCollator));
 }
 
 /**
@@ -237,7 +310,7 @@ boost::optional<UUID> getUUIDFromPrimaryShard(OperationContext* opCtx, const Nam
 
 UUID getOrGenerateUUID(OperationContext* opCtx,
                        const NamespaceString& nss,
-                       const ShardsvrShardCollection& request) {
+                       const ShardsvrShardCollectionRequest& request) {
     if (request.getGetUUIDfromPrimaryShard()) {
         return *getUUIDFromPrimaryShard(opCtx, nss);
     }
@@ -264,10 +337,7 @@ int getNumShards(OperationContext* opCtx) {
 
 ShardCollectionTargetState calculateTargetState(OperationContext* opCtx,
                                                 const NamespaceString& nss,
-                                                const ShardsvrShardCollection& request) {
-    // Fail if there are partially written chunks from a previous failed shardCollection.
-    checkForExistingChunks(opCtx, nss);
-
+                                                const ShardsvrShardCollectionRequest& request) {
     auto proposedKey(request.getKey().getOwned());
     ShardKeyPattern shardKeyPattern(proposedKey);
 
@@ -276,7 +346,7 @@ ShardCollectionTargetState calculateTargetState(OperationContext* opCtx,
         nss,
         proposedKey,
         shardKeyPattern,
-        request.getCollation(),
+        *request.getCollation(),
         request.getUnique(),
         shardkeyutil::ValidationBehaviorsShardCollection(opCtx));
 
@@ -290,7 +360,7 @@ ShardCollectionTargetState calculateTargetState(OperationContext* opCtx,
 void logStartShardCollection(OperationContext* opCtx,
                              const BSONObj& cmdObj,
                              const NamespaceString& nss,
-                             const ShardsvrShardCollection& request,
+                             const ShardsvrShardCollectionRequest& request,
                              const ShardCollectionTargetState& prerequisites,
                              const ShardId& dbPrimaryShardId) {
     LOGV2(
@@ -403,15 +473,18 @@ void updateShardingCatalogEntryForCollection(
                                               ->makeFromBSON(defaultCollation));
     }
 
-    CollectionType coll;
-    coll.setNs(nss);
-    coll.setUUID(prerequisites.uuid);
-    coll.setEpoch(initialChunks.collVersion().epoch());
-    coll.setUpdatedAt(Date_t::fromMillisSinceEpoch(initialChunks.collVersion().toLong()));
+    boost::optional<Timestamp> creationTime;
+    if (feature_flags::gShardingFullDDLSupport.isEnabled(serverGlobalParams.featureCompatibility)) {
+        creationTime = initialChunks.creationTime;
+    }
+
+    CollectionType coll(
+        nss, initialChunks.collVersion().epoch(), creationTime, Date_t::now(), prerequisites.uuid);
     coll.setKeyPattern(prerequisites.shardKeyPattern.toBSON());
-    coll.setDefaultCollation(defaultCollator ? defaultCollator->getSpec().toBSON() : BSONObj());
+    if (defaultCollator) {
+        coll.setDefaultCollation(defaultCollator->getSpec().toBSON());
+    }
     coll.setUnique(unique);
-    coll.setDistributionMode(CollectionType::DistributionMode::kSharded);
 
     uassertStatusOK(ShardingCatalogClientImpl::updateShardingCatalogEntryForCollection(
         opCtx, nss, coll, true /*upsert*/));
@@ -421,7 +494,15 @@ void refreshAllShards(OperationContext* opCtx,
                       const NamespaceString& nss,
                       const ShardId& dbPrimaryShardId,
                       const std::vector<ChunkType>& initialChunks) {
-    forceShardFilteringMetadataRefresh(opCtx, nss);
+    // If the refresh fails, then the shard will end with a shardVersion UNSHARDED.
+    try {
+        forceShardFilteringMetadataRefresh(opCtx, nss);
+    } catch (const DBException&) {
+        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+        AutoGetCollection autoColl(opCtx, nss, MODE_IX);
+        CollectionShardingRuntime::get(opCtx, nss)->clearFilteringMetadata(opCtx);
+        throw;
+    }
 
     auto shardRegistry = Grid::get(opCtx)->shardRegistry();
 
@@ -450,67 +531,72 @@ void refreshAllShards(OperationContext* opCtx,
 UUID shardCollection(OperationContext* opCtx,
                      const NamespaceString& nss,
                      const BSONObj& cmdObj,
-                     const ShardsvrShardCollection& request,
+                     const ShardsvrShardCollectionRequest& request,
                      const ShardId& dbPrimaryShardId) {
-    if (auto collectionOptional =
-            InitialSplitPolicy::checkIfCollectionAlreadyShardedWithSameOptions(
-                opCtx, nss, request, repl::ReadConcernLevel::kMajorityReadConcern)) {
-        uassert(ErrorCodes::InvalidUUID,
-                str::stream() << "Collection " << nss << " is sharded without UUID",
-                collectionOptional->getUUID());
-        return *collectionOptional->getUUID();
+    // Fast check for whether the collection is already sharded without taking any locks
+    if (auto collectionOptional = checkIfCollectionAlreadyShardedWithSameOptions(opCtx, request)) {
+        return collectionOptional->getUuid();
     }
-
-    // Make sure that this shard initializes the collection metadata so we can perform local
-    // operations without getting stale config exception.
-    forceShardFilteringMetadataRefresh(opCtx, nss, true);
-
-    std::unique_ptr<InitialSplitPolicy> splitPolicy;
-    InitialSplitPolicy::ShardCollectionConfig initialChunks;
-    boost::optional<ShardCollectionTargetState> targetState;
 
     auto writeChunkDocumentsAndRefreshShards =
         [&](const ShardCollectionTargetState& targetState,
             const InitialSplitPolicy::ShardCollectionConfig& initialChunks) {
             // Insert chunk documents to config.chunks on the config server.
             writeFirstChunksToConfig(opCtx, initialChunks);
+            // If an error happens when contacting the config server, we don't know if the update
+            // succeded or not, which might cause the local shard version to differ from the config
+            // server, so we clear the metadata to allow another operation to refresh it.
+            try {
+                updateShardingCatalogEntryForCollection(opCtx,
+                                                        nss,
+                                                        targetState,
+                                                        initialChunks,
+                                                        *request.getCollation(),
+                                                        request.getUnique());
 
-            updateShardingCatalogEntryForCollection(opCtx,
-                                                    nss,
-                                                    targetState,
-                                                    initialChunks,
-                                                    *request.getCollation(),
-                                                    request.getUnique());
+            } catch (const DBException&) {
+                UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+                AutoGetCollection autoColl(opCtx, nss, MODE_IX);
+                CollectionShardingRuntime::get(opCtx, nss)->clearFilteringMetadata(opCtx);
+                throw;
+            }
 
             refreshAllShards(opCtx, nss, dbPrimaryShardId, initialChunks.chunks);
         };
 
-    pauseShardCollectionBeforeCriticalSection.pauseWhileSet();
+    boost::optional<ShardCollectionTargetState> targetState;
+    std::unique_ptr<InitialSplitPolicy> splitPolicy;
+    InitialSplitPolicy::ShardCollectionConfig initialChunks;
+
+    bool shouldUseUUIDForChunkIndexing;
+    {
+        invariant(!opCtx->lockState()->isLocked());
+        Lock::SharedLock fcvLock(opCtx->lockState(), FeatureCompatibilityVersion::fcvLock);
+        shouldUseUUIDForChunkIndexing = feature_flags::gShardingFullDDLSupport.isEnabled(
+            serverGlobalParams.featureCompatibility);
+        // TODO SERVER-53092: persist FCV placeholder
+    }
 
     {
+        pauseShardCollectionBeforeCriticalSection.pauseWhileSet();
+
         // From this point onward the collection can only be read, not written to, so it is safe to
         // construct the prerequisites and generate the target state.
-        CollectionCriticalSection critSec(opCtx, nss);
+        ScopedShardVersionCriticalSection critSec(opCtx, nss);
 
         pauseShardCollectionReadOnlyCriticalSection.pauseWhileSet();
 
         if (auto collectionOptional =
-                InitialSplitPolicy::checkIfCollectionAlreadyShardedWithSameOptions(
-                    opCtx, nss, request, repl::ReadConcernLevel::kMajorityReadConcern)) {
-            uassert(ErrorCodes::InvalidUUID,
-                    str::stream() << "Collection " << nss << " is sharded without UUID",
-                    collectionOptional->getUUID());
-            return *collectionOptional->getUUID();
+                checkIfCollectionAlreadyShardedWithSameOptions(opCtx, request)) {
+            return collectionOptional->getUuid();
         }
 
+        // Fail if there are partially written chunks from a previous failed shardCollection.
+        checkForExistingChunks(opCtx, nss);
+
+        checkCollation(opCtx, request);
+
         targetState = calculateTargetState(opCtx, nss, request);
-
-        // From this point onward, the collection can not be written to or read from.
-        critSec.enterCommitPhase();
-
-        pauseShardCollectionCommitPhase.pauseWhileSet();
-        logStartShardCollection(opCtx, cmdObj, nss, request, *targetState, dbPrimaryShardId);
-
         splitPolicy =
             InitialSplitPolicy::calculateOptimizationStrategy(opCtx,
                                                               targetState->shardKeyPattern,
@@ -518,9 +604,22 @@ UUID shardCollection(OperationContext* opCtx,
                                                               targetState->tags,
                                                               getNumShards(opCtx),
                                                               targetState->collectionIsEmpty);
+
+        boost::optional<CollectionUUID> optCollectionUUID;
+        if (shouldUseUUIDForChunkIndexing) {
+            optCollectionUUID = targetState->uuid;
+        }
+
+        initialChunks = splitPolicy->createFirstChunks(
+            opCtx, targetState->shardKeyPattern, {nss, optCollectionUUID, dbPrimaryShardId});
+
+        logStartShardCollection(opCtx, cmdObj, nss, request, *targetState, dbPrimaryShardId);
+
+        // From this point onward, the collection can not be written to or read from.
+        critSec.enterCommitPhase();
+        pauseShardCollectionCommitPhase.pauseWhileSet();
+
         if (splitPolicy->isOptimized()) {
-            initialChunks = splitPolicy->createFirstChunks(
-                opCtx, targetState->shardKeyPattern, {nss, dbPrimaryShardId});
             createCollectionOnShardsReceivingChunks(
                 opCtx, nss, initialChunks.chunks, dbPrimaryShardId);
 
@@ -532,13 +631,10 @@ UUID shardCollection(OperationContext* opCtx,
     pauseShardCollectionAfterCriticalSection.pauseWhileSet();
 
     if (!splitPolicy->isOptimized()) {
-        invariant(initialChunks.chunks.empty());
-
-        initialChunks = splitPolicy->createFirstChunks(
-            opCtx, targetState->shardKeyPattern, {nss, dbPrimaryShardId});
-
         writeChunkDocumentsAndRefreshShards(*targetState, initialChunks);
     }
+
+    // TODO SERVER-53092: delete FCV placeholder
 
     LOGV2(22101,
           "Created {numInitialChunks} chunk(s) for: {namespace}, producing collection version "
@@ -604,12 +700,36 @@ public:
         auto const shardingState = ShardingState::get(opCtx);
         uassertStatusOK(shardingState->canAcceptShardedCommands());
 
-        const auto request = ShardsvrShardCollection::parse(
-            IDLParserErrorContext("_shardsvrShardCollection"), cmdObj);
         const NamespaceString nss(parseNs(dbname, cmdObj));
+
+        // TODO (SERVER-48639): Due to the way that '_configsvrShardCollection' processes the
+        // collation parameter in 5.0 and earlier, the incoming request's collation can have the
+        // following states:
+        //
+        //   - Boost::none: (not possible before 5.1 development) The end user's request did not
+        //                  specify a collation
+        //   - Empty BSON : Either the end user did not specify a collation and the collection did
+        //                  not exist when '_configsvrShardCollection' was called, or the collection
+        //                  existed and had the simple collation
+        //                      OR
+        //                  The end user specified an empty collation
+        //   - Non-empty BSON: The user specified the simple collation and the collection existed,
+        //                  but with a different default collation
+        auto request = ShardsvrShardCollectionRequest::parse(
+            IDLParserErrorContext("_shardsvrShardCollection"), cmdObj);
+        if (!request.getCollation())
+            request.setCollation(BSONObj());
+        if (!request.getCollation()->isEmpty()) {
+            auto requestedCollator =
+                uassertStatusOK(CollatorFactoryInterface::get(opCtx->getServiceContext())
+                                    ->makeFromBSON(*request.getCollation()));
+            if (!requestedCollator)
+                request.setCollation(BSONObj());
+        }
 
         auto scopedShardCollection = uassertStatusOK(
             ActiveShardCollectionRegistry::get(opCtx).registerShardCollection(request));
+
         OptionalCollectionUUID uuid;
 
         // Check if this collection is currently being sharded and if so, join it

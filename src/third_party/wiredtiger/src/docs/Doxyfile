@@ -175,9 +175,9 @@ QT_AUTOBRIEF           = YES
 
 # The MULTILINE_CPP_IS_BRIEF tag can be set to YES to make Doxygen 
 # treat a multi-line C++ special comment block (i.e. a block of //! or /// 
-# comments) as a brief description. This used to be the default behaviour. 
+# comments) as a brief description. This used to be the default behavior.
 # The new default is to treat a multi-line C++ comment block as a detailed 
-# description. Set this tag to YES if you prefer the old behaviour instead.
+# description. Set this tag to YES if you prefer the old behavior instead.
 
 MULTILINE_CPP_IS_BRIEF = NO
 
@@ -206,6 +206,8 @@ TAB_SIZE               = 8
 # You can put \n's in the value part of an alias to insert newlines.
 
 ALIASES                = \
+                         arch_page_table{2}="<div class="arch_head"><table><tr><th rowspan=2 style=\"width:10%;\">@htmlonly <div><a href=\"arch-index.html\"><img class=\"arch_thumbnail\" src=\"wt_diagram.png\" style=\"background-image: url(wt_diagram.png)\"></a></div>@endhtmlonly</th><th style=\"width:44%\">Data Structures</th><th style=\"width:45%\">Source Location</th></tr><tr><td><code>\1</code></td><td><code>\2</code></td></tr></table></div>" \
+                         arch_page_top{2}="@page \1 \2 (Architecture Guide)"  \
                          config{3}="  @row{<tt>\1</tt>,\2,\3}" \
                          configempty{2}="@param config configuration string, see @ref config_strings.  No values currently permitted." \
                          configend="  </table>" \
@@ -719,7 +721,6 @@ FILE_PATTERNS          = *.c \
                          *.cpp \
                          *.c++ \
                          *.d \
-                         *.java \
                          *.ii \
                          *.ixx \
                          *.ipp \
@@ -793,10 +794,10 @@ EXCLUDE_SYMBOLS        = __F \
 # the \include command).
 
 EXAMPLE_PATH           = ../../examples/c \
-			 ../../examples/java/com/wiredtiger/examples/ \
 			 ../../ext/compressors/nop \
 			 ../../ext/encryptors/nop \
-			 ../../ext/encryptors/rotn
+			 ../../ext/encryptors/rotn \
+			 ../../examples/python
 
 # If the value of the EXAMPLE_PATH tag contains directories, you can use the 
 # EXAMPLE_PATTERNS tag to specify one or more wildcard pattern (like *.cpp 
@@ -1570,8 +1571,6 @@ INCLUDE_FILE_PATTERNS  =
 # instead of the = operator.
 
 PREDEFINED             = DOXYGEN \
-                         __wt_async_callback:=WT_ASYNC_CALLBACK \
-                         __wt_async_op:=WT_ASYNC_OP \
                          __wt_collator:=WT_COLLATOR \
                          __wt_compressor:=WT_COMPRESSOR \
                          __wt_config_arg:=WT_CONFIG_ARG \

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -36,10 +36,10 @@
 #include "mongo/client/remote_command_targeter.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/update_metrics.h"
 #include "mongo/db/commands/write_commands/write_commands_common.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/lasterror.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/storage/duplicate_key_error_info.h"
@@ -372,9 +372,9 @@ private:
             if (targetingBatchItem.getOpType() == BatchedCommandRequest::BatchType_Insert) {
                 return std::vector{targeter.targetInsert(opCtx, targetingBatchItem.getDocument())};
             } else if (targetingBatchItem.getOpType() == BatchedCommandRequest::BatchType_Update) {
-                return targeter.targetUpdate(opCtx, targetingBatchItem.getUpdate());
+                return targeter.targetUpdate(opCtx, targetingBatchItem);
             } else if (targetingBatchItem.getOpType() == BatchedCommandRequest::BatchType_Delete) {
-                return targeter.targetDelete(opCtx, targetingBatchItem.getDelete());
+                return targeter.targetDelete(opCtx, targetingBatchItem);
             }
             MONGO_UNREACHABLE;
         }();
@@ -418,11 +418,13 @@ class ClusterWriteCmd::InvocationBase : public CommandInvocation {
 public:
     InvocationBase(const ClusterWriteCmd* command,
                    const OpMsgRequest& request,
-                   BatchedCommandRequest batchedRequest)
+                   BatchedCommandRequest batchedRequest,
+                   UpdateMetrics* updateMetrics = nullptr)
         : CommandInvocation(command),
           _bypass{shouldBypassDocumentValidationForCommand(request.body)},
           _request{&request},
-          _batchedRequest{std::move(batchedRequest)} {}
+          _batchedRequest{std::move(batchedRequest)},
+          _updateMetrics{updateMetrics} {}
 
     const BatchedCommandRequest& getBatchedRequest() const {
         return _batchedRequest;
@@ -506,17 +508,31 @@ private:
                 }
                 catalogCache->checkAndRecordOperationBlockedByRefresh(opCtx,
                                                                       mongo::LogicalOp::opUpdate);
-                debug.upsert = response.isUpsertDetailsSet();
-                debug.additiveMetrics.nMatched =
-                    response.getN() - (debug.upsert ? response.sizeUpsertDetails() : 0);
+
+                // The response.getN() count is the sum of documents matched and upserted.
+                if (response.isUpsertDetailsSet()) {
+                    debug.additiveMetrics.nMatched = response.getN() - response.sizeUpsertDetails();
+                    debug.additiveMetrics.nUpserted = response.sizeUpsertDetails();
+                } else {
+                    debug.additiveMetrics.nMatched = response.getN();
+                }
                 debug.additiveMetrics.nModified = response.getNModified();
+
+                invariant(_updateMetrics);
                 for (auto&& update : _batchedRequest.getUpdateRequest().getUpdates()) {
-                    // If this was a pipeline style update, record which stages were being used.
+                    // If this was a pipeline style update, record that pipeline-style was used and
+                    // which stages were being used.
                     auto updateMod = update.getU();
                     if (updateMod.type() == write_ops::UpdateModification::Type::kPipeline) {
                         auto pipeline = LiteParsedPipeline(_batchedRequest.getNS(),
                                                            updateMod.getUpdatePipeline());
                         pipeline.tickGlobalStageCounters();
+                        _updateMetrics->incrementExecutedWithAggregationPipeline();
+                    }
+
+                    // If this command had arrayFilters option, record that it was used.
+                    if (update.getArrayFilters()) {
+                        _updateMetrics->incrementExecutedWithArrayFilters();
                     }
                 }
                 break;
@@ -580,8 +596,12 @@ private:
         _commandOpWrite(
             opCtx, _batchedRequest.getNS(), explainCmd, targetingBatchItem, &shardResponses);
         auto bodyBuilder = result->getBodyBuilder();
-        uassertStatusOK(ClusterExplain::buildExplainResult(
-            opCtx, shardResponses, ClusterExplain::kWriteOnShards, timer.millis(), &bodyBuilder));
+        uassertStatusOK(ClusterExplain::buildExplainResult(opCtx,
+                                                           shardResponses,
+                                                           ClusterExplain::kWriteOnShards,
+                                                           timer.millis(),
+                                                           _request->body,
+                                                           &bodyBuilder));
     }
 
     NamespaceString ns() const override {
@@ -612,11 +632,18 @@ private:
     bool _bypass;
     const OpMsgRequest* _request;
     BatchedCommandRequest _batchedRequest;
+
+    // Update related command execution metrics.
+    UpdateMetrics* const _updateMetrics;
 };
 
 class ClusterInsertCmd final : public ClusterWriteCmd {
 public:
     ClusterInsertCmd() : ClusterWriteCmd("insert") {}
+
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
 
 private:
     class Invocation final : public InvocationBase {
@@ -649,7 +676,11 @@ private:
 
 class ClusterUpdateCmd final : public ClusterWriteCmd {
 public:
-    ClusterUpdateCmd() : ClusterWriteCmd("update") {}
+    ClusterUpdateCmd() : ClusterWriteCmd("update"), _updateMetrics{"update"} {}
+
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
 
 private:
     class Invocation final : public InvocationBase {
@@ -668,9 +699,10 @@ private:
         auto parsedRequest = BatchedCommandRequest::parseUpdate(request);
         uassert(51195,
                 "Cannot specify runtime constants option to a mongos",
-                !parsedRequest.hasRuntimeConstants());
-        parsedRequest.setRuntimeConstants(Variables::generateRuntimeConstants(opCtx));
-        return std::make_unique<Invocation>(this, request, std::move(parsedRequest));
+                !parsedRequest.hasLegacyRuntimeConstants());
+        parsedRequest.setLegacyRuntimeConstants(Variables::generateRuntimeConstants(opCtx));
+        return std::make_unique<Invocation>(
+            this, request, std::move(parsedRequest), &_updateMetrics);
     }
 
     std::string help() const override {
@@ -680,11 +712,18 @@ private:
     LogicalOp getLogicalOp() const override {
         return LogicalOp::opUpdate;
     }
+
+    // Update related command execution metrics.
+    UpdateMetrics _updateMetrics;
 } clusterUpdateCmd;
 
 class ClusterDeleteCmd final : public ClusterWriteCmd {
 public:
     ClusterDeleteCmd() : ClusterWriteCmd("delete") {}
+
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
 
 private:
     class Invocation final : public InvocationBase {

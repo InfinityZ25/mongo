@@ -82,7 +82,7 @@ const StepdownThread = function() {
                 assert.commandWorkedOrFailedWithCode(
                     primary.adminCommand(
                         {replSetStepDown: options.stepdownDurationSecs, force: true}),
-                    [ErrorCodes.NotMaster, ErrorCodes.ConflictingOperationInProgress]);
+                    [ErrorCodes.NotWritablePrimary, ErrorCodes.ConflictingOperationInProgress]);
 
                 // Wait for primary to get elected and allow the test to make some progress
                 // before attempting another stepdown.
@@ -382,7 +382,7 @@ ContinuousStepdown.configure = function(stepdownOptions,
                             try {
                                 collInfo = db.getCollectionInfos();
                             } catch (e) {
-                                if (ErrorCodes.isNotMasterError(e.code)) {
+                                if (ErrorCodes.isNotPrimaryError(e.code)) {
                                     return false;
                                 }
                                 throw e;
@@ -390,7 +390,7 @@ ContinuousStepdown.configure = function(stepdownOptions,
 
                             collInfo.forEach(collDoc => {
                                 const res = db.runCommand({collStats: collDoc["name"]});
-                                if (ErrorCodes.isNotMasterError(res.code)) {
+                                if (ErrorCodes.isNotPrimaryError(res.code)) {
                                     return false;
                                 }
                                 assert.commandWorked(res);

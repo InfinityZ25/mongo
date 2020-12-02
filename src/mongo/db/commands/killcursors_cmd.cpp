@@ -35,7 +35,7 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/query/killcursors_request.h"
+#include "mongo/db/query/kill_cursors_gen.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/util/scopeguard.h"
 
@@ -47,6 +47,10 @@ class KillCursorsCmd final : public KillCursorsCmdBase {
 
 public:
     KillCursorsCmd() = default;
+
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
 
     bool run(OperationContext* opCtx,
              const std::string& dbname,
@@ -66,12 +70,11 @@ private:
                        CursorId id) const final {
         boost::optional<AutoStatsTracker> statsTracker;
         if (!nss.isCollectionlessCursorNamespace()) {
-            const boost::optional<int> dbProfilingLevel = boost::none;
             statsTracker.emplace(opCtx,
                                  nss,
                                  Top::LockType::NotLocked,
                                  AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
-                                 dbProfilingLevel);
+                                 CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(nss.db()));
         }
 
         auto cursorManager = CursorManager::get(opCtx);

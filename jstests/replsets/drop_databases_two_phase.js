@@ -12,8 +12,6 @@
  * metadata for the database from the server and appends the 'dropDatabase' operation to the oplog.
  * Unlike the 'Collections' phase, we do not wait for the 'dropDatabase' to propagate to a majority
  * unless explicitly requested by the user with a write concern.
- *
- * @tags: [requires_fcv_44]
  */
 
 (function() {
@@ -22,6 +20,7 @@
 load('jstests/replsets/libs/two_phase_drops.js');  // For TwoPhaseDropCollectionTest.
 load("jstests/replsets/rslib.js");
 load("jstests/libs/logv2_helpers.js");
+load("jstests/libs/write_concern_util.js");
 
 // Returns a list of all collections in a given database. Use 'args' as the
 // 'listCollections' command arguments.
@@ -67,10 +66,11 @@ assert.commandWorked(
     collToDrop.insert({_id: 0}, {writeConcern: {w: 2, wtimeout: replTest.kDefaultTimeoutMS}}));
 assert.eq(1, collToDrop.find().itcount());
 
-// Pause application on secondary so that commit point doesn't advance, meaning that a dropped
-// database on the primary will remain in 'drop-pending' state.
-jsTestLog("Pausing oplog application on the secondary node.");
-setFailPoint(secondary, "rsSyncApplyStop");
+// Pause the oplog fetcher on secondary so that commit point doesn't advance, meaning that a dropped
+// database on the primary will remain in 'drop-pending' state. As there isn't anything in the oplog
+// buffer at this time, it is safe to pause the oplog fetcher.
+jsTestLog("Pausing the oplog fetcher on the secondary node.");
+stopServerReplication(secondary);
 
 // Make sure the collection was created.
 assert.contains(collNameToDrop,
@@ -86,7 +86,7 @@ var dropDatabaseFn = function() {
     var dbNameToDrop = 'dbToDrop';
     var primary = db.getMongo();
     jsTestLog('Dropping database ' + dbNameToDrop + ' on primary node ' + primary.host +
-              '. This command will block because oplog application is paused on the secondary.');
+              '. This command will block because the oplog fetcher is paused on the secondary.');
     var dbToDrop = db.getSiblingDB(dbNameToDrop);
     assert.commandWorked(dbToDrop.dropDatabase());
     jsTestLog('Database ' + dbNameToDrop + ' successfully dropped on primary node ' + primary.host);
@@ -132,8 +132,8 @@ assert.commandFailedWithCode(
 
 // Let the secondary apply the collection drop operation, so that the replica set commit point
 // will advance, and the 'Database' phase of the database drop will complete on the primary.
-jsTestLog("Restarting oplog application on the secondary node.");
-clearFailPoint(secondary, "rsSyncApplyStop");
+jsTestLog("Restarting the oplog fetcher on the secondary node.");
+restartServerReplication(secondary);
 
 jsTestLog("Waiting for collection drop operation to replicate to all nodes.");
 replTest.awaitReplication();
@@ -156,7 +156,7 @@ if (isJsonLog(db.getMongo())) {
     checkLog.contains(db.getMongo(),
                       `dropDatabase - dropping collection","attr":{"db":"${
                           dbNameToDrop}","namespace":"${dbNameToDrop}.${collNameToDrop}"`);
-    checkLog.contains(db.getMongo(), 'dropDatabase - finished","attr":{"db":"dbToDrop"');
+    checkLog.containsJson(db.getMongo(), 20336, {"db": "dbToDrop"});
 } else {
     checkLog.contains(db.getMongo(), "dropping collection: " + dbNameToDrop + "." + collNameToDrop);
     checkLog.contains(db.getMongo(), "dropped 1 collection(s)");

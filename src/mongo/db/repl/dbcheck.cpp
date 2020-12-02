@@ -172,7 +172,7 @@ std::unique_ptr<HealthLogEntry> dbCheckBatchEntry(const NamespaceString& nss,
 }
 
 DbCheckHasher::DbCheckHasher(OperationContext* opCtx,
-                             Collection* collection,
+                             const CollectionPtr& collection,
                              const BSONKey& start,
                              const BSONKey& end,
                              int64_t maxCount,
@@ -189,12 +189,12 @@ DbCheckHasher::DbCheckHasher(OperationContext* opCtx,
 
     // Set up a simple index scan on that.
     _exec = InternalPlanner::indexScan(opCtx,
-                                       collection,
+                                       &collection,
                                        desc,
                                        start.obj(),
                                        end.obj(),
                                        BoundInclusion::kIncludeEndKeyOnly,
-                                       PlanExecutor::NO_YIELD,
+                                       PlanYieldPolicy::YieldPolicy::NO_YIELD,
                                        InternalPlanner::FORWARD,
                                        InternalPlanner::IXSCAN_FETCH);
 }
@@ -233,26 +233,23 @@ std::string hashCollectionInfo(const DbCheckCollectionInformation& info) {
 }
 
 std::pair<boost::optional<UUID>, boost::optional<UUID>> getPrevAndNextUUIDs(
-    OperationContext* opCtx, Collection* collection) {
-    const CollectionCatalog& catalog = CollectionCatalog::get(opCtx);
+    OperationContext* opCtx, const CollectionPtr& collection) {
+    auto catalog = CollectionCatalog::get(opCtx);
     const UUID uuid = collection->uuid();
 
     std::vector<CollectionUUID> collectionUUIDs =
-        catalog.getAllCollectionUUIDsFromDb(collection->ns().db());
+        catalog->getAllCollectionUUIDsFromDb(collection->ns().db());
     auto uuidIt = std::find(collectionUUIDs.begin(), collectionUUIDs.end(), uuid);
     invariant(uuidIt != collectionUUIDs.end());
-
-    auto prevIt = std::prev(uuidIt);
-    auto nextIt = std::next(uuidIt);
 
     boost::optional<UUID> prevUUID;
     boost::optional<UUID> nextUUID;
 
-    if (prevIt != collectionUUIDs.end()) {
-        prevUUID = *prevIt;
+    if (uuidIt != collectionUUIDs.begin()) {
+        prevUUID = *std::prev(uuidIt);
     }
 
-    if (nextIt != collectionUUIDs.end()) {
+    if (auto nextIt = std::next(uuidIt); nextIt != collectionUUIDs.end()) {
         nextUUID = *nextIt;
     }
 
@@ -353,7 +350,7 @@ bool DbCheckHasher::_canHash(const BSONObj& obj) {
     return true;
 }
 
-std::vector<BSONObj> collectionIndexInfo(OperationContext* opCtx, Collection* collection) {
+std::vector<BSONObj> collectionIndexInfo(OperationContext* opCtx, const CollectionPtr& collection) {
     std::vector<BSONObj> result;
     std::vector<std::string> names;
 
@@ -373,7 +370,7 @@ std::vector<BSONObj> collectionIndexInfo(OperationContext* opCtx, Collection* co
     return result;
 }
 
-BSONObj collectionOptions(OperationContext* opCtx, Collection* collection) {
+BSONObj collectionOptions(OperationContext* opCtx, const CollectionPtr& collection) {
     return DurableCatalog::get(opCtx)
         ->getCollectionOptions(opCtx, collection->getCatalogId())
         .toBSON();
@@ -389,7 +386,7 @@ AutoGetCollectionForDbCheck::AutoGetCollectionForDbCheck(OperationContext* opCtx
     std::string msg;
 
     _collection = _agd.getDb()
-        ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss)
+        ? CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss)
         : nullptr;
 
     // If the collection gets deleted after the check is launched, record that in the health log.
@@ -410,8 +407,7 @@ namespace {
 Status dbCheckBatchOnSecondary(OperationContext* opCtx,
                                const repl::OpTime& optime,
                                const DbCheckOplogBatch& entry) {
-    AutoGetCollectionForDbCheck agc(opCtx, entry.getNss(), entry.getType());
-    Collection* collection = agc.getCollection();
+    AutoGetCollectionForDbCheck collection(opCtx, entry.getNss(), entry.getType());
     std::string msg = "replication consistency check";
 
     if (!collection) {
@@ -422,7 +418,7 @@ Status dbCheckBatchOnSecondary(OperationContext* opCtx,
     Status status = Status::OK();
     boost::optional<DbCheckHasher> hasher;
     try {
-        hasher.emplace(opCtx, collection, entry.getMinKey(), entry.getMaxKey());
+        hasher.emplace(opCtx, collection.getCollection(), entry.getMinKey(), entry.getMaxKey());
     } catch (const DBException& exception) {
         auto logEntry = dbCheckErrorHealthLogEntry(
             entry.getNss(), msg, OplogEntriesEnum::Batch, exception.toStatus());
@@ -465,7 +461,7 @@ Status dbCheckDatabaseOnSecondary(OperationContext* opCtx,
                                   const DbCheckOplogCollection& entry) {
     // dbCheckCollectionResult-specific stuff.
     auto uuid = uassertStatusOK(UUID::parse(entry.getUuid().toString()));
-    auto collection = CollectionCatalog::get(opCtx).lookupCollectionByUUID(opCtx, uuid);
+    auto collection = CollectionCatalog::get(opCtx)->lookupCollectionByUUID(opCtx, uuid);
 
     if (!collection) {
         Status status(ErrorCodes::NamespaceNotFound, "Could not find collection for dbCheck");

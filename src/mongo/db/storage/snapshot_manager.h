@@ -59,19 +59,19 @@ public:
     virtual void setCommittedSnapshot(const Timestamp& timestamp) = 0;
 
     /**
-     *  Sets the snapshot for the last stable timestamp for reading on secondaries.
+     *  Sets the lastApplied timestamp.
      */
-    virtual void setLocalSnapshot(const Timestamp& timestamp) = 0;
+    virtual void setLastApplied(const Timestamp& timestamp) = 0;
 
     /**
-     * Returns the local snapshot timestamp.
+     * Returns the lastApplied timestamp.
      */
-    virtual boost::optional<Timestamp> getLocalSnapshot() = 0;
+    virtual boost::optional<Timestamp> getLastApplied() = 0;
 
     /**
-     * Drops all snapshots and clears the "committed" snapshot.
+     * Clears the "committed" snapshot.
      */
-    virtual void dropAllSnapshots() = 0;
+    virtual void clearCommittedSnapshot() = 0;
 
 protected:
     /**

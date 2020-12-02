@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplicationRollback
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationRollback
 
 #include "mongo/platform/basic.h"
 
@@ -37,9 +37,9 @@
 #include <fmt/format.h>
 
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/background.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/import_collection_oplog_entry_gen.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
@@ -54,6 +54,7 @@
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/roll_back_local_operations.h"
 #include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/repl/tenant_migration_donor_util.h"
 #include "mongo/db/repl/transaction_oplog_application.h"
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
 #include "mongo/db/s/type_shard_identity.h"
@@ -246,8 +247,7 @@ Status RollbackImpl::runRollback(OperationContext* opCtx) {
     // At this point, the last applied and durable optimes on this node still point to ops on
     // the divergent branch of history. We therefore update the last optimes to the top of the
     // oplog, which should now be at the common point.
-    _replicationCoordinator->resetLastOpTimesFromOplog(
-        opCtx, ReplicationCoordinator::DataConsistency::Consistent);
+    _replicationCoordinator->resetLastOpTimesFromOplog(opCtx);
     status = _triggerOpObserver(opCtx);
     if (!status.isOK()) {
         return status;
@@ -279,7 +279,7 @@ void RollbackImpl::_killAllUserOperations(OperationContext* opCtx) {
 
     for (ServiceContext::LockedClientsCursor cursor(serviceCtx); Client* client = cursor.next();) {
         stdx::lock_guard<Client> lk(*client);
-        if (client->isFromSystemConnection() && !client->shouldKillSystemOperation(lk)) {
+        if (client->isFromSystemConnection() && !client->canKillSystemOperationInStepdown(lk)) {
             continue;
         }
 
@@ -345,7 +345,8 @@ void RollbackImpl::_stopAndWaitForIndexBuilds(OperationContext* opCtx) {
     invariant(opCtx);
 
     // Aborts all active, two-phase index builds.
-    IndexBuildsCoordinator::get(opCtx)->stopIndexBuildsForRollback(opCtx);
+    MONGO_COMPILER_VARIABLE_UNUSED auto stoppedIndexBuilds =
+        IndexBuildsCoordinator::get(opCtx)->stopIndexBuildsForRollback(opCtx);
 
     // Get a list of all databases.
     StorageEngine* storageEngine = opCtx->getServiceContext()->getStorageEngine();
@@ -361,19 +362,15 @@ void RollbackImpl::_stopAndWaitForIndexBuilds(OperationContext* opCtx) {
     std::vector<StringData> dbNames(dbs.begin(), dbs.end());
     LOGV2(21595, "Waiting for all background operations to complete before starting rollback");
     for (auto db : dbNames) {
-        auto numInProg = BackgroundOperation::numInProgForDb(db);
-        auto numInProgInCoordinator = IndexBuildsCoordinator::get(opCtx)->numInProgForDb(db);
-        if (numInProg > 0 || numInProgInCoordinator > 0) {
-            LOGV2_DEBUG(
-                21596,
-                1,
-                "Waiting for {numBackgroundOperationsInProgress} "
-                "background operations to complete on database '{db}'",
-                "Waiting for background operations to complete",
-                "numBackgroundOperationsInProgress"_attr =
-                    (numInProg > numInProgInCoordinator ? numInProg : numInProgInCoordinator),
-                "db"_attr = db);
-            BackgroundOperation::awaitNoBgOpInProgForDb(db);
+        auto numInProg = IndexBuildsCoordinator::get(opCtx)->numInProgForDb(db);
+        if (numInProg > 0) {
+            LOGV2_DEBUG(21596,
+                        1,
+                        "Waiting for {numBackgroundOperationsInProgress} "
+                        "background operations to complete on database '{db}'",
+                        "Waiting for background operations to complete",
+                        "numBackgroundOperationsInProgress"_attr = numInProg,
+                        "db"_attr = db);
             IndexBuildsCoordinator::get(opCtx)->awaitNoBgOpInProgForDb(opCtx, db);
         }
     }
@@ -419,7 +416,6 @@ StatusWith<std::set<NamespaceString>> RollbackImpl::_namespacesForOp(const Oplog
                 break;
             }
             case OplogEntry::CommandType::kDbCheck:
-            case OplogEntry::CommandType::kConvertToCapped:
             case OplogEntry::CommandType::kEmptyCapped: {
                 // These commands do not need to be supported by rollback. 'convertToCapped' should
                 // always be converted to lower level DDL operations, and 'emptycapped' is a
@@ -431,6 +427,7 @@ StatusWith<std::set<NamespaceString>> RollbackImpl::_namespacesForOp(const Oplog
             }
             case OplogEntry::CommandType::kCreate:
             case OplogEntry::CommandType::kDrop:
+            case OplogEntry::CommandType::kImportCollection:
             case OplogEntry::CommandType::kCreateIndexes:
             case OplogEntry::CommandType::kDropIndexes:
             case OplogEntry::CommandType::kStartIndexBuild:
@@ -555,6 +552,8 @@ void RollbackImpl::_runPhaseFromAbortToReconstructPreparedTxns(
     // rollback.
     _correctRecordStoreCounts(opCtx);
 
+    tenant_migration_donor::recoverTenantMigrationAccessBlockers(opCtx);
+
     // Reconstruct prepared transactions after counts have been adjusted. Since prepared
     // transactions were aborted (i.e. the in-memory counts were rolled-back) before computing
     // collection counts, reconstruct the prepared transactions now, adding on any additional counts
@@ -565,10 +564,10 @@ void RollbackImpl::_runPhaseFromAbortToReconstructPreparedTxns(
 void RollbackImpl::_correctRecordStoreCounts(OperationContext* opCtx) {
     // This function explicitly does not check for shutdown since a clean shutdown post oplog
     // truncation is not allowed to occur until the record store counts are corrected.
-    const auto& catalog = CollectionCatalog::get(opCtx);
+    auto catalog = CollectionCatalog::get(opCtx);
     for (const auto& uiCount : _newCounts) {
         const auto uuid = uiCount.first;
-        const auto coll = catalog.lookupCollectionByUUID(opCtx, uuid);
+        const auto coll = catalog->lookupCollectionByUUID(opCtx, uuid);
         invariant(coll,
                   str::stream() << "The collection with UUID " << uuid
                                 << " is unexpectedly missing in the CollectionCatalog");
@@ -608,13 +607,14 @@ void RollbackImpl::_correctRecordStoreCounts(OperationContext* opCtx) {
                   "Scanning collection to fix collection count",
                   "namespace"_attr = nss.ns(),
                   "uuid"_attr = uuid.toString());
-            AutoGetCollectionForRead autoCollToScan(opCtx, nss);
-            auto collToScan = autoCollToScan.getCollection();
-            invariant(coll == collToScan,
+            AutoGetCollectionForRead collToScan(opCtx, nss);
+            invariant(coll == collToScan.getCollection(),
                       str::stream() << "Catalog returned invalid collection: " << nss.ns() << " ("
                                     << uuid.toString() << ")");
-            auto exec = collToScan->makePlanExecutor(
-                opCtx, PlanExecutor::INTERRUPT_ONLY, Collection::ScanDirection::kForward);
+            auto exec = collToScan->makePlanExecutor(opCtx,
+                                                     collToScan.getCollection(),
+                                                     PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
+                                                     Collection::ScanDirection::kForward);
             long long countFromScan = 0;
             PlanExecutor::ExecState state;
             while (PlanExecutor::ADVANCED ==
@@ -665,7 +665,7 @@ void RollbackImpl::_correctRecordStoreCounts(OperationContext* opCtx) {
 }
 
 Status RollbackImpl::_findRecordStoreCounts(OperationContext* opCtx) {
-    const auto& catalog = CollectionCatalog::get(opCtx);
+    auto catalog = CollectionCatalog::get(opCtx);
     auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
 
     LOGV2(21604, "Finding record store counts");
@@ -676,7 +676,7 @@ Status RollbackImpl::_findRecordStoreCounts(OperationContext* opCtx) {
             continue;
         }
 
-        auto nss = catalog.lookupNSSByUUID(opCtx, uuid);
+        auto nss = catalog->lookupNSSByUUID(opCtx, uuid);
         StorageInterface::CollectionCount oldCount = 0;
 
         // Drop-pending collections are not visible to rollback via the catalog when they are
@@ -867,6 +867,22 @@ Status RollbackImpl::_processRollbackOp(OperationContext* opCtx, const OplogEntr
             _countDiffs.erase(oplogEntry.getUuid().get());
             _pendingDrops.erase(oplogEntry.getUuid().get());
             _newCounts.erase(oplogEntry.getUuid().get());
+        } else if (oplogEntry.getCommandType() == OplogEntry::CommandType::kImportCollection) {
+            auto importEntry = mongo::ImportCollectionOplogEntry::parse(
+                IDLParserErrorContext("importCollectionOplogEntry"), oplogEntry.getObject());
+            // Nothing to roll back if this is a dryRun.
+            if (!importEntry.getDryRun()) {
+                const auto& catalogEntry = importEntry.getCatalogEntry();
+                auto importTargetUUID =
+                    invariant(UUID::parse(catalogEntry["md"]["options"]["uuid"]),
+                              str::stream() << "Oplog entry to roll back is unexpectedly missing "
+                                               "import collection UUID: "
+                                            << redact(oplogEntry.toBSON()));
+                // If we roll back an import, then we do not need to change the size of that uuid.
+                _countDiffs.erase(importTargetUUID);
+                _pendingDrops.erase(importTargetUUID);
+                _newCounts.erase(importTargetUUID);
+            }
         } else if (oplogEntry.getCommandType() == OplogEntry::CommandType::kDrop) {
             // If we roll back a collection drop, parse the o2 field for the collection count for
             // use later by _findRecordStoreCounts().
@@ -1115,11 +1131,11 @@ boost::optional<BSONObj> RollbackImpl::_findDocumentById(OperationContext* opCtx
 }
 
 Status RollbackImpl::_writeRollbackFiles(OperationContext* opCtx) {
-    const auto& catalog = CollectionCatalog::get(opCtx);
+    auto catalog = CollectionCatalog::get(opCtx);
     auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
     for (auto&& entry : _observerInfo.rollbackDeletedIdsMap) {
         const auto& uuid = entry.first;
-        const auto nss = catalog.lookupNSSByUUID(opCtx, uuid);
+        const auto nss = catalog->lookupNSSByUUID(opCtx, uuid);
 
         // Drop-pending collections are not visible to rollback via the catalog when they are
         // managed by the storage engine. See StorageEngine::supportsPendingDrops().

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/base/status.h"
 #include "mongo/db/jsobj.h"
@@ -51,8 +51,10 @@ Status::ErrorInfo* Status::ErrorInfo::create(ErrorCodes::Error code,
         return nullptr;
     if (extra) {
         // The public API prevents getting in to this state.
-        invariant(ErrorCodes::shouldHaveExtraInfo(code));
-    } else if (ErrorCodes::shouldHaveExtraInfo(code)) {
+        invariant(ErrorCodes::canHaveExtraInfo(code));
+    } else if (ErrorCodes::mustHaveExtraInfo(code)) {
+        // If an ErrorExtraInfo class is non-optional, return an error.
+
         // This is possible if code calls a 2-argument Status constructor with a code that should
         // have extra info.
         if (kDebugBuild) {
@@ -89,7 +91,11 @@ Status::Status(ErrorCodes::Error code, StringData reason, const BSONObj& extraIn
         try {
             *this = Status(code, reason, parser(extraInfoHolder));
         } catch (const DBException& ex) {
-            *this = ex.toStatus(str::stream() << "Error parsing extra info for " << code);
+            if (ErrorCodes::mustHaveExtraInfo(code)) {
+                *this = ex.toStatus(str::stream() << "Error parsing extra info for " << code);
+            } else {
+                *this = Status(code, reason);
+            }
         }
     } else {
         *this = Status(code, reason);

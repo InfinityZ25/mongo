@@ -32,8 +32,8 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/rpc/topology_version_gen.h"
-#include "mongo/s/mongos_is_master_response.h"
-#include "mongo/transport/ismaster_metrics.h"
+#include "mongo/s/mongos_hello_response.h"
+#include "mongo/transport/hello_metrics.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include <memory>
 
@@ -49,7 +49,7 @@ public:
     MongosTopologyCoordinator();
 
     /**
-     * Constructs and returns a MongosIsMasterResponse. Will block until the given deadline waiting
+     * Constructs and returns a MongosHelloResponse. Will block until the given deadline waiting
      * for a significant topology change if the 'counter' field of 'clientTopologyVersion' is equal
      * to the current TopologyVersion 'counter' maintained by this class. Returns immediately if
      * 'clientTopologyVersion' < TopologyVersion of this class or if the processId
@@ -57,16 +57,46 @@ public:
      *
      * Note that Quiesce Mode is the only valid topology change on mongos.
      */
-    std::shared_ptr<const MongosIsMasterResponse> awaitIsMasterResponse(
+    std::shared_ptr<const MongosHelloResponse> awaitHelloResponse(
         OperationContext* opCtx,
         boost::optional<TopologyVersion> clientTopologyVersion,
-        boost::optional<long long> maxAwaitTimeMS) const;
+        boost::optional<Date_t> deadline) const;
+
+    /**
+     * We only enter quiesce mode during the shutdown process, which means that the
+     * MongosTopologyCoordinator will never need to reset _inQuiesceMode. This function causes us
+     * to increment the topologyVersion and start failing hello requests with ShutdownInProgress.
+     * This will inform clients to route new operations to another mongos.
+     *
+     * We also sleep for quiesceTime, which allows short running operations to finish.
+     */
+    void enterQuiesceModeAndWait(OperationContext* opCtx, Milliseconds quiesceTime);
+
+    TopologyVersion getTopologyVersion() const {
+        stdx::lock_guard lk(_mutex);
+        return _topologyVersion;
+    }
+
+    bool inQuiesceMode() const {
+        stdx::lock_guard lk(_mutex);
+        return _inQuiesceMode;
+    }
+
 
 private:
+    using SharedPromiseOfMongosHelloResponse =
+        SharedPromise<std::shared_ptr<const MongosHelloResponse>>;
+
     /**
-     * Helper for constructing a MongosIsMasterResponse.
+     * Calculates the time (in millis) left in quiesce mode and converts the value to int64.
+     */
+    long long _calculateRemainingQuiesceTimeMillis() const;
+
+    /**
+     * Helper for constructing a MongosHelloResponse.
      **/
-    std::shared_ptr<MongosIsMasterResponse> _makeIsMasterResponse(WithLock) const;
+    std::shared_ptr<MongosHelloResponse> _makeHelloResponse(WithLock) const;
+
     //
     // All member variables are labeled with one of the following codes indicating the
     // synchronization rules for accessing them.
@@ -78,6 +108,15 @@ private:
 
     // Keeps track of the current mongos TopologyVersion.
     TopologyVersion _topologyVersion;  // (M)
+
+    // True if we're in quiesce mode.  If true, we'll respond to hello requests with ok:0.
+    bool _inQuiesceMode;  // (M)
+
+    // The deadline until which quiesce mode will last.
+    Date_t _quiesceDeadline;  // (M)
+
+    // The promise waited on by awaitable hello requests on mongos.
+    std::shared_ptr<SharedPromiseOfMongosHelloResponse> _promise;  // (M)
 };
 
 }  // namespace mongo

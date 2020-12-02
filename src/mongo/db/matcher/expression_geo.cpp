@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/db/matcher/expression_geo.h"
 
@@ -79,7 +79,7 @@ Status GeoExpression::parseQuery(const BSONObj& obj) {
         BSONElement elt = geoIt.next();
         if (elt.fieldNameStringData() == "$uniqueDocs") {
             // Deprecated "$uniqueDocs" field
-            LOGV2_WARNING(23847, "deprecated $uniqueDocs option: {obj}", "obj"_attr = redact(obj));
+            LOGV2_WARNING(23847, "Deprecated $uniqueDocs option", "query"_attr = redact(obj));
         } else {
             // The element must be a geo specifier. "$box", "$center", "$geometry", etc.
             geoContainer.reset(new GeometryContainer());
@@ -194,7 +194,7 @@ bool GeoNearExpression::parseLegacyQuery(const BSONObj& obj) {
             maxDistance = e.Number();
             uassert(16896, "$maxDistance must be non-negative", maxDistance >= 0.0);
         } else if (fieldName == "$uniqueDocs") {
-            LOGV2_WARNING(23848, "ignoring deprecated option $uniqueDocs");
+            LOGV2_WARNING(23848, "Ignoring deprecated option $uniqueDocs");
         } else {
             // In a query document, $near queries can have no non-geo sibling parameters.
             uasserted(34413,
@@ -327,16 +327,24 @@ Status GeoNearExpression::parseFrom(const BSONObj& obj) {
  */
 GeoMatchExpression::GeoMatchExpression(StringData path,
                                        const GeoExpression* query,
-                                       const BSONObj& rawObj)
-    : LeafMatchExpression(GEO, path), _rawObj(rawObj), _query(query), _canSkipValidation(false) {}
+                                       const BSONObj& rawObj,
+                                       clonable_ptr<ErrorAnnotation> annotation)
+    : LeafMatchExpression(GEO, path, std::move(annotation)),
+      _rawObj(rawObj),
+      _query(query),
+      _canSkipValidation(false) {}
 
 /**
  * Takes shared ownership of the passed-in GeoExpression.
  */
 GeoMatchExpression::GeoMatchExpression(StringData path,
                                        std::shared_ptr<const GeoExpression> query,
-                                       const BSONObj& rawObj)
-    : LeafMatchExpression(GEO, path), _rawObj(rawObj), _query(query), _canSkipValidation(false) {}
+                                       const BSONObj& rawObj,
+                                       clonable_ptr<ErrorAnnotation> annotation)
+    : LeafMatchExpression(GEO, path, std::move(annotation)),
+      _rawObj(rawObj),
+      _query(query),
+      _canSkipValidation(false) {}
 
 bool GeoMatchExpression::matchesSingleElement(const BSONElement& e, MatchDetails* details) const {
     if (!e.isABSONObj())
@@ -400,12 +408,12 @@ bool GeoMatchExpression::equivalent(const MatchExpression* other) const {
 
 std::unique_ptr<MatchExpression> GeoMatchExpression::shallowClone() const {
     std::unique_ptr<GeoMatchExpression> next =
-        std::make_unique<GeoMatchExpression>(path(), _query, _rawObj);
+        std::make_unique<GeoMatchExpression>(path(), _query, _rawObj, _errorAnnotation);
     next->_canSkipValidation = _canSkipValidation;
     if (getTag()) {
         next->setTag(getTag()->clone());
     }
-    return std::move(next);
+    return next;
 }
 
 //
@@ -462,6 +470,6 @@ std::unique_ptr<MatchExpression> GeoNearMatchExpression::shallowClone() const {
     if (getTag()) {
         next->setTag(getTag()->clone());
     }
-    return std::move(next);
+    return next;
 }
 }  // namespace mongo

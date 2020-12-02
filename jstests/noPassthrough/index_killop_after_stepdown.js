@@ -10,6 +10,7 @@
 "use strict";
 
 load('jstests/noPassthrough/libs/index_build.js');
+load("jstests/libs/fail_point_util.js");
 
 const rst = new ReplSetTest({
     nodes: [
@@ -85,13 +86,8 @@ rst.awaitReplication();
 // The old primary, now secondary, should process the commitIndexBuild oplog entry.
 
 const secondaryColl = rst.getSecondary().getCollection(coll.getFullName());
-if (IndexBuildTest.supportsTwoPhaseIndexBuild(primary)) {
-    IndexBuildTest.assertIndexes(coll, 2, ['_id_', 'a_1'], [], {includeBuildUUIDs: true});
-    IndexBuildTest.assertIndexes(secondaryColl, 2, ['_id_', 'a_1'], [], {includeBuildUUIDs: true});
-} else {
-    IndexBuildTest.assertIndexes(coll, 1, ['_id_'], [], {includeBuildUUIDs: true});
-    IndexBuildTest.assertIndexes(secondaryColl, 1, ['_id_'], [], {includeBuildUUIDs: true});
-}
+IndexBuildTest.assertIndexes(coll, 2, ['_id_', 'a_1'], [], {includeBuildUUIDs: true});
+IndexBuildTest.assertIndexes(secondaryColl, 2, ['_id_', 'a_1'], [], {includeBuildUUIDs: true});
 
 rst.stopSet();
 })();

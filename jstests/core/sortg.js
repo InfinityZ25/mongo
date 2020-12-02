@@ -1,6 +1,10 @@
 // Cannot implicitly shard accessed collections because of extra shard key index in sharded
 // collection.
-// @tags: [assumes_no_implicit_index_creation, requires_getmore]
+// @tags: [
+//   assumes_no_implicit_index_creation,
+//   requires_getmore,
+//   sbe_incompatible,
+// ]
 
 // Test that a memory exception is triggered for in memory sorts, but not for indexed sorts.
 (function() {
@@ -43,9 +47,9 @@ noMemoryException({$natural: 1});
 
 assert.eq(1, t.getIndexes().length);
 
-t.ensureIndex({a: 1});
-t.ensureIndex({b: 1});
-t.ensureIndex({c: 1});
+t.createIndex({a: 1});
+t.createIndex({b: 1});
+t.createIndex({c: 1});
 
 assert.eq(4, t.getIndexes().length);
 

@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authorization_session.h"
@@ -65,12 +63,20 @@ class CmdCount : public BasicCommand {
 public:
     CmdCount() : BasicCommand("count") {}
 
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
+
     std::string help() const override {
         return "count objects in collection";
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
+    }
+
+    bool collectsResourceConsumptionMetrics() const override {
+        return true;
     }
 
     bool canIgnorePrepareConflicts() const override {
@@ -91,7 +97,14 @@ public:
 
     ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
                                                  repl::ReadConcernLevel level) const override {
-        return ReadConcernSupportResult::allSupportedAndDefaultPermitted();
+        static const Status kSnapshotNotSupported{ErrorCodes::InvalidOptions,
+                                                  "read concern snapshot not supported"};
+        return {{level == repl::ReadConcernLevel::kSnapshotReadConcern, kSnapshotNotSupported},
+                Status::OK()};
+    }
+
+    bool shouldAffectReadConcernCounter() const override {
+        return true;
     }
 
     bool supportsReadMirroring(const BSONObj&) const override {
@@ -113,7 +126,7 @@ public:
 
         const auto hasTerm = false;
         return authSession->checkAuthForFind(
-            CollectionCatalog::get(opCtx).resolveNamespaceStringOrUUID(
+            CollectionCatalog::get(opCtx)->resolveNamespaceStringOrUUID(
                 opCtx, CommandHelpers::parseNsOrUUID(dbname, cmdObj)),
             hasTerm);
     }
@@ -129,7 +142,7 @@ public:
         boost::optional<AutoGetCollectionForReadCommand> ctx;
         ctx.emplace(opCtx,
                     CommandHelpers::parseNsCollectionRequired(dbname, cmdObj),
-                    AutoGetCollection::ViewMode::kViewsPermitted);
+                    AutoGetCollectionViewMode::kViewsPermitted);
         const auto nss = ctx->getNss();
 
         CountCommand request(NamespaceStringOrUUID(NamespaceString{}));
@@ -164,20 +177,25 @@ public:
                                 result);
         }
 
-        Collection* const collection = ctx->getCollection();
+        const auto& collection = ctx->getCollection();
 
         // Prevent chunks from being cleaned up during yields - this allows us to only check the
         // version on initial entry into count.
-        auto rangePreserver =
-            CollectionShardingState::get(opCtx, nss)
-                ->getOwnershipFilter(
-                    opCtx, CollectionShardingState::OrphanCleanupPolicy::kDisallowOrphanCleanup);
+        auto* const css = CollectionShardingState::get(opCtx, nss);
+        boost::optional<ScopedCollectionFilter> rangePreserver;
+        if (css->getCollectionDescription(opCtx).isSharded()) {
+            rangePreserver.emplace(
+                CollectionShardingState::get(opCtx, nss)
+                    ->getOwnershipFilter(
+                        opCtx,
+                        CollectionShardingState::OrphanCleanupPolicy::kDisallowOrphanCleanup));
+        }
 
         auto expCtx = makeExpressionContextForGetExecutor(
             opCtx, request.getCollation().value_or(BSONObj()), nss);
 
         auto statusWithPlanExecutor =
-            getExecutorCount(expCtx, collection, request, true /*explain*/, nss);
+            getExecutorCount(expCtx, &collection, request, true /*explain*/, nss);
         if (!statusWithPlanExecutor.isOK()) {
             return statusWithPlanExecutor.getStatus();
         }
@@ -185,7 +203,7 @@ public:
         auto exec = std::move(statusWithPlanExecutor.getValue());
 
         auto bodyBuilder = result->getBodyBuilder();
-        Explain::explainStages(exec.get(), collection, verbosity, BSONObj(), &bodyBuilder);
+        Explain::explainStages(exec.get(), collection, verbosity, BSONObj(), cmdObj, &bodyBuilder);
         return Status::OK();
     }
 
@@ -199,7 +217,7 @@ public:
         boost::optional<AutoGetCollectionForReadCommand> ctx;
         ctx.emplace(opCtx,
                     CommandHelpers::parseNsOrUUID(dbname, cmdObj),
-                    AutoGetCollection::ViewMode::kViewsPermitted);
+                    AutoGetCollectionViewMode::kViewsPermitted);
         const auto& nss = ctx->getNss();
 
         CurOpFailpointHelpers::waitWhileFailPointEnabled(
@@ -227,19 +245,24 @@ public:
             return true;
         }
 
-        Collection* const collection = ctx->getCollection();
+        const auto& collection = ctx->getCollection();
 
         // Prevent chunks from being cleaned up during yields - this allows us to only check the
         // version on initial entry into count.
-        auto rangePreserver =
-            CollectionShardingState::get(opCtx, nss)
-                ->getOwnershipFilter(
-                    opCtx, CollectionShardingState::OrphanCleanupPolicy::kDisallowOrphanCleanup);
+        auto* const css = CollectionShardingState::get(opCtx, nss);
+        boost::optional<ScopedCollectionFilter> rangePreserver;
+        if (css->getCollectionDescription(opCtx).isSharded()) {
+            rangePreserver.emplace(
+                CollectionShardingState::get(opCtx, nss)
+                    ->getOwnershipFilter(
+                        opCtx,
+                        CollectionShardingState::OrphanCleanupPolicy::kDisallowOrphanCleanup));
+        }
 
         auto statusWithPlanExecutor =
             getExecutorCount(makeExpressionContextForGetExecutor(
                                  opCtx, request.getCollation().value_or(BSONObj()), nss),
-                             collection,
+                             &collection,
                              request,
                              false /*explain*/,
                              nss);
@@ -251,31 +274,26 @@ public:
         auto curOp = CurOp::get(opCtx);
         {
             stdx::lock_guard<Client> lk(*opCtx->getClient());
-            curOp->setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
+            curOp->setPlanSummary_inlock(exec->getPlanExplainer().getPlanSummary());
         }
 
-        Status execPlanStatus = exec->executePlan();
-        uassertStatusOK(execPlanStatus);
+        auto countResult = exec->executeCount();
 
         PlanSummaryStats summaryStats;
-        Explain::getSummaryStats(*exec, &summaryStats);
+        exec->getPlanExplainer().getSummaryStats(&summaryStats);
         if (collection) {
-            CollectionQueryInfo::get(collection).notifyOfQuery(opCtx, summaryStats);
+            CollectionQueryInfo::get(collection).notifyOfQuery(opCtx, collection, summaryStats);
         }
         curOp->debug().setPlanSummaryMetrics(summaryStats);
 
-        if (curOp->shouldDBProfile()) {
-            BSONObjBuilder execStatsBob;
-            Explain::getWinningPlanStats(exec.get(), &execStatsBob);
-            curOp->debug().execStats = execStatsBob.obj();
+        if (curOp->shouldDBProfile(opCtx)) {
+            auto&& explainer = exec->getPlanExplainer();
+            auto&& [stats, _] =
+                explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
+            curOp->debug().execStats = std::move(stats);
         }
 
-        // Plan is done executing. We just need to pull the count out of the root stage.
-        invariant(STAGE_COUNT == exec->getRootStage()->stageType() ||
-                  STAGE_RECORD_STORE_FAST_COUNT == exec->getRootStage()->stageType());
-        auto* countStats = static_cast<const CountStats*>(exec->getRootStage()->getSpecificStats());
-
-        result.appendNumber("n", countStats->nCounted);
+        result.appendNumber("n", countResult);
         return true;
     }
 

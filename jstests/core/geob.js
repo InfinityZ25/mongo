@@ -1,3 +1,8 @@
+/**
+ * @tags: [
+ *   sbe_incompatible,
+ * ]
+ */
 (function() {
 "use strict";
 var t = db.geob;
@@ -12,7 +17,7 @@ t.save(a);
 t.save(b);
 t.save(c);
 t.save(d);
-t.ensureIndex({p: "2d"});
+t.createIndex({p: "2d"});
 
 let res = t.aggregate({$geoNear: {near: [0, 0], distanceField: "dis"}}).toArray();
 

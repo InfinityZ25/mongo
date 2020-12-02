@@ -3,7 +3,6 @@
  * commands using UUIDs instead of namespaces. This verifies initial sync behavior in
  * cases where using UUIDs results in NamespaceNotFound while using namespace strings
  * results in an empty result or zero count.
- * @tags: [requires_fcv_44]
  */
 (function() {
 'use strict';
@@ -40,7 +39,7 @@ function ResyncWithFailpoint(failpointName, failpointData) {
     assert.eq(primary, rst.getPrimary(), 'Primary changed after reconfig');
 
     jsTestLog('Wait for new node to start cloning');
-    secondary.setSlaveOk();
+    secondary.setSecondaryOk();
     const secondaryDB = secondary.getDB(primaryDB.getName());
     const secondaryColl = secondaryDB[primaryColl.getName()];
 

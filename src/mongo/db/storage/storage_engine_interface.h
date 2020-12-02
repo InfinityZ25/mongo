@@ -41,9 +41,6 @@ public:
     virtual ~StorageEngineInterface() = default;
     virtual StorageEngine* getStorageEngine() = 0;
     virtual KVEngine* getEngine() = 0;
-    virtual void addDropPendingIdent(const Timestamp& dropTimestamp,
-                                     const NamespaceString& nss,
-                                     StringData ident) = 0;
     virtual DurableCatalog* getCatalog() = 0;
 };
 }  // namespace mongo

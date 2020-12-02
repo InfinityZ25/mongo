@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -45,7 +45,6 @@
 #include "mongo/db/storage/storage_engine_metadata.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/storage_repair_observer.h"
-#include "mongo/db/unclean_shutdown.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
@@ -60,9 +59,10 @@ namespace {
 void createLockFile(ServiceContext* service);
 }  // namespace
 
-extern bool _supportsDocLocking;
+LastStorageEngineShutdownState initializeStorageEngine(OperationContext* opCtx,
+                                                       const StorageEngineInitFlags initFlags) {
+    ServiceContext* service = opCtx->getServiceContext();
 
-void initializeStorageEngine(ServiceContext* service, const StorageEngineInitFlags initFlags) {
     // This should be set once.
     invariant(!service->getStorageEngine());
 
@@ -155,7 +155,7 @@ void initializeStorageEngine(ServiceContext* service, const StorageEngineInitFla
 
     auto& lockFile = StorageEngineLockFile::get(service);
     service->setStorageEngine(std::unique_ptr<StorageEngine>(
-        factory->create(storageGlobalParams, lockFile ? &*lockFile : nullptr)));
+        factory->create(opCtx, storageGlobalParams, lockFile ? &*lockFile : nullptr)));
     service->getStorageEngine()->finishInit();
 
     if (lockFile) {
@@ -173,13 +173,29 @@ void initializeStorageEngine(ServiceContext* service, const StorageEngineInitFla
 
     guard.dismiss();
 
-    _supportsDocLocking = service->getStorageEngine()->supportsDocLocking();
+    if (serverGlobalParams.enableMajorityReadConcern) {
+        uassert(4939200,
+                str::stream() << "Cannot initialize " << storageGlobalParams.engine
+                              << " with 'enableMajorityReadConcern=true' "
+                                 "as it does not support read concern majority",
+                service->getStorageEngine()->supportsReadConcernMajority());
+    }
+
+    if (lockFile && lockFile->createdByUncleanShutdown()) {
+        return LastStorageEngineShutdownState::kUnclean;
+    } else {
+        return LastStorageEngineShutdownState::kClean;
+    }
 }
 
 void shutdownGlobalStorageEngineCleanly(ServiceContext* service) {
-    invariant(service->getStorageEngine());
-    StorageControl::stopStorageControls(service);
-    service->getStorageEngine()->cleanShutdown();
+    auto storageEngine = service->getStorageEngine();
+    invariant(storageEngine);
+    StorageControl::stopStorageControls(
+        service,
+        {ErrorCodes::ShutdownInProgress, "The storage catalog is being closed."},
+        /*forRestart=*/false);
+    storageEngine->cleanShutdown();
     auto& lockFile = StorageEngineLockFile::get(service);
     if (lockFile) {
         lockFile->clearPidAndUnlock();
@@ -213,9 +229,8 @@ void createLockFile(ServiceContext* service) {
                                 "previously not shut down cleanly.");
         }
         LOGV2_WARNING(22271,
-                      "Detected unclean shutdown - Lock file is not empty.",
+                      "Detected unclean shutdown - Lock file is not empty",
                       "lockFile"_attr = lockFile->getFilespec());
-        startingAfterUncleanShutdown(service) = true;
     }
 }
 
@@ -307,19 +322,22 @@ public:
     void onCreateClient(Client* client) override{};
     void onDestroyClient(Client* client) override{};
     void onCreateOperationContext(OperationContext* opCtx) {
+        // Use a fully fledged lock manager even when the storage engine is not set.
+        opCtx->setLockState(std::make_unique<LockerImpl>());
+
+        // There are a few cases where we don't have a storage engine available yet when creating an
+        // operation context.
+        // 1. During startup, we create an operation context to allow the storage engine
+        //    initialization code to make use of the lock manager.
+        // 2. There are unit tests that create an operation context before initializing the storage
+        //    engine.
+        // 3. Unit tests that use an operation context but don't require a storage engine for their
+        //    testing purpose.
         auto service = opCtx->getServiceContext();
         auto storageEngine = service->getStorageEngine();
-        // NOTE(schwerin): The following uassert would be more desirable than the early return when
-        // no storage engine is set, but to achieve that we would have to ensure that this file was
-        // never linked into a test binary that didn't actually need/use the storage engine.
-        //
-        // uassert(<some code>,
-        //         "Must instantiate storage engine before creating OperationContext",
-        //         storageEngine);
         if (!storageEngine) {
             return;
         }
-        opCtx->setLockState(std::make_unique<LockerImpl>());
         opCtx->setRecoveryUnit(std::unique_ptr<RecoveryUnit>(storageEngine->newRecoveryUnit()),
                                WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
     }

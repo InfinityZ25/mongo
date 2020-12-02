@@ -82,9 +82,9 @@ bool filterMatches(const BSONObj& testFilter,
         return false;
     }
     const std::unique_ptr<MatchExpression> root = std::move(statusWithMatcher.getValue());
-    CanonicalQuery::sortTree(root.get());
+    MatchExpression::sortTree(root.get());
     std::unique_ptr<MatchExpression> trueFilter(trueFilterNode->filter->shallowClone());
-    CanonicalQuery::sortTree(trueFilter.get());
+    MatchExpression::sortTree(trueFilter.get());
     return trueFilter->equivalent(root.get());
 }
 
@@ -137,9 +137,7 @@ bool bsonObjFieldsAreInSet(BSONObj obj, const std::set<std::string>& allowedFiel
     while (i.more()) {
         BSONElement child = i.next();
         if (!allowedFields.count(child.fieldName())) {
-            LOGV2_ERROR(23932,
-                        "Did not expect to find {child_fieldName}",
-                        "child_fieldName"_attr = child.fieldName());
+            LOGV2_ERROR(23932, "Unexpected field", "field"_attr = child.fieldName());
             return false;
         }
     }

@@ -48,6 +48,10 @@ class EndSessionsCommand final : public BasicCommand {
 public:
     EndSessionsCommand() : BasicCommand("endSessions") {}
 
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
+
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
@@ -90,6 +94,14 @@ public:
             makeLogicalSessionIds(endSessionsRequest.getSessions(), opCtx));
 
         return true;
+    }
+
+    /**
+     * Drivers may implicitly call {endSessions:...} for unauthenticated clients.
+     * Don't bother auditing when this happens.
+     */
+    bool auditAuthorizationFailure() const final {
+        return false;
     }
 
 } endSessionsCommand;

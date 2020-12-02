@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/db/catalog/collection_compact.h"
 
@@ -46,17 +46,17 @@
 
 namespace mongo {
 
-using logger::LogComponent;
+using logv2::LogComponent;
 
 namespace {
 
-Collection* getCollectionForCompact(OperationContext* opCtx,
-                                    Database* database,
-                                    const NamespaceString& collectionNss) {
+CollectionPtr getCollectionForCompact(OperationContext* opCtx,
+                                      Database* database,
+                                      const NamespaceString& collectionNss) {
     invariant(opCtx->lockState()->isCollectionLockedForMode(collectionNss, MODE_IX));
 
-    CollectionCatalog& collectionCatalog = CollectionCatalog::get(opCtx);
-    Collection* collection = collectionCatalog.lookupCollectionByNamespace(opCtx, collectionNss);
+    auto collectionCatalog = CollectionCatalog::get(opCtx);
+    CollectionPtr collection = collectionCatalog->lookupCollectionByNamespace(opCtx, collectionNss);
 
     if (!collection) {
         std::shared_ptr<ViewDefinition> view =
@@ -81,7 +81,7 @@ StatusWith<int64_t> compactCollection(OperationContext* opCtx,
     boost::optional<Lock::CollectionLock> collLk;
     collLk.emplace(opCtx, collectionNss, MODE_X);
 
-    Collection* collection = getCollectionForCompact(opCtx, database, collectionNss);
+    CollectionPtr collection = getCollectionForCompact(opCtx, database, collectionNss);
     DisableDocumentValidation validationDisabler(opCtx);
 
     auto recordStore = collection->getRecordStore();
@@ -104,9 +104,10 @@ StatusWith<int64_t> compactCollection(OperationContext* opCtx,
     }
 
     LOGV2_OPTIONS(20284,
-                  {logComponentV1toV2(LogComponent::kCommand)},
-                  "compact {collectionNss} begin",
-                  "collectionNss"_attr = collectionNss);
+                  {LogComponent::kCommand},
+                  "compact {namespace} begin",
+                  "Compact begin",
+                  "namespace"_attr = collectionNss);
 
     auto oldTotalSize = recordStore->storageSize(opCtx) + collection->getIndexSize(opCtx);
     auto indexCatalog = collection->getIndexCatalog();
@@ -122,11 +123,11 @@ StatusWith<int64_t> compactCollection(OperationContext* opCtx,
 
     auto totalSizeDiff =
         oldTotalSize - recordStore->storageSize(opCtx) - collection->getIndexSize(opCtx);
-    LOGV2(20285,
-          "compact {collectionNss} bytes freed: {totalSizeDiff}",
-          "collectionNss"_attr = collectionNss,
-          "totalSizeDiff"_attr = totalSizeDiff);
-    LOGV2(20286, "compact {collectionNss} end", "collectionNss"_attr = collectionNss);
+    LOGV2(20286,
+          "compact {namespace} end, bytes freed: {freedBytes}",
+          "Compact end",
+          "namespace"_attr = collectionNss,
+          "freedBytes"_attr = totalSizeDiff);
     return totalSizeDiff;
 }
 

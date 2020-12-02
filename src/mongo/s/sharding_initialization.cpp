@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -40,7 +40,6 @@
 #include "mongo/db/audit.h"
 #include "mongo/db/keys_collection_client_sharded.h"
 #include "mongo/db/keys_collection_manager.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
@@ -68,7 +67,7 @@
 #include "mongo/s/client/sharding_network_connection_hook.h"
 #include "mongo/s/cluster_identity_loader.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/mongos_server_parameters_gen.h"
+#include "mongo/s/mongod_and_mongos_server_parameters_gen.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/s/sharding_task_executor.h"
 #include "mongo/s/sharding_task_executor_pool_controller.h"
@@ -218,7 +217,7 @@ Status initializeGlobalShardingState(OperationContext* opCtx,
                networkPtr);
 
     // The shard registry must be started once the grid is initialized
-    grid->shardRegistry()->startup(opCtx);
+    grid->shardRegistry()->startupPeriodicReloader(opCtx);
 
     // The catalog client must be started after the shard registry has been started up
     grid->catalogClient()->startup();
@@ -280,20 +279,14 @@ Status preCacheMongosRoutingInfo(OperationContext* opCtx) {
     }
 
     auto grid = Grid::get(opCtx);
+    auto catalogClient = grid->catalogClient();
+    auto catalogCache = grid->catalogCache();
+    auto allDbs = catalogClient->getAllDBs(opCtx, repl::ReadConcernLevel::kMajorityReadConcern);
 
-    auto shardingCatalogClient = grid->catalogClient();
-    auto result =
-        shardingCatalogClient->getAllDBs(opCtx, repl::ReadConcernLevel::kMajorityReadConcern);
-
-    if (!result.isOK()) {
-        return result.getStatus();
-    }
-
-    auto cache = grid->catalogCache();
-    for (auto& db : result.getValue().value) {
-        for (auto& coll : shardingCatalogClient->getAllShardedCollectionsForDb(
+    for (auto& db : allDbs) {
+        for (auto& coll : catalogClient->getAllShardedCollectionsForDb(
                  opCtx, db.getName(), repl::ReadConcernLevel::kMajorityReadConcern)) {
-            auto resp = cache->getShardedCollectionRoutingInfoWithRefresh(opCtx, coll);
+            auto resp = catalogCache->getShardedCollectionRoutingInfoWithRefresh(opCtx, coll);
             if (!resp.isOK()) {
                 return resp.getStatus();
             }

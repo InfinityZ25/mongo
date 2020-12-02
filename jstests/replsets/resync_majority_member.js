@@ -5,13 +5,17 @@
  * have that write is forced to (try to) roll back, and it crashes as it refuses to roll back
  * majority-committed writes.
  *
- * @tags: [multiversion_incompatible]
+ * @tags: [
+ *   multiversion_incompatible,
+ *   live_record_incompatible,
+ * ]
  */
 
 (function() {
 "use strict";
 
 load("jstests/libs/write_concern_util.js");
+load("jstests/libs/fail_point_util.js");
 
 TestData.skipCheckDBHashes = true;  // the set is not consistent when we shutdown the test
 
@@ -98,10 +102,12 @@ assert.soon(() => {
 });
 
 // Observe that the old write does not exist anywhere in the set.
-syncSource.setSlaveOk();
-resyncNode.setSlaveOk();
+syncSource.setSecondaryOk();
+resyncNode.setSecondaryOk();
 assert.eq(0, syncSource.getDB(dbName)[collName].find(disappearingDoc).itcount());
 assert.eq(0, resyncNode.getDB(dbName)[collName].find(disappearingDoc).itcount());
 
+// We expect node 1 to have crashed.
+rst.stop(0, undefined, {allowedExitCode: MongoRunner.EXIT_ABORT});
 rst.stopSet();
 })();

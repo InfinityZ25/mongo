@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kFTDC
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kFTDC
 
 #include "mongo/platform/basic.h"
 
@@ -183,7 +183,7 @@ void FTDCController::stop() {
         if (!s.isOK()) {
             LOGV2(20627,
                   "Failed to close full-time diagnostic data capture file manager",
-                  "status"_attr = s);
+                  "error"_attr = s);
         }
     }
 }
@@ -191,7 +191,7 @@ void FTDCController::stop() {
 void FTDCController::doLoop() noexcept {
     // Note: All exceptions thrown in this loop are considered process fatal. The default terminate
     // is used to provide a good stack trace of the issue.
-    Client::initThread("ftdc");
+    Client::initThread(kFTDCThreadName);
     Client* client = &cc();
 
     // Update config

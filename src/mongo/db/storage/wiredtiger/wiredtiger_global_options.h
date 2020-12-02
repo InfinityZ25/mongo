@@ -40,21 +40,19 @@ class WiredTigerGlobalOptions {
 public:
     WiredTigerGlobalOptions()
         : cacheSizeGB(0),
-          checkpointDelaySecs(0),
           statisticsLogDelaySecs(0),
           directoryForIndexes(false),
-          maxCacheOverflowFileSizeGB(0),
+          maxCacheOverflowFileSizeGBDeprecated(0),
           useCollectionPrefixCompression(false),
           useIndexPrefixCompression(false){};
 
     Status store(const optionenvironment::Environment& params);
 
     double cacheSizeGB;
-    size_t checkpointDelaySecs;
     size_t statisticsLogDelaySecs;
     std::string journalCompressor;
     bool directoryForIndexes;
-    double maxCacheOverflowFileSizeGB;
+    double maxCacheOverflowFileSizeGBDeprecated;
     std::string engineConfig;
 
     std::string collectionBlockCompressor;
@@ -65,7 +63,14 @@ public:
     std::string indexConfig;
 
     static Status validateWiredTigerCompressor(const std::string&);
-    static Status validateMaxCacheOverflowFileSizeGB(double);
+
+    /**
+     * Returns current history file size limit in MB.
+     * Always returns 0 for unbounded.
+     */
+    std::size_t getMaxHistoryFileSizeMB() const {
+        return 0;
+    }
 };
 
 extern WiredTigerGlobalOptions wiredTigerGlobalOptions;

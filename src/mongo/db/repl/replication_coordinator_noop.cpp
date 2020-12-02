@@ -37,11 +37,18 @@ namespace repl {
 ReplicationCoordinatorNoOp::ReplicationCoordinatorNoOp(ServiceContext* service)
     : _service(service) {}
 
-void ReplicationCoordinatorNoOp::startup(OperationContext* opCtx) {}
+void ReplicationCoordinatorNoOp::startup(
+    OperationContext* opCtx, LastStorageEngineShutdownState lastStorageEngineShutdownState) {}
 
 void ReplicationCoordinatorNoOp::enterTerminalShutdown() {}
 
-void ReplicationCoordinatorNoOp::enterQuiesceMode() {}
+bool ReplicationCoordinatorNoOp::enterQuiesceModeIfSecondary(Milliseconds quiesceTime) {
+    MONGO_UNREACHABLE;
+}
+
+bool ReplicationCoordinatorNoOp::inQuiesceMode() const {
+    MONGO_UNREACHABLE;
+}
 
 void ReplicationCoordinatorNoOp::shutdown(OperationContext* opCtx) {}
 
@@ -67,7 +74,7 @@ const ReplSettings& ReplicationCoordinatorNoOp::getSettings() const {
     MONGO_UNREACHABLE;
 }
 
-bool ReplicationCoordinatorNoOp::isMasterForReportingPurposes() {
+bool ReplicationCoordinatorNoOp::isWritablePrimaryForReportingPurposes() {
     MONGO_UNREACHABLE;
 }
 
@@ -93,13 +100,13 @@ bool ReplicationCoordinatorNoOp::canAcceptWritesFor(OperationContext* opCtx,
 
 Status ReplicationCoordinatorNoOp::checkCanServeReadsFor_UNSAFE(OperationContext* opCtx,
                                                                 const NamespaceString& ns,
-                                                                bool slaveOk) {
+                                                                bool secondaryOkay) {
     MONGO_UNREACHABLE;
 }
 
 Status ReplicationCoordinatorNoOp::checkCanServeReadsFor(OperationContext* opCtx,
                                                          const NamespaceString& ns,
-                                                         bool slaveOk) {
+                                                         bool secondaryOkay) {
     MONGO_UNREACHABLE;
 }
 
@@ -128,7 +135,8 @@ bool ReplicationCoordinatorNoOp::buildsIndexes() {
     MONGO_UNREACHABLE;
 }
 
-OpTimeAndWallTime ReplicationCoordinatorNoOp::getMyLastAppliedOpTimeAndWallTime() const {
+OpTimeAndWallTime ReplicationCoordinatorNoOp::getMyLastAppliedOpTimeAndWallTime(
+    bool rollbackSafe) const {
     MONGO_UNREACHABLE;
 }
 
@@ -141,9 +149,6 @@ OpTime ReplicationCoordinatorNoOp::getCurrentCommittedSnapshotOpTime() const {
     MONGO_UNREACHABLE;
 }
 
-OpTimeAndWallTime ReplicationCoordinatorNoOp::getCurrentCommittedSnapshotOpTimeAndWallTime() const {
-    MONGO_UNREACHABLE;
-}
 void ReplicationCoordinatorNoOp::appendDiagnosticBSON(mongo::BSONObjBuilder*) {
     MONGO_UNREACHABLE;
 }
@@ -164,7 +169,7 @@ Status ReplicationCoordinatorNoOp::waitForMemberState(MemberState, Milliseconds)
     MONGO_UNREACHABLE;
 }
 
-Seconds ReplicationCoordinatorNoOp::getSlaveDelaySecs() const {
+Seconds ReplicationCoordinatorNoOp::getSecondaryDelaySecs() const {
     MONGO_UNREACHABLE;
 }
 
@@ -188,10 +193,6 @@ void ReplicationCoordinatorNoOp::signalDrainComplete(OperationContext*, long lon
     MONGO_UNREACHABLE;
 }
 
-Status ReplicationCoordinatorNoOp::waitForDrainFinish(Milliseconds) {
-    MONGO_UNREACHABLE;
-}
-
 void ReplicationCoordinatorNoOp::signalUpstreamUpdater() {
     MONGO_UNREACHABLE;
 }
@@ -200,8 +201,8 @@ void ReplicationCoordinatorNoOp::setMyHeartbeatMessage(const std::string&) {
     MONGO_UNREACHABLE;
 }
 
-void ReplicationCoordinatorNoOp::setMyLastAppliedOpTimeAndWallTimeForward(const OpTimeAndWallTime&,
-                                                                          DataConsistency) {
+void ReplicationCoordinatorNoOp::setMyLastAppliedOpTimeAndWallTimeForward(
+    const OpTimeAndWallTime&) {
     MONGO_UNREACHABLE;
 }
 
@@ -227,6 +228,12 @@ OpTimeAndWallTime ReplicationCoordinatorNoOp::getMyLastDurableOpTimeAndWallTime(
 }
 
 OpTime ReplicationCoordinatorNoOp::getMyLastDurableOpTime() const {
+    MONGO_UNREACHABLE;
+}
+
+Status ReplicationCoordinatorNoOp::waitUntilMajorityOpTime(OperationContext* opCtx,
+                                                           OpTime targetOpTime,
+                                                           boost::optional<Date_t> deadline) {
     MONGO_UNREACHABLE;
 }
 
@@ -278,7 +285,7 @@ Status ReplicationCoordinatorNoOp::processReplSetGetStatus(BSONObjBuilder*,
     MONGO_UNREACHABLE;
 }
 
-void ReplicationCoordinatorNoOp::appendSlaveInfoData(BSONObjBuilder*) {
+void ReplicationCoordinatorNoOp::appendSecondaryInfoData(BSONObjBuilder*) {
     MONGO_UNREACHABLE;
 }
 
@@ -287,7 +294,8 @@ ReplSetConfig ReplicationCoordinatorNoOp::getConfig() const {
 }
 
 void ReplicationCoordinatorNoOp::processReplSetGetConfig(BSONObjBuilder* result,
-                                                         bool commitmentStatus) {
+                                                         bool commitmentStatus,
+                                                         bool includeNewlyAdded) {
     MONGO_UNREACHABLE;
 }
 
@@ -344,8 +352,7 @@ void ReplicationCoordinatorNoOp::incrementNumCatchUpOpsIfCatchingUp(long numOps)
     MONGO_UNREACHABLE;
 }
 
-Status ReplicationCoordinatorNoOp::processReplSetUpdatePosition(const UpdatePositionArgs&,
-                                                                long long*) {
+Status ReplicationCoordinatorNoOp::processReplSetUpdatePosition(const UpdatePositionArgs&) {
     MONGO_UNREACHABLE;
 }
 
@@ -380,14 +387,16 @@ void ReplicationCoordinatorNoOp::blacklistSyncSource(const HostAndPort&, Date_t)
     MONGO_UNREACHABLE;
 }
 
-void ReplicationCoordinatorNoOp::resetLastOpTimesFromOplog(OperationContext*, DataConsistency) {
+void ReplicationCoordinatorNoOp::resetLastOpTimesFromOplog(OperationContext*) {
     MONGO_UNREACHABLE;
 }
 
-bool ReplicationCoordinatorNoOp::shouldChangeSyncSource(const HostAndPort&,
-                                                        const rpc::ReplSetMetadata&,
-                                                        const rpc::OplogQueryMetadata&,
-                                                        const OpTime&) {
+ChangeSyncSourceAction ReplicationCoordinatorNoOp::shouldChangeSyncSource(
+    const HostAndPort&,
+    const rpc::ReplSetMetadata&,
+    const rpc::OplogQueryMetadata&,
+    const OpTime&,
+    const OpTime&) {
     MONGO_UNREACHABLE;
 }
 
@@ -440,7 +449,7 @@ void ReplicationCoordinatorNoOp::createWMajorityWriteAvailabilityDateWaiter(OpTi
     MONGO_UNREACHABLE;
 }
 
-void ReplicationCoordinatorNoOp::dropAllSnapshots() {
+void ReplicationCoordinatorNoOp::clearCommittedSnapshot() {
     MONGO_UNREACHABLE;
 }
 
@@ -457,6 +466,10 @@ boost::optional<Timestamp> ReplicationCoordinatorNoOp::getRecoveryTimestamp() {
 }
 
 bool ReplicationCoordinatorNoOp::setContainsArbiter() const {
+    MONGO_UNREACHABLE;
+}
+
+bool ReplicationCoordinatorNoOp::replSetContainsNewlyAddedMembers() const {
     MONGO_UNREACHABLE;
 }
 
@@ -483,7 +496,7 @@ void ReplicationCoordinatorNoOp::incrementTopologyVersion() {
     MONGO_UNREACHABLE;
 }
 
-std::shared_ptr<const IsMasterResponse> ReplicationCoordinatorNoOp::awaitIsMasterResponse(
+std::shared_ptr<const HelloResponse> ReplicationCoordinatorNoOp::awaitHelloResponse(
     OperationContext* opCtx,
     const SplitHorizon::Parameters& horizonParams,
     boost::optional<TopologyVersion> clientTopologyVersion,
@@ -492,14 +505,15 @@ std::shared_ptr<const IsMasterResponse> ReplicationCoordinatorNoOp::awaitIsMaste
 }
 
 
-SharedSemiFuture<std::shared_ptr<const IsMasterResponse>>
-ReplicationCoordinatorNoOp::getIsMasterResponseFuture(
+SharedSemiFuture<std::shared_ptr<const HelloResponse>>
+ReplicationCoordinatorNoOp::getHelloResponseFuture(
     const SplitHorizon::Parameters& horizonParams,
     boost::optional<TopologyVersion> clientTopologyVersion) {
     MONGO_UNREACHABLE;
 }
 
-OpTime ReplicationCoordinatorNoOp::getLatestWriteOpTime(OperationContext* opCtx) const {
+StatusWith<OpTime> ReplicationCoordinatorNoOp::getLatestWriteOpTime(OperationContext* opCtx) const
+    noexcept {
     return getMyLastAppliedOpTime();
 }
 
@@ -521,7 +535,7 @@ BSONObj ReplicationCoordinatorNoOp::runCmdOnPrimaryAndAwaitResponse(
     MONGO_UNREACHABLE;
 }
 
-void ReplicationCoordinatorNoOp::restartHeartbeats_forTest() {
+void ReplicationCoordinatorNoOp::restartScheduledHeartbeats_forTest() {
     MONGO_UNREACHABLE;
 }
 

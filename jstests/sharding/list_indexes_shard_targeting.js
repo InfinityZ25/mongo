@@ -1,18 +1,30 @@
-/*
+/**
  * Test that for an unsharded collection the listIndexes command targets the database's primary
  * shard, and for a sharded collection the command sends and checks shard versions and only
  * targets the shard that owns the MinKey chunk.
- * @tags: [requires_fcv_44]
  */
 (function() {
 "use strict";
 
 load("jstests/sharding/libs/shard_versioning_util.js");
+load("jstests/libs/fail_point_util.js");
 
 // This test makes shards have inconsistent indexes.
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 
-const st = new ShardingTest({shards: 3});
+// Disable checking for index consistency to ensure that the config server doesn't trigger a
+// StaleShardVersion exception on shards and cause them to refresh their sharding metadata.
+const nodeOptions = {
+    setParameter: {enableShardedIndexConsistencyCheck: false}
+};
+
+const st = new ShardingTest({
+    shards: 3,
+    other: {
+        configOptions: nodeOptions,
+        mongosOptions: {setParameter: {enableFinerGrainedCatalogCacheRefresh: true}}
+    }
+});
 const dbName = "test";
 const collName = "user";
 const ns = dbName + "." + collName;

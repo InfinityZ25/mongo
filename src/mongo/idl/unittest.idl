@@ -137,6 +137,11 @@ structs:
                 type: object
                 optional: true
 
+    reply_type_struct:
+        description: Used for testing the IDL command reply_type field
+        fields:
+            reply_field: int
+
 ##################################################################################################
 #
 # Structs to test derived parsers
@@ -482,6 +487,21 @@ structs:
         strict: true
         fields:
             stringField: string
+            field1o:
+                type: string
+                optional: true
+            field2o:
+                type: int
+                optional: true
+            field3o:
+                type: object
+                optional: true
+            field4o:
+                type: bindata_generic
+                optional: true
+            field5o:
+                type: bindata_uuid
+                optional: true
 
     chained_struct_inline:
         description: Chained struct with chained structs and fields
@@ -588,6 +608,11 @@ structs:
                 optional: true
                 validator: { callback: "validateStartsWith<'x'>" }
 
+    chained_validators:
+        description: Uses a chained struct that includes fields with validators
+        chained_structs:
+            int_basic_ranges: int_basic_ranges
+
     unusual_callback_validators:
         description: Struct using fields with unusual callback validators
         fields:
@@ -627,6 +652,7 @@ structs:
 commands:
     BasicIgnoredCommand:
         description: UnitTest for a basic ignored command
+        command_name: BasicIgnoredCommand
         namespace: ignored
         fields:
             field1: int
@@ -634,6 +660,7 @@ commands:
 
     BasicConcatenateWithDbCommand:
         description: UnitTest for a basic concatenate_with_db command
+        command_name: BasicConcatenateWithDbCommand
         namespace: concatenate_with_db
         fields:
             field1: int
@@ -641,6 +668,7 @@ commands:
 
     BasicConcatenateWithDbOrUUIDCommand:
         description: UnitTest for a basic concatenate_with_db_or_uuid command
+        command_name: BasicConcatenateWithDbOrUUIDCommand
         namespace: concatenate_with_db_or_uuid
         fields:
             field1: int
@@ -648,6 +676,7 @@ commands:
 
     KnownFieldCommand:
         description: UnitTest for a command that has a field that is special known generic command field
+        command_name: KnownFieldCommand
         namespace: concatenate_with_db
         fields:
             field1: int
@@ -655,6 +684,7 @@ commands:
 
     DocSequenceCommand:
         description: UnitTest for a basic command with fields marked with supports_doc_sequence
+        command_name: DocSequenceCommand
         namespace: concatenate_with_db
         fields:
             field1: int
@@ -672,6 +702,7 @@ commands:
 
     DocSequenceCommandNonStrict:
         description: UnitTest for a basic command with fields marked with supports_doc_sequence and non-strict parsing
+        command_name: DocSequenceCommandNonStrict
         namespace: concatenate_with_db
         strict: false
         fields:
@@ -690,6 +721,7 @@ commands:
 
     chained_command_type_mixed:
         description: Chained command with chained types, structs, and fields
+        command_name: chained_command_type_mixed
         namespace: concatenate_with_db
         strict: false
         chained_types:
@@ -705,6 +737,7 @@ commands:
 
     CommandTypeStringCommand:
         description: Command with custom type string
+        command_name: CommandTypeStringCommand
         namespace: type
         type: string
         fields:
@@ -712,21 +745,25 @@ commands:
 
     CommandTypeArrayObjectCommand:
         description: Command with just an array of object parameter
+        command_name: CommandTypeArrayObjectCommand
         namespace: type
         type: array<object>
 
     CommandTypeStructCommand:
         description: Command with just a struct parameter
+        command_name: CommandTypeStructCommand
         namespace: type
         type: one_string
 
     CommandTypeArrayStructCommand:
         description: Command with just an array of struct parameter
+        command_name: CommandTypeArrayStructCommand
         namespace: type
         type: array<one_string>
 
     _underscore_command:
         description: Command with custom type string
+        command_name: _underscore_command
         namespace: type
         type: string
         cpp_name: WellNamedCommand
@@ -735,6 +772,7 @@ commands:
 
     int_type_command:
         description: Command with custom type int
+        command_name: int_type_command
         namespace: type
         type: int
         fields:
@@ -742,6 +780,7 @@ commands:
 
     int_array_type_command:
         description: Command with custom type for array of int
+        command_name: int_array_type_command
         namespace: type
         type: array<int>
         fields:
@@ -749,6 +788,7 @@ commands:
 
     validated_command:
         description: Renamed command with validator
+        command_name: validated_command
         namespace: ignored
         cpp_name: doubleBasicRanges
         fields:
@@ -758,3 +798,68 @@ commands:
             negative_double:
                 type: double
                 validator: { lt: 0.0 }
+
+    CommandWithReplyType:
+        description: A command with its reply type specified by an IDL struct
+        command_name: CommandWithReplyType
+        namespace: ignored
+        reply_type: reply_type_struct
+
+    CommandWithOkReply:
+        description: "A mock command that replies with only {ok: 1}"
+        command_name: CommandWithOkReply
+        namespace: ignored
+        reply_type: OkReply
+
+    CommandWithAnyTypeMember:
+        description: "A mock command to test IDLAnyType"
+        command_name: CommandWithValueTypeMember
+        namespace: ignored
+        reply_type: OkReply
+        fields:
+            anyTypeField: IDLAnyType
+
+    # Test that we correctly generate C++ base classes for versioned API commands with different
+    # key names, command names, and C++ names.
+    APIVersion1CommandIDLName:
+        description: A versioned API command
+        command_name: APIVersion1CommandRuntimeName
+        namespace: ignored
+        strict: true
+        api_version: "1"
+        reply_type: OkReply
+
+    APIVersion1CommandIDLName2:
+        description: A versioned API command
+        command_name: APIVersion1CommandRuntimeName2
+        cpp_name: APIVersion1CommandCPPName2
+        namespace: ignored
+        strict: true
+        api_version: "1"
+        reply_type: OkReply
+
+##################################################################################################
+#
+# Test field lists
+#
+##################################################################################################
+
+generic_argument_lists:
+    my_generic_args_list:
+        description: UnitTest for generic arguments list
+        fields:
+            my_generic_field_0:
+                forward_to_shards: false
+            my_generic_field_1:
+                forward_to_shards: true
+            my_generic_field_3: {}
+
+generic_reply_field_lists:
+    my_generic_reply_field_list:
+        description: UnitTest for generic reply fields list
+        fields:
+            my_generic_field_0:
+                forward_from_shards: false
+            my_generic_field_1:
+                forward_from_shards: true
+            my_generic_field_3: {}

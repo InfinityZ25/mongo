@@ -24,6 +24,7 @@ assert.neq(null, configDB.databases.findOne({_id: 'testDB'}));
 
 var newShardDoc = configDB.shards.findOne({_id: newShard});
 assert.eq(1024, newShardDoc.maxSize);
+assert(newShardDoc.topologyTime instanceof Timestamp);
 
 // a mongod with an existing database name should not be allowed to become a shard
 var conn2 = MongoRunner.runMongod({'shardsvr': ""});
@@ -61,7 +62,7 @@ assert.eq(
     numObjs, sdb1.foo.count(), "wrong count after moving datbase that existed before addshard");
 
 // make sure we can shard the original collections
-sdb1.foo.ensureIndex({a: 1}, {unique: true});  // can't shard populated collection without an index
+sdb1.foo.createIndex({a: 1}, {unique: true});  // can't shard populated collection without an index
 s.adminCommand({enablesharding: "testDB"});
 s.adminCommand({shardcollection: "testDB.foo", key: {a: 1}});
 s.adminCommand({split: "testDB.foo", middle: {a: Math.floor(numObjs / 2)}});

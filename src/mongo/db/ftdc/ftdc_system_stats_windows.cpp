@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kFTDC
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kFTDC
 
 #include "mongo/platform/basic.h"
 
@@ -146,7 +146,7 @@ void installSystemMetricsCollector(FTDCController* controller) {
     if (!swCollector.getStatus().isOK()) {
         LOGV2_WARNING(23718,
                       "Failed to initialize Performance Counters for FTDC",
-                      "status"_attr = swCollector.getStatus());
+                      "error"_attr = swCollector.getStatus());
         return;
     }
 

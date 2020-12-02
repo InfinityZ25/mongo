@@ -1,6 +1,8 @@
 // Cannot implicitly shard accessed collections because of extra shard key index in sharded
 // collection.
-// @tags: [assumes_no_implicit_index_creation]
+// @tags: [
+//   assumes_no_implicit_index_creation,
+// ]
 
 t = db.in5;
 
@@ -25,7 +27,7 @@ function go(fn) {
 
     i = {};
     i[fn] = 1;
-    t.ensureIndex(i);
+    t.createIndex(i);
 
     assert.eq(1, t.find(x).itcount(), "B1 - " + fn);
     assert.eq(1, t.find(y).itcount(), "B2 - " + fn);
@@ -37,7 +39,7 @@ function go(fn) {
 
     i = {};
     i[fn + ".a"] = 1;
-    t.ensureIndex(i);
+    t.createIndex(i);
     assert.eq(2, t.getIndexes().length, "T3");
 
     assert.eq(1, t.find(x).itcount(), "C1 - " + fn);

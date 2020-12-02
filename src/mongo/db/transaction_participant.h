@@ -33,6 +33,7 @@
 #include <iostream>
 #include <map>
 
+#include "mongo/db/api_parameters.h"
 #include "mongo/db/catalog/uncommitted_collections.h"
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/concurrency/d_concurrency.h"
@@ -207,17 +208,27 @@ public:
         void release(OperationContext* opCtx);
 
         /**
+         * Returns the stored API parameters.
+         */
+        const APIParameters& getAPIParameters() const {
+            return _apiParameters;
+        }
+
+        /**
          * Returns the read concern arguments.
          */
         const repl::ReadConcernArgs& getReadConcernArgs() const {
             return _readConcernArgs;
         }
 
+        void setNoEvictionAfterRollback();
+
     private:
         bool _released = false;
         std::unique_ptr<Locker> _locker;
         std::unique_ptr<Locker::LockSnapshot> _lockSnapshot;
         std::unique_ptr<RecoveryUnit> _recoveryUnit;
+        APIParameters _apiParameters;
         repl::ReadConcernArgs _readConcernArgs;
         WriteUnitOfWork::RecoveryUnitState _ruState;
         std::shared_ptr<UncommittedCollections::UncommittedCollectionsMap> _uncommittedCollections;
@@ -308,6 +319,10 @@ public:
             return o().txnState.isInProgress();
         }
 
+        bool transactionIsInRetryableWriteMode() const {
+            return o().txnState.isInRetryableWriteMode();
+        }
+
         /**
          * If this session is holding stashed locks in txnResourceStash, reports the current state
          * of the session using the provided builder.
@@ -394,7 +409,7 @@ public:
          * currently active one or the last one which committed
          *   - PreparedTransactionInProgress - if the transaction is in the prepared state and a new
          * transaction or retryable write is attempted
-         *   - NotMaster - if the node is not a primary when this method is called.
+         *   - NotWritablePrimary - if the node is not a primary when this method is called.
          *   - IncompleteTransactionHistory - if an attempt is made to begin a retryable write for a
          * TransactionParticipant that is not in retryable write mode. This is expected behavior if
          * a retryable write has been upgraded to a transaction by the server, which can happen e.g.
@@ -414,13 +429,14 @@ public:
                                                        TxnNumber txnNumber);
 
         /**
-         * If the participant is in prepare, returns a future whose promise is fulfilled when the
-         * participant transitions out of prepare.
+         * If the participant is in prepare, returns a future whose promise is fulfilled when
+         * the participant transitions out of prepare.
          *
          * If the participant is not in prepare, returns an immediately ready future.
          *
-         * The caller should not wait on the future with the session checked out, since that will
-         * prevent the promise from being able to be fulfilled, i.e., will cause a deadlock.
+         * The caller should not wait on the future with the session checked out, since that
+         * will prevent the promise from being able to be fulfilled, i.e., will cause a
+         * deadlock.
          */
         SharedSemiFuture<void> onExitPrepare() const;
 
@@ -543,9 +559,13 @@ public:
          * Throws if the session has been invalidated or the active transaction number is newer than
          * the one specified.
          */
-        void onMigrateCompletedOnPrimary(OperationContext* opCtx,
-                                         std::vector<StmtId> stmtIdsWritten,
-                                         const SessionTxnRecord& sessionTxnRecord);
+        void onRetryableWriteCloningCompleted(OperationContext* opCtx,
+                                              std::vector<StmtId> stmtIdsWritten,
+                                              const SessionTxnRecord& sessionTxnRecord);
+
+        void onTxnMigrateCompletedOnPrimary(OperationContext* opCtx,
+                                            std::vector<StmtId> stmtIdsWritten,
+                                            const SessionTxnRecord& sessionTxnRecord);
 
         /**
          * Checks whether the given statementId for the specified transaction has already executed
@@ -583,6 +603,12 @@ public:
          */
         void shutdown(OperationContext* opCtx);
 
+        /**
+         * Returns the API parameters stored in the transaction resources stash if it exists and we
+         * are not in a retryable write. Otherwise, returns the API parameters decorating the opCtx.
+         */
+        APIParameters getAPIParameters(OperationContext* opCtx) const;
+
         //
         // Methods for use in C++ unit tests, only. Beware: these methods may not adhere to the
         // concurrency control rules.
@@ -592,22 +618,26 @@ public:
             OperationContext* opCtx,
             const SingleThreadedLockStats* lockStats,
             bool committed,
+            const APIParameters& apiParameters,
             const repl::ReadConcernArgs& readConcernArgs) const {
 
             TerminationCause terminationCause =
                 committed ? TerminationCause::kCommitted : TerminationCause::kAborted;
-            return _transactionInfoForLog(opCtx, lockStats, terminationCause, readConcernArgs);
+            return _transactionInfoForLog(
+                opCtx, lockStats, terminationCause, apiParameters, readConcernArgs);
         }
 
         BSONObj getTransactionInfoBSONForLogForTest(
             OperationContext* opCtx,
             const SingleThreadedLockStats* lockStats,
             bool committed,
+            const APIParameters& apiParameters,
             const repl::ReadConcernArgs& readConcernArgs) const {
 
             TerminationCause terminationCause =
                 committed ? TerminationCause::kCommitted : TerminationCause::kAborted;
-            return _transactionInfoBSONForLog(opCtx, lockStats, terminationCause, readConcernArgs);
+            return _transactionInfoBSONForLog(
+                opCtx, lockStats, terminationCause, apiParameters, readConcernArgs);
         }
 
 
@@ -640,6 +670,8 @@ public:
             stdx::lock_guard<Client> lk(*opCtx->getClient());
             o(lk).txnState.transitionTo(TransactionState::kAbortedWithPrepare);
         }
+
+        void setCommittedStmtIdsForTest(std::vector<int> stmtIdsCommitted);
 
     private:
         boost::optional<repl::OpTime> _checkStatementExecuted(StmtId stmtId) const;
@@ -701,6 +733,7 @@ public:
         void _logSlowTransaction(OperationContext* opCtx,
                                  const SingleThreadedLockStats* lockStats,
                                  TerminationCause terminationCause,
+                                 APIParameters apiParameters,
                                  repl::ReadConcernArgs readConcernArgs);
 
         // This method returns a string with information about a slow transaction. The format of the
@@ -710,17 +743,20 @@ public:
         std::string _transactionInfoForLog(OperationContext* opCtx,
                                            const SingleThreadedLockStats* lockStats,
                                            TerminationCause terminationCause,
+                                           APIParameters apiParameters,
                                            repl::ReadConcernArgs readConcernArgs) const;
 
         void _transactionInfoForLog(OperationContext* opCtx,
                                     const SingleThreadedLockStats* lockStats,
                                     TerminationCause terminationCause,
+                                    APIParameters apiParameters,
                                     repl::ReadConcernArgs readConcernArgs,
                                     logv2::DynamicAttributes* pAttrs) const;
 
         BSONObj _transactionInfoBSONForLog(OperationContext* opCtx,
                                            const SingleThreadedLockStats* lockStats,
                                            TerminationCause terminationCause,
+                                           APIParameters apiParameters,
                                            repl::ReadConcernArgs readConcernArgs) const;
 
         // Bumps up the transaction number of this transaction and perform the necessary cleanup.

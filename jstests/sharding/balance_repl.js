@@ -5,22 +5,22 @@
 (function() {
 'use strict';
 
-// The mongod secondaries are set to priority 0 and votes 0 to prevent the primaries
-// from stepping down during migrations on slow evergreen builders.
+// The mongod secondaries are set to priority 0 to prevent the primaries from stepping down during
+// migrations on slow evergreen builders.
 var s = new ShardingTest({
     shards: 2,
     other: {
         chunkSize: 1,
         rs0: {
             nodes: [
-                {rsConfig: {votes: 1}},
-                {rsConfig: {priority: 0, votes: 0}},
+                {rsConfig: {}},
+                {rsConfig: {priority: 0}},
             ],
         },
         rs1: {
             nodes: [
-                {rsConfig: {votes: 1}},
-                {rsConfig: {priority: 0, votes: 0}},
+                {rsConfig: {}},
+                {rsConfig: {priority: 0}},
             ],
         }
     }
@@ -30,7 +30,7 @@ var bulk = s.s0.getDB('TestDB').TestColl.initializeUnorderedBulkOp();
 for (var i = 0; i < 2100; i++) {
     bulk.insert({_id: i, x: i});
 }
-assert.commandWorked(bulk.execute());
+assert.commandWorked(bulk.execute({w: "majority"}));
 
 assert.commandWorked(s.s0.adminCommand({enablesharding: 'TestDB'}));
 s.ensurePrimaryShard('TestDB', s.shard0.shardName);
@@ -43,9 +43,9 @@ for (i = 0; i < 20; i++) {
 var collPrimary = (new Mongo(s.s0.host)).getDB('TestDB').TestColl;
 assert.eq(2100, collPrimary.find().itcount());
 
-var collSlaveOk = (new Mongo(s.s0.host)).getDB('TestDB').TestColl;
-collSlaveOk.setSlaveOk();
-assert.eq(2100, collSlaveOk.find().itcount());
+var collSecondaryOk = (new Mongo(s.s0.host)).getDB('TestDB').TestColl;
+collSecondaryOk.setSecondaryOk();
+assert.eq(2100, collSecondaryOk.find().itcount());
 
 assert.commandWorked(s.s0.adminCommand({
     moveChunk: 'TestDB.TestColl',
@@ -57,7 +57,7 @@ assert.commandWorked(s.s0.adminCommand({
 }));
 
 assert.eq(2100,
-          collSlaveOk.find().itcount(),
+          collSecondaryOk.find().itcount(),
           'Incorrect count when reading from secondary. Count from primary is ' +
               collPrimary.find().itcount());
 

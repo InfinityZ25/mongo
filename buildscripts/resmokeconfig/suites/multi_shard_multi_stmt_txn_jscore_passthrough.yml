@@ -25,7 +25,6 @@ selector:
   - jstests/core/diagdata.js # Command not supported in mongos
   - jstests/core/dropdb_race.js  # syncdelay.
   - jstests/core/fsync.js  # uses fsync.
-  - jstests/core/geo_haystack*.js  # geoSearch.
   - jstests/core/geo_s2cursorlimitskip.js  # profiling.
   - jstests/core/geo_update_btree2.js  # notablescan.
   - jstests/core/index_id_options.js  # "local" database.
@@ -320,12 +319,17 @@ selector:
   # Cannot retry a getMore command if a transient transaction or network error occurs during
   # it, since we won't know whether the cursor was advanced or not.
   - requires_getmore
+  # Snapshot reads in transactions are banned on capped collections.
+  - requires_capped
   # system.profile collection doesn't exist on mongos.
   - requires_profiling
   # Retrying a query can change whether a plan cache entry is active.
   - inspects_whether_plan_cache_entry_is_active
   # $out is not supported in transactions
   - uses_$out
+  # Transaction-continuing commands cannot specify API parameters, so tests that use API parameters
+  # cannot be run with transactions.
+  - uses_api_parameters
 
 executor:
   archive:
@@ -350,11 +354,10 @@ executor:
           networkErrorAndTxnOverrideConfig:
             wrapCRUDinTransactions: true
           sessionOptions:
-            # Causal consistency is not required because tests in this suite only read from
-            # primaries, only one node is electable in each shard, all writes use majority write
-            # concern, and they use transactions with "snapshot" level read concern, which should
-            # see all majority committed writes.
-            causalConsistency: false
+            # Read your own writes is not guaranteed without causal consistency since the
+            # coordinateCommit commmand returns as soon as the decision is made durable, and
+            # prepare conflicts are explicity ignored for non-causal reads.
+            causalConsistency: true
       readMode: commands
   hooks:
   - class: CheckReplDBHashInBackground
@@ -385,5 +388,6 @@ executor:
           transaction: 4
         enableTestCommands: 1
         numInitialSyncAttempts: 1
+        coordinateCommitReturnImmediatelyAfterPersistingDecision: true
     num_rs_nodes_per_shard: 2
     num_shards: 2

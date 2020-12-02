@@ -16,7 +16,9 @@ env.Library(
         ],
         LIBDEPS_PRIVATE=[
             '$BUILD_DIR/mongo/db/index_names',
+            '$BUILD_DIR/mongo/db/matcher/expressions',
             '$BUILD_DIR/mongo/db/namespace_string',
+            '$BUILD_DIR/mongo/db/query/collation/collator_factory_interface',
         ],
 )
 
@@ -106,12 +108,15 @@ env.Library(
 
 env.Library(
     target='index_access_method_factory',
-        source=[
-            'index_access_method_factory.cpp',
-        ],
-        LIBDEPS=[
-            '$BUILD_DIR/mongo/base',
-        ],
+    source=[
+        'index_access_method_factory.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ],
+    LIBDEPS_TYPEINFO=[
+        '$BUILD_DIR/mongo/db/service_context',
+    ],
 )
 
 serveronlyEnv = env.Clone()
@@ -124,8 +129,8 @@ serveronlyEnv.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/catalog/index_catalog_entry',
-        '$BUILD_DIR/mongo/db/curop',
         '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
+        '$BUILD_DIR/mongo/db/curop',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         '$BUILD_DIR/mongo/db/storage/encryption_hooks',
         '$BUILD_DIR/mongo/db/storage/execution_context',
@@ -136,10 +141,14 @@ serveronlyEnv.Library(
         'index_descriptor',
     ],
     LIBDEPS_PRIVATE=[
-        'skipped_record_tracker',
-        '$BUILD_DIR/mongo/db/logical_clock',
+        '$BUILD_DIR/mongo/db/sorter/sorter_idl',
+        '$BUILD_DIR/mongo/db/vector_clock',
         '$BUILD_DIR/mongo/idl/server_parameter',
+        'skipped_record_tracker',
     ],
+    LIBDEPS_TYPEINFO=[
+        '$BUILD_DIR/mongo/db/matcher/expressions',
+    ]
 )
 
 env.Library(
@@ -156,17 +165,16 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/query_exec',
         'index_access_method',
         'key_generator',
-    ],
+    ]
 )
 
 env.Library(
     target="index_build_interceptor",
     source=[
         "index_build_interceptor.cpp",
-        env.Idlc('index_build_interceptor.idl')[0],
+        'index_build_interceptor.idl',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -174,7 +182,6 @@ env.Library(
         'skipped_record_tracker',
     ],
     LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/catalog/index_timestamp_helper',
         '$BUILD_DIR/mongo/db/multi_key_path_tracker',
         'index_access_methods',
     ],

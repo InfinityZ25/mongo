@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -42,6 +42,65 @@
 
 namespace mongo {
 
+namespace {
+
+using Slpi = SYSTEM_LOGICAL_PROCESSOR_INFORMATION;
+using SlpiBuf = std::aligned_storage_t<sizeof(Slpi)>;
+
+struct LpiRecords {
+    const Slpi* begin() const {
+        return reinterpret_cast<const Slpi*>(slpiRecords.get());
+    }
+
+    const Slpi* end() const {
+        return begin() + count;
+    }
+
+    std::unique_ptr<SlpiBuf[]> slpiRecords;
+    size_t count;
+};
+
+// Both the body of this getLogicalProcessorInformationRecords and the callers of
+// getLogicalProcessorInformationRecords are largely modeled off of the example code at
+// https://docs.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getlogicalprocessorinformation
+LpiRecords getLogicalProcessorInformationRecords() {
+
+    DWORD returnLength = 0;
+    LpiRecords lpiRecords{};
+
+    DWORD returnCode = 0;
+    do {
+        returnCode = GetLogicalProcessorInformation(
+            reinterpret_cast<Slpi*>(lpiRecords.slpiRecords.get()), &returnLength);
+        if (returnCode == FALSE) {
+            if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+                lpiRecords.slpiRecords = std::unique_ptr<SlpiBuf[]>(
+                    new SlpiBuf[((returnLength - 1) / sizeof(Slpi)) + 1]);
+            } else {
+                DWORD gle = GetLastError();
+                LOGV2_WARNING(23811,
+                              "GetLogicalProcessorInformation failed",
+                              "error"_attr = errnoWithDescription(gle));
+                return LpiRecords{};
+            }
+        }
+    } while (returnCode == FALSE);
+
+
+    lpiRecords.count = returnLength / sizeof(Slpi);
+    return lpiRecords;
+}
+
+int getPhysicalCores() {
+    int processorCoreCount = 0;
+    for (auto&& lpi : getLogicalProcessorInformationRecords()) {
+        if (lpi.Relationship == RelationProcessorCore)
+            processorCoreCount++;
+    }
+    return processorCoreCount;
+}
+
+}  // namespace
 int _wconvertmtos(SIZE_T s) {
     return (int)(s / (1024 * 1024));
 }
@@ -72,9 +131,7 @@ int ProcessInfo::getVirtualMemorySize() {
     BOOL status = GlobalMemoryStatusEx(&mse);
     if (!status) {
         DWORD gle = GetLastError();
-        LOGV2_ERROR(23812,
-                    "GlobalMemoryStatusEx failed with {errnoWithDescription_gle}",
-                    "errnoWithDescription_gle"_attr = errnoWithDescription(gle));
+        LOGV2_ERROR(23812, "GlobalMemoryStatusEx failed", "error"_attr = errnoWithDescription(gle));
         fassert(28621, status);
     }
 
@@ -88,52 +145,11 @@ int ProcessInfo::getResidentSize() {
     BOOL status = GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc));
     if (!status) {
         DWORD gle = GetLastError();
-        LOGV2_ERROR(23813,
-                    "GetProcessMemoryInfo failed with {errnoWithDescription_gle}",
-                    "errnoWithDescription_gle"_attr = errnoWithDescription(gle));
+        LOGV2_ERROR(23813, "GetProcessMemoryInfo failed", "error"_attr = errnoWithDescription(gle));
         fassert(28622, status);
     }
 
     return _wconvertmtos(pmc.WorkingSetSize);
-}
-
-double ProcessInfo::getSystemMemoryPressurePercentage() {
-    MEMORYSTATUSEX mse;
-    mse.dwLength = sizeof(mse);
-    BOOL status = GlobalMemoryStatusEx(&mse);
-    if (!status) {
-        DWORD gle = GetLastError();
-        LOGV2_ERROR(23814,
-                    "GlobalMemoryStatusEx failed with {errnoWithDescription_gle}",
-                    "errnoWithDescription_gle"_attr = errnoWithDescription(gle));
-        fassert(28623, status);
-    }
-
-    DWORDLONG totalPageFile = mse.ullTotalPageFile;
-    if (totalPageFile == 0) {
-        return false;
-    }
-
-    // If the page file is >= 50%, say we are low on system memory
-    // If the page file is >= 75%, we are running very low on system memory
-    //
-    DWORDLONG highWatermark = totalPageFile / 2;
-    DWORDLONG veryHighWatermark = 3 * (totalPageFile / 4);
-
-    DWORDLONG usedPageFile = mse.ullTotalPageFile - mse.ullAvailPageFile;
-
-    // Below the watermark, we are fine
-    // Also check we will not do a divide by zero below
-    if (usedPageFile < highWatermark || veryHighWatermark <= highWatermark) {
-        return 0.0;
-    }
-
-    // Above the high watermark, we tell MMapV1 how much to remap
-    // < 1.0, we have some pressure, but not much so do not be very aggressive
-    // 1.0 = we are at very high watermark, remap everything
-    // > 1.0, the user may run out of memory, remap everything
-    // i.e., Example (N - 50) / (75 - 50)
-    return static_cast<double>(usedPageFile - highWatermark) / (veryHighWatermark - highWatermark);
 }
 
 void ProcessInfo::getExtraInfo(BSONObjBuilder& info) {
@@ -161,22 +177,20 @@ bool getFileVersion(const char* filePath, DWORD& fileVersionMS, DWORD& fileVersi
     DWORD verSize = GetFileVersionInfoSizeA(filePath, NULL);
     if (verSize == 0) {
         DWORD gle = GetLastError();
-        LOGV2_WARNING(
-            23807,
-            "GetFileVersionInfoSizeA on {filePath} failed with {errnoWithDescription_gle}",
-            "filePath"_attr = filePath,
-            "errnoWithDescription_gle"_attr = errnoWithDescription(gle));
+        LOGV2_WARNING(23807,
+                      "GetFileVersionInfoSizeA failed",
+                      "path"_attr = filePath,
+                      "error"_attr = errnoWithDescription(gle));
         return false;
     }
 
     std::unique_ptr<char[]> verData(new char[verSize]);
     if (GetFileVersionInfoA(filePath, NULL, verSize, verData.get()) == 0) {
         DWORD gle = GetLastError();
-        LOGV2_WARNING(
-            23808,
-            "GetFileVersionInfoSizeA on {filePath} failed with {errnoWithDescription_gle}",
-            "filePath"_attr = filePath,
-            "errnoWithDescription_gle"_attr = errnoWithDescription(gle));
+        LOGV2_WARNING(23808,
+                      "GetFileVersionInfoSizeA failed",
+                      "path"_attr = filePath,
+                      "error"_attr = errnoWithDescription(gle));
         return false;
     }
 
@@ -185,16 +199,16 @@ bool getFileVersion(const char* filePath, DWORD& fileVersionMS, DWORD& fileVersi
     if (VerQueryValueA(verData.get(), "\\", (LPVOID*)&verInfo, &size) == 0) {
         DWORD gle = GetLastError();
         LOGV2_WARNING(23809,
-                      "VerQueryValueA on {filePath} failed with {errnoWithDescription_gle}",
-                      "filePath"_attr = filePath,
-                      "errnoWithDescription_gle"_attr = errnoWithDescription(gle));
+                      "VerQueryValueA failed",
+                      "path"_attr = filePath,
+                      "error"_attr = errnoWithDescription(gle));
         return false;
     }
 
     if (size != sizeof(VS_FIXEDFILEINFO)) {
         LOGV2_WARNING(23810,
-                      "VerQueryValueA on {filePath} returned structure with unexpected size",
-                      "filePath"_attr = filePath);
+                      "VerQueryValueA returned structure with unexpected size",
+                      "path"_attr = filePath);
         return false;
     }
 
@@ -214,8 +228,10 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
     GetNativeSystemInfo(&ntsysinfo);
     addrSize = (ntsysinfo.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 ? 64 : 32);
     numCores = ntsysinfo.dwNumberOfProcessors;
+    numPhysicalCores = getPhysicalCores();
     pageSize = static_cast<unsigned long long>(ntsysinfo.dwPageSize);
     bExtra.append("pageSize", static_cast<long long>(pageSize));
+    bExtra.append("physicalCores", static_cast<int>(numPhysicalCores));
 
     // get memory info
     mse.dwLength = sizeof(mse);
@@ -309,43 +325,13 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
     _extraStats = bExtra.obj();
 }
 
+
 bool ProcessInfo::checkNumaEnabled() {
-    typedef BOOL(WINAPI * LPFN_GLPI)(PSYSTEM_LOGICAL_PROCESSOR_INFORMATION, PDWORD);
-
-    DWORD returnLength = 0;
     DWORD numaNodeCount = 0;
-    std::unique_ptr<SYSTEM_LOGICAL_PROCESSOR_INFORMATION[]> buffer;
-
-    DWORD returnCode = 0;
-    do {
-        returnCode = GetLogicalProcessorInformation(buffer.get(), &returnLength);
-
-        if (returnCode == FALSE) {
-            if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
-                buffer.reset(reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION>(
-                    new BYTE[returnLength]));
-            } else {
-                DWORD gle = GetLastError();
-                LOGV2_WARNING(
-                    23811,
-                    "GetLogicalProcessorInformation failed with {errnoWithDescription_gle}",
-                    "errnoWithDescription_gle"_attr = errnoWithDescription(gle));
-                return false;
-            }
-        }
-    } while (returnCode == FALSE);
-
-    PSYSTEM_LOGICAL_PROCESSOR_INFORMATION ptr = buffer.get();
-
-    unsigned int byteOffset = 0;
-    while (byteOffset + sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION) <= returnLength) {
-        if (ptr->Relationship == RelationNumaNode) {
+    for (auto&& lpi : getLogicalProcessorInformationRecords()) {
+        if (lpi.Relationship == RelationNumaNode)
             // Non-NUMA systems report a single record of this type.
-            numaNodeCount++;
-        }
-
-        byteOffset += sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION);
-        ptr++;
+            ++numaNodeCount;
     }
 
     // For non-NUMA machines, the count is 1
@@ -367,9 +353,11 @@ bool ProcessInfo::blockInMemory(const void* start) {
         if (bstat) {
             for (int i=0; i<30; i++) {
                 if (wiex[i].BasicInfo.FaultingPc == 0) break;
-                cout << "faulting pc = " << wiex[i].BasicInfo.FaultingPc <<
-                    " address = " << wiex[i].BasicInfo.FaultingVa <<
-                    " thread id = " << wiex[i].FaultingThreadId << endl;
+                LOGV2(677707,
+                      "Encountered a page fault",
+                      "faulting_pc"_attr = wiex[i].BasicInfo.FaultingPcm,
+                      "address"_attr = wiex[i].BasicInfo.FaultingVa,
+                      "thread_id"_attr = wiex[i].FaultingThreadId);
             }
         }
 #endif

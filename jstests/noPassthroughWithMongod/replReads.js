@@ -1,4 +1,4 @@
-// Test that doing slaveOk reads from secondaries hits all the secondaries evenly
+// Test that doing secondaryOk reads from secondaries hits all the secondaries evenly
 // @tags: [requires_sharding]
 
 function testReadLoadBalancing(numReplicas) {
@@ -12,8 +12,8 @@ function testReadLoadBalancing(numReplicas) {
 
     s.getDB("test").foo.insert({a: 123});
 
-    primary = s.rs0._master;
-    secondaries = s.rs0._slaves;
+    primary = s.rs0.getPrimary();
+    secondaries = s.rs0.getSecondaries();
 
     function rsStats() {
         return s.getDB("admin").runCommand("connPoolStats")["replicaSets"][s.rs0.name];
@@ -21,7 +21,7 @@ function testReadLoadBalancing(numReplicas) {
 
     assert.eq(numReplicas, rsStats().hosts.length);
 
-    function isMasterOrSecondary(info) {
+    function isPrimaryOrSecondary(info) {
         if (!info.ok)
             return false;
         if (info.ismaster)
@@ -33,7 +33,7 @@ function testReadLoadBalancing(numReplicas) {
         var x = rsStats().hosts;
         printjson(x);
         for (var i = 0; i < x.length; i++)
-            if (!isMasterOrSecondary(x[i]))
+            if (!isPrimaryOrSecondary(x[i]))
                 return false;
         return true;
     });
@@ -52,7 +52,7 @@ function testReadLoadBalancing(numReplicas) {
 
     for (var i = 0; i < secondaries.length * 10; i++) {
         conn = new Mongo(s._mongos[0].host);
-        conn.setSlaveOk();
+        conn.setSecondaryOk();
         conn.getDB('test').foo.findOne();
         connections.push(conn);
     }
@@ -73,7 +73,7 @@ function testReadLoadBalancing(numReplicas) {
     c = rs.conf();
     print("config before: " + tojson(c));
     for (i = 0; i < c.members.length; i++) {
-        if (c.members[i].host == db.runCommand("ismaster").primary)
+        if (c.members[i].host == db.runCommand("hello").primary)
             continue;
         c.members[i].hidden = true;
         c.members[i].priority = 0;
@@ -96,14 +96,14 @@ function testReadLoadBalancing(numReplicas) {
                 return true;
         */
         return false;
-    }, "one slave not ok", 180000, 5000);
+    }, "one secondary not ok", 180000, 5000);
 
     // Secondaries may change here
-    secondaries = s.rs0._slaves;
+    secondaries = s.rs0.getSecondaries();
 
     for (var i = 0; i < secondaries.length * 10; i++) {
         conn = new Mongo(s._mongos[0].host);
-        conn.setSlaveOk();
+        conn.setSecondaryOk();
         conn.getDB('test').foo.findOne();
         connections.push(conn);
     }

@@ -53,20 +53,30 @@ class DocumentSourceWriteBlock {
     repl::ReadConcernArgs _originalArgs;
     RecoveryUnit::ReadSource _originalSource;
     EnforcePrepareConflictsBlock _enforcePrepareConflictsBlock;
+    Timestamp _originalTimestamp;
 
 public:
     DocumentSourceWriteBlock(OperationContext* opCtx)
         : _opCtx(opCtx), _enforcePrepareConflictsBlock(opCtx) {
         _originalArgs = repl::ReadConcernArgs::get(_opCtx);
         _originalSource = _opCtx->recoveryUnit()->getTimestampReadSource();
+        if (_originalSource == RecoveryUnit::ReadSource::kProvided) {
+            // Storage engine operations require at least Global IS.
+            Lock::GlobalLock lk(_opCtx, MODE_IS);
+            _originalTimestamp = *_opCtx->recoveryUnit()->getPointInTimeReadTimestamp(_opCtx);
+        }
 
         repl::ReadConcernArgs::get(_opCtx) = repl::ReadConcernArgs();
-        _opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::kUnset);
+        _opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
     }
 
     ~DocumentSourceWriteBlock() {
         repl::ReadConcernArgs::get(_opCtx) = _originalArgs;
-        _opCtx->recoveryUnit()->setTimestampReadSource(_originalSource);
+        if (_originalSource == RecoveryUnit::ReadSource::kProvided) {
+            _opCtx->recoveryUnit()->setTimestampReadSource(_originalSource, _originalTimestamp);
+        } else {
+            _opCtx->recoveryUnit()->setTimestampReadSource(_originalSource);
+        }
     }
 };
 

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
 
 #include "mongo/platform/basic.h"
 
@@ -63,8 +63,9 @@ std::unique_ptr<IndexAccessMethod> IndexAccessMethodFactoryImpl::make(
     else if (IndexNames::WILDCARD == type)
         return std::make_unique<WildcardAccessMethod>(entry, std::move(sortedDataInterface));
     LOGV2(20688,
-          "Can't find index for keyPattern {desc_keyPattern}",
-          "desc_keyPattern"_attr = desc->keyPattern());
+          "Can't find index for keyPattern {keyPattern}",
+          "Can't find index for keyPattern",
+          "keyPattern"_attr = desc->keyPattern());
     fassertFailed(31021);
 }
 

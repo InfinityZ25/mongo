@@ -30,9 +30,9 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/bson/bsonmisc.h"
-#include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/query/explain_common.h"
+#include "mongo/idl/command_generic_argument.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/commands/cluster_explain.h"
@@ -327,6 +327,7 @@ Status ClusterExplain::buildExplainResult(
     const vector<AsyncRequestsSender::Response>& shardResponses,
     const char* mongosStageName,
     long long millisElapsed,
+    const BSONObj& command,
     BSONObjBuilder* out) {
     // Explain only succeeds if all shards support the explain command.
     try {
@@ -338,6 +339,7 @@ Status ClusterExplain::buildExplainResult(
     buildPlannerInfo(opCtx, shardResponses, mongosStageName, out);
     buildExecStats(shardResponses, mongosStageName, millisElapsed, out);
     explain_common::generateServerInfo(out);
+    appendIfRoom(out, command, "command");
 
     return Status::OK();
 }

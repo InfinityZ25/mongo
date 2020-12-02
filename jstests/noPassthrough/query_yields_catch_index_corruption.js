@@ -2,26 +2,24 @@
 (function() {
 "use strict";
 
-const name = "query_yields_catch_index_corruption";
-const dbpath = MongoRunner.dataPath + name + "/";
+const dbName = "test";
+const collName = "query_yields_catch_index_corruption";
 
-resetDbpath(dbpath);
+const replSet = new ReplSetTest({nodes: 1});
+replSet.startSet();
+replSet.initiate();
 
-let mongod = MongoRunner.runMongod({dbpath: dbpath});
-assert.neq(null, mongod, "mongod failed to start.");
+const primary = replSet.getPrimary();
 
-let db = mongod.getDB("test");
-
+let db = primary.getDB(dbName);
 assert.commandWorked(db.adminCommand({
     configureFailPoint: "skipUnindexingDocumentWhenDeleted",
     mode: "alwaysOn",
-    data: {indexName: "a_1"}
+    data: {indexName: "a_1_b_1"}
 }));
 
-let coll = db.getCollection(name);
-coll.drop();
-
-assert.commandWorked(coll.createIndex({a: 1}));
+let coll = db.getCollection(collName);
+assert.commandWorked(coll.createIndex({a: 1, b: 1}));
 
 // Corrupt the collection by inserting a document and then deleting it without deleting its index
 // entry (thanks to the "skipUnindexingDocumentWhenDeleted" failpoint).
@@ -34,36 +32,49 @@ function createDanglingIndexEntry(doc) {
     assert.eq(false, validateRes.valid);
 
     // A query that accesses the now dangling index entry should fail with a
-    // "DataCorruptionDetected" error.
-    const error = assert.throws(() => coll.find(doc).toArray());
-    assert.eq(error.code, ErrorCodes.DataCorruptionDetected, error);
+    // "DataCorruptionDetected" error. Most reads will not detect this problem because they ignore
+    // prepare conflicts by default and that exempts them from checking this assertion. Only writes
+    // and reads in multi-document transactions enforce prepare conflicts and should encounter this
+    // assertion.
+    assert.commandFailedWithCode(coll.update(doc, {$set: {c: 1}}),
+                                 ErrorCodes.DataCorruptionDetected);
+
+    const session = db.getMongo().startSession();
+    const sessionDB = session.getDatabase(dbName);
+    session.startTransaction();
+
+    const error = assert.throws(() => {
+        sessionDB[collName].find(doc).toArray();
+    });
+    assert.eq(error.code, ErrorCodes.DataCorruptionDetected);
+    session.abortTransaction_forTesting();
 }
 
-createDanglingIndexEntry({a: 1});
+createDanglingIndexEntry({a: 1, b: 1});
 
 // Fix the index by rebuilding it, and ensure that it validates.
-assert.commandWorked(coll.dropIndex({a: 1}));
-assert.commandWorked(coll.createIndex({a: 1}));
+assert.commandWorked(coll.dropIndex({a: 1, b: 1}));
+assert.commandWorked(coll.createIndex({a: 1, b: 1}));
 
 let validateRes = assert.commandWorked(coll.validate());
 assert.eq(true, validateRes.valid, tojson(validateRes));
 
 // Reintroduce the dangling index entry, and this time fix it using the "repair" flag.
-createDanglingIndexEntry({a: 1});
+createDanglingIndexEntry({a: 1, b: 1});
 
-MongoRunner.stopMongod(mongod, MongoRunner.EXIT_CLEAN, {skipValidation: true});
-mongod = MongoRunner.runMongod({dbpath: dbpath, noCleanData: true, repair: ""});
+const dbpath = replSet.getDbPath(primary);
+replSet.stopSet(MongoRunner.EXIT_CLEAN, true /* forRestart */, {skipValidation: true});
+
+let mongod = MongoRunner.runMongod({dbpath: dbpath, noCleanData: true, repair: ""});
 assert.eq(null, mongod, "Expect this to exit cleanly");
 
-// Verify that the server starts up successfully after the repair and that validate() now succeeds.
+// Verify that the server starts up successfully after the repair.
 mongod = MongoRunner.runMongod({dbpath: dbpath, noCleanData: true});
 assert.neq(null, mongod, "mongod failed to start after repair");
 
 db = mongod.getDB("test");
-coll = db.getCollection(name);
+coll = db.getCollection(collName);
 
-validateRes = assert.commandWorked(coll.validate());
-assert.eq(true, validateRes.valid, tojson(validateRes));
-
+// Runs validate before shutting down.
 MongoRunner.stopMongod(mongod);
 })();

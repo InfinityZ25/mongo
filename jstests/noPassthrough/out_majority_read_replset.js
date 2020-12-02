@@ -1,16 +1,11 @@
 // Tests the $out and read concern majority.
+// @tags: [requires_majority_read_concern]
 (function() {
 "use strict";
 
-load("jstests/replsets/rslib.js");           // For startSetIfSupportsReadMajority.
 load("jstests/libs/write_concern_util.js");  // For stopReplicationOnSecondaries.
 
-// This test create indexes with majority of nodes not avialable for replication. So, disabling
-// index build commit quorum.
-const rst = new ReplSetTest({
-    nodes: 2,
-    nodeOptions: {enableMajorityReadConcern: "", setParameter: "enableIndexBuildCommitQuorum=false"}
-});
+const rst = new ReplSetTest({nodes: 2, nodeOptions: {enableMajorityReadConcern: ""}});
 
 // Skip this test if running with --nojournal and WiredTiger.
 if (jsTest.options().noJournal &&
@@ -20,12 +15,7 @@ if (jsTest.options().noJournal &&
     return;
 }
 
-if (!startSetIfSupportsReadMajority(rst)) {
-    jsTestLog("Skipping test since storage engine doesn't support majority read concern.");
-    rst.stopSet();
-    return;
-}
-
+rst.startSet();
 rst.initiate();
 
 const name = "out_majority_read";
@@ -38,10 +28,22 @@ rst.awaitLastOpCommitted();
 
 stopReplicationOnSecondaries(rst);
 
-// Create the index that is not majority commited
-assert.commandWorked(sourceColl.createIndex({state: 1}, {name: "secondIndex"}));
+// Rename the collection temporarily and then back to its original name. This advances the minimum
+// visible snapshot and forces the $out to block until its snapshot advances.
+const tempColl = db.getName() + '.temp';
+assert.commandWorked(db.adminCommand({
+    renameCollection: sourceColl.getFullName(),
+    to: tempColl,
+}));
+assert.commandWorked(db.adminCommand({
+    renameCollection: tempColl,
+    to: sourceColl.getFullName(),
+}));
 
-// Run the $out in the parallel shell as it will block in the metadata until the shapshot is
+// Create the index that is not majority committed
+assert.commandWorked(sourceColl.createIndex({state: 1}, {name: "secondIndex"}, 0));
+
+// Run the $out in the parallel shell as it will block in the metadata until the snapshot is
 // advanced.
 const awaitShell = startParallelShell(`{
         const testDB = db.getSiblingDB("${name}");
@@ -66,7 +68,7 @@ assert.soon(function() {
     return assert.commandWorked(db.currentOp(filter)).inprog.length === 1;
 });
 
-// Restart data replicaiton and wait until the new write becomes visible.
+// Restart data replication and wait until the new write becomes visible.
 restartReplicationOnSecondaries(rst);
 rst.awaitLastOpCommitted();
 

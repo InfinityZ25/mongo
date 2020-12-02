@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -69,11 +69,7 @@ StatusWith<WriteConcernOptions> ChunkMoveWriteConcernOptions::getEffectiveWriteC
     OperationContext* opCtx, const MigrationSecondaryThrottleOptions& options) {
     auto secondaryThrottle = options.getSecondaryThrottle();
     if (secondaryThrottle == MigrationSecondaryThrottleOptions::kDefault) {
-        if (opCtx->getServiceContext()->getStorageEngine()->supportsDocLocking()) {
-            secondaryThrottle = MigrationSecondaryThrottleOptions::kOff;
-        } else {
-            secondaryThrottle = MigrationSecondaryThrottleOptions::kOn;
-        }
+        secondaryThrottle = MigrationSecondaryThrottleOptions::kOff;
     }
 
     if (secondaryThrottle == MigrationSecondaryThrottleOptions::kOff) {

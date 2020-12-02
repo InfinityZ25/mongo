@@ -30,6 +30,7 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <fmt/format.h>
 #include <functional>
 #include <string>
 #include <vector>
@@ -38,6 +39,7 @@
 #include "mongo/base/init.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/db/api_parameters.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/client.h"
@@ -47,10 +49,12 @@
 #include "mongo/db/query/explain.h"
 #include "mongo/db/read_concern_support_result.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/request_execution_context.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/rpc/reply_builder_interface.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/future.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -58,6 +62,8 @@ namespace mongo {
 extern FailPoint failCommand;
 extern FailPoint waitInCommandMarkKillOnClientDisconnect;
 extern const OperationContext::Decoration<boost::optional<BSONArray>> errorLabelsOverride;
+extern const std::set<std::string> kNoApiVersions;
+extern const std::set<std::string> kApiVersions1;
 
 class Command;
 class CommandInvocation;
@@ -90,11 +96,27 @@ public:
                              CommandInvocation* invocation) = 0;
 
     /**
+     * A behavior to perform before CommandInvocation::asyncRun(). Defaults to `onBeforeRun(...)`.
+     */
+    virtual void onBeforeAsyncRun(std::shared_ptr<RequestExecutionContext> rec,
+                                  CommandInvocation* invocation) {
+        onBeforeRun(rec->getOpCtx(), rec->getRequest(), invocation);
+    }
+
+    /**
      * A behavior to perform after CommandInvocation::run()
      */
     virtual void onAfterRun(OperationContext* opCtx,
                             const OpMsgRequest& request,
                             CommandInvocation* invocation) = 0;
+
+    /**
+     * A behavior to perform after CommandInvocation::asyncRun(). Defaults to `onAfterRun(...)`.
+     */
+    virtual void onAfterAsyncRun(std::shared_ptr<RequestExecutionContext> rec,
+                                 CommandInvocation* invocation) {
+        onAfterRun(rec->getOpCtx(), rec->getRequest(), invocation);
+    }
 };
 
 // Various helpers unrelated to any single command or to the command registry.
@@ -170,10 +192,19 @@ struct CommandHelpers {
                                       const WriteConcernResult& wcResult = WriteConcernResult());
 
     /**
-     * Appends passthrough fields from a cmdObj to a given request.
+     * Forward generic arguments from a client request to shards.
      */
-    static BSONObj appendPassthroughFields(const BSONObj& cmdObjWithPassthroughFields,
-                                           const BSONObj& request);
+    static BSONObj appendGenericCommandArgs(const BSONObj& cmdObjWithGenericArgs,
+                                            const BSONObj& request);
+
+    /**
+     * Forward generic reply fields from a shard's reply to the client.
+     */
+    static void appendGenericReplyFields(const BSONObj& replyObjWithGenericReplyFields,
+                                         const BSONObj& reply,
+                                         BSONObjBuilder* replyBuilder);
+    static BSONObj appendGenericReplyFields(const BSONObj& replyObjWithGenericReplyFields,
+                                            const BSONObj& reply);
 
     /**
      * Returns a copy of 'cmdObj' with a majority writeConcern appended.  If the command object does
@@ -232,6 +263,15 @@ struct CommandHelpers {
                                      const OpMsgRequest& request,
                                      CommandInvocation* invocation,
                                      rpc::ReplyBuilderInterface* response);
+
+    /**
+     * Runs a previously parsed command and propagates the result to the ReplyBuilderInterface. For
+     * commands that do not offer an implementation tailored for asynchronous execution, the future
+     * schedules the execution of the default implementation, historically designed for synchronous
+     * execution.
+     */
+    static Future<void> runCommandInvocationAsync(std::shared_ptr<RequestExecutionContext> rec,
+                                                  std::shared_ptr<CommandInvocation> invocation);
 
     /**
      * If '!invocation', we're logging about a Command pre-parse. It has to punt on the logged
@@ -353,6 +393,23 @@ public:
         return false;
     }
 
+    /*
+     * Returns the list of API versions that include this command.
+     */
+    virtual const std::set<std::string>& apiVersions() const;
+
+    /*
+     * Returns the list of API versions in which this command is deprecated.
+     */
+    virtual const std::set<std::string>& deprecatedApiVersions() const;
+
+    /*
+     * Some commands permit any values for apiVersion, apiStrict, and apiDeprecationErrors.
+     */
+    virtual bool acceptsAnyApiVersionParameters() const {
+        return false;
+    }
+
     /**
      * Like adminOnly, but even stricter: we must either be authenticated for admin db,
      * or, if running without auth, on the local interface.  Used for things which
@@ -366,8 +423,8 @@ public:
 
     /**
      * Note that secondaryAllowed should move to CommandInvocation but cannot because there is
-     * one place (i.e. 'listCommands') that inappropriately produces the "slaveOk" and
-     * "slaveOverrideOk" fields for each Command without regard to payload. This is
+     * one place (i.e. 'listCommands') that inappropriately produces the "secondaryOk" and
+     * "secondaryOverrideOk" fields for each Command without regard to payload. This is
      * inappropriate because for some Commands (e.g. 'aggregate'), these properties depend
      * on request payload. See SERVER-34578 for fixing listCommands.
      */
@@ -379,6 +436,21 @@ public:
      */
     virtual bool shouldAffectCommandCounter() const {
         return true;
+    }
+
+    /**
+     * Override and return true if the readConcernCounters in serverStatus should not be incremented
+     * on behalf of this command.
+     */
+    virtual bool shouldAffectReadConcernCounter() const {
+        return false;
+    }
+
+    /**
+      Returns true if this command collects operation resource consumption metrics.
+     */
+    virtual bool collectsResourceConsumptionMetrics() const {
+        return false;
     }
 
     /**
@@ -487,6 +559,13 @@ public:
      */
     bool hasAlias(const StringData& alias) const;
 
+    /**
+     * Audit when this command fails authz check.
+     */
+    virtual bool auditAuthorizationFailure() const {
+        return true;
+    }
+
 private:
     // The full name of the command
     const std::string _name;
@@ -526,6 +605,16 @@ public:
      * `CommandHelpers::extractOrAppendOk`.
      */
     virtual void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* result) = 0;
+
+    /**
+     * Returns a future that can schedule asynchronous execution of the command. By default, the
+     * future falls back to the execution of `run(...)`, thus the default semantics of
+     * `runAsync(...)` is identical to that of `run(...).
+     */
+    virtual Future<void> runAsync(std::shared_ptr<RequestExecutionContext> rec) {
+        run(rec->getOpCtx(), rec->getReplyBuilder());
+        return Status::OK();
+    }
 
     virtual void explain(OperationContext* opCtx,
                          ExplainOptions::Verbosity verbosity,
@@ -662,6 +751,18 @@ public:
                                      const std::string& db,
                                      const BSONObj& cmdObj,
                                      rpc::ReplyBuilderInterface* replyBuilder) = 0;
+
+    /**
+     * Provides a future that may run the command asynchronously. By default, it falls back to
+     * runWithReplyBuilder.
+     */
+    virtual Future<void> runAsync(std::shared_ptr<RequestExecutionContext> rec, std::string db) {
+        if (!runWithReplyBuilder(
+                rec->getOpCtx(), db, rec->getRequest().body, rec->getReplyBuilder()))
+            return Status(ErrorCodes::FailedToRunWithReplyBuilder,
+                          fmt::format("Failed to run command: {}", rec->getCommand()->getName()));
+        return Status::OK();
+    }
 
     /**
      * Commands which can be explained override this method. Any operation which has a query
@@ -871,10 +972,12 @@ class TypedCommand<Derived>::InvocationBaseInternal : public CommandInvocation {
 public:
     using RequestType = typename Derived::Request;
 
-    InvocationBaseInternal(OperationContext*,
+    InvocationBaseInternal(OperationContext* opCtx,
                            const Command* command,
                            const OpMsgRequest& opMsgRequest)
-        : CommandInvocation(command), _request{_parseRequest(command->getName(), opMsgRequest)} {}
+        : CommandInvocation(command),
+
+          _request{_parseRequest(opCtx, command->getName(), opMsgRequest)} {}
 
 protected:
     const RequestType& request() const {
@@ -882,8 +985,12 @@ protected:
     }
 
 private:
-    static RequestType _parseRequest(StringData name, const OpMsgRequest& opMsgRequest) {
-        return RequestType::parse(IDLParserErrorContext(name), opMsgRequest);
+    static RequestType _parseRequest(OperationContext* opCtx,
+                                     StringData name,
+                                     const OpMsgRequest& opMsgRequest) {
+        return RequestType::parse(
+            IDLParserErrorContext(name, APIParameters::get(opCtx).getAPIStrict().value_or(false)),
+            opMsgRequest);
     }
 
     RequestType _request;
@@ -996,12 +1103,15 @@ CommandRegistry* globalCommandRegistry();
  * Prefer this syntax to using MONGO_INITIALIZER directly.
  * The created Command object is "leaked" intentionally, since it will register itself.
  */
-#define MONGO_REGISTER_TEST_COMMAND(CmdType)                                \
-    MONGO_INITIALIZER(RegisterTestCommand_##CmdType)(InitializerContext*) { \
-        if (getTestCommandsEnabled()) {                                     \
-            new CmdType();                                                  \
-        }                                                                   \
-        return Status::OK();                                                \
+#define MONGO_REGISTER_TEST_COMMAND(CmdType)                                     \
+    MONGO_INITIALIZER_WITH_PREREQUISITES(                                        \
+        RegisterTestCommand_##CmdType,                                           \
+        (::mongo::defaultInitializerName().c_str(), "EndStartupOptionHandling")) \
+    (InitializerContext*) {                                                      \
+        if (getTestCommandsEnabled()) {                                          \
+            new CmdType();                                                       \
+        }                                                                        \
+        return Status::OK();                                                     \
     }
 
 }  // namespace mongo

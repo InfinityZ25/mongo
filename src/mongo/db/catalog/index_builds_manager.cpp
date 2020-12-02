@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -36,13 +36,16 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/catalog/index_timestamp_helper.h"
 #include "mongo/db/catalog/uncommitted_collections.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/storage/storage_repair_observer.h"
 #include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/progress_meter.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -77,11 +80,12 @@ IndexBuildsManager::~IndexBuildsManager() {
 }
 
 Status IndexBuildsManager::setUpIndexBuild(OperationContext* opCtx,
-                                           Collection* collection,
+                                           CollectionWriter& collection,
                                            const std::vector<BSONObj>& specs,
                                            const UUID& buildUUID,
                                            OnInitFn onInit,
-                                           SetupOptions options) {
+                                           SetupOptions options,
+                                           const boost::optional<ResumeIndexInfo>& resumeInfo) {
     _registerIndexBuild(buildUUID);
 
     const auto& nss = collection->ns();
@@ -107,44 +111,49 @@ Status IndexBuildsManager::setUpIndexBuild(OperationContext* opCtx,
     std::vector<BSONObj> indexes;
     try {
         indexes = writeConflictRetry(opCtx, "IndexBuildsManager::setUpIndexBuild", nss.ns(), [&]() {
-            return uassertStatusOK(builder->init(opCtx, collection, specs, onInit));
+            return uassertStatusOK(builder->init(opCtx, collection, specs, onInit, resumeInfo));
         });
     } catch (const DBException& ex) {
         return ex.toStatus();
     }
 
-    LOGV2(
-        20346,
-        "Index build initialized: {buildUUID}: {nss} ({collection_uuid} ): indexes: {indexes_size}",
-        "Index build initialized",
-        "indexBuildUUID"_attr = buildUUID,
-        "namespace"_attr = nss,
-        "collectionUuid"_attr = collection->uuid(),
-        "numIndexes"_attr = indexes.size());
-
     return Status::OK();
 }
 
 Status IndexBuildsManager::startBuildingIndex(OperationContext* opCtx,
-                                              Collection* collection,
-                                              const UUID& buildUUID) {
+                                              const CollectionPtr& collection,
+                                              const UUID& buildUUID,
+                                              boost::optional<RecordId> resumeAfterRecordId) {
     auto builder = invariant(_getBuilder(buildUUID));
 
-    return builder->insertAllDocumentsInCollection(opCtx, collection);
+    return builder->insertAllDocumentsInCollection(opCtx, collection, resumeAfterRecordId);
+}
+
+Status IndexBuildsManager::resumeBuildingIndexFromBulkLoadPhase(OperationContext* opCtx,
+                                                                const CollectionPtr& collection,
+                                                                const UUID& buildUUID) {
+    return invariant(_getBuilder(buildUUID))->dumpInsertsFromBulk(opCtx, collection);
 }
 
 StatusWith<std::pair<long long, long long>> IndexBuildsManager::startBuildingIndexForRecovery(
-    OperationContext* opCtx, NamespaceString ns, const UUID& buildUUID, RepairData repair) {
+    OperationContext* opCtx, const CollectionPtr& coll, const UUID& buildUUID, RepairData repair) {
     auto builder = invariant(_getBuilder(buildUUID));
-
-    auto coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, ns);
-    auto rs = coll ? coll->getRecordStore() : nullptr;
 
     // Iterate all records in the collection. Validate the records and index them
     // if they are valid.  Delete them (if in repair mode), or crash, if they are not valid.
     long long numRecords = 0;
     long long dataSize = 0;
 
+    const char* curopMessage = "Index Build: scanning collection";
+    ProgressMeterHolder progressMeter;
+    {
+        stdx::unique_lock<Client> lk(*opCtx->getClient());
+        progressMeter.set(
+            CurOp::get(opCtx)->setProgress_inlock(curopMessage, coll->numRecords(opCtx)));
+    }
+
+    auto ns = coll->ns();
+    auto rs = coll->getRecordStore();
     auto cursor = rs->getCursor(opCtx);
     auto record = cursor->next();
     while (record) {
@@ -160,9 +169,8 @@ StatusWith<std::pair<long long, long long>> IndexBuildsManager::startBuildingInd
             for (int i = 0; record && i < internalInsertMaxBatchSize.load(); i++) {
                 RecordId id = record->id;
                 RecordData& data = record->data;
-                // Use the latest BSON validation version. We retain decimal data when repairing
-                // database even if decimal is disabled.
-                auto validStatus = validateBSON(data.data(), data.size(), BSONVersion::kLatest);
+                // We retain decimal data when repairing database even if decimal is disabled.
+                auto validStatus = validateBSON(data.data(), data.size());
                 if (!validStatus.isOK()) {
                     if (repair == RepairData::kNo) {
                         LOGV2_FATAL(31396,
@@ -173,17 +181,22 @@ StatusWith<std::pair<long long, long long>> IndexBuildsManager::startBuildingInd
                     }
                     LOGV2_WARNING(20348,
                                   "Invalid BSON detected at {id}: {validStatus}. Deleting.",
-                                  "Invalid BSON detected; deleting.",
+                                  "Invalid BSON detected; deleting",
                                   "id"_attr = id,
                                   "error"_attr = redact(validStatus));
                     rs->deleteRecord(opCtx, id);
+                    // Must reduce the progress meter's expected total after deleting an invalid
+                    // document from the collection.
+                    progressMeter->setTotalWhileRunning(coll->numRecords(opCtx));
                 } else {
                     numRecords++;
                     dataSize += data.size();
-                    auto insertStatus = builder->insert(opCtx, data.releaseToBson(), id);
+                    auto insertStatus = builder->insertSingleDocumentForInitialSyncOrRecovery(
+                        opCtx, data.releaseToBson(), id);
                     if (!insertStatus.isOK()) {
                         return insertStatus;
                     }
+                    progressMeter.hit();
                 }
                 record = cursor->next();
             }
@@ -207,10 +220,49 @@ StatusWith<std::pair<long long, long long>> IndexBuildsManager::startBuildingInd
         }
     }
 
-    Status status = builder->dumpInsertsFromBulk(opCtx);
+    progressMeter.finished();
+
+    long long recordsRemoved = 0;
+    long long bytesRemoved = 0;
+
+    const NamespaceString lostAndFoundNss =
+        NamespaceString(NamespaceString::kLocalDb, "lost_and_found." + coll->uuid().toString());
+
+    // Delete duplicate record and insert it into local lost and found.
+    Status status = [&] {
+        if (repair == RepairData::kYes) {
+            return builder->dumpInsertsFromBulk(opCtx, coll, [&](const RecordId& rid) {
+                auto moveStatus = _moveRecordToLostAndFound(opCtx, ns, lostAndFoundNss, rid);
+                if (moveStatus.isOK() && (moveStatus.getValue() > 0)) {
+                    recordsRemoved++;
+                    bytesRemoved += moveStatus.getValue();
+                }
+                return moveStatus.getStatus();
+            });
+        } else {
+            return builder->dumpInsertsFromBulk(opCtx, coll);
+        }
+    }();
     if (!status.isOK()) {
         return status;
     }
+
+    if (recordsRemoved > 0) {
+        StorageRepairObserver::get(opCtx->getServiceContext())
+            ->invalidatingModification(str::stream()
+                                       << "Moved " << recordsRemoved
+                                       << " records to lost and found: " << lostAndFoundNss.ns());
+
+        LOGV2(3956200,
+              "Moved records to lost and found.",
+              "numRecords"_attr = recordsRemoved,
+              "lostAndFoundNss"_attr = lostAndFoundNss,
+              "originalCollection"_attr = ns);
+
+        numRecords -= recordsRemoved;
+        dataSize -= bytesRemoved;
+    }
+
     return std::make_pair(numRecords, dataSize);
 }
 
@@ -226,20 +278,21 @@ Status IndexBuildsManager::drainBackgroundWrites(
 
 Status IndexBuildsManager::retrySkippedRecords(OperationContext* opCtx,
                                                const UUID& buildUUID,
-                                               Collection* collection) {
+                                               const CollectionPtr& collection) {
     auto builder = invariant(_getBuilder(buildUUID));
     return builder->retrySkippedRecords(opCtx, collection);
 }
 
 Status IndexBuildsManager::checkIndexConstraintViolations(OperationContext* opCtx,
+                                                          const CollectionPtr& collection,
                                                           const UUID& buildUUID) {
     auto builder = invariant(_getBuilder(buildUUID));
 
-    return builder->checkConstraints(opCtx);
+    return builder->checkConstraints(opCtx, collection);
 }
 
 Status IndexBuildsManager::commitIndexBuild(OperationContext* opCtx,
-                                            Collection* collection,
+                                            CollectionWriter& collection,
                                             const NamespaceString& nss,
                                             const UUID& buildUUID,
                                             MultiIndexBlock::OnCreateEachFn onCreateEachFn,
@@ -250,9 +303,10 @@ Status IndexBuildsManager::commitIndexBuild(OperationContext* opCtx,
         opCtx,
         "IndexBuildsManager::commitIndexBuild",
         nss.ns(),
-        [this, builder, buildUUID, opCtx, collection, nss, &onCreateEachFn, &onCommitFn] {
+        [this, builder, buildUUID, opCtx, &collection, nss, &onCreateEachFn, &onCommitFn] {
             WriteUnitOfWork wunit(opCtx);
-            auto status = builder->commit(opCtx, collection, onCreateEachFn, onCommitFn);
+            auto status = builder->commit(
+                opCtx, collection.getWritableCollection(), onCreateEachFn, onCommitFn);
             if (!status.isOK()) {
                 return status;
             }
@@ -262,7 +316,7 @@ Status IndexBuildsManager::commitIndexBuild(OperationContext* opCtx,
 }
 
 bool IndexBuildsManager::abortIndexBuild(OperationContext* opCtx,
-                                         Collection* collection,
+                                         CollectionWriter& collection,
                                          const UUID& buildUUID,
                                          OnCleanUpFn onCleanUpFn) {
     auto builder = _getBuilder(buildUUID);
@@ -280,21 +334,18 @@ bool IndexBuildsManager::abortIndexBuild(OperationContext* opCtx,
 }
 
 bool IndexBuildsManager::abortIndexBuildWithoutCleanup(OperationContext* opCtx,
-                                                       Collection* collection,
+                                                       const CollectionPtr& collection,
                                                        const UUID& buildUUID,
-                                                       const std::string& reason) {
+                                                       bool isResumable) {
     auto builder = _getBuilder(buildUUID);
     if (!builder.isOK()) {
         return false;
     }
 
-    LOGV2(20347,
-          "Index build aborted without cleanup: {buildUUID}: {reason}",
-          "Index build aborted without cleanup",
-          "buildUUID"_attr = buildUUID,
-          "reason"_attr = reason);
+    LOGV2(20347, "Index build aborted without cleanup", "buildUUID"_attr = buildUUID);
 
-    builder.getValue()->abortWithoutCleanup(opCtx);
+    builder.getValue()->abortWithoutCleanup(opCtx, collection, isResumable);
+
     return true;
 }
 
@@ -331,6 +382,72 @@ StatusWith<MultiIndexBlock*> IndexBuildsManager::_getBuilder(const UUID& buildUU
         return {ErrorCodes::NoSuchKey, str::stream() << "No index build with UUID: " << buildUUID};
     }
     return builderIt->second.get();
+}
+
+StatusWith<int> IndexBuildsManager::_moveRecordToLostAndFound(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const NamespaceString& lostAndFoundNss,
+    RecordId dupRecord) {
+    invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_IX));
+
+    auto catalog = CollectionCatalog::get(opCtx);
+    auto originalCollection = catalog->lookupCollectionByNamespace(opCtx, nss);
+    CollectionPtr localCollection = catalog->lookupCollectionByNamespace(opCtx, lostAndFoundNss);
+
+    // Create the collection if it doesn't exist.
+    if (!localCollection) {
+        Status status =
+            writeConflictRetry(opCtx, "createLostAndFoundCollection", lostAndFoundNss.ns(), [&]() {
+                WriteUnitOfWork wuow(opCtx);
+                AutoGetOrCreateDb autoDb(opCtx, NamespaceString::kLocalDb, MODE_X);
+                Database* db = autoDb.getDb();
+
+                // Ensure the database exists.
+                invariant(db);
+
+                // Since we are potentially deleting a document with duplicate _id values, we need
+                // to be able to insert into the lost and found collection without generating any
+                // duplicate key errors on the _id value.
+                CollectionOptions collOptions;
+                collOptions.setNoIdIndex();
+                localCollection = db->createCollection(opCtx, lostAndFoundNss, collOptions);
+
+                // Ensure the collection exists.
+                invariant(localCollection);
+
+                wuow.commit();
+                return Status::OK();
+            });
+        if (!status.isOK()) {
+            return status;
+        }
+    }
+
+    return writeConflictRetry(
+        opCtx, "writeDupDocToLostAndFoundCollection", nss.ns(), [&]() -> StatusWith<int> {
+            WriteUnitOfWork wuow(opCtx);
+            Snapshotted<BSONObj> doc;
+            int docSize = 0;
+
+            if (!originalCollection->findDoc(opCtx, dupRecord, &doc)) {
+                return docSize;
+            } else {
+                docSize = doc.value().objsize();
+            }
+
+            // Write document to lost_and_found collection and delete from original collection.
+            Status status =
+                localCollection->insertDocument(opCtx, InsertStatement(doc.value()), nullptr);
+            if (!status.isOK()) {
+                return status;
+            }
+
+            originalCollection->deleteDocument(opCtx, kUninitializedStmtId, dupRecord, nullptr);
+
+            wuow.commit();
+            return docSize;
+        });
 }
 
 }  // namespace mongo

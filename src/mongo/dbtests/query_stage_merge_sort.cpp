@@ -45,7 +45,7 @@
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/json.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
-#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_executor_factory.h"
 #include "mongo/dbtests/dbtests.h"
 
 /**
@@ -72,7 +72,7 @@ public:
         ASSERT_OK(dbtests::createIndex(&_opCtx, ns(), obj));
     }
 
-    const IndexDescriptor* getIndex(const BSONObj& obj, Collection* coll) {
+    const IndexDescriptor* getIndex(const BSONObj& obj, const CollectionPtr& coll) {
         std::vector<const IndexDescriptor*> indexes;
         coll->getIndexCatalog()->findIndexesByKeyPattern(&_opCtx, obj, false, &indexes);
         return indexes.empty() ? nullptr : indexes[0];
@@ -101,7 +101,7 @@ public:
         _client.update(ns(), predicate, update);
     }
 
-    void getRecordIds(set<RecordId>* out, Collection* coll) {
+    void getRecordIds(set<RecordId>* out, const CollectionPtr& coll) {
         auto cursor = coll->getCursor(&_opCtx);
         while (auto record = cursor->next()) {
             out->insert(record->id);
@@ -148,8 +148,8 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        Collection* coll =
-            CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(&_opCtx, nss());
+        CollectionPtr coll =
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
             coll = db->createCollection(&_opCtx, nss());
@@ -177,17 +177,21 @@ public:
 
         // a:1
         auto params = makeIndexScanParams(&_opCtx, getIndex(firstIndex, coll));
-        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), params, ws.get(), nullptr));
+        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, ws.get(), nullptr));
 
         // b:1
         params = makeIndexScanParams(&_opCtx, getIndex(secondIndex, coll));
-        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), params, ws.get(), nullptr));
+        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, ws.get(), nullptr));
 
         unique_ptr<FetchStage> fetchStage =
             make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(ms), nullptr, coll);
         // Must fetch if we want to easily pull out an obj.
-        auto statusWithPlanExecutor = PlanExecutor::make(
-            _expCtx, std::move(ws), std::move(fetchStage), coll, PlanExecutor::NO_YIELD);
+        auto statusWithPlanExecutor =
+            plan_executor_factory::make(_expCtx,
+                                        std::move(ws),
+                                        std::move(fetchStage),
+                                        &coll,
+                                        PlanYieldPolicy::YieldPolicy::NO_YIELD);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         auto exec = std::move(statusWithPlanExecutor.getValue());
 
@@ -214,8 +218,8 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        Collection* coll =
-            CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(&_opCtx, nss());
+        CollectionPtr coll =
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
             coll = db->createCollection(&_opCtx, nss());
@@ -243,16 +247,20 @@ public:
 
         // a:1
         auto params = makeIndexScanParams(&_opCtx, getIndex(firstIndex, coll));
-        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), params, ws.get(), nullptr));
+        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, ws.get(), nullptr));
 
         // b:1
         params = makeIndexScanParams(&_opCtx, getIndex(secondIndex, coll));
-        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), params, ws.get(), nullptr));
+        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, ws.get(), nullptr));
         unique_ptr<FetchStage> fetchStage =
             make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(ms), nullptr, coll);
 
-        auto statusWithPlanExecutor = PlanExecutor::make(
-            _expCtx, std::move(ws), std::move(fetchStage), coll, PlanExecutor::NO_YIELD);
+        auto statusWithPlanExecutor =
+            plan_executor_factory::make(_expCtx,
+                                        std::move(ws),
+                                        std::move(fetchStage),
+                                        &coll,
+                                        PlanYieldPolicy::YieldPolicy::NO_YIELD);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         auto exec = std::move(statusWithPlanExecutor.getValue());
 
@@ -279,8 +287,8 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        Collection* coll =
-            CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(&_opCtx, nss());
+        CollectionPtr coll =
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
             coll = db->createCollection(&_opCtx, nss());
@@ -308,16 +316,20 @@ public:
 
         // a:1
         auto params = makeIndexScanParams(&_opCtx, getIndex(firstIndex, coll));
-        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), params, ws.get(), nullptr));
+        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, ws.get(), nullptr));
 
         // b:1
         params = makeIndexScanParams(&_opCtx, getIndex(secondIndex, coll));
-        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), params, ws.get(), nullptr));
+        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, ws.get(), nullptr));
         unique_ptr<FetchStage> fetchStage =
             make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(ms), nullptr, coll);
 
-        auto statusWithPlanExecutor = PlanExecutor::make(
-            _expCtx, std::move(ws), std::move(fetchStage), coll, PlanExecutor::NO_YIELD);
+        auto statusWithPlanExecutor =
+            plan_executor_factory::make(_expCtx,
+                                        std::move(ws),
+                                        std::move(fetchStage),
+                                        &coll,
+                                        PlanYieldPolicy::YieldPolicy::NO_YIELD);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         auto exec = std::move(statusWithPlanExecutor.getValue());
 
@@ -345,8 +357,8 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        Collection* coll =
-            CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(&_opCtx, nss());
+        CollectionPtr coll =
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
             coll = db->createCollection(&_opCtx, nss());
@@ -377,18 +389,22 @@ public:
         auto params = makeIndexScanParams(&_opCtx, getIndex(firstIndex, coll));
         params.bounds.startKey = objWithMaxKey(1);
         params.bounds.endKey = objWithMinKey(1);
-        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), params, ws.get(), nullptr));
+        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, ws.get(), nullptr));
 
         // b:1
         params = makeIndexScanParams(&_opCtx, getIndex(secondIndex, coll));
         params.bounds.startKey = objWithMaxKey(1);
         params.bounds.endKey = objWithMinKey(1);
-        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), params, ws.get(), nullptr));
+        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, ws.get(), nullptr));
         unique_ptr<FetchStage> fetchStage =
             make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(ms), nullptr, coll);
 
-        auto statusWithPlanExecutor = PlanExecutor::make(
-            _expCtx, std::move(ws), std::move(fetchStage), coll, PlanExecutor::NO_YIELD);
+        auto statusWithPlanExecutor =
+            plan_executor_factory::make(_expCtx,
+                                        std::move(ws),
+                                        std::move(fetchStage),
+                                        &coll,
+                                        PlanYieldPolicy::YieldPolicy::NO_YIELD);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         auto exec = std::move(statusWithPlanExecutor.getValue());
 
@@ -415,8 +431,8 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        Collection* coll =
-            CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(&_opCtx, nss());
+        CollectionPtr coll =
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
             coll = db->createCollection(&_opCtx, nss());
@@ -444,18 +460,22 @@ public:
 
         // a:1
         auto params = makeIndexScanParams(&_opCtx, getIndex(firstIndex, coll));
-        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), params, ws.get(), nullptr));
+        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, ws.get(), nullptr));
 
         // b:51 (EOF)
         params = makeIndexScanParams(&_opCtx, getIndex(secondIndex, coll));
         params.bounds.startKey = BSON("" << 51 << "" << MinKey);
         params.bounds.endKey = BSON("" << 51 << "" << MaxKey);
-        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), params, ws.get(), nullptr));
+        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, ws.get(), nullptr));
         unique_ptr<FetchStage> fetchStage =
             make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(ms), nullptr, coll);
 
-        auto statusWithPlanExecutor = PlanExecutor::make(
-            _expCtx, std::move(ws), std::move(fetchStage), coll, PlanExecutor::NO_YIELD);
+        auto statusWithPlanExecutor =
+            plan_executor_factory::make(_expCtx,
+                                        std::move(ws),
+                                        std::move(fetchStage),
+                                        &coll,
+                                        PlanYieldPolicy::YieldPolicy::NO_YIELD);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         auto exec = std::move(statusWithPlanExecutor.getValue());
 
@@ -479,8 +499,8 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        Collection* coll =
-            CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(&_opCtx, nss());
+        CollectionPtr coll =
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
             coll = db->createCollection(&_opCtx, nss());
@@ -502,13 +522,18 @@ public:
             BSONObj indexSpec = BSON(index << 1 << "foo" << 1);
             addIndex(indexSpec);
             auto params = makeIndexScanParams(&_opCtx, getIndex(indexSpec, coll));
-            ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), params, ws.get(), nullptr));
+            ms->addChild(
+                std::make_unique<IndexScan>(_expCtx.get(), coll, params, ws.get(), nullptr));
         }
         unique_ptr<FetchStage> fetchStage =
             make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(ms), nullptr, coll);
 
-        auto statusWithPlanExecutor = PlanExecutor::make(
-            _expCtx, std::move(ws), std::move(fetchStage), coll, PlanExecutor::NO_YIELD);
+        auto statusWithPlanExecutor =
+            plan_executor_factory::make(_expCtx,
+                                        std::move(ws),
+                                        std::move(fetchStage),
+                                        &coll,
+                                        PlanYieldPolicy::YieldPolicy::NO_YIELD);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         auto exec = std::move(statusWithPlanExecutor.getValue());
 
@@ -532,8 +557,8 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        Collection* coll =
-            CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(&_opCtx, nss());
+        CollectionPtr coll =
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
             coll = db->createCollection(&_opCtx, nss());
@@ -557,7 +582,7 @@ public:
             BSONObj indexSpec = BSON(index << 1 << "foo" << 1);
             addIndex(indexSpec);
             auto params = makeIndexScanParams(&_opCtx, getIndex(indexSpec, coll));
-            ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), params, &ws, nullptr));
+            ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
         }
 
         set<RecordId> recordIds;
@@ -590,7 +615,7 @@ public:
         // stage, and therefore should still be returned.
         ms->saveState();
         remove(BSON(std::string(1u, 'a' + count) << 1));
-        ms->restoreState();
+        ms->restoreState(&coll);
 
         // Make sure recordIds[11] is returned as expected. We expect the corresponding working set
         // member to remain in RID_AND_IDX state. It should have been marked as "suspicious", since
@@ -652,8 +677,8 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        Collection* coll =
-            CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(&_opCtx, nss());
+        CollectionPtr coll =
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
             coll = db->createCollection(&_opCtx, nss());
@@ -685,7 +710,7 @@ public:
             auto fetchStage = std::make_unique<FetchStage>(
                 _expCtx.get(),
                 &ws,
-                std::make_unique<IndexScan>(_expCtx.get(), params, &ws, nullptr),
+                std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr),
                 nullptr,
                 coll);
             ms->addChild(std::move(fetchStage));
@@ -699,7 +724,7 @@ public:
             auto fetchStage = std::make_unique<FetchStage>(
                 _expCtx.get(),
                 &ws,
-                std::make_unique<IndexScan>(_expCtx.get(), params, &ws, nullptr),
+                std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr),
                 nullptr,
                 coll);
             ms->addChild(std::move(fetchStage));
@@ -715,7 +740,7 @@ public:
         // Update doc {a: 5} such that the postimage will no longer match the query.
         ms->saveState();
         update(BSON("a" << 5), BSON("$set" << BSON("a" << 15)));
-        ms->restoreState();
+        ms->restoreState(&coll);
 
         // Invalidated doc {a: 5} should still get returned. We expect an RID_AND_OBJ working set
         // member with an owned BSONObj.
@@ -755,8 +780,8 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        Collection* coll =
-            CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(&_opCtx, nss());
+        CollectionPtr coll =
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
             coll = db->createCollection(&_opCtx, nss());
@@ -787,17 +812,21 @@ public:
 
         // a:1
         auto params = makeIndexScanParams(&_opCtx, getIndex(firstIndex, coll));
-        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), params, ws.get(), nullptr));
+        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, ws.get(), nullptr));
 
         // b:1
         params = makeIndexScanParams(&_opCtx, getIndex(secondIndex, coll));
-        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), params, ws.get(), nullptr));
+        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, ws.get(), nullptr));
 
         auto fetchStage =
             make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(ms), nullptr, coll);
         // Must fetch if we want to easily pull out an obj.
-        auto statusWithPlanExecutor = PlanExecutor::make(
-            _expCtx, std::move(ws), std::move(fetchStage), coll, PlanExecutor::NO_YIELD);
+        auto statusWithPlanExecutor =
+            plan_executor_factory::make(_expCtx,
+                                        std::move(ws),
+                                        std::move(fetchStage),
+                                        &coll,
+                                        PlanYieldPolicy::YieldPolicy::NO_YIELD);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         auto exec = std::move(statusWithPlanExecutor.getValue());
 
@@ -823,8 +852,8 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        Collection* coll =
-            CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(&_opCtx, nss());
+        CollectionPtr coll =
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
             coll = db->createCollection(&_opCtx, nss());
@@ -856,17 +885,22 @@ public:
 
         // a:1
         auto params = makeIndexScanParams(&_opCtx, getIndex(firstIndex, coll));
-        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), params, ws.get(), nullptr));
+        auto idxScan = std::make_unique<IndexScan>(_expCtx.get(), coll, params, ws.get(), nullptr);
+
+        // Wrap 'idxScan' with a FETCH stage so a document is fetched and MERGE_SORT is forced to
+        // use the provided collator 'collator'. Also, this permits easier retrieval of result
+        // objects in the result verification code.
+        ms->addChild(
+            make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(idxScan), nullptr, coll));
 
         // b:1
         params = makeIndexScanParams(&_opCtx, getIndex(secondIndex, coll));
-        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), params, ws.get(), nullptr));
+        idxScan = std::make_unique<IndexScan>(_expCtx.get(), coll, params, ws.get(), nullptr);
+        ms->addChild(
+            make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(idxScan), nullptr, coll));
 
-        unique_ptr<FetchStage> fetchStage =
-            make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(ms), nullptr, coll);
-        // Must fetch if we want to easily pull out an obj.
-        auto statusWithPlanExecutor = PlanExecutor::make(
-            _expCtx, std::move(ws), std::move(fetchStage), coll, PlanExecutor::NO_YIELD);
+        auto statusWithPlanExecutor = plan_executor_factory::make(
+            _expCtx, std::move(ws), std::move(ms), &coll, PlanYieldPolicy::YieldPolicy::NO_YIELD);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         auto exec = std::move(statusWithPlanExecutor.getValue());
 

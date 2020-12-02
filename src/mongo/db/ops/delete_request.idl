@@ -34,7 +34,7 @@ global:
 
 imports:
     - "mongo/db/logical_session_id.idl"
-    - "mongo/db/pipeline/runtime_constants.idl"
+    - "mongo/db/pipeline/legacy_runtime_constants.idl"
     - "mongo/idl/basic_types.idl"
     - "mongo/db/query/hint.idl"
 
@@ -42,9 +42,9 @@ types:
     yield_policy:
         bson_serialization_type: string
         description: "The yielding policy of the plan executor"
-        cpp_type: "PlanExecutor::YieldPolicy"
-        serializer: "::mongo::PlanExecutor::serializeYieldPolicy"
-        deserializer: "mongo::PlanExecutor::parseFromBSON"
+        cpp_type: "PlanYieldPolicy::YieldPolicy"
+        serializer: "::mongo::PlanYieldPolicy::serializeYieldPolicy"
+        deserializer: "mongo::PlanYieldPolicy::parseFromBSON"
     stmt_id:
         bson_serialization_type: int
         description: ""
@@ -73,9 +73,17 @@ structs:
             collation:
                 description: "Specifies the collation to use for the delete."
                 type: object
+            let:
+                description: "User-defined constant values to be used within $expr. These can be 
+                              specified by the user for each individual element of the 'deletes' 
+                              array."
+                type: object
+                optional: true
             runtimeConstants:
-                description: "A collection of values that do not change once computed."
-                type: RuntimeConstants
+                description: "A legacy way to specify constant variables available during execution.
+                             'let' is now preferred."
+                cpp_name: legacyRuntimeConstants
+                type: LegacyRuntimeConstants
                 optional: true
             stmtId:
                 description: "The statement ID for the delete."
@@ -105,4 +113,4 @@ structs:
             yieldPolicy:
                 description: "The yielding policy of the plan executor."
                 type: yield_policy
-                default: PlanExecutor::NO_YIELD
+                default: PlanYieldPolicy::YieldPolicy::NO_YIELD

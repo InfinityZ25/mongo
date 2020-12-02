@@ -1,12 +1,15 @@
 // Confirms that the dbStats command returns expected content.
 //
-// @tags: [requires_dbstats, requires_fcv_44]
+// @tags: [
+//   requires_dbstats,
+//   requires_fcv_47,
+// ]
 
 (function() {
 "use strict";
 
 function serverIsMongos() {
-    const res = db.runCommand("ismaster");
+    const res = db.runCommand("hello");
     assert.commandWorked(res);
     return res.msg === "isdbgrid";
 }
@@ -51,6 +54,11 @@ assert(dbStats.hasOwnProperty("totalSize"), tojson(dbStats));
 assert(dbStats.hasOwnProperty("indexSize"), tojson(dbStats));
 
 if (isUsingPersistentStorage) {
+    assert(dbStats.hasOwnProperty("freeStorageSize"), tojson(dbStats));
+    assert(dbStats.hasOwnProperty("indexFreeStorageSize"), tojson(dbStats));
+    assert(dbStats.hasOwnProperty("totalFreeStorageSize"), tojson(dbStats));
+    assert.eq(dbStats.freeStorageSize + dbStats.indexFreeStorageSize, dbStats.totalFreeStorageSize);
+
     assert(dbStats.hasOwnProperty("fsUsedSize"), tojson(dbStats));
     assert(dbStats.hasOwnProperty("fsTotalSize"), tojson(dbStats));
 }

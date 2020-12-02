@@ -43,6 +43,7 @@
 
 namespace mongo {
 
+class ClientAPIVersionParameters;
 class DBClientBase;
 class MongoURI;
 
@@ -51,7 +52,7 @@ class MongoURI;
  * samples:
  *    server
  *    server:port
- *    foo/server:port,server:port   SET
+ *    foo/server:port,server:port   kReplicaSet
  *
  * Typical use:
  *
@@ -61,14 +62,20 @@ class MongoURI;
  */
 class ConnectionString {
 public:
-    enum ConnectionType { INVALID, MASTER, SET, CUSTOM, LOCAL };
+    enum class ConnectionType { kInvalid = 0, kStandalone, kReplicaSet, kCustom, kLocal };
 
     ConnectionString() = default;
 
     /**
      * Constructs a connection string representing a replica set.
      */
-    static ConnectionString forReplicaSet(StringData setName, std::vector<HostAndPort> servers);
+    static ConnectionString forReplicaSet(StringData replicaSetName,
+                                          std::vector<HostAndPort> servers);
+
+    /**
+     * Constructs a connection string representing a list of standalone servers.
+     */
+    static ConnectionString forStandalones(std::vector<HostAndPort> servers);
 
     /**
      * Constructs a local connection string.
@@ -76,34 +83,42 @@ public:
     static ConnectionString forLocal();
 
     /**
-     * Creates a MASTER connection string with the specified server.
+     * Creates a standalone connection string with the specified server.
      */
     explicit ConnectionString(const HostAndPort& server);
 
     /**
-     * Creates a connection string from an unparsed list of servers, type, and setName.
+     * Creates a connection string from an unparsed list of servers, type, and replicaSetName.
      */
-    ConnectionString(ConnectionType type, const std::string& s, const std::string& setName);
+    ConnectionString(ConnectionType type, const std::string& s, const std::string& replicaSetName);
 
     /**
-     * Creates a connection string from a pre-parsed list of servers, type, and setName.
+     * Creates a connection string from a pre-parsed list of servers, type, and replicaSetName.
      */
     ConnectionString(ConnectionType type,
                      std::vector<HostAndPort> servers,
-                     const std::string& setName);
+                     const std::string& replicaSetName);
 
     ConnectionString(const std::string& s, ConnectionType connType);
 
     bool isValid() const {
-        return _type != INVALID;
+        return _type != ConnectionType::kInvalid;
+    }
+
+    explicit operator bool() const {
+        return isValid();
     }
 
     const std::string& toString() const {
         return _string;
     }
 
+    const std::string& getReplicaSetName() const {
+        return _replicaSetName;
+    }
+
     const std::string& getSetName() const {
-        return _setName;
+        return getReplicaSetName();
     }
 
     const std::vector<HostAndPort>& getServers() const {
@@ -115,16 +130,27 @@ public:
     }
 
     /**
+     * Creates a new ConnectionString object which contains all the servers in either this
+     * ConnectionString or the given one.  Useful for "extending" a connection string with
+     * (potentially) new servers.
+     *
+     * The given ConnectionString must have the same type() and getSetName() as this one.
+     */
+    ConnectionString makeUnionWith(const ConnectionString& other);
+
+    /**
      * Returns true if two connection strings match in terms of their type and the exact order of
      * their hosts.
      */
     bool operator==(const ConnectionString& other) const;
     bool operator!=(const ConnectionString& other) const;
 
-    std::unique_ptr<DBClientBase> connect(StringData applicationName,
-                                          std::string& errmsg,
-                                          double socketTimeout = 0,
-                                          const MongoURI* uri = nullptr) const;
+    std::unique_ptr<DBClientBase> connect(
+        StringData applicationName,
+        std::string& errmsg,
+        double socketTimeout = 0,
+        const MongoURI* uri = nullptr,
+        const ClientAPIVersionParameters* apiParameters = nullptr) const;
 
     static StatusWith<ConnectionString> parse(const std::string& url);
 
@@ -147,9 +173,11 @@ public:
         virtual ~ConnectionHook() {}
 
         // Returns an alternative connection object for a string
-        virtual std::unique_ptr<DBClientBase> connect(const ConnectionString& c,
-                                                      std::string& errmsg,
-                                                      double socketTimeout) = 0;
+        virtual std::unique_ptr<DBClientBase> connect(
+            const ConnectionString& c,
+            std::string& errmsg,
+            double socketTimeout,
+            const ClientAPIVersionParameters* apiParameters = nullptr) = 0;
     };
 
     static void setConnectionHook(ConnectionHook* hook) {
@@ -173,22 +201,25 @@ public:
 
 private:
     /**
-     * Creates a SET connection string with the specified set name and servers.
+     * Creates a replica set connection string with the specified name and servers.
      */
-    ConnectionString(StringData setName, std::vector<HostAndPort> servers);
+    ConnectionString(StringData replicaSetName, std::vector<HostAndPort> servers);
 
     /**
-     * Creates a connection string with the specified type. Used for creating LOCAL strings.
+     * Creates a connection string with the specified type.
+     *
+     * This ctor is mostly used to create ConnectionStrings to the current node with
+     * ConnectionType::kLocal.
      */
     explicit ConnectionString(ConnectionType connType);
 
     void _fillServers(std::string s);
     void _finishInit();
 
-    ConnectionType _type{INVALID};
+    ConnectionType _type{ConnectionType::kInvalid};
     std::vector<HostAndPort> _servers;
     std::string _string;
-    std::string _setName;
+    std::string _replicaSetName;
 
     static Mutex _connectHookMutex;
     static ConnectionHook* _connectHook;
@@ -201,6 +232,16 @@ inline std::ostream& operator<<(std::ostream& ss, const ConnectionString& cs) {
 
 inline StringBuilder& operator<<(StringBuilder& sb, const ConnectionString& cs) {
     sb << cs._string;
+    return sb;
+}
+
+inline std::ostream& operator<<(std::ostream& ss, const ConnectionString::ConnectionType& ct) {
+    ss << ConnectionString::typeToString(ct);
+    return ss;
+}
+
+inline StringBuilder& operator<<(StringBuilder& sb, const ConnectionString::ConnectionType& ct) {
+    sb << ConnectionString::typeToString(ct);
     return sb;
 }
 

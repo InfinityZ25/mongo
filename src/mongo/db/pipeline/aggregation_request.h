@@ -36,7 +36,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/exchange_spec_gen.h"
-#include "mongo/db/pipeline/runtime_constants_gen.h"
+#include "mongo/db/pipeline/legacy_runtime_constants_gen.h"
 #include "mongo/db/query/explain_options.h"
 #include "mongo/db/write_concern_options.h"
 
@@ -62,9 +62,12 @@ public:
     static constexpr StringData kAllowDiskUseName = "allowDiskUse"_sd;
     static constexpr StringData kHintName = "hint"_sd;
     static constexpr StringData kExchangeName = "exchange"_sd;
-    static constexpr StringData kRuntimeConstants = "runtimeConstants"_sd;
-    static constexpr StringData kUse44SortKeys = "use44SortKeys"_sd;
-    static constexpr StringData kIsMapReduceCommand = "isMapReduceCommand"_sd;
+    static constexpr StringData kLegacyRuntimeConstantsName = "runtimeConstants"_sd;
+    static constexpr StringData kUse44SortKeysName = "use44SortKeys"_sd;
+    static constexpr StringData kIsMapReduceCommandName = "isMapReduceCommand"_sd;
+    static constexpr StringData kLetName = "let"_sd;
+    static constexpr StringData kCollectionUUIDName = "collectionUUID"_sd;
+    static constexpr StringData kRequestReshardingResumeToken = "$_requestReshardingResumeToken"_sd;
 
     static constexpr long long kDefaultBatchSize = 101;
 
@@ -86,7 +89,7 @@ public:
             pipeline.push_back(elem.embeddedObject().getOwned());
         }
 
-        return std::move(pipeline);
+        return pipeline;
     }
 
 
@@ -179,6 +182,10 @@ public:
         return _bypassDocumentValidation;
     }
 
+    bool getRequestReshardingResumeToken() const {
+        return _requestReshardingResumeToken;
+    }
+
     /**
      * Returns an empty object if no collation was specified.
      */
@@ -214,12 +221,20 @@ public:
         return _writeConcern;
     }
 
-    const auto& getRuntimeConstants() const {
-        return _runtimeConstants;
+    const auto& getLegacyRuntimeConstants() const {
+        return _legacyRuntimeConstants;
+    }
+
+    const auto& getLetParameters() const {
+        return _letParameters;
     }
 
     bool getIsMapReduceCommand() const {
         return _isMapReduceCommand;
+    }
+
+    const auto& getCollectionUUID() const {
+        return _collectionUUID;
     }
 
     //
@@ -262,6 +277,10 @@ public:
         _bypassDocumentValidation = shouldBypassDocumentValidation;
     }
 
+    void setRequestReshardingResumeToken(bool requestReshardingResumeToken) {
+        _requestReshardingResumeToken = requestReshardingResumeToken;
+    }
+
     void setMaxTimeMS(unsigned int maxTimeMS) {
         _maxTimeMS = maxTimeMS;
     }
@@ -282,12 +301,20 @@ public:
         _writeConcern = writeConcern;
     }
 
-    void setRuntimeConstants(RuntimeConstants runtimeConstants) {
-        _runtimeConstants = std::move(runtimeConstants);
+    void setLegacyRuntimeConstants(LegacyRuntimeConstants runtimeConstants) {
+        _legacyRuntimeConstants = std::move(runtimeConstants);
+    }
+
+    void setLetParameters(BSONObj letParameters) {
+        _letParameters = letParameters.getOwned();
     }
 
     void setIsMapReduceCommand(bool isMapReduce) {
         _isMapReduceCommand = isMapReduce;
+    }
+
+    void setCollectionUUID(UUID collectionUUID) {
+        _collectionUUID = std::move(collectionUUID);
     }
 
 private:
@@ -324,6 +351,7 @@ private:
     bool _fromMongos = false;
     bool _needsMerge = false;
     bool _bypassDocumentValidation = false;
+    bool _requestReshardingResumeToken = false;
 
     // A user-specified maxTimeMS limit, or a value of '0' if not specified.
     unsigned int _maxTimeMS = 0;
@@ -338,7 +366,14 @@ private:
 
     // A document containing runtime constants; i.e. values that do not change once computed (e.g.
     // $$NOW).
-    boost::optional<RuntimeConstants> _runtimeConstants;
+    boost::optional<LegacyRuntimeConstants> _legacyRuntimeConstants;
+
+    // The expected UUID of the namespace the aggregation executes on.
+    boost::optional<UUID> _collectionUUID;
+
+    // A document containing user-specified let parameter constants; i.e. values that do not change
+    // once computed.
+    BSONObj _letParameters;
 
     // True when an aggregation was invoked by the MapReduce command.
     bool _isMapReduceCommand = false;

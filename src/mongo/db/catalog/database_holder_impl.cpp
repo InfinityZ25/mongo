@@ -27,14 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/catalog/database_holder_impl.h"
 
 #include "mongo/db/audit.h"
-#include "mongo/db/background.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_impl.h"
 #include "mongo/db/catalog/database_impl.h"
@@ -44,6 +43,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/views/view_catalog.h"
 #include "mongo/logv2/log.h"
 
 namespace mongo {
@@ -68,7 +68,6 @@ StringData _todb(StringData ns) {
 
 }  // namespace
 
-
 Database* DatabaseHolderImpl::getDb(OperationContext* opCtx, StringData ns) const {
     const StringData db = _todb(ns);
     invariant(opCtx->lockState()->isDbLockedForMode(db, MODE_IS) ||
@@ -78,6 +77,20 @@ Database* DatabaseHolderImpl::getDb(OperationContext* opCtx, StringData ns) cons
     DBs::const_iterator it = _dbs.find(db);
     if (it != _dbs.end()) {
         return it->second;
+    }
+
+    return nullptr;
+}
+
+std::shared_ptr<ViewCatalog> DatabaseHolderImpl::getSharedViewCatalog(OperationContext* opCtx,
+                                                                      StringData dbName) const {
+    stdx::lock_guard<SimpleMutex> lk(_m);
+    DBs::const_iterator it = _dbs.find(dbName);
+    if (it != _dbs.end()) {
+        const Database* db = it->second;
+        if (db) {
+            return ViewCatalog::getShared(db);
+        }
     }
 
     return nullptr;
@@ -141,13 +154,13 @@ Database* DatabaseHolderImpl::openDb(OperationContext* opCtx, StringData ns, boo
     // block.
     lk.unlock();
 
-    if (CollectionCatalog::get(opCtx).getAllCollectionUUIDsFromDb(dbname).empty()) {
+    if (CollectionCatalog::get(opCtx)->getAllCollectionUUIDsFromDb(dbname).empty()) {
         audit::logCreateDatabase(opCtx->getClient(), dbname);
         if (justCreated)
             *justCreated = true;
     }
 
-    auto newDb = std::make_unique<DatabaseImpl>(dbname, ++_epoch);
+    auto newDb = std::make_unique<DatabaseImpl>(dbname);
     newDb->init(opCtx);
 
     // Finally replace our nullptr entry with the new Database pointer.
@@ -179,7 +192,8 @@ void DatabaseHolderImpl::dropDb(OperationContext* opCtx, Database* db) {
 
     invariant(opCtx->lockState()->isDbLockedForMode(name, MODE_X));
 
-    for (auto collIt = db->begin(opCtx); collIt != db->end(opCtx); ++collIt) {
+    auto catalog = CollectionCatalog::get(opCtx);
+    for (auto collIt = catalog->begin(opCtx, name); collIt != catalog->end(opCtx); ++collIt) {
         auto coll = *collIt;
         if (!coll) {
             break;
@@ -195,7 +209,7 @@ void DatabaseHolderImpl::dropDb(OperationContext* opCtx, Database* db) {
 
     auto const serviceContext = opCtx->getServiceContext();
 
-    for (auto collIt = db->begin(opCtx); collIt != db->end(opCtx); ++collIt) {
+    for (auto collIt = catalog->begin(opCtx, name); collIt != catalog->end(opCtx); ++collIt) {
         auto coll = *collIt;
         if (!coll) {
             break;
@@ -204,6 +218,9 @@ void DatabaseHolderImpl::dropDb(OperationContext* opCtx, Database* db) {
         Top::get(serviceContext).collectionDropped(coll->ns());
     }
 
+    // Clean up the in-memory database state.
+    CollectionCatalog::write(
+        opCtx, [&](CollectionCatalog& catalog) { catalog.clearDatabaseProfileSettings(name); });
     close(opCtx, name);
 
     auto const storageEngine = serviceContext->getStorageEngine();
@@ -224,7 +241,9 @@ void DatabaseHolderImpl::close(OperationContext* opCtx, StringData ns) {
     }
 
     auto db = it->second;
-    CollectionCatalog::get(opCtx).onCloseDatabase(opCtx, dbName.toString());
+    CollectionCatalog::write(opCtx, [&](CollectionCatalog& catalog) {
+        catalog.onCloseDatabase(opCtx, dbName.toString());
+    });
 
     delete db;
     db = nullptr;
@@ -254,7 +273,8 @@ void DatabaseHolderImpl::closeAll(OperationContext* opCtx) {
         LOGV2_DEBUG(20311, 2, "DatabaseHolder::closeAll name:{name}", "name"_attr = name);
 
         Database* db = _dbs[name];
-        CollectionCatalog::get(opCtx).onCloseDatabase(opCtx, name);
+        CollectionCatalog::write(
+            opCtx, [&](CollectionCatalog& catalog) { catalog.onCloseDatabase(opCtx, name); });
         delete db;
 
         _dbs.erase(name);

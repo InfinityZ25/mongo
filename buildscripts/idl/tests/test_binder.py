@@ -1374,16 +1374,24 @@ class TestBinder(testcase.IDLTestcase):
                 serializer: foo
                 deserializer: foo
                 default: foo
+        
+        structs:
+            reply:
+                description: foo
+                fields:
+                    foo: string
         """)
 
         self.assert_bind(test_preamble + textwrap.dedent("""
             commands:
                 foo:
                     description: foo
+                    command_name: foo
                     namespace: ignored
                     strict: true
                     fields:
                         foo1: string
+                    reply_type: reply
             """))
 
     def test_command_negative(self):
@@ -1408,12 +1416,14 @@ class TestBinder(testcase.IDLTestcase):
             commands:
                 foo:
                     description: foo
+                    command_name: foo
                     namespace: ignored
                     fields:
                         foo1: string
 
                 bar:
                     description: foo
+                    command_name: bar
                     namespace: ignored
                     fields:
                         foo: foo
@@ -1425,6 +1435,7 @@ class TestBinder(testcase.IDLTestcase):
             commands:
                 foo:
                     description: foo
+                    command_name: foo
                     namespace: ignored
                     fields:
                         foo1: string
@@ -1442,10 +1453,33 @@ class TestBinder(testcase.IDLTestcase):
             commands:
                 foo:
                     description: foo
+                    command_name: foo
                     namespace: ignored
                     fields:
                         foo: string
             """), idl.errors.ERROR_ID_COMMAND_DUPLICATES_FIELD)
+
+        # Reply type must be resolvable
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
+            commands:
+                foo:
+                    description: foo
+                    command_name: foo
+                    namespace: ignored
+                    reply_type: not_defined
+            """), idl.errors.ERROR_ID_UNKNOWN_TYPE)
+
+        # Reply type must be a struct
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
+            commands:
+                foo:
+                    description: foo
+                    command_name: foo
+                    namespace: ignored
+                    reply_type: string
+            """), idl.errors.ERROR_ID_INVALID_REPLY_TYPE)
 
     def test_command_doc_sequence_positive(self):
         # type: () -> None
@@ -1481,6 +1515,7 @@ class TestBinder(testcase.IDLTestcase):
             commands:
                 foo:
                     description: foo
+                    command_name: foo
                     namespace: ignored
                     fields:
                         foo1:
@@ -1492,6 +1527,7 @@ class TestBinder(testcase.IDLTestcase):
             commands:
                 foo:
                     description: foo
+                    command_name: foo
                     namespace: ignored
                     fields:
                         foo1:
@@ -1556,6 +1592,7 @@ class TestBinder(testcase.IDLTestcase):
             commands:
                 foo:
                     description: foo
+                    command_name: foo
                     namespace: ignored
                     fields:
                         foo:
@@ -1569,6 +1606,7 @@ class TestBinder(testcase.IDLTestcase):
             commands:
                 foo:
                     description: foo
+                    command_name: foo
                     namespace: ignored
                     fields:
                         foo1:
@@ -1582,6 +1620,7 @@ class TestBinder(testcase.IDLTestcase):
             commands:
                 foo:
                     description: foo
+                    command_name: foo
                     namespace: ignored
                     fields:
                         foo1:
@@ -1607,6 +1646,7 @@ class TestBinder(testcase.IDLTestcase):
         commands:
             foo:
                 description: foo
+                command_name: foo
                 strict: true
                 namespace: type
                 type: string
@@ -1619,6 +1659,7 @@ class TestBinder(testcase.IDLTestcase):
         commands:
             foo:
                 description: foo
+                command_name: foo
                 strict: true
                 namespace: type
                 type: array<string>
@@ -1645,6 +1686,7 @@ class TestBinder(testcase.IDLTestcase):
         commands:
             foo:
                 description: foo
+                command_name: foo
                 namespace: type
                 type: int
                 fields:
@@ -1984,6 +2026,52 @@ class TestBinder(testcase.IDLTestcase):
                     description: comment
                     source: cli
             """), idl.errors.ERROR_ID_MISSING_SHORT_NAME_WITH_SINGLE_NAME)
+
+    def test_feature_flag(self):
+        # type: () -> None
+        """Test feature flag checks around version."""
+
+        # feature flag can default to false without a version
+        self.assert_bind(
+            textwrap.dedent("""
+            feature_flags:
+                featureFlagToaster:
+                    description: "Make toast"
+                    cpp_varname: gToaster
+                    default: false
+            """))
+
+        # feature flag can default to true with a version
+        self.assert_bind(
+            textwrap.dedent("""
+            feature_flags:
+                featureFlagToaster:
+                    description: "Make toast"
+                    cpp_varname: gToaster
+                    default: true
+                    version: 123
+            """))
+
+        # true is only allowed with a version
+        self.assert_bind_fail(
+            textwrap.dedent("""
+            feature_flags:
+                featureFlagToaster:
+                    description: "Make toast"
+                    cpp_varname: gToaster
+                    default: true
+            """), idl.errors.ERROR_ID_FEATURE_FLAG_DEFAULT_TRUE_MISSING_VERSION)
+
+        # false is not allowed with a version
+        self.assert_bind_fail(
+            textwrap.dedent("""
+            feature_flags:
+                featureFlagToaster:
+                    description: "Make toast"
+                    cpp_varname: gToaster
+                    default: false
+                    version: 123
+            """), idl.errors.ERROR_ID_FEATURE_FLAG_DEFAULT_FALSE_HAS_VERSION)
 
 
 if __name__ == '__main__':

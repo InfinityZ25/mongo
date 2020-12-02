@@ -40,6 +40,9 @@
 #include "mongo/util/concurrency/spin_lock.h"
 
 namespace mongo {
+namespace projection_executor {
+class ProjectionExecutor;
+}  // namespace projection_executor
 
 const std::string IdentityNS("local.me");
 const BSONField<std::string> HostField("host");
@@ -180,12 +183,13 @@ public:
     double getSoTimeout() const;
 
     /**
-     * @return the exact std::string address passed to hostAndPort parameter of the
+     * @returns the value passed to hostAndPort parameter of the
      *     constructor. In other words, doesn't automatically append a
      *     'default' port if none is specified.
      */
     std::string getServerAddress() const;
     std::string toString();
+    const HostAndPort& getServerHostAndPort() const;
 
     //
     // Call counters
@@ -219,13 +223,26 @@ private:
      */
     void checkIfUp(InstanceID id) const;
 
+    /**
+     * Creates a ProjectionExecutor to handle fieldsToReturn.
+     */
+    std::unique_ptr<projection_executor::ProjectionExecutor> createProjectionExecutor(
+        const BSONObj& projectionSpec);
+
+    /**
+     * Projects the object, unless the projectionExecutor is null, in which case returns a
+     * copy of the object.
+     */
+    BSONObj project(projection_executor::ProjectionExecutor* projectionExecutor, const BSONObj& o);
+
+
     typedef stdx::unordered_map<std::string, std::shared_ptr<CircularBSONIterator>> CmdToReplyObj;
     typedef stdx::unordered_map<std::string, std::vector<BSONObj>> MockDataMgr;
     typedef stdx::unordered_map<mongo::UUID, std::string, UUID::Hash> UUIDMap;
 
     bool _isRunning;
 
-    const std::string _hostAndPort;
+    const HostAndPort _hostAndPort;
     long long _delayMilliSec;
 
     //

@@ -32,11 +32,11 @@
 #include <deque>
 
 #include "mongo/base/status.h"
+#include "mongo/db/service_context.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/transport/service_executor.h"
-#include "mongo/transport/service_executor_task_names.h"
 #include "mongo/util/hierarchical_acquisition.h"
 
 namespace mongo {
@@ -50,13 +50,18 @@ class ServiceExecutorSynchronous final : public ServiceExecutor {
 public:
     explicit ServiceExecutorSynchronous(ServiceContext* ctx);
 
+    static ServiceExecutorSynchronous* get(ServiceContext* ctx);
+
     Status start() override;
     Status shutdown(Milliseconds timeout) override;
-    Status schedule(Task task, ScheduleFlags flags, ServiceExecutorTaskName taskName) override;
+    Status scheduleTask(Task task, ScheduleFlags flags) override;
 
     Mode transportMode() const override {
         return Mode::kSynchronous;
     }
+
+    void runOnDataAvailable(Session* session,
+                            OutOfLineExecutor::Task onCompletionCallback) override;
 
     void appendStats(BSONObjBuilder* bob) const override;
 
@@ -69,7 +74,7 @@ private:
 
     mutable Mutex _shutdownMutex = MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0),
                                                     "ServiceExecutorSynchronous::_shutdownMutex");
-    stdx::condition_variable _shutdownCondition;
+    std::shared_ptr<stdx::condition_variable> _shutdownCondition;
 
     AtomicWord<size_t> _numRunningWorkerThreads{0};
     size_t _numHardwareCores{0};

@@ -7,11 +7,14 @@
  * test queries below show most $match/$sort/$group combinations where that is possible.
  *
  * @tags: [
- * # The sharding and $facet passthrough suites modifiy aggregation pipelines in a way that
- * # prevents the DISTINCT_SCAN optimization from being applied, which breaks the test.
- * assumes_unsharded_collection, do_not_wrap_aggregations_in_facets,
- * # Index filter commands do not support causal consistency.
- * does_not_support_causal_consistency]
+ *   # The sharding and $facet passthrough suites modifiy aggregation pipelines in a way that
+ *   # prevents the DISTINCT_SCAN optimization from being applied, which breaks the test.
+ *   assumes_unsharded_collection,
+ *   do_not_wrap_aggregations_in_facets,
+ *   # Index filter commands do not support causal consistency.
+ *   does_not_support_causal_consistency,
+ *   sbe_incompatible,
+ * ]
  */
 
 (function() {
@@ -542,6 +545,18 @@ pipeline = [{$match: {a: {$gt: 0}}}, {$sort: {b: 1}}, {$group: {_id: "$b"}}];
 assertResultsMatchWithAndWithoutHintandIndexes(pipeline, [{_id: 1}, {_id: 2}, {_id: 3}]);
 explain = coll.explain().aggregate(pipeline);
 assert.eq(null, getAggPlanStage(explain, "DISTINCT_SCAN"), explain);
+
+//
+// Verify that a $sort-$group pipeline with a $first accumulator can use DISTINCT_SCAN, even when
+// the group _id field is a singleton object instead of a fieldPath.
+//
+pipeline = [{$sort: {a: 1, b: 1}}, {$group: {_id: {v: "$a"}, accum: {$first: "$b"}}}];
+assertResultsMatchWithAndWithoutHintandIndexes(
+    pipeline, [{_id: {v: null}, accum: null}, {_id: {v: 1}, accum: 1}, {_id: {v: 2}, accum: 2}]);
+explain = coll.explain().aggregate(pipeline);
+assert.neq(null, getAggPlanStage(explain, "DISTINCT_SCAN"), explain);
+assert.eq({a: 1, b: 1, c: 1}, getAggPlanStage(explain, "DISTINCT_SCAN").keyPattern);
+assert.eq(null, getAggPlanStage(explain, "SORT"), explain);
 
 ////////////////////////////////////////////////////////////////////////////////////////////////
 // We execute all the collation-related tests three times with three different configurations

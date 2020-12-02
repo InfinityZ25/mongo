@@ -1,8 +1,12 @@
-// @tags: [requires_getmore, requires_non_retryable_writes]
+// @tags: [
+//   requires_getmore,
+//   requires_non_retryable_writes,
+//   sbe_incompatible,
+// ]
 
 var t = db.get_s2nearcomplex;
 t.drop();
-t.ensureIndex({geo: "2dsphere"});
+t.createIndex({geo: "2dsphere"});
 
 /* Short names for math operations */
 Random.setRandomSeed();
@@ -172,7 +176,7 @@ print("Total points:");
 print(t.find(query).itcount());
 
 t.drop();
-t.ensureIndex({geo: "2dsphere"});
+t.createIndex({geo: "2dsphere"});
 // Test a uniform distribution with 5 gaps each with 10 points missing.
 uniformPointsWithGaps(origin, 1000, 1, 10.0, 5, 10);
 
@@ -184,7 +188,7 @@ print("Total points:");
 print(t.find(query).itcount());
 
 t.drop();
-t.ensureIndex({geo: "2dsphere"});
+t.createIndex({geo: "2dsphere"});
 
 // Test a uniform distribution with 5 clusters each with between 10 and 100 points.
 uniformPointsWithClusters(origin, 1000, 1, 10.0, 5, 10, 100);
@@ -197,7 +201,7 @@ print("Total points:");
 print(t.find(query).itcount());
 
 t.drop();
-t.ensureIndex({geo: "2dsphere"});
+t.createIndex({geo: "2dsphere"});
 
 // Test a uniform near search with origin around the pole.
 
@@ -221,7 +225,7 @@ print(t.find({geo: {$geoNear: {$geometry: originGeo}}})
 assert.eq(t.find({geo: {$geoNear: {$geometry: originGeo}}}).itcount(), 50);
 
 t.drop();
-t.ensureIndex({geo: "2dsphere"});
+t.createIndex({geo: "2dsphere"});
 
 // Center point near the meridian
 originGeo = {
@@ -243,7 +247,7 @@ print(t.find({geo: {$geoNear: {$geometry: originGeo}}})
 assert.eq(t.find({geo: {$geoNear: {$geometry: originGeo}}}).itcount(), 50);
 
 t.drop();
-t.ensureIndex({geo: "2dsphere"});
+t.createIndex({geo: "2dsphere"});
 
 // Center point near the negative meridian
 originGeo = {
@@ -266,7 +270,7 @@ assert.eq(t.find({geo: {$near: {$geometry: originGeo}}}).itcount(), 50);
 
 // Near search with points that are really far away.
 t.drop();
-t.ensureIndex({geo: "2dsphere"});
+t.createIndex({geo: "2dsphere"});
 originGeo = {
     type: "Point",
     coordinates: [0.0, 0.0]

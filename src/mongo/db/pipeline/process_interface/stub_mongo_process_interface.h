@@ -149,8 +149,8 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    BSONObj attachCursorSourceAndExplain(Pipeline* ownedPipeline,
-                                         ExplainOptions::Verbosity verbosity) override {
+    BSONObj preparePipelineAndExplain(Pipeline* ownedPipeline,
+                                      ExplainOptions::Verbosity verbosity) override {
         MONGO_UNREACHABLE;
     }
 
@@ -209,7 +209,7 @@ public:
 
     BackupCursorState openBackupCursor(OperationContext* opCtx,
                                        const StorageEngine::BackupOptions& options) final {
-        return BackupCursorState{UUID::gen(), boost::none, {}};
+        return BackupCursorState{UUID::gen(), boost::none, nullptr, {}};
     }
 
     void closeBackupCursor(OperationContext* opCtx, const UUID& backupId) final {}
@@ -258,6 +258,12 @@ public:
         }
 
         return {*fieldPaths, targetCollectionVersion};
+    }
+
+    void setExpectedShardVersion(OperationContext* opCtx,
+                                 const NamespaceString& nss,
+                                 boost::optional<ChunkVersion> chunkVersion) override {
+        // Do nothing.
     }
 };
 }  // namespace mongo

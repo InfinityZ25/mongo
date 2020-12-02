@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -94,6 +94,10 @@ intrusive_ptr<DocumentSource> DocumentSourceGeoNear::createFromBson(
     intrusive_ptr<DocumentSourceGeoNear> out = new DocumentSourceGeoNear(pCtx);
     out->parseOptions(elem.embeddedObjectUserCheck());
     return out;
+}
+
+bool DocumentSourceGeoNear::hasQuery() const {
+    return true;
 }
 
 void DocumentSourceGeoNear::parseOptions(BSONObj options) {

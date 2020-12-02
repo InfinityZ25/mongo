@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -38,16 +38,17 @@
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/range_arithmetic.h"
+#include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/range_deletion_util.h"
 #include "mongo/db/s/sharding_runtime_d_params_gen.h"
 #include "mongo/logv2/log.h"
-#include "mongo/s/grid.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace {
+
 using TaskExecutor = executor::TaskExecutor;
 using CallbackArgs = TaskExecutor::CallbackArgs;
 
@@ -56,45 +57,8 @@ using CallbackArgs = TaskExecutor::CallbackArgs;
  * input range.
  */
 bool metadataOverlapsRange(const CollectionMetadata& metadata, const ChunkRange& range) {
-    auto metadataShardKeyPattern = KeyPattern(metadata.getKeyPattern());
-
-    // If the input range is shorter than the range in the ChunkManager inside
-    // 'metadata', we must extend its bounds to get a correct comparison. If the input
-    // range is longer than the range in the ChunkManager, we likewise must shorten it.
-    // We make sure to match what's in the ChunkManager instead of the other way around,
-    // since the ChunkManager only stores ranges and compares overlaps using a string version of the
-    // key, rather than a BSONObj. This logic is necessary because the _metadata list can
-    // contain ChunkManagers with different shard keys if the shard key has been refined.
-    //
-    // Note that it's safe to use BSONObj::nFields() (which returns the number of top level
-    // fields in the BSONObj) to compare the two, since shard key refine operations can only add
-    // top-level fields.
-    //
-    // Using extractFieldsUndotted to shorten the input range is correct because the ChunkRange and
-    // the shard key pattern will both already store nested shard key fields as top-level dotted
-    // fields, and extractFieldsUndotted uses the top-level fields verbatim rather than treating
-    // dots as accessors for subfields.
-    auto chunkRangeToCompareToMetadata = [&] {
-        auto metadataShardKeyPatternBson = metadataShardKeyPattern.toBSON();
-        auto numFieldsInMetadataShardKey = metadataShardKeyPatternBson.nFields();
-        auto numFieldsInInputRangeShardKey = range.getMin().nFields();
-        if (numFieldsInInputRangeShardKey < numFieldsInMetadataShardKey) {
-            auto extendedRangeMin = metadataShardKeyPattern.extendRangeBound(
-                range.getMin(), false /* makeUpperInclusive */);
-            auto extendedRangeMax = metadataShardKeyPattern.extendRangeBound(
-                range.getMax(), false /* makeUpperInclusive */);
-            return ChunkRange(extendedRangeMin, extendedRangeMax);
-        } else if (numFieldsInInputRangeShardKey > numFieldsInMetadataShardKey) {
-            auto shortenedRangeMin =
-                range.getMin().extractFieldsUndotted(metadataShardKeyPatternBson);
-            auto shortenedRangeMax =
-                range.getMax().extractFieldsUndotted(metadataShardKeyPatternBson);
-            return ChunkRange(shortenedRangeMin, shortenedRangeMax);
-        } else {
-            return range;
-        }
-    }();
-
+    auto chunkRangeToCompareToMetadata =
+        migrationutil::extendOrTruncateBoundsForMetadata(metadata, range);
     return metadata.rangeOverlapsChunk(chunkRangeToCompareToMetadata);
 }
 
@@ -154,8 +118,7 @@ MetadataManager::MetadataManager(ServiceContext* serviceContext,
     : _serviceContext(serviceContext),
       _nss(std::move(nss)),
       _collectionUuid(*initialMetadata.getChunkManager()->getUUID()),
-      _executor(std::move(executor)),
-      _receivingChunks(SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<BSONObj>()) {
+      _executor(std::move(executor)) {
     _metadata.emplace_back(std::make_shared<CollectionMetadataTracker>(std::move(initialMetadata)));
 }
 
@@ -173,10 +136,6 @@ std::shared_ptr<ScopedCollectionDescription::Impl> MetadataManager::getActiveMet
             lg, shared_from_this(), std::move(activeMetadataTracker));
     }
 
-    auto chunkManager = activeMetadata->getChunkManager();
-    auto chunkManagerAtClusterTime = std::make_shared<ChunkManager>(
-        chunkManager->getRoutingHistory(), atClusterTime->asTimestamp());
-
     class MetadataAtTimestamp : public ScopedCollectionDescription::Impl {
     public:
         MetadataAtTimestamp(CollectionMetadata metadata) : _metadata(std::move(metadata)) {}
@@ -189,8 +148,9 @@ std::shared_ptr<ScopedCollectionDescription::Impl> MetadataManager::getActiveMet
         CollectionMetadata _metadata;
     };
 
-    return std::make_shared<MetadataAtTimestamp>(
-        CollectionMetadata(chunkManagerAtClusterTime, activeMetadata->shardId()));
+    return std::make_shared<MetadataAtTimestamp>(CollectionMetadata(
+        ChunkManager::makeAtTime(*activeMetadata->getChunkManager(), atClusterTime->asTimestamp()),
+        activeMetadata->shardId()));
 }
 
 size_t MetadataManager::numberOfMetadataSnapshots() const {
@@ -243,29 +203,6 @@ void MetadataManager::setFilteringMetadata(CollectionMetadata remoteMetadata) {
           "activeMetadata"_attr = activeMetadata.toStringBasic(),
           "remoteMetadata"_attr = remoteMetadata.toStringBasic());
 
-    // Resolve any receiving chunks, which might have completed by now
-    for (auto it = _receivingChunks.begin(); it != _receivingChunks.end();) {
-        const ChunkRange receivingRange(it->first, it->second);
-
-        if (!metadataOverlapsRange(remoteMetadata, receivingRange)) {
-            ++it;
-            continue;
-        }
-
-        // The remote metadata contains a chunk we were earlier in the process of receiving, so we
-        // deem it successfully received
-        LOGV2_DEBUG(21986,
-                    2,
-                    "Chunk {range} for {namespace} has already been migrated to this "
-                    "shard",
-                    "The incoming chunk migration for this shard has already been completed",
-                    "range"_attr = redact(receivingRange.toString()),
-                    "namespace"_attr = _nss.ns());
-
-        _receivingChunks.erase(it);
-        it = _receivingChunks.begin();
-    }
-
     _setActiveMetadata(lg, std::move(remoteMetadata));
 }
 
@@ -298,17 +235,6 @@ void MetadataManager::_retireExpiredMetadata(WithLock) {
     }
 }
 
-void MetadataManager::toBSONPending(BSONArrayBuilder& bb) const {
-    stdx::lock_guard<Latch> lg(_managerLock);
-
-    for (auto it = _receivingChunks.begin(); it != _receivingChunks.end(); ++it) {
-        BSONArrayBuilder pendingBB(bb.subarrayStart());
-        pendingBB.append(it->first);
-        pendingBB.append(it->second);
-        pendingBB.done();
-    }
-}
-
 void MetadataManager::append(BSONObjBuilder* builder) const {
     stdx::lock_guard<Latch> lg(_managerLock);
 
@@ -318,15 +244,6 @@ void MetadataManager::append(BSONObjBuilder* builder) const {
         range.append(&obj);
         arr.append(obj.done());
     }
-
-    BSONArrayBuilder pcArr(builder->subarrayStart("pendingChunks"));
-    for (const auto& entry : _receivingChunks) {
-        BSONObjBuilder obj;
-        ChunkRange r = ChunkRange(entry.first, entry.second);
-        r.append(&obj);
-        pcArr.append(obj.done());
-    }
-    pcArr.done();
 
     invariant(!_metadata.empty());
 
@@ -338,59 +255,6 @@ void MetadataManager::append(BSONObjBuilder* builder) const {
         amrArr.append(obj.done());
     }
     amrArr.done();
-}
-
-SharedSemiFuture<void> MetadataManager::beginReceive(ChunkRange const& range) {
-    stdx::lock_guard<Latch> lg(_managerLock);
-    invariant(!_metadata.empty());
-
-    if (_overlapsInUseChunk(lg, range)) {
-        return Status{ErrorCodes::RangeOverlapConflict,
-                      "Documents in target range may still be in use on the destination shard."};
-    }
-
-    _receivingChunks.emplace(range.getMin().getOwned(), range.getMax().getOwned());
-
-    LOGV2_OPTIONS(21987,
-                  {logv2::LogComponent::kShardingMigration},
-                  "Scheduling deletion of any documents in {namespace} range {range} before "
-                  "migrating in a chunk covering the range",
-                  "Scheduling deletion of any documents in the collection's specified range "
-                  "before migrating chunks into said range",
-                  "namespace"_attr = _nss.ns(),
-                  "range"_attr = redact(range.toString()));
-
-    return _submitRangeForDeletion(lg,
-                                   SemiFuture<void>::makeReady(),
-                                   range,
-                                   boost::none,
-                                   Seconds(orphanCleanupDelaySecs.load()));
-}
-
-void MetadataManager::forgetReceive(ChunkRange const& range) {
-    stdx::lock_guard<Latch> lg(_managerLock);
-    invariant(!_metadata.empty());
-
-    // This is potentially a partially received chunk, which needs to be cleaned up. We know none
-    // of these documents are in use, so they can go straight to the deletion queue.
-    LOGV2_OPTIONS(
-        21988,
-        {logv2::LogComponent::kShardingMigration},
-        "Abandoning incoming migration for {namespace} range {range}; scheduling deletion of any "
-        "documents already copied",
-        "Abandoning migration for the collection's specified range; scheduling deletion of any "
-        "documents already copied",
-        "namespace"_attr = _nss.ns(),
-        "range"_attr = redact(range.toString()));
-
-    invariant(!_overlapsInUseChunk(lg, range));
-
-    auto it = _receivingChunks.find(range.getMin());
-    invariant(it != _receivingChunks.end());
-    _receivingChunks.erase(it);
-
-    std::ignore =
-        _submitRangeForDeletion(lg, SemiFuture<void>::makeReady(), range, boost::none, Seconds(0));
 }
 
 SharedSemiFuture<void> MetadataManager::cleanUpRange(ChunkRange const& range,
@@ -405,12 +269,6 @@ SharedSemiFuture<void> MetadataManager::cleanUpRange(ChunkRange const& range,
     if (overlapMetadata == activeMetadata) {
         return Status{ErrorCodes::RangeOverlapConflict,
                       str::stream() << "Requested deletion range overlaps a live shard chunk"};
-    }
-
-    if (rangeMapOverlaps(_receivingChunks, range.getMin(), range.getMax())) {
-        return Status{ErrorCodes::RangeOverlapConflict,
-                      str::stream() << "Requested deletion range overlaps a chunk being"
-                                       " migrated in"};
     }
 
     auto delayForActiveQueriesOnSecondariesToComplete =
@@ -508,12 +366,6 @@ bool MetadataManager::_overlapsInUseChunk(WithLock lk, ChunkRange const& range) 
     return (cm != nullptr);
 }
 
-boost::optional<ChunkRange> MetadataManager::getNextOrphanRange(BSONObj const& from) const {
-    stdx::lock_guard<Latch> lg(_managerLock);
-    invariant(!_metadata.empty());
-    return _metadata.back()->metadata->getNextOrphanRange(_receivingChunks, from);
-}
-
 SharedSemiFuture<void> MetadataManager::_submitRangeForDeletion(
     const WithLock&,
     SemiFuture<void> waitForActiveQueriesToComplete,
@@ -551,8 +403,4 @@ SharedSemiFuture<void> MetadataManager::_submitRangeForDeletion(
     return cleanupComplete;
 }
 
-void MetadataManager::clearReceivingChunks() {
-    stdx::lock_guard<Latch> lg(_managerLock);
-    _receivingChunks.clear();
-}
 }  // namespace mongo

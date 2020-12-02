@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/exec/trial_stage.h"
@@ -40,7 +38,6 @@
 #include "mongo/db/exec/or.h"
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/logv2/log.h"
 
 namespace mongo {
 
@@ -76,11 +73,11 @@ Status TrialStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
     while (!_specificStats.trialCompleted) {
         WorkingSetID id = WorkingSet::INVALID_ID;
         const bool mustYield = (work(&id) == PlanStage::NEED_YIELD);
-        if (mustYield || yieldPolicy->shouldYieldOrInterrupt()) {
+        if (mustYield || yieldPolicy->shouldYieldOrInterrupt(expCtx()->opCtx)) {
             if (mustYield && !yieldPolicy->canAutoYield()) {
                 throw WriteConflictException();
             }
-            auto yieldStatus = yieldPolicy->yieldOrInterrupt();
+            auto yieldStatus = yieldPolicy->yieldOrInterrupt(expCtx()->opCtx);
             if (!yieldStatus.isOK()) {
                 return yieldStatus;
             }
@@ -141,18 +138,6 @@ PlanStage::StageState TrialStage::_workTrialPlan(WorkingSetID* out) {
             _specificStats.trialCompleted = _specificStats.trialSucceeded = true;
             _replaceCurrentPlan(_queuedData);
             return NEED_TIME;
-        case PlanStage::FAILURE:
-            // Either of these cause us to immediately end the trial phase and switch to the backup.
-            auto statusDoc = WorkingSetCommon::getStatusMemberDocument(*_ws, *out);
-            BSONObj statusObj = statusDoc ? statusDoc->toBson() : BSONObj();
-            LOGV2_DEBUG(20604,
-                        1,
-                        "Trial plan failed; switching to backup plan. Status: {statusObj}",
-                        "statusObj"_attr = redact(statusObj));
-            _specificStats.trialCompleted = true;
-            _replaceCurrentPlan(_backupPlan);
-            *out = WorkingSet::INVALID_ID;
-            return NEED_TIME;
     }
 
     MONGO_UNREACHABLE;
@@ -211,15 +196,6 @@ void TrialStage::doReattachToOperationContext() {
     }
     if (_queuedData) {
         _queuedData->reattachToOperationContext(opCtx());
-    }
-}
-
-void TrialStage::doDispose() {
-    if (_backupPlan) {
-        _backupPlan->dispose(opCtx());
-    }
-    if (_queuedData) {
-        _queuedData->dispose(opCtx());
     }
 }
 

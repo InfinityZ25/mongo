@@ -2,7 +2,11 @@
 // actually matters for lookup speed.  That is, if we're looking for a non-geo key of which
 // there are not many, the index order (nongeo, geo) should be faster than (geo, nongeo)
 // for 2dsphere.
-// @tags: [assumes_balancer_off, operations_longer_than_stepdown_interval_in_txns]
+// @tags: [
+//   assumes_balancer_off,
+//   operations_longer_than_stepdown_interval_in_txns,
+//   sbe_incompatible,
+// ]
 (function() {
 "use strict";
 
@@ -31,7 +35,7 @@ function makepoints(needle) {
 }
 
 function runTest(index) {
-    assert.commandWorked(coll.ensureIndex(index));
+    assert.commandWorked(coll.createIndex(index));
     const cursor =
         coll.find({nongeo: needle, geo: {$within: {$centerSphere: [[0, 0], Math.PI / 180.0]}}});
     const stats = cursor.explain("executionStats").executionStats;

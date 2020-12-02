@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -102,8 +102,7 @@ bool StorageEngineLockFile::createdByUncleanShutdown() const {
 Status StorageEngineLockFile::open() {
     try {
         if (!boost::filesystem::exists(_dbpath)) {
-            return Status(ErrorCodes::NonExistentPath,
-                          str::stream() << "Data directory " << _dbpath << " not found.");
+            return Status(ErrorCodes::NonExistentPath, _getNonExistentPathMessage());
         }
     } catch (const std::exception& ex) {
         return Status(ErrorCodes::UnknownError,
@@ -190,7 +189,10 @@ void StorageEngineLockFile::clearPidAndUnlock() {
     // with StorageEngineLockFile::open().
     Status status = _truncateFile(_lockFileHandle->_handle);
     if (!status.isOK()) {
-        LOGV2(22282, "couldn't remove fs lock {status}", "status"_attr = status.toString());
+        LOGV2(22282,
+              "couldn't remove fs lock: {error}",
+              "Couldn't remove fs lock",
+              "error"_attr = status);
     }
     CloseHandle(_lockFileHandle->_handle);
     _lockFileHandle->clear();

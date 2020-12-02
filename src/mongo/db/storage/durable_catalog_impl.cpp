@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/db/storage/durable_catalog_impl.h"
 
@@ -37,12 +37,12 @@
 
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/bson/util/builder.h"
-#include "mongo/db/catalog/index_timestamp_helper.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/storage/durable_catalog_feature_tracker.h"
 #include "mongo/db/storage/kv/kv_engine.h"
@@ -65,6 +65,7 @@ const char kNamespaceFieldName[] = "ns";
 const char kNonRepairableFeaturesFieldName[] = "nonRepairable";
 const char kRepairableFeaturesFieldName[] = "repairable";
 const char kInternalIdentPrefix[] = "internal-";
+const char kResumableIndexBuildIdentStem[] = "resumable-index-build-";
 
 void appendPositionsOfBitsSet(uint64_t value, StringBuilder* sb) {
     invariant(sb);
@@ -140,6 +141,47 @@ bool indexTypeSupportsPathLevelMultikeyTracking(StringData accessMethod) {
     return accessMethod == IndexNames::BTREE || accessMethod == IndexNames::GEO_2DSPHERE;
 }
 
+/**
+ * Returns true if writes to the catalog entry for the input namespace require being timestamped.
+ */
+bool requiresTimestampForCatalogWrite(OperationContext* opCtx, const NamespaceString& nss) {
+    if (!nss.isReplicated() || nss.coll().startsWith("tmp.mr.") || nss.isDropPendingNamespace()) {
+        return false;
+    }
+
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    if (!replCoord->isReplEnabled()) {
+        return false;
+    }
+
+    if (replCoord->canAcceptWritesFor(opCtx, nss)) {
+        return false;
+    }
+
+    // If there is a timestamp already assigned, there's no need to explicitly assign a timestamp.
+    if (opCtx->recoveryUnit()->isTimestamped()) {
+        return false;
+    }
+
+    // Nodes in `startup` do not need to timestamp writes.
+    // Nodes in the oplog application phase of initial sync (`startup2`) must not timestamp writes
+    // before the `initialDataTimestamp`.  Nodes in initial sync may also be in the `removed` state
+    // due to DNS resolution errors; they may continue writing during that time.
+    const auto memberState = replCoord->getMemberState();
+    if (memberState.startup() || memberState.startup2() || memberState.removed()) {
+        return false;
+    }
+
+    // When rollback completes, index builds may be restarted, which requires untimestamped catalog
+    // writes. Additionally, it's illegal to timestamp a write later than the timestamp associated
+    // with the node exiting the rollback state.
+    if (memberState.rollback()) {
+        return false;
+    }
+
+    return true;
+}
+
 }  // namespace
 
 using std::string;
@@ -178,69 +220,18 @@ public:
 
 class DurableCatalogImpl::AddIndexChange : public RecoveryUnit::Change {
 public:
-    AddIndexChange(OperationContext* opCtx,
-                   RecoveryUnit* ru,
-                   StorageEngineInterface* engine,
-                   StringData ident)
-        : _opCtx(opCtx), _recoveryUnit(ru), _engine(engine), _ident(ident.toString()) {}
+    AddIndexChange(RecoveryUnit* ru, StorageEngineInterface* engine, StringData ident)
+        : _recoveryUnit(ru), _engine(engine), _ident(ident.toString()) {}
 
     virtual void commit(boost::optional<Timestamp>) {}
     virtual void rollback() {
         // Intentionally ignoring failure.
         auto kvEngine = _engine->getEngine();
-        MONGO_COMPILER_VARIABLE_UNUSED auto status =
-            kvEngine->dropIdent(_opCtx, _recoveryUnit, _ident);
+        kvEngine->dropIdent(_recoveryUnit, _ident).ignore();
     }
 
-    OperationContext* const _opCtx;
     RecoveryUnit* const _recoveryUnit;
     StorageEngineInterface* _engine;
-    const std::string _ident;
-};
-
-class DurableCatalogImpl::RemoveIndexChange : public RecoveryUnit::Change {
-public:
-    RemoveIndexChange(OperationContext* opCtx,
-                      StorageEngineInterface* engine,
-                      OptionalCollectionUUID uuid,
-                      const NamespaceString& indexNss,
-                      StringData indexName,
-                      StringData ident)
-        : _opCtx(opCtx),
-          _recoveryUnit(opCtx->recoveryUnit()),
-          _engine(engine),
-          _uuid(uuid),
-          _indexNss(indexNss),
-          _indexName(indexName),
-          _ident(ident.toString()) {}
-
-    virtual void rollback() {}
-    virtual void commit(boost::optional<Timestamp> commitTimestamp) {
-        // Intentionally ignoring failure here. Since we've removed the metadata pointing to the
-        // index, we should never see it again anyway.
-        if (_engine->getStorageEngine()->supportsPendingDrops() && commitTimestamp) {
-            LOGV2(22206,
-                  "Deferring table drop for index '{indexName}' on collection "
-                  "'{indexNss}{uuid_uuid}. Ident: '{ident}', commit timestamp: '{commitTimestamp}'",
-                  "indexName"_attr = _indexName,
-                  "indexNss"_attr = _indexNss,
-                  "uuid_uuid"_attr = (_uuid ? " (" + _uuid->toString() + ")'" : ""),
-                  "ident"_attr = _ident,
-                  "commitTimestamp"_attr = commitTimestamp);
-            _engine->addDropPendingIdent(*commitTimestamp, _indexNss, _ident);
-        } else {
-            auto kvEngine = _engine->getEngine();
-            MONGO_COMPILER_VARIABLE_UNUSED auto status =
-                kvEngine->dropIdent(_opCtx, _recoveryUnit, _ident);
-        }
-    }
-
-    OperationContext* const _opCtx;
-    RecoveryUnit* const _recoveryUnit;
-    StorageEngineInterface* _engine;
-    OptionalCollectionUUID _uuid;
-    const NamespaceString _indexNss;
-    const std::string _indexName;
     const std::string _ident;
 };
 
@@ -352,7 +343,9 @@ DurableCatalogImpl::FeatureTracker::FeatureBits DurableCatalogImpl::FeatureTrack
     if (!nonRepairableFeaturesStatus.isOK()) {
         LOGV2_ERROR(22215,
                     "error: exception extracting typed field with obj:{obj}",
-                    "obj"_attr = redact(obj));
+                    "Exception extracting typed field from obj",
+                    "obj"_attr = redact(obj),
+                    "fieldName"_attr = kNonRepairableFeaturesFieldName);
         fassert(40111, nonRepairableFeaturesStatus);
     }
 
@@ -362,7 +355,9 @@ DurableCatalogImpl::FeatureTracker::FeatureBits DurableCatalogImpl::FeatureTrack
     if (!repairableFeaturesStatus.isOK()) {
         LOGV2_ERROR(22216,
                     "error: exception extracting typed field with obj:{obj}",
-                    "obj"_attr = redact(obj));
+                    "Exception extracting typed field from obj",
+                    "obj"_attr = redact(obj),
+                    "fieldName"_attr = kRepairableFeaturesFieldName);
         fassert(40112, repairableFeaturesStatus);
     }
 
@@ -408,6 +403,7 @@ DurableCatalogImpl::DurableCatalogImpl(RecordStore* rs,
       _directoryPerDb(directoryPerDb),
       _directoryForIndexes(directoryForIndexes),
       _rand(_newRand()),
+      _next(0),
       _engine(engine) {}
 
 DurableCatalogImpl::~DurableCatalogImpl() {
@@ -418,8 +414,7 @@ std::string DurableCatalogImpl::_newRand() {
     return str::stream() << SecureRandom().nextInt64();
 }
 
-bool DurableCatalogImpl::_hasEntryCollidingWithRand() const {
-    // Only called from init() so don't need to lock.
+bool DurableCatalogImpl::_hasEntryCollidingWithRand(WithLock) const {
     for (auto it = _catalogIdToEntryMap.begin(); it != _catalogIdToEntryMap.end(); ++it) {
         if (StringData(it->second.ident).endsWith(_rand))
             return true;
@@ -428,9 +423,19 @@ bool DurableCatalogImpl::_hasEntryCollidingWithRand() const {
 }
 
 std::string DurableCatalogImpl::newInternalIdent() {
+    return _newInternalIdent("");
+}
+
+std::string DurableCatalogImpl::newInternalResumableIndexBuildIdent() {
+    return _newInternalIdent(kResumableIndexBuildIdentStem);
+}
+
+std::string DurableCatalogImpl::_newInternalIdent(StringData identStem) {
+    stdx::lock_guard<Latch> lk(_randLock);
     StringBuilder buf;
     buf << kInternalIdentPrefix;
-    buf << _next.fetchAndAdd(1) << '-' << _rand;
+    buf << identStem;
+    buf << _next++ << '-' << _rand;
     return buf.str();
 }
 
@@ -444,13 +449,14 @@ std::string DurableCatalogImpl::getFilesystemPathForDb(const std::string& dbName
 
 std::string DurableCatalogImpl::_newUniqueIdent(NamespaceString nss, const char* kind) {
     // If this changes to not put _rand at the end, _hasEntryCollidingWithRand will need fixing.
+    stdx::lock_guard<Latch> lk(_randLock);
     StringBuilder buf;
     if (_directoryPerDb) {
         buf << escapeDbName(nss.db()) << '/';
     }
     buf << kind;
     buf << (_directoryForIndexes ? '/' : '-');
-    buf << _next.fetchAndAdd(1) << '-' << _rand;
+    buf << _next++ << '-' << _rand;
     return buf.str();
 }
 
@@ -487,7 +493,8 @@ void DurableCatalogImpl::init(OperationContext* opCtx) {
     }
 
     // In the unlikely event that we have used this _rand before generate a new one.
-    while (_hasEntryCollidingWithRand()) {
+    stdx::lock_guard<Latch> lk(_randLock);
+    while (_hasEntryCollidingWithRand(lk)) {
         _rand = _newRand();
     }
 }
@@ -553,6 +560,27 @@ StatusWith<DurableCatalog::Entry> DurableCatalogImpl::_addEntry(OperationContext
                 "stored meta data for {nss_ns} @ {res_getValue}",
                 "nss_ns"_attr = nss.ns(),
                 "res_getValue"_attr = res.getValue());
+    return {{res.getValue(), ident, nss}};
+}
+
+StatusWith<DurableCatalog::Entry> DurableCatalogImpl::_importEntry(OperationContext* opCtx,
+                                                                   NamespaceString nss,
+                                                                   const BSONObj& metadata) {
+    invariant(opCtx->lockState()->isDbLockedForMode(nss.db(), MODE_IX));
+
+    const string ident = metadata["ident"].String();
+    StatusWith<RecordId> res =
+        _rs->insertRecord(opCtx, metadata.objdata(), metadata.objsize(), Timestamp());
+    if (!res.isOK())
+        return res.getStatus();
+
+    stdx::lock_guard<Latch> lk(_catalogIdToEntryMapLock);
+    invariant(_catalogIdToEntryMap.find(res.getValue()) == _catalogIdToEntryMap.end());
+    _catalogIdToEntryMap[res.getValue()] = {res.getValue(), ident, nss};
+    opCtx->recoveryUnit()->registerChange(std::make_unique<AddIdentChange>(this, res.getValue()));
+
+    LOGV2_DEBUG(
+        5095101, 1, "imported meta data", "nss"_attr = nss.ns(), "metadata"_attr = res.getValue());
     return {{res.getValue(), ident, nss}};
 }
 
@@ -629,14 +657,36 @@ void DurableCatalogImpl::putMetaData(OperationContext* opCtx,
         obj = b.obj();
     }
 
-    if (IndexTimestampHelper::requiresGhostCommitTimestampForCatalogWrite(opCtx, nss) &&
-        !nss.isDropPendingNamespace()) {
+    if (requiresTimestampForCatalogWrite(opCtx, nss)) {
         opCtx->recoveryUnit()->setMustBeTimestamped();
     }
 
     LOGV2_DEBUG(22211, 3, "recording new metadata: {obj}", "obj"_attr = obj);
     Status status = _rs->updateRecord(opCtx, catalogId, obj.objdata(), obj.objsize());
     fassert(28521, status);
+}
+
+Status DurableCatalogImpl::checkMetaDataForIndex(OperationContext* opCtx,
+                                                 RecordId catalogId,
+                                                 const std::string& indexName,
+                                                 const BSONObj& spec) {
+    auto md = getMetaData(opCtx, catalogId);
+    int offset = md.findIndexOffset(indexName);
+    if (offset < 0) {
+        return {ErrorCodes::IndexNotFound,
+                str::stream() << "Index [" << indexName
+                              << "] not found in metadata for recordId: " << catalogId};
+    }
+
+    if (spec.woCompare(md.indexes[offset].spec)) {
+        return {ErrorCodes::BadValue,
+                str::stream() << "Spec for index [" << indexName
+                              << "] does not match spec in the metadata for recordId: " << catalogId
+                              << ". Spec: " << spec
+                              << " metadata's spec: " << md.indexes[offset].spec};
+    }
+
+    return Status::OK();
 }
 
 Status DurableCatalogImpl::_replaceEntry(OperationContext* opCtx,
@@ -676,9 +726,7 @@ Status DurableCatalogImpl::_replaceEntry(OperationContext* opCtx,
         it->second.nss = fromName;
     });
 
-    NamespaceString fromNss(fromName);
-    if (IndexTimestampHelper::requiresGhostCommitTimestampForCatalogWrite(opCtx, fromNss) &&
-        !fromNss.isDropPendingNamespace()) {
+    if (requiresTimestampForCatalogWrite(opCtx, fromName)) {
         opCtx->recoveryUnit()->setMustBeTimestamped();
     }
 
@@ -746,6 +794,11 @@ bool DurableCatalogImpl::isInternalIdent(StringData ident) const {
     return ident.find(kInternalIdentPrefix) != std::string::npos;
 }
 
+bool DurableCatalogImpl::isResumableIndexBuildIdent(StringData ident) const {
+    invariant(isInternalIdent(ident), ident.toString());
+    return ident.find(kResumableIndexBuildIdentStem) != std::string::npos;
+}
+
 bool DurableCatalogImpl::isCollectionIdent(StringData ident) const {
     // Internal idents prefixed "internal-" should not be considered collections, because
     // they are not eligible for orphan recovery through repair.
@@ -803,7 +856,7 @@ StatusWith<std::pair<RecordId, std::unique_ptr<RecordStore>>> DurableCatalogImpl
     invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_IX));
     invariant(nss.coll().size() > 0);
 
-    if (CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss)) {
+    if (CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss)) {
         throw WriteConflictException();
     }
 
@@ -829,17 +882,124 @@ StatusWith<std::pair<RecordId, std::unique_ptr<RecordStore>>> DurableCatalogImpl
 
     auto ru = opCtx->recoveryUnit();
     CollectionUUID uuid = options.uuid.get();
-    opCtx->recoveryUnit()->onRollback(
-        [opCtx, ru, catalog = this, nss, ident = entry.ident, uuid]() {
-            // Intentionally ignoring failure
-            catalog->_engine->getEngine()->dropIdent(opCtx, ru, ident).ignore();
-        });
+    opCtx->recoveryUnit()->onRollback([ru, catalog = this, nss, ident = entry.ident, uuid]() {
+        // Intentionally ignoring failure
+        catalog->_engine->getEngine()->dropIdent(ru, ident).ignore();
+    });
 
     auto rs =
         _engine->getEngine()->getGroupedRecordStore(opCtx, nss.ns(), entry.ident, options, prefix);
     invariant(rs);
 
     return std::pair<RecordId, std::unique_ptr<RecordStore>>(entry.catalogId, std::move(rs));
+}
+
+StatusWith<DurableCatalog::ImportResult> DurableCatalogImpl::importCollection(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const BSONObj& metadata,
+    const BSONObj& storageMetadata,
+    DurableCatalogImpl::ImportCollectionUUIDOption uuidOption) {
+    invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_X));
+    invariant(nss.coll().size() > 0);
+
+    uassert(ErrorCodes::NamespaceExists,
+            str::stream() << "Collection already exists. NS: " << nss,
+            !CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss));
+
+    BSONCollectionCatalogEntry::MetaData md;
+    const BSONElement mdElement = metadata["md"];
+    uassert(ErrorCodes::BadValue, "Malformed catalog metadata", mdElement.isABSONObj());
+    md.parse(mdElement.Obj());
+
+    uassert(ErrorCodes::BadValue,
+            "Attempted to import catalog entry without an ident",
+            metadata.hasField("ident"));
+    uassert(ErrorCodes::BadValue,
+            "Attempted to import collection without idxIdent",
+            metadata.hasField("idxIdent"));
+
+    const auto& catalogEntry = [&] {
+        if (uuidOption == ImportCollectionUUIDOption::kGenerateNew) {
+            // Generate a new UUID for the collection.
+            md.options.uuid = CollectionUUID::gen();
+            BSONObjBuilder catalogEntryBuilder;
+            // Generate a new "md" field after setting the new UUID.
+            catalogEntryBuilder.append("md", md.toBSON());
+            // Append the rest of the metadata.
+            catalogEntryBuilder.appendElementsUnique(metadata);
+            return catalogEntryBuilder.obj();
+        }
+        return metadata;
+    }();
+
+    // Before importing the idents belonging to the collection and indexes, change '_rand' if there
+    // will be a conflict.
+    std::set<std::string> indexIdents;
+    {
+        const std::string collectionIdent = catalogEntry["ident"].String();
+
+        for (const auto& indexIdent : catalogEntry["idxIdent"].Obj()) {
+            indexIdents.insert(indexIdent.String());
+        }
+
+        auto identsToImportConflict = [&](WithLock) -> bool {
+            if (StringData(collectionIdent).endsWith(_rand)) {
+                return true;
+            }
+
+            for (const std::string& ident : indexIdents) {
+                if (StringData(ident).endsWith(_rand)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        stdx::lock_guard<Latch> lk(_randLock);
+        while (_hasEntryCollidingWithRand(lk) || identsToImportConflict(lk)) {
+            _rand = _newRand();
+        }
+    }
+
+    StatusWith<Entry> swEntry = _importEntry(opCtx, nss, catalogEntry);
+    if (!swEntry.isOK())
+        return swEntry.getStatus();
+    Entry& entry = swEntry.getValue();
+
+    auto kvEngine = _engine->getEngine();
+    Status status = kvEngine->importRecordStore(opCtx, entry.ident, storageMetadata);
+    if (!status.isOK())
+        return status;
+
+    for (const std::string& indexIdent : indexIdents) {
+        status = kvEngine->importSortedDataInterface(opCtx, indexIdent, storageMetadata);
+        if (!status.isOK()) {
+            return status;
+        }
+    }
+
+    // Mark collation feature as in use if the collection has a non-simple default collation.
+    if (!md.options.collation.isEmpty()) {
+        const auto feature = DurableCatalogImpl::FeatureTracker::NonRepairableFeature::kCollation;
+        if (getFeatureTracker()->isNonRepairableFeatureInUse(opCtx, feature)) {
+            getFeatureTracker()->markNonRepairableFeatureAsInUse(opCtx, feature);
+        }
+    }
+
+    opCtx->recoveryUnit()->onRollback(
+        [opCtx, catalog = this, ident = entry.ident, indexIdents = indexIdents]() {
+            catalog->_engine->getEngine()->dropIdentForImport(opCtx, ident);
+            for (const auto& indexIdent : indexIdents) {
+                catalog->_engine->getEngine()->dropIdentForImport(opCtx, indexIdent);
+            }
+        });
+
+    auto rs = _engine->getEngine()->getGroupedRecordStore(
+        opCtx, nss.ns(), entry.ident, md.options, md.prefix);
+    invariant(rs);
+
+    return DurableCatalog::ImportResult(entry.catalogId, std::move(rs), md.options.uuid.get());
 }
 
 Status DurableCatalogImpl::renameCollection(OperationContext* opCtx,
@@ -857,15 +1017,6 @@ Status DurableCatalogImpl::dropCollection(OperationContext* opCtx, RecordId cata
     }
 
     invariant(opCtx->lockState()->isCollectionLockedForMode(entry.nss, MODE_X));
-    invariant(getTotalIndexCount(opCtx, catalogId) == getCompletedIndexCount(opCtx, catalogId));
-    {
-        std::vector<std::string> indexNames;
-        getAllIndexes(opCtx, catalogId, &indexNames);
-        for (size_t i = 0; i < indexNames.size(); i++) {
-            Status status = removeIndex(opCtx, catalogId, indexNames[i]);
-        }
-    }
-
     invariant(getTotalIndexCount(opCtx, catalogId) == 0);
 
     // Remove metadata from mdb_catalog
@@ -873,28 +1024,6 @@ Status DurableCatalogImpl::dropCollection(OperationContext* opCtx, RecordId cata
     if (!status.isOK()) {
         return status;
     }
-
-    auto ru = opCtx->recoveryUnit();
-    // This will notify the storageEngine to drop the collection only on WUOW::commit().
-    opCtx->recoveryUnit()->onCommit(
-        [opCtx, ru, catalog = this, entry](boost::optional<Timestamp> commitTimestamp) {
-            StorageEngineInterface* engine = catalog->_engine;
-            auto storageEngine = engine->getStorageEngine();
-            if (storageEngine->supportsPendingDrops() && commitTimestamp) {
-                LOGV2(22214,
-                      "Deferring table drop for collection '{entry_nss}'. Ident: {entry_ident}, "
-                      "commit timestamp: {commitTimestamp}",
-                      "entry_nss"_attr = entry.nss,
-                      "entry_ident"_attr = entry.ident,
-                      "commitTimestamp"_attr = commitTimestamp);
-                engine->addDropPendingIdent(*commitTimestamp, entry.nss, entry.ident);
-            } else {
-                // Intentionally ignoring failure here. Since we've removed the metadata pointing to
-                // the collection, we should never see it again anyway.
-                auto kvEngine = engine->getEngine();
-                kvEngine->dropIdent(opCtx, ru, entry.ident).ignore();
-            }
-        });
 
     return Status::OK();
 }
@@ -964,23 +1093,16 @@ void DurableCatalogImpl::updateValidator(OperationContext* opCtx,
     putMetaData(opCtx, catalogId, md);
 }
 
-Status DurableCatalogImpl::removeIndex(OperationContext* opCtx,
-                                       RecordId catalogId,
-                                       StringData indexName) {
+void DurableCatalogImpl::removeIndex(OperationContext* opCtx,
+                                     RecordId catalogId,
+                                     StringData indexName) {
     BSONCollectionCatalogEntry::MetaData md = getMetaData(opCtx, catalogId);
 
     if (md.findIndexOffset(indexName) < 0)
-        return Status::OK();  // never had the index so nothing to do.
-
-    const string ident = getIndexIdent(opCtx, catalogId, indexName);
+        return;  // never had the index so nothing to do.
 
     md.eraseIndex(indexName);
     putMetaData(opCtx, catalogId, md);
-
-    // Lazily remove to isolate underlying engine from rollback.
-    opCtx->recoveryUnit()->registerChange(std::make_unique<RemoveIndexChange>(
-        opCtx, _engine, md.options.uuid, NamespaceString(md.ns), indexName, ident));
-    return Status::OK();
 }
 
 Status DurableCatalogImpl::prepareForIndexBuild(OperationContext* opCtx,
@@ -1028,8 +1150,23 @@ Status DurableCatalogImpl::prepareForIndexBuild(OperationContext* opCtx,
         opCtx, getCollectionOptions(opCtx, catalogId), ident, spec, prefix);
     if (status.isOK()) {
         opCtx->recoveryUnit()->registerChange(
-            std::make_unique<AddIndexChange>(opCtx, opCtx->recoveryUnit(), _engine, ident));
+            std::make_unique<AddIndexChange>(opCtx->recoveryUnit(), _engine, ident));
     }
+
+    return status;
+}
+
+Status DurableCatalogImpl::dropAndRecreateIndexIdentForResume(OperationContext* opCtx,
+                                                              RecordId catalogId,
+                                                              const IndexDescriptor* spec,
+                                                              StringData ident,
+                                                              KVPrefix prefix) {
+    auto status = _engine->getEngine()->dropGroupedSortedDataInterface(opCtx, ident);
+    if (!status.isOK())
+        return status;
+
+    status = _engine->getEngine()->createGroupedSortedDataInterface(
+        opCtx, getCollectionOptions(opCtx, catalogId), ident, spec, prefix);
 
     return status;
 }
@@ -1221,4 +1358,15 @@ KVPrefix DurableCatalogImpl::getIndexPrefix(OperationContext* opCtx,
                             << " : " << md.toBSON());
     return md.indexes[offset].prefix;
 }
+
+void DurableCatalogImpl::setRand_forTest(const std::string& rand) {
+    stdx::lock_guard<Latch> lk(_randLock);
+    _rand = rand;
+}
+
+std::string DurableCatalogImpl::getRand_forTest() const {
+    stdx::lock_guard<Latch> lk(_randLock);
+    return _rand;
+}
+
 }  // namespace mongo

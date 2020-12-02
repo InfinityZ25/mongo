@@ -42,6 +42,7 @@
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/execution_context.h"
+#include "mongo/db/storage/index_entry_comparison.h"
 #include "mongo/logv2/log.h"
 
 namespace mongo {
@@ -81,9 +82,14 @@ bool WorkingSetCommon::fetch(OperationContext* opCtx,
         // The record referenced by this index entry is gone. If the query yielded some time after
         // we first examined the index entry, then it's likely that the record was deleted while we
         // were yielding. However, if the snapshot id hasn't changed since the index lookup, then
-        // there could not have been a yield, and the only explanation is corruption.
+        // there could not have been a yield, meaning the document we are searching for has been
+        // deleted.
+        // One possibility is that the record was deleted by a prepared transaction, but if we are
+        // not ignoring prepare conflicts, then this definitely indicates an error.
         std::vector<IndexKeyDatum>::iterator keyDataIt;
         if (member->getState() == WorkingSetMember::RID_AND_IDX &&
+            opCtx->recoveryUnit()->getPrepareConflictBehavior() ==
+                PrepareConflictBehavior::kEnforce &&
             (keyDataIt = std::find_if(member->keyData.begin(),
                                       member->keyData.end(),
                                       [currentSnapshotId = opCtx->recoveryUnit()->getSnapshotId()](
@@ -92,23 +98,24 @@ bool WorkingSetCommon::fetch(OperationContext* opCtx,
                                       })) != member->keyData.end()) {
             auto indexKeyEntryToObjFn = [](const IndexKeyDatum& ikd) {
                 BSONObjBuilder builder;
-                builder.append("key"_sd, redact(ikd.keyData));
+                // Rehydrate the index key fields to prevent duplicate "" fields from being logged.
+                builder.append(
+                    "key"_sd,
+                    redact(IndexKeyEntry::rehydrateKey(ikd.indexKeyPattern, ikd.keyData)));
                 builder.append("pattern"_sd, ikd.indexKeyPattern);
                 return builder.obj();
             };
             LOGV2_ERROR_OPTIONS(
                 4615603,
                 {logv2::UserAssertAfterLog(ErrorCodes::DataCorruptionDetected)},
-                "Erroneous index key found with reference to non-existent record id "
-                "{recordId}: "
-                "{indexKeyData}. Consider dropping and then re-creating the index with key "
-                "pattern "
-                "{indexKeyPattern} and then running the validate command on the collection.",
+                "Erroneous index key found with reference to non-existent record id. Consider "
+                "dropping and then re-creating the index and then running the validate command "
+                "on the collection.",
+                "namespace"_attr = ns,
                 "recordId"_attr = member->recordId,
                 "indexKeyData"_attr = logv2::seqLog(
                     boost::make_transform_iterator(member->keyData.begin(), indexKeyEntryToObjFn),
-                    boost::make_transform_iterator(member->keyData.end(), indexKeyEntryToObjFn)),
-                "indexKeyPattern"_attr = keyDataIt->indexKeyPattern);
+                    boost::make_transform_iterator(member->keyData.end(), indexKeyEntryToObjFn)));
         }
         return false;
     }
@@ -160,79 +167,6 @@ bool WorkingSetCommon::fetch(OperationContext* opCtx,
     member->keyData.clear();
     workingSet->transitionToRecordIdAndObj(id);
     return true;
-}
-
-Document WorkingSetCommon::buildMemberStatusObject(const Status& status) {
-    BSONObjBuilder bob;
-    bob.append("ok", status.isOK() ? 1.0 : 0.0);
-    bob.append("code", status.code());
-    bob.append("errmsg", status.reason());
-    if (auto extraInfo = status.extraInfo()) {
-        extraInfo->serialize(&bob);
-    }
-
-    return Document{bob.obj()};
-}
-
-WorkingSetID WorkingSetCommon::allocateStatusMember(WorkingSet* ws, const Status& status) {
-    invariant(ws);
-
-    WorkingSetID wsid = ws->allocate();
-    WorkingSetMember* member = ws->get(wsid);
-    member->doc = {SnapshotId(), buildMemberStatusObject(status)};
-    member->transitionToOwnedObj();
-
-    return wsid;
-}
-
-bool WorkingSetCommon::isValidStatusMemberObject(const Document& obj) {
-    return !obj["ok"].missing() && obj["code"].getType() == BSONType::NumberInt &&
-        obj["errmsg"].getType() == BSONType::String;
-}
-
-bool WorkingSetCommon::isValidStatusMemberObject(const BSONObj& obj) {
-    return isValidStatusMemberObject(Document{obj});
-}
-
-boost::optional<Document> WorkingSetCommon::getStatusMemberDocument(const WorkingSet& ws,
-                                                                    WorkingSetID wsid) {
-    if (WorkingSet::INVALID_ID == wsid) {
-        return boost::none;
-    }
-    auto member = ws.get(wsid);
-    if (!member->hasOwnedObj()) {
-        return boost::none;
-    }
-
-    if (!isValidStatusMemberObject(member->doc.value())) {
-        return boost::none;
-    }
-    return member->doc.value();
-}
-
-Status WorkingSetCommon::getMemberObjectStatus(const BSONObj& memberObj) {
-    invariant(WorkingSetCommon::isValidStatusMemberObject(memberObj));
-    return Status(ErrorCodes::Error(memberObj["code"].numberInt()),
-                  memberObj["errmsg"].valueStringData(),
-                  memberObj);
-}
-
-Status WorkingSetCommon::getMemberObjectStatus(const Document& doc) {
-    return getMemberObjectStatus(doc.toBson());
-}
-
-Status WorkingSetCommon::getMemberStatus(const WorkingSetMember& member) {
-    invariant(member.hasObj());
-    return getMemberObjectStatus(member.doc.value().toBson());
-}
-
-std::string WorkingSetCommon::toStatusString(const BSONObj& obj) {
-    Document doc{obj};
-    if (!isValidStatusMemberObject(doc)) {
-        Status unknownStatus(ErrorCodes::UnknownError, "no details available");
-        return unknownStatus.toString();
-    }
-    return getMemberObjectStatus(doc).toString();
 }
 
 }  // namespace mongo

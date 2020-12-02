@@ -1,7 +1,5 @@
 # -*- mode: python -*-
 
-import libdeps
-
 Import([
     'env',
     'get_option',
@@ -13,7 +11,7 @@ env.Library(
     target='scripting_common',
     source=[
         'deadline_monitor.cpp',
-        env.Idlc('deadline_monitor.idl')[0],
+        'deadline_monitor.idl',
         'dbdirectclient_factory.cpp',
         'engine.cpp',
         'jsexception.cpp',
@@ -110,19 +108,19 @@ if usemozjs:
             'mozjs/uri.cpp',
             'mozjs/valuereader.cpp',
             'mozjs/valuewriter.cpp',
-            env.Idlc('mozjs/engine.idl')[0],
-            env.Idlc('mozjs/scripting_util.idl')[0],
+            'mozjs/engine.idl',
+            'mozjs/scripting_util.idl',
         ],
         LIBDEPS=[
+            '$BUILD_DIR/mongo/db/service_context',
+            '$BUILD_DIR/mongo/shell/mongojs',
             'bson_template_evaluator',
             'scripting_common',
-            '$BUILD_DIR/mongo/shell/mongojs',
-            '$BUILD_DIR/mongo/db/service_context',
         ],
         LIBDEPS_PRIVATE=[
             '$BUILD_DIR/mongo/client/clientdriver_network',
-            '$BUILD_DIR/third_party/shim_mozjs',
             '$BUILD_DIR/mongo/idl/server_parameter',
+            '$BUILD_DIR/third_party/shim_mozjs',
         ],
     )
 else:

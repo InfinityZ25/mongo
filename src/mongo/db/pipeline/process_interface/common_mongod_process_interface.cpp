@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -52,7 +52,9 @@
 #include "mongo/db/pipeline/document_source_cursor.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/pipeline/pipeline_d.h"
+#include "mongo/db/query/collection_index_usage_tracker_decoration.h"
 #include "mongo/db/query/collection_query_info.h"
+#include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/repl/speculative_majority_read_info.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
@@ -154,9 +156,8 @@ std::vector<Document> CommonMongodProcessInterface::getIndexStats(OperationConte
                                                                   const NamespaceString& ns,
                                                                   StringData host,
                                                                   bool addShardName) {
-    AutoGetCollectionForReadCommand autoColl(opCtx, ns);
+    AutoGetCollectionForReadCommand collection(opCtx, ns);
 
-    Collection* collection = autoColl.getCollection();
     std::vector<Document> indexStats;
     if (!collection) {
         LOGV2_DEBUG(23881,
@@ -166,16 +167,18 @@ std::vector<Document> CommonMongodProcessInterface::getIndexStats(OperationConte
         return indexStats;
     }
 
-    auto indexStatsMap = CollectionQueryInfo::get(collection).getIndexUsageStats();
-    for (auto&& indexStatsMapIter : indexStatsMap) {
+    auto indexStatsMap =
+        CollectionIndexUsageTrackerDecoration::get(collection->getSharedDecorations())
+            .getUsageStats();
+    for (auto&& indexStatsMapIter : *indexStatsMap) {
         auto indexName = indexStatsMapIter.first;
         auto stats = indexStatsMapIter.second;
         MutableDocument doc;
         doc["name"] = Value(indexName);
-        doc["key"] = Value(stats.indexKey);
+        doc["key"] = Value(stats->indexKey);
         doc["host"] = Value(host);
-        doc["accesses"]["ops"] = Value(stats.accesses.loadRelaxed());
-        doc["accesses"]["since"] = Value(stats.trackerStartTime);
+        doc["accesses"]["ops"] = Value(stats->accesses.loadRelaxed());
+        doc["accesses"]["since"] = Value(stats->trackerStartTime);
 
         if (addShardName)
             doc["shard"] = Value(getShardName(opCtx));
@@ -191,7 +194,14 @@ std::vector<Document> CommonMongodProcessInterface::getIndexStats(OperationConte
         auto entry = idxCatalog->getEntry(idx);
         doc["spec"] = Value(idx->infoObj());
 
-        if (!entry->isReady(opCtx)) {
+        // Not all indexes in the CollectionIndexUsageTracker may be visible or consistent with our
+        // snapshot. For this reason, it is unsafe to check `isReady` on the entry, which
+        // asserts that the index's in-memory state is consistent with our snapshot.
+        if (!entry->isPresentInMySnapshot(opCtx)) {
+            continue;
+        }
+
+        if (!entry->isReadyInMySnapshot(opCtx)) {
             doc["building"] = Value(true);
         }
 
@@ -223,21 +233,21 @@ Status CommonMongodProcessInterface::appendRecordCount(OperationContext* opCtx,
 Status CommonMongodProcessInterface::appendQueryExecStats(OperationContext* opCtx,
                                                           const NamespaceString& nss,
                                                           BSONObjBuilder* builder) const {
-    AutoGetCollectionForReadCommand autoColl(opCtx, nss);
+    AutoGetCollectionForReadCommand collection(opCtx, nss);
 
-    if (!autoColl.getDb()) {
+    if (!collection.getDb()) {
         return {ErrorCodes::NamespaceNotFound,
                 str::stream() << "Database [" << nss.db().toString() << "] not found."};
     }
-
-    Collection* collection = autoColl.getCollection();
 
     if (!collection) {
         return {ErrorCodes::NamespaceNotFound,
                 str::stream() << "Collection [" << nss.toString() << "] not found."};
     }
 
-    auto collectionScanStats = CollectionQueryInfo::get(collection).getCollectionScanStats();
+    auto collectionScanStats =
+        CollectionIndexUsageTrackerDecoration::get(collection->getSharedDecorations())
+            .getCollectionScanStats();
 
     dassert(collectionScanStats.collectionScans <=
             static_cast<unsigned long long>(std::numeric_limits<long long>::max()));
@@ -255,12 +265,11 @@ Status CommonMongodProcessInterface::appendQueryExecStats(OperationContext* opCt
 
 BSONObj CommonMongodProcessInterface::getCollectionOptions(OperationContext* opCtx,
                                                            const NamespaceString& nss) {
-    AutoGetCollectionForReadCommand autoColl(opCtx, nss);
+    AutoGetCollectionForReadCommand collection(opCtx, nss);
     BSONObj collectionOptions = {};
-    if (!autoColl.getDb()) {
+    if (!collection.getDb()) {
         return collectionOptions;
     }
-    Collection* collection = autoColl.getCollection();
     if (!collection) {
         return collectionOptions;
     }
@@ -286,7 +295,7 @@ CommonMongodProcessInterface::attachCursorSourceToPipelineForLocalRead(Pipeline*
         : expCtx->ns;
     autoColl.emplace(expCtx->opCtx,
                      nsOrUUID,
-                     AutoGetCollection::ViewMode::kViewsForbidden,
+                     AutoGetCollectionViewMode::kViewsForbidden,
                      Date_t::max(),
                      AutoStatsTracker::LogMode::kUpdateTop);
 
@@ -353,10 +362,12 @@ boost::optional<Document> CommonMongodProcessInterface::lookupSingleDocument(
         repl::SpeculativeMajorityReadInfo::get(expCtx->opCtx);
     if (speculativeMajorityReadInfo.isSpeculativeRead()) {
         // Speculative majority reads are required to use the 'kNoOverlap' read source.
+        // Storage engine operations require at least Global IS.
+        Lock::GlobalLock lk(expCtx->opCtx, MODE_IS);
         invariant(expCtx->opCtx->recoveryUnit()->getTimestampReadSource() ==
                   RecoveryUnit::ReadSource::kNoOverlap);
         boost::optional<Timestamp> readTs =
-            expCtx->opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
+            expCtx->opCtx->recoveryUnit()->getPointInTimeReadTimestamp(expCtx->opCtx);
         invariant(readTs);
         speculativeMajorityReadInfo.setSpeculativeReadTimestampForward(*readTs);
     }
@@ -406,12 +417,11 @@ std::vector<BSONObj> CommonMongodProcessInterface::getMatchingPlanCacheEntryStat
         return !matchExp ? true : matchExp->matchesBSON(obj);
     };
 
-    AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-    const auto collection = autoColl.getCollection();
+    AutoGetCollection collection(opCtx, nss, MODE_IS);
     uassert(
         50933, str::stream() << "collection '" << nss.toString() << "' does not exist", collection);
 
-    const auto planCache = CollectionQueryInfo::get(collection).getPlanCache();
+    const auto planCache = CollectionQueryInfo::get(collection.getCollection()).getPlanCache();
     invariant(planCache);
 
     return planCache->getMatchingStats(serializer, predicate);
@@ -430,7 +440,7 @@ bool CommonMongodProcessInterface::fieldsHaveSupportingUniqueIndex(
     auto databaseHolder = DatabaseHolder::get(opCtx);
     auto db = databaseHolder->getDb(opCtx, nss.db());
     auto collection =
-        db ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss) : nullptr;
+        db ? CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss) : nullptr;
     if (!collection) {
         return fieldPaths == std::set<FieldPath>{"_id"};
     }
@@ -485,6 +495,17 @@ BSONObj CommonMongodProcessInterface::_reportCurrentOpForClient(
 void CommonMongodProcessInterface::_reportCurrentOpsForTransactionCoordinators(
     OperationContext* opCtx, bool includeIdle, std::vector<BSONObj>* ops) const {
     reportCurrentOpsForTransactionCoordinators(opCtx, includeIdle, ops);
+}
+
+void CommonMongodProcessInterface::_reportCurrentOpsForPrimaryOnlyServices(
+    OperationContext* opCtx,
+    CurrentOpConnectionsMode connMode,
+    CurrentOpSessionsMode sessionMode,
+    std::vector<BSONObj>* ops) const {
+    auto registry = repl::PrimaryOnlyServiceRegistry::get(opCtx->getServiceContext());
+    invariant(registry);
+
+    registry->reportServiceInfoForCurrentOp(connMode, sessionMode, ops);
 }
 
 void CommonMongodProcessInterface::_reportCurrentOpsForIdleSessions(
@@ -612,7 +633,12 @@ Update CommonMongodProcessInterface::buildUpdateOp(
         wcb.setBypassDocumentValidation(expCtx->bypassDocumentValidation);
         return wcb;
     }());
-    updateOp.setRuntimeConstants(expCtx->getRuntimeConstants());
+    auto [constants, letParams] =
+        expCtx->variablesParseState.transitionalCompatibilitySerialize(expCtx->variables);
+    updateOp.setLegacyRuntimeConstants(std::move(constants));
+    if (!letParams.isEmpty()) {
+        updateOp.setLet(std::move(letParams));
+    }
     return updateOp;
 }
 

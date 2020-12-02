@@ -1,6 +1,12 @@
 // Aggregation $substrBytes tests.
+// @tags: [
+//   sbe_incompatible,
+// ]
 
-t = db.jstests_aggregation_substr;
+(function() {
+"use strict";
+
+let t = db.jstests_aggregation_substr;
 t.drop();
 
 t.save({});
@@ -45,10 +51,11 @@ assertException('abcd', -10, 0);
 // Additional numeric types for offset / length.
 assertSubstring('bc', 'abcd', 1, 2);
 assertSubstring('bc', 'abcd', 1.0, 2.0);
-assertSubstring('bc', 'abcd', NumberInt(1), NumberInt(2));
-assertSubstring('bc', 'abcd', NumberLong(1), NumberLong(2));
-assertSubstring('bc', 'abcd', NumberInt(1), NumberLong(2));
-assertSubstring('bc', 'abcd', NumberLong(1), NumberInt(2));
+assertSubstring('bc', 'abcd', NumberInt("1"), NumberInt("2"));
+assertSubstring('bc', 'abcd', NumberLong("1"), NumberLong("2"));
+assertSubstring('bc', 'abcd', NumberInt("1"), NumberLong("2"));
+assertSubstring('bc', 'abcd', NumberLong("1"), NumberInt("2"));
+assertSubstring('bc', 'abcd', NumberDecimal("1"), NumberDecimal("2"));
 // Integer component is used.
 assertSubstring('bc', 'abcd', 1.2, 2.2);
 assertSubstring('bc', 'abcd', 1.9, 2.9);
@@ -133,3 +140,4 @@ assert.eq(
      })
         .toArray()[0]
         .a);
+}());

@@ -12,14 +12,14 @@ env.Library(
     target="framework_options",
     source=[
         "framework_options.cpp",
-        env.Idlc("framework_options.idl")[0],
+        "framework_options.idl",
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/server_options_core',
         '$BUILD_DIR/mongo/db/storage/flow_control_parameters',
         '$BUILD_DIR/mongo/db/storage/storage_options',
-        '$BUILD_DIR/mongo/util/options_parser/options_parser_init',
         '$BUILD_DIR/mongo/unittest/unittest',
+        '$BUILD_DIR/mongo/util/options_parser/options_parser_init',
     ],
 )
 
@@ -35,8 +35,8 @@ env.Library(
         '$BUILD_DIR/mongo/db/index/index_access_methods',
         '$BUILD_DIR/mongo/db/index_builds_coordinator_mongod',
         '$BUILD_DIR/mongo/db/op_observer',
-        '$BUILD_DIR/mongo/db/service_context_d',
         '$BUILD_DIR/mongo/db/s/sharding_runtime_d',
+        '$BUILD_DIR/mongo/db/service_context_d',
         '$BUILD_DIR/mongo/db/storage/storage_control',
         '$BUILD_DIR/mongo/scripting/scripting_common',
         '$BUILD_DIR/mongo/unittest/unittest',
@@ -56,6 +56,12 @@ env.Library(
         '$BUILD_DIR/mongo/client/clientdriver_network',
         '$BUILD_DIR/mongo/client/dbclient_mockcursor',
         '$BUILD_DIR/mongo/db/repl/replica_set_messages'
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/exec/projection_executor',
+        '$BUILD_DIR/mongo/db/pipeline/expression_context',
+        '$BUILD_DIR/mongo/db/query/projection_ast',
+        '$BUILD_DIR/mongo/db/query/query_test_service_context',
     ],
 )
 
@@ -118,7 +124,6 @@ if not has_option('noshell') and usemozjs:
             'replica_set_tests.cpp',
             'repltests.cpp',
             'rollbacktests.cpp',
-            'scanning_replica_set_monitor_test.cpp',
             'socktests.cpp',
             'storage_timestamp_tests.cpp',
             'threadedtests.cpp',
@@ -129,10 +134,12 @@ if not has_option('noshell') and usemozjs:
         ],
         LIBDEPS=[
             "$BUILD_DIR/mongo/bson/mutable/mutable_bson_test_utils",
+            "$BUILD_DIR/mongo/client/clientdriver_network",
             "$BUILD_DIR/mongo/client/replica_set_monitor_protocol_test_util",
             "$BUILD_DIR/mongo/db/auth/authmongod",
             "$BUILD_DIR/mongo/db/bson/dotted_path_support",
             "$BUILD_DIR/mongo/db/catalog/collection_validation",
+            "$BUILD_DIR/mongo/db/catalog/index_key_validate",
             "$BUILD_DIR/mongo/db/catalog/multi_index_block",
             "$BUILD_DIR/mongo/db/catalog_raii",
             "$BUILD_DIR/mongo/db/commands/mongod",
@@ -141,14 +148,16 @@ if not has_option('noshell') and usemozjs:
             "$BUILD_DIR/mongo/db/exec/document_value/document_value_test_util",
             "$BUILD_DIR/mongo/db/index/index_access_methods",
             "$BUILD_DIR/mongo/db/index/index_build_interceptor",
-            "$BUILD_DIR/mongo/db/logical_clock",
             "$BUILD_DIR/mongo/db/logical_time_metadata_hook",
+            "$BUILD_DIR/mongo/db/mongohasher",
             "$BUILD_DIR/mongo/db/query/collation/collator_interface_mock",
             "$BUILD_DIR/mongo/db/query/command_request_response",
             "$BUILD_DIR/mongo/db/query/query_planner_test_lib",
+            "$BUILD_DIR/mongo/db/query/query_request",
             "$BUILD_DIR/mongo/db/query/query_test_service_context",
             "$BUILD_DIR/mongo/db/query_exec",
             "$BUILD_DIR/mongo/db/repl/drop_pending_collection_reaper",
+            "$BUILD_DIR/mongo/db/repl/oplog_entry_test_helpers",
             "$BUILD_DIR/mongo/db/repl/repl_coordinator_interface",
             "$BUILD_DIR/mongo/db/repl/replication_consistency_markers_impl",
             "$BUILD_DIR/mongo/db/repl/replication_recovery",
@@ -156,21 +165,28 @@ if not has_option('noshell') and usemozjs:
             "$BUILD_DIR/mongo/db/repl/serveronly_repl",
             "$BUILD_DIR/mongo/db/repl/storage_interface_impl",
             "$BUILD_DIR/mongo/db/repl/timestamp_block",
-            "$BUILD_DIR/mongo/db/s/op_observer_sharding_impl",
+            "$BUILD_DIR/mongo/db/s/resharding_util",
+            "$BUILD_DIR/mongo/db/s/sharding_runtime_d",
+            "$BUILD_DIR/mongo/db/server_options_core",
             "$BUILD_DIR/mongo/db/sessions_collection_standalone",
-            "$BUILD_DIR/mongo/db/storage/biggie/storage_biggie",
             "$BUILD_DIR/mongo/db/storage/durable_catalog_impl",
             "$BUILD_DIR/mongo/db/storage/ephemeral_for_test/storage_ephemeral_for_test",
-            "$BUILD_DIR/mongo/db/storage/storage_engine_impl",
             "$BUILD_DIR/mongo/db/storage/storage_debug_util",
+            "$BUILD_DIR/mongo/db/storage/storage_engine_impl",
             "$BUILD_DIR/mongo/db/storage/wiredtiger/storage_wiredtiger" if wiredtiger else [],
+            "$BUILD_DIR/mongo/db/traffic_reader",
             "$BUILD_DIR/mongo/db/transaction",
-            "$BUILD_DIR/mongo/shell_core",
+            "$BUILD_DIR/mongo/db/vector_clock",
+            "$BUILD_DIR/mongo/shell/shell_utils",
             "$BUILD_DIR/mongo/transport/message_compressor_options_server",
             "$BUILD_DIR/mongo/transport/transport_layer_manager",
             "$BUILD_DIR/mongo/util/clock_source_mock",
             "$BUILD_DIR/mongo/util/net/network",
+            "$BUILD_DIR/mongo/util/options_parser/options_parser_init",
+            "$BUILD_DIR/mongo/util/password",
+            "$BUILD_DIR/mongo/util/processinfo",
             "$BUILD_DIR/mongo/util/progress_meter",
+            "$BUILD_DIR/mongo/util/signal_handlers",
             "$BUILD_DIR/mongo/util/version_impl",
             "mocklib",
             "testframework",
@@ -180,9 +196,3 @@ if not has_option('noshell') and usemozjs:
             "tests",
         ],
     )
-
-    hygienic = get_option('install-mode') == 'hygienic'
-    if not hygienic:
-        install_dbtest = env.Install('#/', dbtest)
-        if env.TargetOSIs("windows"):
-            env.Alias("dbtest", install_dbtest)

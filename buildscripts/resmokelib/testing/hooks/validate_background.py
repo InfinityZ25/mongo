@@ -9,7 +9,6 @@ import os.path
 
 from buildscripts.resmokelib import errors
 from buildscripts.resmokelib.testing.hooks import jsfile
-from buildscripts.resmokelib.testing.testcases import interface as testcase
 from buildscripts.resmokelib.testing.hooks.background_job import _BackgroundJob, _ContinuousDynamicJSTestCase
 
 
@@ -27,13 +26,6 @@ class ValidateCollectionsInBackground(jsfile.JSHook):
 
     def before_suite(self, test_report):
         """Start the background thread."""
-        server_status = self.fixture.mongo_client().admin.command("serverStatus")
-        if not server_status["storageEngine"].get("supportsCheckpointCursors", False):
-            self.logger.info(
-                "Not enabling the background collection validation thread because '%s' storage"
-                " engine does not support checkpoints.", server_status["storageEngine"]["name"])
-            return
-
         self._background_job = _BackgroundJob("ValidateCollectionsInBackground")
         self.logger.info("Starting the background collection validation thread.")
         self._background_job.start()
@@ -52,7 +44,7 @@ class ValidateCollectionsInBackground(jsfile.JSHook):
             return
 
         hook_test_case = _ContinuousDynamicJSTestCase.create_before_test(
-            self.logger.test_case_logger, test, self, self._js_filename, self._shell_options)
+            self.logger, test, self, self._js_filename, self._shell_options)
         hook_test_case.configure(self.fixture)
 
         self.logger.info("Resuming the background collection validation thread.")

@@ -56,7 +56,7 @@ public:
             _nssIndex.erase(nss);
         }
 
-        std::map<UUID, std::unique_ptr<Collection>> _collections;
+        std::map<UUID, std::shared_ptr<Collection>> _collections;
         std::map<NamespaceString, UUID> _nssIndex;
     };
 
@@ -69,8 +69,10 @@ public:
         return std::weak_ptr<UncommittedCollectionsMap>(_resourcesPtr);
     }
 
-    std::shared_ptr<UncommittedCollectionsMap> shareResources() {
-        return _resourcesPtr;
+    std::shared_ptr<UncommittedCollectionsMap> releaseResources() {
+        auto ret = std::move(_resourcesPtr);
+        _resourcesPtr = std::make_shared<UncommittedCollectionsMap>();
+        return ret;
     }
 
     void receiveResources(std::shared_ptr<UncommittedCollectionsMap> resources) {
@@ -80,11 +82,13 @@ public:
 
     static UncommittedCollections& get(OperationContext* opCtx);
 
-    static void addToTxn(OperationContext* opCtx, std::unique_ptr<Collection> coll);
+    static void addToTxn(OperationContext* opCtx, std::shared_ptr<Collection> coll);
 
-    static Collection* getForTxn(OperationContext* opCtx, const NamespaceStringOrUUID& nss);
-    static Collection* getForTxn(OperationContext* opCtx, const NamespaceString& nss);
-    static Collection* getForTxn(OperationContext* opCtx, const UUID& uuid);
+    static std::shared_ptr<Collection> getForTxn(OperationContext* opCtx,
+                                                 const NamespaceStringOrUUID& nss);
+    static std::shared_ptr<Collection> getForTxn(OperationContext* opCtx,
+                                                 const NamespaceString& nss);
+    static std::shared_ptr<Collection> getForTxn(OperationContext* opCtx, const UUID& uuid);
 
     /**
      * Registers any uncommitted collections with the CollectionCatalog. If registering a collection
@@ -99,7 +103,7 @@ public:
      * entries for the collection identified by `uuid` to UncommittedCollections. This function
      * assumes `commit` has previously been called for `uuid`.
      */
-    static void rollback(ServiceContext* svcCtx,
+    static void rollback(OperationContext* opCtx,
                          CollectionUUID uuid,
                          UncommittedCollectionsMap* map);
 

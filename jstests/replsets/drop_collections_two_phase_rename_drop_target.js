@@ -42,8 +42,7 @@ twoPhaseDropTest.createCollection(fromCollName);
 twoPhaseDropTest.createCollection(toCollName);
 
 // Collection renames with dropTarget set to true should handle long index names in the target
-// collection gracefully. MMAPv1 imposes a hard limit on index namespaces so we have to drop
-// indexes that are too long to store on disk after renaming the collection.
+// collection gracefully.
 const primary = replTest.getPrimary();
 const testDb = primary.getDB(dbName);
 const fromColl = testDb.getCollection(fromCollName);
@@ -53,8 +52,8 @@ let shortIndexName = "short_name";
 
 // In the target collection, which will be dropped, create one index with a "too long" name, and
 // one with a name of acceptable size.
-assert.commandWorked(toColl.ensureIndex({a: 1}, {name: longIndexName}));
-assert.commandWorked(toColl.ensureIndex({b: 1}, {name: shortIndexName}));
+assert.commandWorked(toColl.createIndex({a: 1}, {name: longIndexName}));
+assert.commandWorked(toColl.createIndex({b: 1}, {name: shortIndexName}));
 
 // Insert documents into both collections so that we can tell them apart.
 assert.commandWorked(fromColl.insert({_id: 'from'}));
@@ -105,7 +104,7 @@ try {
     // Confirm in the logs that the renameCollection dropped the target collection on the
     // secondary using two phase collection drop.
     if (isJsonLog(secondary)) {
-        checkLog.containsJson(secondary, 20315, {nss: toColl.getFullName()});
+        checkLog.containsJson(secondary, 20315, {namespace: toColl.getFullName()});
     } else {
         checkLog.contains(secondary, new RegExp('dropCollection:.*' + toColl.getFullName()));
     }

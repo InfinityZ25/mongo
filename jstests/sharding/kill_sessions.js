@@ -2,7 +2,7 @@
  * Run the kill_sessions tests against a sharded cluster.
  *
  * TODO SERVER-45385: These tests can be enabled in multiversion once the logging of session cursor
- * cleanup has been backported and released in last-stable.
+ * cleanup has been backported and released in last-lts.
  * @tags: [multiversion_incompatible]
  */
 
@@ -11,8 +11,8 @@ load("jstests/libs/kill_sessions.js");
 (function() {
 'use strict';
 
-// TODO SERVER-35447: This test involves killing all sessions, which will not work as expected
-// if the kill command is sent with an implicit session.
+// This test involves killing all sessions, which will not work as expected if the kill command is
+// sent with an implicit session.
 TestData.disableImplicitSessions = true;
 
 function runTests(needAuth) {

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -41,15 +41,18 @@
 #include "mongo/db/s/sharding_logging.h"
 #include "mongo/db/s/sharding_state_recovery.h"
 #include "mongo/db/s/sharding_statistics.h"
+#include "mongo/db/s/type_shard_database.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/s/catalog/type_shard_database.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
+
+MONGO_FAIL_POINT_DEFINE(hangInCloneStage);
+MONGO_FAIL_POINT_DEFINE(hangInCleanStaleDataStage);
 
 using namespace shardmetadatautil;
 
@@ -105,6 +108,11 @@ Status MovePrimarySourceManager::clone(OperationContext* opCtx) {
     }
 
     _state = kCloning;
+
+    if (MONGO_unlikely(hangInCloneStage.shouldFail())) {
+        LOGV2(4908700, "Hit hangInCloneStage");
+        hangInCloneStage.pauseWhileSet(opCtx);
+    }
 
     auto const shardRegistry = Grid::get(opCtx)->shardRegistry();
     auto fromShardObj = uassertStatusOK(shardRegistry->getShard(opCtx, _fromShard));
@@ -193,6 +201,7 @@ Status MovePrimarySourceManager::enterCriticalSection(OperationContext* opCtx) {
     LOGV2(22043, "movePrimary successfully entered critical section");
 
     scopedGuard.dismiss();
+
     return Status::OK();
 }
 
@@ -229,7 +238,7 @@ Status MovePrimarySourceManager::commitOnConfig(OperationContext* opCtx) {
         opCtx,
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
         "admin",
-        CommandHelpers::appendMajorityWriteConcern(CommandHelpers::appendPassthroughFields(
+        CommandHelpers::appendMajorityWriteConcern(CommandHelpers::appendGenericCommandArgs(
             finalCommandObj, commitMovePrimaryRequest.toBSON())),
         Shard::RetryPolicy::kIdempotent);
 
@@ -328,6 +337,11 @@ Status MovePrimarySourceManager::cleanStaleData(OperationContext* opCtx) {
     invariant(!opCtx->lockState()->isLocked());
     invariant(_state == kNeedCleanStaleData);
 
+    if (MONGO_unlikely(hangInCleanStaleDataStage.shouldFail())) {
+        LOGV2(4908701, "Hit hangInCleanStaleDataStage");
+        hangInCleanStaleDataStage.pauseWhileSet(opCtx);
+    }
+
     // Only drop the cloned (unsharded) collections.
     DBDirectClient client(opCtx);
     for (auto& coll : _clonedColls) {
@@ -362,7 +376,7 @@ void MovePrimarySourceManager::cleanupOnError(OperationContext* opCtx) {
 
     try {
         _cleanup(opCtx);
-    } catch (const ExceptionForCat<ErrorCategory::NotMasterError>& ex) {
+    } catch (const ExceptionForCat<ErrorCategory::NotPrimaryError>& ex) {
         BSONObjBuilder requestArgsBSON;
         _requestArgs.serialize(&requestArgsBSON);
         LOGV2_WARNING(22046,

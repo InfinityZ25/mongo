@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -35,11 +35,13 @@
 #include "mongo/db/catalog/coll_mod.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/drop_indexes.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
-#include "mongo/db/commands/feature_compatibility_version_command_parser.h"
 #include "mongo/db/commands/feature_compatibility_version_documentation.h"
 #include "mongo/db/commands/feature_compatibility_version_parser.h"
+#include "mongo/db/commands/set_feature_compatibility_version_gen.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
@@ -52,23 +54,25 @@
 #include "mongo/db/s/active_migrations_registry.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/migration_util.h"
+#include "mongo/db/s/shard_metadata_util.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/views/view_catalog.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/s/catalog/type_collection.h"
-#include "mongo/s/database_version_helpers.h"
-#include "mongo/s/grid.h"
+#include "mongo/s/sharded_collections_ddl_parameters_gen.h"
+#include "mongo/stdx/unordered_set.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
+using FCVP = FeatureCompatibilityVersionParser;
+using FeatureCompatibilityParams = ServerGlobalParams::FeatureCompatibility;
+
 namespace {
 
-MONGO_FAIL_POINT_DEFINE(featureCompatibilityDowngrade);
-MONGO_FAIL_POINT_DEFINE(featureCompatibilityUpgrade);
 MONGO_FAIL_POINT_DEFINE(failUpgrading);
 MONGO_FAIL_POINT_DEFINE(hangWhileUpgrading);
 MONGO_FAIL_POINT_DEFINE(failDowngrading);
@@ -93,8 +97,9 @@ void deletePersistedDefaultRWConcernDocument(OperationContext* opCtx) {
 }
 
 /**
- * Sets the minimum allowed version for the cluster. If it is 4.4, then the node should not use 4.6
- * features.
+ * Sets the minimum allowed feature compatibility version for the cluster. The cluster should not
+ * use any new features introduced in binary versions that are newer than the feature compatibility
+ * version set.
  *
  * Format:
  * {
@@ -104,7 +109,7 @@ void deletePersistedDefaultRWConcernDocument(OperationContext* opCtx) {
 class SetFeatureCompatibilityVersionCommand : public BasicCommand {
 public:
     SetFeatureCompatibilityVersionCommand()
-        : BasicCommand(FeatureCompatibilityVersionCommandParser::kCommandName) {}
+        : BasicCommand(SetFeatureCompatibilityVersion::kCommandName) {}
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
@@ -119,13 +124,17 @@ public:
     }
 
     std::string help() const override {
-        using FCVP = FeatureCompatibilityVersionParser;
         std::stringstream h;
-        h << "Set the API version exposed by this node. If set to '" << FCVP::kVersion44
-          << "', then " << FCVP::kVersion46 << " features are disabled. If set to '"
-          << FCVP::kVersion46 << "', then " << FCVP::kVersion46
-          << " features are enabled, and all nodes in the cluster must be binary version "
-          << FCVP::kVersion46 << ". See "
+        h << "Set the featureCompatibilityVersion used by this cluster. If set to '"
+          << FCVP::kLastLTS << "', then features introduced in versions greater than '"
+          << FCVP::kLastLTS << "' will be disabled";
+        if (FCVP::kLastContinuous != FCVP::kLastLTS) {
+            h << " If set to '" << FCVP::kLastContinuous << "', then features introduced in '"
+              << FCVP::kLatest << "' will be disabled.";
+        }
+        h << " If set to '" << FCVP::kLatest << "', then '" << FCVP::kLatest
+          << "' features are enabled, and all nodes in the cluster must be binary version "
+          << FCVP::kLatest << ". See "
           << feature_compatibility_version_documentation::kCompatibilityLink << ".";
         return h.str();
     }
@@ -166,47 +175,51 @@ public:
             CommandHelpers::appendCommandWCStatus(result, waitForWCStatus, res);
         });
 
-        {
-            // Acquire the global IX lock and then immediately release it to ensure this operation
-            // will be killed by the RstlKillOpThread during step-up or stepdown. Note that the
-            // RstlKillOpThread kills any operations on step-up or stepdown for which
-            // Locker::wasGlobalLockTakenInModeConflictingWithWrites() returns true.
-            Lock::GlobalLock lk(opCtx, MODE_IX);
-        }
+        // Ensure that this operation will be killed by the RstlKillOpThread during step-up or
+        // stepdown.
+        opCtx->setAlwaysInterruptAtStepDownOrUp();
 
         // Only allow one instance of setFeatureCompatibilityVersion to run at a time.
         invariant(!opCtx->lockState()->isLocked());
         Lock::ExclusiveLock lk(opCtx->lockState(), FeatureCompatibilityVersion::fcvLock);
 
-        const auto requestedVersion = uassertStatusOK(
-            FeatureCompatibilityVersionCommandParser::extractVersionFromCommand(getName(), cmdObj));
-        ServerGlobalParams::FeatureCompatibility::Version actualVersion =
+        auto request = SetFeatureCompatibilityVersion::parse(
+            IDLParserErrorContext("setFeatureCompatibilityVersion"), cmdObj);
+        const auto requestedVersion = request.getCommandParameter();
+        const auto requestedVersionString = FCVP::serializeVersion(requestedVersion);
+        FeatureCompatibilityParams::Version actualVersion =
             serverGlobalParams.featureCompatibility.getVersion();
+        if (request.getDowngradeOnDiskChanges() &&
+            (requestedVersion != FeatureCompatibilityParams::kLastContinuous ||
+             actualVersion < requestedVersion)) {
+            std::stringstream downgradeOnDiskErrorSS;
+            downgradeOnDiskErrorSS
+                << "cannot set featureCompatibilityVersion to " << requestedVersionString
+                << " with '" << SetFeatureCompatibilityVersion::kDowngradeOnDiskChangesFieldName
+                << "' set to true. This is only allowed when downgrading to "
+                << FCVP::kLastContinuous;
+            uasserted(ErrorCodes::IllegalOperation, downgradeOnDiskErrorSS.str());
+        }
 
-        if (requestedVersion == FeatureCompatibilityVersionParser::kVersion46) {
-            uassert(ErrorCodes::IllegalOperation,
-                    "cannot initiate featureCompatibilityVersion upgrade to 4.6 while a previous "
-                    "featureCompatibilityVersion downgrade to 4.4 has not completed. Finish "
-                    "downgrade to 4.4, then upgrade to 4.6.",
-                    actualVersion !=
-                        ServerGlobalParams::FeatureCompatibility::Version::kDowngradingTo44);
+        if (actualVersion == requestedVersion) {
+            // Set the client's last opTime to the system last opTime so no-ops wait for
+            // writeConcern.
+            repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
+            return true;
+        }
 
-            if (actualVersion ==
-                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo46) {
-                // Set the client's last opTime to the system last opTime so no-ops wait for
-                // writeConcern.
-                repl::ReplClientInfo::forClient(opCtx->getClient())
-                    .setLastOpToSystemLastOpTime(opCtx);
-                return true;
-            }
+        auto isFromConfigServer = request.getFromConfigServer().value_or(false);
+        FeatureCompatibilityVersion::validateSetFeatureCompatibilityVersionRequest(
+            actualVersion, requestedVersion, isFromConfigServer);
 
-            FeatureCompatibilityVersion::setTargetUpgrade(opCtx);
-
+        if (actualVersion < requestedVersion) {
+            FeatureCompatibilityVersion::updateFeatureCompatibilityVersionDocument(
+                opCtx, actualVersion, requestedVersion, isFromConfigServer);
             {
                 // Take the global lock in S mode to create a barrier for operations taking the
                 // global IX or X locks. This ensures that either
                 //   - The global IX/X locked operation will start after the FCV change, see the
-                //     upgrading to 4.6 FCV and act accordingly.
+                //     upgrading to the latest FCV and act accordingly.
                 //   - The global IX/X locked operation began prior to the FCV change, is acting on
                 //     that assumption and will finish before upgrade procedures begin right after
                 //     this.
@@ -224,37 +237,86 @@ public:
                 }
             }
 
-            // Upgrade shards before config finishes its upgrade.
+            // Delete any haystack indexes if we're upgrading to an FCV of 4.9 or higher.
+            // TODO SERVER-51871: This block can removed once 5.0 becomes last-lts.
+            if (requestedVersion >= FeatureCompatibilityParams::Version::kVersion49) {
+                _deleteHaystackIndexesOnUpgrade(opCtx);
+            }
+
             if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+                if (requestedVersion >= FeatureCompatibilityParams::Version::kVersion49) {
+                    // SERVER-52630: Remove once 5.0 becomes the LastLTS
+                    ShardingCatalogManager::get(opCtx)->removePre49LegacyMetadata(opCtx);
+                }
+
+                // Upgrade shards before config finishes its upgrade.
                 uassertStatusOK(
                     ShardingCatalogManager::get(opCtx)->setFeatureCompatibilityVersionOnShards(
-                        opCtx,
-                        CommandHelpers::appendMajorityWriteConcern(
-                            CommandHelpers::appendPassthroughFields(
-                                cmdObj,
-                                BSON(FeatureCompatibilityVersionCommandParser::kCommandName
-                                     << requestedVersion)))));
+                        opCtx, CommandHelpers::appendMajorityWriteConcern(request.toBSON({}))));
+
+                // Create a 'timestamp' for the collections that don't have one. This must be done
+                // after all shards have been upgraded in order to guarantee that when
+                // createCollectionTimestampsFor49 starts, no new collections without a timestamp
+                // will be added.
+                if (requestedVersion >= FeatureCompatibilityParams::Version::kVersion49 &&
+                    feature_flags::gShardingFullDDLSupport.isEnabledAndIgnoreFCV()) {
+                    ShardingCatalogManager::get(opCtx)->createCollectionTimestampsFor49(opCtx);
+                }
             }
 
             hangWhileUpgrading.pauseWhileSet(opCtx);
-            FeatureCompatibilityVersion::unsetTargetUpgradeOrDowngrade(opCtx, requestedVersion);
-        } else if (requestedVersion == FeatureCompatibilityVersionParser::kVersion44) {
-            uassert(ErrorCodes::IllegalOperation,
-                    "cannot initiate setting featureCompatibilityVersion to 4.4 while a previous "
-                    "featureCompatibilityVersion upgrade to 4.6 has not completed.",
-                    actualVersion !=
-                        ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo46);
-
-            if (actualVersion ==
-                ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo44) {
-                // Set the client's last opTime to the system last opTime so no-ops wait for
-                // writeConcern.
-                repl::ReplClientInfo::forClient(opCtx->getClient())
-                    .setLastOpToSystemLastOpTime(opCtx);
-                return true;
+            // Completed transition to requestedVersion.
+            FeatureCompatibilityVersion::updateFeatureCompatibilityVersionDocument(
+                opCtx,
+                serverGlobalParams.featureCompatibility.getVersion(),
+                requestedVersion,
+                isFromConfigServer);
+        } else {
+            // Time-series collections are only supported in 5.0. If the user tries to downgrade the
+            // cluster to an earlier version, they must first remove all time-series collections.
+            for (const auto& dbName : DatabaseHolder::get(opCtx)->getNames()) {
+                auto viewCatalog = DatabaseHolder::get(opCtx)->getSharedViewCatalog(opCtx, dbName);
+                if (!viewCatalog) {
+                    continue;
+                }
+                viewCatalog->iterate(opCtx, [](const ViewDefinition& view) {
+                    uassert(ErrorCodes::CannotDowngrade,
+                            str::stream()
+                                << "Cannot downgrade the cluster when there are time-series "
+                                   "collections present; drop all time-series collections before "
+                                   "downgrading. First detected time-series collection: "
+                                << view.name(),
+                            !view.timeseries());
+                });
             }
 
-            FeatureCompatibilityVersion::setTargetDowngrade(opCtx);
+            auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+            const bool isReplSet =
+                replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
+
+            uassert(ErrorCodes::ConflictingOperationInProgress,
+                    str::stream() << "Cannot downgrade the cluster when the replica set config "
+                                  << "contains 'newlyAdded' members; wait for those members to "
+                                  << "finish its initial sync procedure",
+                    !(isReplSet && replCoord->replSetContainsNewlyAddedMembers()));
+
+            // We should make sure the current config w/o 'newlyAdded' members got replicated
+            // to all nodes.
+            LOGV2(4637904, "Waiting for the current replica set config to propagate to all nodes.");
+            // If a write concern is given, we'll use its wTimeout. It's kNoTimeout by default.
+            WriteConcernOptions writeConcern(repl::ReplSetConfig::kConfigAllWriteConcernName,
+                                             WriteConcernOptions::SyncMode::NONE,
+                                             opCtx->getWriteConcern().wTimeout);
+            writeConcern.checkCondition = WriteConcernOptions::CheckCondition::Config;
+            repl::OpTime fakeOpTime(Timestamp(1, 1), replCoord->getTerm());
+            uassertStatusOKWithContext(
+                replCoord->awaitReplication(opCtx, fakeOpTime, writeConcern).status,
+                "Failed to wait for the current replica set config to propagate to all "
+                "nodes");
+            LOGV2(4637905, "The current replica set config has been propagated to all nodes.");
+
+            FeatureCompatibilityVersion::updateFeatureCompatibilityVersionDocument(
+                opCtx, actualVersion, requestedVersion, isFromConfigServer);
 
             {
                 // Take the global lock in S mode to create a barrier for operations taking the
@@ -267,38 +329,109 @@ public:
                 Lock::GlobalLock lk(opCtx, MODE_S);
             }
 
-            auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-            const bool isReplSet =
-                replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
             if (failDowngrading.shouldFail())
                 return false;
 
             if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
                 LOGV2(20502, "Downgrade: dropping config.rangeDeletions collection");
                 migrationutil::dropRangeDeletionsCollection(opCtx);
+
+                if (requestedVersion < FeatureCompatibilityParams::Version::kVersion49) {
+                    // SERVER-52632: Remove once 5.0 becomes the LastLTS
+                    shardmetadatautil::downgradeShardConfigCollectionEntriesToPre49(opCtx);
+                }
+
+
             } else if (isReplSet || serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
                 // The default rwc document should only be deleted on plain replica sets and the
                 // config server replica set, not on shards or standalones.
                 deletePersistedDefaultRWConcernDocument(opCtx);
             }
 
-            // Downgrade shards before config finishes its downgrade.
             if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+                // Downgrade shards before config finishes its downgrade.
                 uassertStatusOK(
                     ShardingCatalogManager::get(opCtx)->setFeatureCompatibilityVersionOnShards(
-                        opCtx,
-                        CommandHelpers::appendMajorityWriteConcern(
-                            CommandHelpers::appendPassthroughFields(
-                                cmdObj,
-                                BSON(FeatureCompatibilityVersionCommandParser::kCommandName
-                                     << requestedVersion)))));
+                        opCtx, CommandHelpers::appendMajorityWriteConcern(request.toBSON({}))));
+
+                // Delete the 'timestamp' field in config.collections entries. This must be done
+                // after all shards have been downgraded in order to guarantee that when
+                // downgradeConfigCollectionEntriesToPre49 starts, no new collections with a
+                // timestamp will be added.
+                if (requestedVersion < FeatureCompatibilityParams::Version::kVersion49) {
+                    ShardingCatalogManager::get(opCtx)->downgradeConfigCollectionEntriesToPre49(
+                        opCtx);
+                }
             }
 
             hangWhileDowngrading.pauseWhileSet(opCtx);
-            FeatureCompatibilityVersion::unsetTargetUpgradeOrDowngrade(opCtx, requestedVersion);
+            // Completed transition to requestedVersion.
+            FeatureCompatibilityVersion::updateFeatureCompatibilityVersionDocument(
+                opCtx,
+                serverGlobalParams.featureCompatibility.getVersion(),
+                requestedVersion,
+                isFromConfigServer);
+
+            if (request.getDowngradeOnDiskChanges()) {
+                invariant(requestedVersion == FeatureCompatibilityParams::kLastContinuous);
+                _downgradeOnDiskChanges();
+                LOGV2(4875603, "Downgrade of on-disk format complete.");
+            }
         }
 
         return true;
+    }
+
+private:
+    /*
+     * Rolls back any upgraded on-disk changes to reflect the disk format of the last-continuous
+     * version.
+     */
+    void _downgradeOnDiskChanges() {
+        LOGV2(4975602,
+              "Downgrading on-disk format to reflect the last-continuous version.",
+              "last_continuous_version"_attr = FCVP::kLastContinuous);
+    }
+
+    /**
+     * Removes all haystack indexes from the catalog.
+     *
+     * TODO SERVER-51871: This method can be removed once 5.0 becomes last-lts.
+     */
+    void _deleteHaystackIndexesOnUpgrade(OperationContext* opCtx) {
+        auto collCatalog = CollectionCatalog::get(opCtx);
+        for (const auto& db : collCatalog->getAllDbNames()) {
+            for (auto collIt = collCatalog->begin(opCtx, db); collIt != collCatalog->end(opCtx);
+                 ++collIt) {
+                NamespaceStringOrUUID collName(
+                    collCatalog->lookupNSSByUUID(opCtx, collIt.uuid().get()).get());
+                AutoGetCollectionForRead coll(opCtx, collName);
+                auto idxCatalog = coll->getIndexCatalog();
+                std::vector<const IndexDescriptor*> haystackIndexes;
+                idxCatalog->findIndexByType(opCtx, IndexNames::GEO_HAYSTACK, haystackIndexes);
+
+                // Continue if 'coll' has no haystack indexes.
+                if (haystackIndexes.empty()) {
+                    continue;
+                }
+
+                // Construct a dropIndexes command to drop the indexes in 'haystackIndexes'.
+                BSONObjBuilder dropIndexesCmd;
+                dropIndexesCmd.append("dropIndexes", collName.nss()->coll());
+                BSONArrayBuilder indexNames;
+                for (auto&& haystackIndex : haystackIndexes) {
+                    indexNames.append(haystackIndex->indexName());
+                }
+                dropIndexesCmd.append("index", indexNames.arr());
+
+                BSONObjBuilder response;  // This response is ignored.
+                uassertStatusOK(
+                    dropIndexes(opCtx,
+                                *collName.nss(),
+                                CommandHelpers::appendMajorityWriteConcern(dropIndexesCmd.obj()),
+                                &response));
+            }
+        }
     }
 
 } setFeatureCompatibilityVersionCommand;

@@ -10,50 +10,56 @@ TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 (function() {
 "use strict";
 
-const lastStable = "last-stable";
+function runTest(downgradeVersion) {
+    jsTestLog("Running test with downgradeVersion: " + downgradeVersion);
+    const downgradeFCV = binVersionToFCV(downgradeVersion);
+    let st = new ShardingTest({mongos: 1, shards: 1});
+    const ns = "testDB.testColl";
+    let mongosAdminDB = st.s.getDB("admin");
 
-let st = new ShardingTest({mongos: 1, shards: 1});
-const ns = "testDB.testColl";
-let mongosAdminDB = st.s.getDB("admin");
+    // Assert that a mongos using the downgraded binary version will crash when connecting to a
+    // cluster running on the 'latest' binary version with the 'latest' FCV.
+    let downgradedMongos =
+        MongoRunner.runMongos({configdb: st.configRS.getURL(), binVersion: downgradeVersion});
 
-// Assert that a mongos using the 'last-stable' binary version will crash when connecting to a
-// cluster running on the 'latest' binary version with the 'latest' FCV.
-let lastStableMongos =
-    MongoRunner.runMongos({configdb: st.configRS.getURL(), binVersion: lastStable});
+    assert(!downgradedMongos);
 
-assert(!lastStableMongos);
+    // Assert that a mongos using the downgraded binary version will successfully connect to a
+    // cluster running on the 'latest' binary version with the downgraded FCV.
+    assert.commandWorked(mongosAdminDB.runCommand({setFeatureCompatibilityVersion: downgradeFCV}));
 
-// Assert that a mongos using the 'last-stable' binary version will successfully connect to a
-// cluster running on the 'latest' binary version with the 'last-stable' FCV.
-assert.commandWorked(mongosAdminDB.runCommand({setFeatureCompatibilityVersion: lastStableFCV}));
+    // wait until all config server nodes are downgraded
+    // awaitReplication waits for all secondaries to replicate primary's latest opTime which will
+    // guarantee propagation of the write to the admin.system.version collection which triggers the
+    // change FCV.
+    st.configRS.awaitReplication();
 
-// wait until all config server nodes are downgraded
-// awaitReplication waits for all slaves to replicate primary's latest opTime which will
-// guarantee propagation of the write to the admin.system.version collection which triggers the
-// change FCV.
-st.configRS.awaitReplication();
+    downgradedMongos =
+        MongoRunner.runMongos({configdb: st.configRS.getURL(), binVersion: downgradeVersion});
+    assert.neq(null,
+               downgradedMongos,
+               "mongos was unable to start up with binary version=" + downgradeVersion +
+                   " and connect to FCV=" + downgradeFCV + " cluster");
 
-lastStableMongos = MongoRunner.runMongos({configdb: st.configRS.getURL(), binVersion: lastStable});
-assert.neq(null,
-           lastStableMongos,
-           "mongos was unable to start up with binary version=" + lastStable +
-               " and connect to FCV=" + lastStableFCV + " cluster");
+    // Ensure that the 'downgradeVersion' binary mongos can perform reads and writes to the shards
+    // in the cluster.
+    assert.commandWorked(downgradedMongos.getDB("test").foo.insert({x: 1}));
+    let foundDoc = downgradedMongos.getDB("test").foo.findOne({x: 1});
+    assert.neq(null, foundDoc);
+    assert.eq(1, foundDoc.x, tojson(foundDoc));
 
-// Ensure that the 'lastStable' binary mongos can perform reads and writes to the shards in the
-// cluster.
-assert.commandWorked(lastStableMongos.getDB("test").foo.insert({x: 1}));
-let foundDoc = lastStableMongos.getDB("test").foo.findOne({x: 1});
-assert.neq(null, foundDoc);
-assert.eq(1, foundDoc.x, tojson(foundDoc));
+    // Assert that the 'downgradeVersion' binary mongos will crash after the cluster is upgraded to
+    // 'latestFCV'.
+    assert.commandWorked(mongosAdminDB.runCommand({setFeatureCompatibilityVersion: latestFCV}));
+    let error = assert.throws(function() {
+        downgradedMongos.getDB("test").foo.insert({x: 1});
+    });
+    assert(isNetworkError(error));
+    assert(!downgradedMongos.conn);
 
-// Assert that the 'lastStable' binary mongos will crash after the cluster is upgraded to
-// 'latestFCV'.
-assert.commandWorked(mongosAdminDB.runCommand({setFeatureCompatibilityVersion: latestFCV}));
-let error = assert.throws(function() {
-    lastStableMongos.getDB("test").foo.insert({x: 1});
-});
-assert(isNetworkError(error));
-assert(!lastStableMongos.conn);
+    st.stop();
+}
 
-st.stop();
+runTest('last-continuous');
+runTest('last-lts');
 })();

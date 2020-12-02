@@ -32,7 +32,7 @@
 
 namespace mongo {
 
-class ServiceContext;
+class OperationContext;
 
 /**
  * Validates that 'doc' is legal for insertion, possibly with some modifications.
@@ -42,20 +42,17 @@ class ServiceContext;
  *  - an empty BSONObj if 'doc' can be inserted as-is; or
  *  - a non-empty BSONObj representing what should be inserted instead of 'doc'.
  */
-StatusWith<BSONObj> fixDocumentForInsert(ServiceContext* service, const BSONObj& doc);
+StatusWith<BSONObj> fixDocumentForInsert(OperationContext* opCtx, const BSONObj& doc);
 
 
 /**
  * Returns Status::OK() if this namespace is valid for user write operations.  If not, returns
  * an error Status.
  */
-Status userAllowedWriteNS(StringData db, StringData coll);
-Status userAllowedWriteNS(StringData ns);
 Status userAllowedWriteNS(const NamespaceString& ns);
 
 /**
- * Returns Status::OK() if the namespace described by (db, coll) is valid for user create
- * operations.  If not, returns an error Status.
+ * Checks if the namespace is valid for user create operations.
  */
-Status userAllowedCreateNS(StringData db, StringData coll);
+Status userAllowedCreateNS(const NamespaceString& ns);
 }  // namespace mongo

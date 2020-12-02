@@ -40,6 +40,7 @@
 #include "mongo/db/query/getmore_request.h"
 #include "mongo/db/query/query_request.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/query/results_merger_test_fixture.h"
 #include "mongo/unittest/death_test.h"
@@ -464,8 +465,8 @@ TEST_F(AsyncResultsMergerTest, SortedButNoSortKey) {
     ASSERT_EQ(statusWithNext.getStatus().code(), ErrorCodes::InternalError);
 
     // Required to kill the 'arm' on error before destruction.
-    auto killEvent = arm->kill(operationContext());
-    executor()->waitForEvent(killEvent);
+    auto killFuture = arm->kill(operationContext());
+    killFuture.wait();
 }
 
 TEST_F(AsyncResultsMergerTest, HasFirstBatch) {
@@ -648,13 +649,9 @@ TEST_F(AsyncResultsMergerTest, StreamResultsFromOneShardIfOtherDoesntRespond) {
     ASSERT_TRUE(arm->ready());
     ASSERT_BSONOBJ_EQ(fromjson("{_id: 8}"), *unittest::assertGet(arm->nextReady()).getResult());
 
-    // Kill cursor before deleting it, as the second remote cursor has not been exhausted. We don't
-    // wait on 'killEvent' here, as the blackholed request's callback will only run on shutdown of
-    // the network interface.
-    auto killEvent = arm->kill(operationContext());
-    ASSERT_TRUE(killEvent.isValid());
+    auto killFuture = arm->kill(operationContext());
     executor()->shutdown();
-    executor()->waitForEvent(killEvent);
+    killFuture.wait();
 }
 
 TEST_F(AsyncResultsMergerTest, ErrorOnMismatchedCursorIds) {
@@ -677,8 +674,8 @@ TEST_F(AsyncResultsMergerTest, ErrorOnMismatchedCursorIds) {
     ASSERT(!arm->nextReady().isOK());
 
     // Required to kill the 'arm' on error before destruction.
-    auto killEvent = arm->kill(operationContext());
-    executor()->waitForEvent(killEvent);
+    auto killFuture = arm->kill(operationContext());
+    killFuture.wait();
 }
 
 TEST_F(AsyncResultsMergerTest, BadResponseReceivedFromShard) {
@@ -710,8 +707,8 @@ TEST_F(AsyncResultsMergerTest, BadResponseReceivedFromShard) {
     ASSERT(!statusWithNext.isOK());
 
     // Required to kill the 'arm' on error before destruction.
-    auto killEvent = arm->kill(operationContext());
-    executor()->waitForEvent(killEvent);
+    auto killFuture = arm->kill(operationContext());
+    killFuture.wait();
 }
 
 TEST_F(AsyncResultsMergerTest, ErrorReceivedFromShard) {
@@ -745,8 +742,8 @@ TEST_F(AsyncResultsMergerTest, ErrorReceivedFromShard) {
     ASSERT_EQ(statusWithNext.getStatus().reason(), "bad thing happened");
 
     // Required to kill the 'arm' on error before destruction.
-    auto killEvent = arm->kill(operationContext());
-    executor()->waitForEvent(killEvent);
+    auto killFuture = arm->kill(operationContext());
+    killFuture.wait();
 }
 
 TEST_F(AsyncResultsMergerTest, ErrorCantScheduleEventBeforeLastSignaled) {
@@ -775,8 +772,8 @@ TEST_F(AsyncResultsMergerTest, ErrorCantScheduleEventBeforeLastSignaled) {
     ASSERT_TRUE(unittest::assertGet(arm->nextReady()).isEOF());
 
     // Required to kill the 'arm' on error before destruction.
-    auto killEvent = arm->kill(operationContext());
-    executor()->waitForEvent(killEvent);
+    auto killFuture = arm->kill(operationContext());
+    killFuture.wait();
 }
 
 TEST_F(AsyncResultsMergerTest, NextEventAfterTaskExecutorShutdown) {
@@ -787,8 +784,8 @@ TEST_F(AsyncResultsMergerTest, NextEventAfterTaskExecutorShutdown) {
 
     executor()->shutdown();
     ASSERT_EQ(ErrorCodes::ShutdownInProgress, arm->nextEvent().getStatus());
-    auto killEvent = arm->kill(operationContext());
-    ASSERT_FALSE(killEvent.isValid());
+    auto killFuture = arm->kill(operationContext());
+    killFuture.wait();
 }
 
 TEST_F(AsyncResultsMergerTest, KillAfterTaskExecutorShutdownWithOutstandingBatches) {
@@ -805,8 +802,8 @@ TEST_F(AsyncResultsMergerTest, KillAfterTaskExecutorShutdownWithOutstandingBatch
 
     // Executor shuts down before a response is received.
     executor()->shutdown();
-    auto killEvent = arm->kill(operationContext());
-    ASSERT_FALSE(killEvent.isValid());
+    auto killFuture = arm->kill(operationContext());
+    killFuture.wait();
 
     // Ensure that the executor finishes all of the outstanding callbacks before the ARM is freed.
     executor()->join();
@@ -819,7 +816,7 @@ TEST_F(AsyncResultsMergerTest, KillNoBatchesRequested) {
     auto arm = makeARMFromExistingCursors(std::move(cursors));
 
     ASSERT_FALSE(arm->ready());
-    auto killedEvent = arm->kill(operationContext());
+    auto killFuture = arm->kill(operationContext());
     assertKillCusorsCmdHasCursorId(getNthPendingRequest(0u).cmdObj, 1);
 
     // Killed cursors are considered ready, but return an error when you try to receive the next
@@ -827,7 +824,7 @@ TEST_F(AsyncResultsMergerTest, KillNoBatchesRequested) {
     ASSERT_TRUE(arm->ready());
     ASSERT_NOT_OK(arm->nextReady().getStatus());
 
-    executor()->waitForEvent(killedEvent);
+    killFuture.wait();
 }
 
 TEST_F(AsyncResultsMergerTest, KillAllRemotesExhausted) {
@@ -853,14 +850,14 @@ TEST_F(AsyncResultsMergerTest, KillAllRemotesExhausted) {
     responses.emplace_back(kTestNss, CursorId(0), batch3);
     scheduleNetworkResponses(std::move(responses));
 
-    auto killedEvent = arm->kill(operationContext());
+    auto killFuture = arm->kill(operationContext());
 
     // ARM shouldn't schedule killCursors on anything since all of the remotes are exhausted.
     ASSERT_FALSE(networkHasReadyRequests());
 
     ASSERT_TRUE(arm->ready());
     ASSERT_NOT_OK(arm->nextReady().getStatus());
-    executor()->waitForEvent(killedEvent);
+    killFuture.wait();
 }
 
 TEST_F(AsyncResultsMergerTest, KillNonExhaustedCursorWithoutPendingRequest) {
@@ -887,14 +884,14 @@ TEST_F(AsyncResultsMergerTest, KillNonExhaustedCursorWithoutPendingRequest) {
     responses.emplace_back(kTestNss, CursorId(123), batch3);
     scheduleNetworkResponses(std::move(responses));
 
-    auto killedEvent = arm->kill(operationContext());
+    auto killFuture = arm->kill(operationContext());
 
     // ARM should schedule killCursors on cursor 123
     assertKillCusorsCmdHasCursorId(getNthPendingRequest(0u).cmdObj, 123);
 
     ASSERT_TRUE(arm->ready());
     ASSERT_NOT_OK(arm->nextReady().getStatus());
-    executor()->waitForEvent(killedEvent);
+    killFuture.wait();
 }
 
 TEST_F(AsyncResultsMergerTest, KillTwoOutstandingBatches) {
@@ -917,7 +914,7 @@ TEST_F(AsyncResultsMergerTest, KillTwoOutstandingBatches) {
     scheduleNetworkResponses(std::move(responses));
 
     // Kill event will only be signalled once the callbacks for the pending batches have run.
-    auto killedEvent = arm->kill(operationContext());
+    auto killFuture = arm->kill(operationContext());
 
     // Check that the ARM kills both batches.
     assertKillCusorsCmdHasCursorId(getNthPendingRequest(0u).cmdObj, 2);
@@ -928,7 +925,7 @@ TEST_F(AsyncResultsMergerTest, KillTwoOutstandingBatches) {
 
     // Ensure that we properly signal those waiting for more results to be ready.
     executor()->waitForEvent(readyEvent);
-    executor()->waitForEvent(killedEvent);
+    killFuture.wait();
 }
 
 TEST_F(AsyncResultsMergerTest, NextEventErrorsAfterKill) {
@@ -946,12 +943,12 @@ TEST_F(AsyncResultsMergerTest, NextEventErrorsAfterKill) {
     responses.emplace_back(kTestNss, CursorId(1), batch1);
     scheduleNetworkResponses(std::move(responses));
 
-    auto killedEvent = arm->kill(operationContext());
+    auto killFuture = arm->kill(operationContext());
 
     // Attempting to schedule more network operations on a killed arm is an error.
     ASSERT_NOT_OK(arm->nextEvent().getStatus());
 
-    executor()->waitForEvent(killedEvent);
+    killFuture.wait();
 }
 
 TEST_F(AsyncResultsMergerTest, KillCalledTwice) {
@@ -959,12 +956,10 @@ TEST_F(AsyncResultsMergerTest, KillCalledTwice) {
     cursors.push_back(
         makeRemoteCursor(kTestShardIds[0], kTestShardHosts[0], CursorResponse(kTestNss, 1, {})));
     auto arm = makeARMFromExistingCursors(std::move(cursors));
-    auto killedEvent1 = arm->kill(operationContext());
-    ASSERT(killedEvent1.isValid());
-    auto killedEvent2 = arm->kill(operationContext());
-    ASSERT(killedEvent2.isValid());
-    executor()->waitForEvent(killedEvent1);
-    executor()->waitForEvent(killedEvent2);
+    auto killFuture1 = arm->kill(operationContext());
+    auto killFuture2 = arm->kill(operationContext());
+    killFuture1.wait();
+    killFuture2.wait();
 }
 
 TEST_F(AsyncResultsMergerTest, TailableBasic) {
@@ -1011,8 +1006,8 @@ TEST_F(AsyncResultsMergerTest, TailableBasic) {
     ASSERT_TRUE(unittest::assertGet(arm->nextReady()).isEOF());
     ASSERT_FALSE(arm->remotesExhausted());
 
-    auto killedEvent = arm->kill(operationContext());
-    executor()->waitForEvent(killedEvent);
+    auto killFuture = arm->kill(operationContext());
+    killFuture.wait();
 }
 
 TEST_F(AsyncResultsMergerTest, TailableEmptyBatch) {
@@ -1039,8 +1034,8 @@ TEST_F(AsyncResultsMergerTest, TailableEmptyBatch) {
     ASSERT_TRUE(unittest::assertGet(arm->nextReady()).isEOF());
     ASSERT_FALSE(arm->remotesExhausted());
 
-    auto killedEvent = arm->kill(operationContext());
-    executor()->waitForEvent(killedEvent);
+    auto killFuture = arm->kill(operationContext());
+    killFuture.wait();
 }
 
 TEST_F(AsyncResultsMergerTest, TailableExhaustedCursor) {
@@ -1269,8 +1264,8 @@ TEST_F(AsyncResultsMergerTest, ReturnsErrorOnRetriableError) {
     ASSERT_EQ(statusWithNext.getStatus().reason(), "host unreachable");
 
     // Required to kill the 'arm' on error before destruction.
-    auto killEvent = arm->kill(operationContext());
-    executor()->waitForEvent(killEvent);
+    auto killFuture = arm->kill(operationContext());
+    killFuture.wait();
 }
 
 TEST_F(AsyncResultsMergerTest, GetMoreRequestIncludesMaxTimeMS) {
@@ -1348,7 +1343,8 @@ DEATH_TEST_REGEX_F(
     cursors.push_back(makeRemoteCursor(
         kTestShardIds[0],
         kTestShardHosts[0],
-        CursorResponse(kTestNss, 123, {firstCursorResponse}, boost::none, pbrtFirstCursor)));
+        CursorResponse(
+            kTestNss, 123, {firstCursorResponse}, boost::none, boost::none, pbrtFirstCursor)));
     // Create a second cursor whose initial batch has no PBRT.
     cursors.push_back(
         makeRemoteCursor(kTestShardIds[1], kTestShardHosts[1], CursorResponse(kTestNss, 456, {})));
@@ -1381,7 +1377,8 @@ DEATH_TEST_REGEX_F(AsyncResultsMergerTest,
     cursors.push_back(makeRemoteCursor(
         kTestShardIds[0],
         kTestShardHosts[0],
-        CursorResponse(kTestNss, 123, {firstCursorResponse}, boost::none, pbrtFirstCursor)));
+        CursorResponse(
+            kTestNss, 123, {firstCursorResponse}, boost::none, boost::none, pbrtFirstCursor)));
     params.setRemotes(std::move(cursors));
     params.setTailableMode(TailableModeEnum::kTailableAndAwaitData);
     params.setSort(change_stream_constants::kSortSpec);
@@ -1409,11 +1406,13 @@ TEST_F(AsyncResultsMergerTest, SortedTailableCursorNotReadyIfRemoteHasLowerPostB
     cursors.push_back(makeRemoteCursor(
         kTestShardIds[0],
         kTestShardHosts[0],
-        CursorResponse(kTestNss, 123, {firstCursorResponse}, boost::none, pbrtFirstCursor)));
+        CursorResponse(
+            kTestNss, 123, {firstCursorResponse}, boost::none, boost::none, pbrtFirstCursor)));
     auto tooLowPBRT = makePostBatchResumeToken(Timestamp(1, 2));
-    cursors.push_back(makeRemoteCursor(kTestShardIds[1],
-                                       kTestShardHosts[1],
-                                       CursorResponse(kTestNss, 456, {}, boost::none, tooLowPBRT)));
+    cursors.push_back(
+        makeRemoteCursor(kTestShardIds[1],
+                         kTestShardHosts[1],
+                         CursorResponse(kTestNss, 456, {}, boost::none, boost::none, tooLowPBRT)));
     params.setRemotes(std::move(cursors));
     params.setTailableMode(TailableModeEnum::kTailableAndAwaitData);
     params.setSort(change_stream_constants::kSortSpec);
@@ -1428,8 +1427,8 @@ TEST_F(AsyncResultsMergerTest, SortedTailableCursorNotReadyIfRemoteHasLowerPostB
     std::vector<CursorResponse> responses;
     responses.emplace_back(kTestNss, CursorId(0), std::vector<BSONObj>{});
     scheduleNetworkResponses(std::move(responses));
-    auto killEvent = arm->kill(operationContext());
-    executor()->waitForEvent(killEvent);
+    auto killFuture = arm->kill(operationContext());
+    killFuture.wait();
 }
 
 TEST_F(AsyncResultsMergerTest, SortedTailableCursorNewShardOrderedAfterExisting) {
@@ -1459,7 +1458,8 @@ TEST_F(AsyncResultsMergerTest, SortedTailableCursorNewShardOrderedAfterExisting)
                       << firstDocSortKey.firstElement().String() << "'}]}");
     std::vector<BSONObj> batch1 = {firstCursorResponse};
     auto firstDoc = batch1.front();
-    responses.emplace_back(kTestNss, CursorId(123), batch1, boost::none, pbrtFirstCursor);
+    responses.emplace_back(
+        kTestNss, CursorId(123), batch1, boost::none, boost::none, pbrtFirstCursor);
     scheduleNetworkResponses(std::move(responses));
 
     // Should be ready now.
@@ -1471,7 +1471,7 @@ TEST_F(AsyncResultsMergerTest, SortedTailableCursorNewShardOrderedAfterExisting)
     newCursors.push_back(
         makeRemoteCursor(kTestShardIds[1],
                          kTestShardHosts[1],
-                         CursorResponse(kTestNss, 456, {}, boost::none, tooLowPBRT)));
+                         CursorResponse(kTestNss, 456, {}, boost::none, boost::none, tooLowPBRT)));
     arm->addNewShardCursors(std::move(newCursors));
 
     // Now shouldn't be ready, our guarantee from the new shard isn't sufficiently advanced.
@@ -1488,7 +1488,8 @@ TEST_F(AsyncResultsMergerTest, SortedTailableCursorNewShardOrderedAfterExisting)
                       << secondDocSortKey.firstElement().String() << "'}]}");
     std::vector<BSONObj> batch2 = {secondCursorResponse};
     auto secondDoc = batch2.front();
-    responses.emplace_back(kTestNss, CursorId(456), batch2, boost::none, pbrtSecondCursor);
+    responses.emplace_back(
+        kTestNss, CursorId(456), batch2, boost::none, boost::none, pbrtSecondCursor);
     scheduleNetworkResponses(std::move(responses));
     executor()->waitForEvent(readyEvent);
     ASSERT_TRUE(arm->ready());
@@ -1536,7 +1537,8 @@ TEST_F(AsyncResultsMergerTest, SortedTailableCursorNewShardOrderedBeforeExisting
                       << "', documentKey: {_id: 1}}, $sortKey: [{_data: '"
                       << firstDocSortKey.firstElement().String() << "'}]}");
     std::vector<BSONObj> batch1 = {firstCursorResponse};
-    responses.emplace_back(kTestNss, CursorId(123), batch1, boost::none, pbrtFirstCursor);
+    responses.emplace_back(
+        kTestNss, CursorId(123), batch1, boost::none, boost::none, pbrtFirstCursor);
     scheduleNetworkResponses(std::move(responses));
 
     // Should be ready now.
@@ -1548,7 +1550,7 @@ TEST_F(AsyncResultsMergerTest, SortedTailableCursorNewShardOrderedBeforeExisting
     newCursors.push_back(
         makeRemoteCursor(kTestShardIds[1],
                          kTestShardHosts[1],
-                         CursorResponse(kTestNss, 456, {}, boost::none, tooLowPBRT)));
+                         CursorResponse(kTestNss, 456, {}, boost::none, boost::none, tooLowPBRT)));
     arm->addNewShardCursors(std::move(newCursors));
 
     // Now shouldn't be ready, our guarantee from the new shard isn't sufficiently advanced.
@@ -1566,7 +1568,8 @@ TEST_F(AsyncResultsMergerTest, SortedTailableCursorNewShardOrderedBeforeExisting
     std::vector<BSONObj> batch2 = {secondCursorResponse};
     // The last observed time should still be later than the first shard, so we can get the data
     // from it.
-    responses.emplace_back(kTestNss, CursorId(456), batch2, boost::none, pbrtSecondCursor);
+    responses.emplace_back(
+        kTestNss, CursorId(456), batch2, boost::none, boost::none, pbrtSecondCursor);
     scheduleNetworkResponses(std::move(responses));
     executor()->waitForEvent(readyEvent);
     ASSERT_TRUE(arm->ready());
@@ -1594,20 +1597,20 @@ TEST_F(AsyncResultsMergerTest, SortedTailableCursorReturnsHighWaterMarkSortKey) 
     std::vector<RemoteCursor> cursors;
     // Create three cursors with empty initial batches. Each batch has a PBRT.
     auto pbrtFirstCursor = makePostBatchResumeToken(Timestamp(1, 5));
-    cursors.push_back(
-        makeRemoteCursor(kTestShardIds[0],
-                         kTestShardHosts[0],
-                         CursorResponse(kTestNss, 123, {}, boost::none, pbrtFirstCursor)));
+    cursors.push_back(makeRemoteCursor(
+        kTestShardIds[0],
+        kTestShardHosts[0],
+        CursorResponse(kTestNss, 123, {}, boost::none, boost::none, pbrtFirstCursor)));
     auto pbrtSecondCursor = makePostBatchResumeToken(Timestamp(1, 1));
-    cursors.push_back(
-        makeRemoteCursor(kTestShardIds[1],
-                         kTestShardHosts[1],
-                         CursorResponse(kTestNss, 456, {}, boost::none, pbrtSecondCursor)));
+    cursors.push_back(makeRemoteCursor(
+        kTestShardIds[1],
+        kTestShardHosts[1],
+        CursorResponse(kTestNss, 456, {}, boost::none, boost::none, pbrtSecondCursor)));
     auto pbrtThirdCursor = makePostBatchResumeToken(Timestamp(1, 4));
-    cursors.push_back(
-        makeRemoteCursor(kTestShardIds[2],
-                         kTestShardHosts[2],
-                         CursorResponse(kTestNss, 789, {}, boost::none, pbrtThirdCursor)));
+    cursors.push_back(makeRemoteCursor(
+        kTestShardIds[2],
+        kTestShardHosts[2],
+        CursorResponse(kTestNss, 789, {}, boost::none, boost::none, pbrtThirdCursor)));
     params.setRemotes(std::move(cursors));
     params.setTailableMode(TailableModeEnum::kTailableAndAwaitData);
     params.setSort(change_stream_constants::kSortSpec);
@@ -1625,27 +1628,156 @@ TEST_F(AsyncResultsMergerTest, SortedTailableCursorReturnsHighWaterMarkSortKey) 
     // each cursor to be updated in-order, so we keep the first and third PBRTs constant.
     pbrtSecondCursor = makePostBatchResumeToken(Timestamp(1, 3));
     std::vector<BSONObj> emptyBatch = {};
-    scheduleNetworkResponse({kTestNss, CursorId(123), emptyBatch, boost::none, pbrtFirstCursor});
-    scheduleNetworkResponse({kTestNss, CursorId(456), emptyBatch, boost::none, pbrtSecondCursor});
-    scheduleNetworkResponse({kTestNss, CursorId(789), emptyBatch, boost::none, pbrtThirdCursor});
+    scheduleNetworkResponse(
+        {kTestNss, CursorId(123), emptyBatch, boost::none, boost::none, pbrtFirstCursor});
+    scheduleNetworkResponse(
+        {kTestNss, CursorId(456), emptyBatch, boost::none, boost::none, pbrtSecondCursor});
+    scheduleNetworkResponse(
+        {kTestNss, CursorId(789), emptyBatch, boost::none, boost::none, pbrtThirdCursor});
     ASSERT_BSONOBJ_EQ(arm->getHighWaterMark(), pbrtSecondCursor);
     ASSERT_FALSE(arm->ready());
 
     // Advance the second cursor again, so that it surpasses the other two. The third cursor becomes
     // the new high water mark.
     pbrtSecondCursor = makePostBatchResumeToken(Timestamp(1, 6));
-    scheduleNetworkResponse({kTestNss, CursorId(123), emptyBatch, boost::none, pbrtFirstCursor});
-    scheduleNetworkResponse({kTestNss, CursorId(456), emptyBatch, boost::none, pbrtSecondCursor});
-    scheduleNetworkResponse({kTestNss, CursorId(789), emptyBatch, boost::none, pbrtThirdCursor});
+    scheduleNetworkResponse(
+        {kTestNss, CursorId(123), emptyBatch, boost::none, boost::none, pbrtFirstCursor});
+    scheduleNetworkResponse(
+        {kTestNss, CursorId(456), emptyBatch, boost::none, boost::none, pbrtSecondCursor});
+    scheduleNetworkResponse(
+        {kTestNss, CursorId(789), emptyBatch, boost::none, boost::none, pbrtThirdCursor});
     ASSERT_BSONOBJ_EQ(arm->getHighWaterMark(), pbrtThirdCursor);
     ASSERT_FALSE(arm->ready());
 
     // Advance the third cursor such that the first cursor becomes the high water mark.
     pbrtThirdCursor = makePostBatchResumeToken(Timestamp(1, 7));
-    scheduleNetworkResponse({kTestNss, CursorId(123), emptyBatch, boost::none, pbrtFirstCursor});
-    scheduleNetworkResponse({kTestNss, CursorId(456), emptyBatch, boost::none, pbrtSecondCursor});
-    scheduleNetworkResponse({kTestNss, CursorId(789), emptyBatch, boost::none, pbrtThirdCursor});
+    scheduleNetworkResponse(
+        {kTestNss, CursorId(123), emptyBatch, boost::none, boost::none, pbrtFirstCursor});
+    scheduleNetworkResponse(
+        {kTestNss, CursorId(456), emptyBatch, boost::none, boost::none, pbrtSecondCursor});
+    scheduleNetworkResponse(
+        {kTestNss, CursorId(789), emptyBatch, boost::none, boost::none, pbrtThirdCursor});
     ASSERT_BSONOBJ_EQ(arm->getHighWaterMark(), pbrtFirstCursor);
+    ASSERT_FALSE(arm->ready());
+
+    // Clean up the cursors.
+    std::vector<BSONObj> cleanupBatch = {};
+    scheduleNetworkResponse({kTestNss, CursorId(0), cleanupBatch});
+    scheduleNetworkResponse({kTestNss, CursorId(0), cleanupBatch});
+    scheduleNetworkResponse({kTestNss, CursorId(0), cleanupBatch});
+}
+
+TEST_F(AsyncResultsMergerTest, SortedTailableCursorDoesNotAdvanceHighWaterMarkForIneligibleCursor) {
+    AsyncResultsMergerParams params;
+    params.setNss(kTestNss);
+    std::vector<RemoteCursor> cursors;
+    // Create three cursors with empty initial batches. Each batch has a PBRT. The third cursor is
+    // the $changeStream opened on "config.shards" to monitor for the addition of new shards.
+    auto pbrtFirstCursor = makePostBatchResumeToken(Timestamp(1, 5));
+    cursors.push_back(makeRemoteCursor(
+        kTestShardIds[0],
+        kTestShardHosts[0],
+        CursorResponse(kTestNss, 123, {}, boost::none, boost::none, pbrtFirstCursor)));
+    auto pbrtSecondCursor = makePostBatchResumeToken(Timestamp(1, 3));
+    cursors.push_back(makeRemoteCursor(
+        kTestShardIds[1],
+        kTestShardHosts[1],
+        CursorResponse(kTestNss, 456, {}, boost::none, boost::none, pbrtSecondCursor)));
+    auto pbrtConfigCursor = makePostBatchResumeToken(Timestamp(1, 1));
+    cursors.push_back(makeRemoteCursor(
+        kTestShardIds[2],
+        kTestShardHosts[2],
+        CursorResponse(ShardType::ConfigNS, 789, {}, boost::none, boost::none, pbrtConfigCursor)));
+    params.setRemotes(std::move(cursors));
+    params.setTailableMode(TailableModeEnum::kTailableAndAwaitData);
+    params.setSort(change_stream_constants::kSortSpec);
+    auto arm =
+        std::make_unique<AsyncResultsMerger>(operationContext(), executor(), std::move(params));
+
+    // We have no results to return, so the ARM is not ready.
+    auto readyEvent = unittest::assertGet(arm->nextEvent());
+    ASSERT_FALSE(arm->ready());
+
+    // For a change stream cursor on "config.shards", the first batch is not eligible to provide the
+    // HWM. Despite the fact that 'pbrtConfigCursor' has the lowest PBRT, the ARM returns the PBRT
+    // of 'pbrtSecondCursor' as the current high water mark. This guards against the possibility
+    // that the user requests a start time in the future. The "config.shards" cursor must start
+    // monitoring for shards at the current point in time, and so its initial PBRT will be lower
+    // than that of the shards. We do not wish to return a high water mark to the client that is
+    // earlier than the start time they specified in their request.
+    auto initialHighWaterMark = arm->getHighWaterMark();
+    ASSERT_BSONOBJ_EQ(initialHighWaterMark, pbrtSecondCursor);
+
+    // Advance the PBRT of the 'pbrtConfigCursor'. It is still the lowest, but is ineligible to
+    // provide the high water mark because it is still lower than the high water mark that was
+    // already returned. As above, the guards against the possibility that the user requested a
+    // stream with a start point at an arbitrary point in the future.
+    pbrtConfigCursor = makePostBatchResumeToken(Timestamp(1, 2));
+    scheduleNetworkResponse(
+        {kTestNss, CursorId(123), {}, boost::none, boost::none, pbrtFirstCursor});
+    scheduleNetworkResponse(
+        {kTestNss, CursorId(456), {}, boost::none, boost::none, pbrtSecondCursor});
+    scheduleNetworkResponse(
+        {ShardType::ConfigNS, CursorId(789), {}, boost::none, boost::none, pbrtConfigCursor});
+
+    // The high water mark has not advanced from its previous value.
+    ASSERT_BSONOBJ_EQ(arm->getHighWaterMark(), initialHighWaterMark);
+    ASSERT_FALSE(arm->ready());
+
+    // If the "config.shards" cursor returns a result, this document does not advance the HWM. We
+    // consume this event internally but do not return it to the client, and its resume token is not
+    // actually resumable. We therefore do not want to expose it to the client via the PBRT.
+    const auto configUUID = UUID::gen();
+    auto configEvent = fromjson("{_id: 'shard_add_event'}");
+    pbrtFirstCursor = makePostBatchResumeToken(Timestamp(1, 15));
+    pbrtSecondCursor = makePostBatchResumeToken(Timestamp(1, 13));
+    pbrtConfigCursor = makeResumeToken(Timestamp(1, 11), configUUID, configEvent);
+    configEvent =
+        configEvent.addField(BSON("$sortKey" << BSON_ARRAY(pbrtConfigCursor)).firstElement());
+    scheduleNetworkResponse(
+        {kTestNss, CursorId(123), {}, boost::none, boost::none, pbrtFirstCursor});
+    scheduleNetworkResponse(
+        {kTestNss, CursorId(456), {}, boost::none, boost::none, pbrtSecondCursor});
+    scheduleNetworkResponse({ShardType::ConfigNS,
+                             CursorId(789),
+                             {configEvent},
+                             boost::none,
+                             boost::none,
+                             pbrtConfigCursor});
+
+    // The config cursor has a lower sort key than the other shards, so we can retrieve the event.
+    ASSERT_TRUE(arm->ready());
+    ASSERT_BSONOBJ_EQ(configEvent, *unittest::assertGet(arm->nextReady()).getResult());
+    readyEvent = unittest::assertGet(arm->nextEvent());
+
+    // Reading the config cursor event document does not advance the high water mark.
+    ASSERT_BSONOBJ_EQ(arm->getHighWaterMark(), initialHighWaterMark);
+    ASSERT_FALSE(arm->ready());
+
+    // If the next config batch is empty but the PBRT is still the resume token of the addShard
+    // event, it does not advance the ARM's high water mark sort key.
+    scheduleNetworkResponse(
+        {kTestNss, CursorId(123), {}, boost::none, boost::none, pbrtFirstCursor});
+    scheduleNetworkResponse(
+        {kTestNss, CursorId(456), {}, boost::none, boost::none, pbrtSecondCursor});
+    scheduleNetworkResponse(
+        {ShardType::ConfigNS, CursorId(789), {}, boost::none, boost::none, pbrtConfigCursor});
+    ASSERT_BSONOBJ_EQ(arm->getHighWaterMark(), initialHighWaterMark);
+    ASSERT_FALSE(arm->ready());
+
+    // If none of the above criteria obtain, then the "config.shards" cursor is eligible to advance
+    // the ARM's high water mark. The only reason we allow the config.shards cursor to participate
+    // in advancing of the high water mark at all is so that we cannot end up in a situation where
+    // the config cursor is always the lowest and the high water mark can therefore never advance.
+    pbrtConfigCursor = makePostBatchResumeToken(Timestamp(1, 12));
+    scheduleNetworkResponse(
+        {kTestNss, CursorId(123), {}, boost::none, boost::none, pbrtFirstCursor});
+    scheduleNetworkResponse(
+        {kTestNss, CursorId(456), {}, boost::none, boost::none, pbrtSecondCursor});
+    scheduleNetworkResponse(
+        {ShardType::ConfigNS, CursorId(789), {}, boost::none, boost::none, pbrtConfigCursor});
+    ASSERT_BSONOBJ_GT(arm->getHighWaterMark(), initialHighWaterMark);
+    ASSERT_BSONOBJ_EQ(arm->getHighWaterMark(), pbrtConfigCursor);
     ASSERT_FALSE(arm->ready());
 
     // Clean up the cursors.
@@ -1663,8 +1795,8 @@ TEST_F(AsyncResultsMergerTest, GetMoreRequestWithoutTailableCantHaveMaxTime) {
     auto arm = makeARMFromExistingCursors(std::move(cursors), findCmd);
 
     ASSERT_NOT_OK(arm->setAwaitDataTimeout(Milliseconds(789)));
-    auto killEvent = arm->kill(operationContext());
-    executor()->waitForEvent(killEvent);
+    auto killFuture = arm->kill(operationContext());
+    killFuture.wait();
 }
 
 TEST_F(AsyncResultsMergerTest, GetMoreRequestWithoutAwaitDataCantHaveMaxTime) {
@@ -1675,8 +1807,8 @@ TEST_F(AsyncResultsMergerTest, GetMoreRequestWithoutAwaitDataCantHaveMaxTime) {
     auto arm = makeARMFromExistingCursors(std::move(cursors), findCmd);
 
     ASSERT_NOT_OK(arm->setAwaitDataTimeout(Milliseconds(789)));
-    auto killEvent = arm->kill(operationContext());
-    executor()->waitForEvent(killEvent);
+    auto killFuture = arm->kill(operationContext());
+    killFuture.wait();
 }
 
 TEST_F(AsyncResultsMergerTest, ShardCanErrorInBetweenReadyAndNextEvent) {
@@ -1693,8 +1825,8 @@ TEST_F(AsyncResultsMergerTest, ShardCanErrorInBetweenReadyAndNextEvent) {
     ASSERT_EQ(ErrorCodes::BadValue, arm->nextEvent().getStatus());
 
     // Required to kill the 'arm' on error before destruction.
-    auto killEvent = arm->kill(operationContext());
-    executor()->waitForEvent(killEvent);
+    auto killFuture = arm->kill(operationContext());
+    killFuture.wait();
 }
 
 TEST_F(AsyncResultsMergerTest, KillShouldNotWaitForRemoteCommandsBeforeSchedulingKillCursors) {
@@ -1716,7 +1848,7 @@ TEST_F(AsyncResultsMergerTest, KillShouldNotWaitForRemoteCommandsBeforeSchedulin
 
     // Kill the ARM while a batch is still outstanding. The callback for the outstanding batch
     // should be canceled.
-    auto killEvent = arm->kill(operationContext());
+    auto killFuture = arm->kill(operationContext());
 
     // Check that the ARM will run killCursors.
     assertKillCusorsCmdHasCursorId(getNthPendingRequest(0u).cmdObj, 1);
@@ -1725,7 +1857,7 @@ TEST_F(AsyncResultsMergerTest, KillShouldNotWaitForRemoteCommandsBeforeSchedulin
     runReadyCallbacks();
 
     executor()->waitForEvent(readyEvent);
-    executor()->waitForEvent(killEvent);
+    killFuture.wait();
 }
 
 TEST_F(AsyncResultsMergerTest, GetMoresShouldNotIncludeLSIDOrTxnNumberIfNoneSpecified) {
@@ -1898,8 +2030,8 @@ TEST_F(AsyncResultsMergerTest, ShouldNotScheduleGetMoresWithoutAnOperationContex
     ASSERT_FALSE(arm->ready());
     ASSERT_FALSE(arm->remotesExhausted());
 
-    auto killedEvent = arm->kill(operationContext());
-    executor()->waitForEvent(killedEvent);
+    auto killFuture = arm->kill(operationContext());
+    killFuture.wait();
 }
 
 }  // namespace

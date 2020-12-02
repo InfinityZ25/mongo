@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kASIO
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kASIO
 
 #include "mongo/platform/basic.h"
 
@@ -48,8 +48,7 @@ namespace mongo {
 namespace executor {
 
 void NetworkInterfaceIntegrationFixture::createNet(
-    std::unique_ptr<NetworkConnectionHook> connectHook) {
-    ConnectionPool::Options options;
+    std::unique_ptr<NetworkConnectionHook> connectHook, ConnectionPool::Options options) {
 
     options.minConnections = 0u;
 
@@ -108,7 +107,16 @@ Future<RemoteCommandResponse> NetworkInterfaceIntegrationFixture::runCommand(
     RemoteCommandRequestOnAny rcroa{request};
 
     return net().startCommand(cbHandle, rcroa).then([](TaskExecutor::ResponseOnAnyStatus roa) {
-        return RemoteCommandResponse(roa);
+        auto res = RemoteCommandResponse(roa);
+        if (res.isOK()) {
+            LOGV2(4820500,
+                  "Got command result: {response}",
+                  "Got command result",
+                  "response"_attr = res.toString());
+        } else {
+            LOGV2(4820501, "Command failed: {error}", "Command failed", "error"_attr = res.status);
+        }
+        return res;
     });
 }
 
@@ -117,6 +125,14 @@ Future<RemoteCommandOnAnyResponse> NetworkInterfaceIntegrationFixture::runComman
     RemoteCommandRequestOnAny rcroa{request};
 
     return net().startCommand(cbHandle, rcroa).then([](TaskExecutor::ResponseOnAnyStatus roa) {
+        if (roa.isOK()) {
+            LOGV2(4820502,
+                  "Got command result: {response}",
+                  "Got command result",
+                  "response"_attr = roa.toString());
+        } else {
+            LOGV2(4820503, "Command failed: {error}", "Command failed", "error"_attr = roa.status);
+        }
         return roa;
     });
 }
@@ -158,14 +174,6 @@ RemoteCommandResponse NetworkInterfaceIntegrationFixture::runCommandSync(
     RemoteCommandRequest& request) {
     auto deferred = runCommand(makeCallbackHandle(), request);
     auto& res = deferred.get();
-    if (res.isOK()) {
-        LOGV2(22586,
-              "Got command result: {response}",
-              "Got command result",
-              "response"_attr = res.toString());
-    } else {
-        LOGV2(22587, "Command failed: {error}", "Command failed", "error"_attr = res.status);
-    }
     return res;
 }
 

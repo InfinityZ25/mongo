@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -51,9 +51,13 @@ public:
 
         void typedRun(OperationContext* opCtx) {
             auto primaryShardId = ShardId(request().getPrimaryShard().toString());
-            auto collectionOptionsAndIndexes =
-                MigrationDestinationManager::getCollectionIndexesAndOptions(
-                    opCtx, ns(), primaryShardId);
+            auto collectionOptionsAndIndexes = [&]() -> CollectionOptionsAndIndexes {
+                auto [collOptions, uuid] = MigrationDestinationManager::getCollectionOptions(
+                    opCtx, ns(), primaryShardId, boost::none, boost::none);
+                auto [indexes, idIndex] = MigrationDestinationManager::getCollectionIndexes(
+                    opCtx, ns(), primaryShardId, boost::none, boost::none);
+                return {uuid, indexes, idIndex, collOptions};
+            }();
             MigrationDestinationManager::cloneCollectionIndexesAndOptions(
                 opCtx, ns(), collectionOptionsAndIndexes);
 

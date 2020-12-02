@@ -1,11 +1,13 @@
 // Check explain results for a plan that uses an index to obtain the requested sort order.
-// @tags: [assumes_balancer_off]
+// @tags: [
+//   assumes_balancer_off,
+// ]
 
 t = db.jstests_explain5;
 t.drop();
 
-t.ensureIndex({a: 1});
-t.ensureIndex({b: 1});
+t.createIndex({a: 1});
+t.createIndex({b: 1});
 
 for (i = 0; i < 1000; ++i) {
     t.save({a: i, b: i % 3});

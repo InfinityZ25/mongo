@@ -44,6 +44,7 @@
 #include "mongo/db/ftdc/ftdc_server_gen.h"
 #include "mongo/db/ftdc/ftdc_system_stats.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/mirror_maestro.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/synchronized_value.h"
 
@@ -187,6 +188,58 @@ std::string FTDCSimpleInternalCommandCollector::name() const {
     return _name;
 }
 
+
+/**
+ * A FTDC Collector for serverStatus
+ */
+class FTDCServerStatusCommandCollector : public FTDCCollectorInterface {
+private:
+    constexpr static StringData kName = "serverStatus"_sd;
+    constexpr static StringData kCommand = "serverStatus"_sd;
+
+public:
+    FTDCServerStatusCommandCollector() {}
+
+    void collect(OperationContext* opCtx, BSONObjBuilder& builder) final {
+        // CmdServerStatus
+        // The "sharding" section is filtered out because at this time it only consists of strings
+        // in migration status. This section triggers too many schema changes in the serverStatus
+        // which hurt ftdc compression efficiency, because its output varies depending on the list
+        // of active migrations.
+        // "timing" is filtered out because it triggers frequent schema changes.
+        // "defaultRWConcern" is excluded because it changes rarely and instead included in rotation
+        // "mirroredReads" is included to append the number of mirror-able operations observed and
+        // mirrored by this process in FTDC collections.
+
+        BSONObjBuilder commandBuilder;
+        commandBuilder.append(kCommand, 1);
+        commandBuilder.append("sharding", false);
+        commandBuilder.append("timing", false);
+        commandBuilder.append("defaultRWConcern", false);
+        commandBuilder.append(MirrorMaestro::kServerStatusSectionName, true);
+
+        if (gDiagnosticDataCollectionEnableLatencyHistograms.load()) {
+            BSONObjBuilder subObjBuilder(commandBuilder.subobjStart("opLatencies"));
+            subObjBuilder.append("histograms", true);
+            subObjBuilder.append("slowBuckets", true);
+        }
+
+        if (gDiagnosticDataCollectionVerboseTCMalloc.load()) {
+            commandBuilder.append("tcmalloc", 2);
+        }
+
+        commandBuilder.done();
+
+        auto request = OpMsgRequest::fromDBAndBody("", commandBuilder.obj());
+        auto result = CommandHelpers::runCommandDirectly(opCtx, request);
+        builder.appendElements(result);
+    }
+
+    std::string name() const final {
+        return kName.toString();
+    }
+};
+
 // Register the FTDC system
 // Note: This must be run before the server parameters are parsed during startup
 // so that the FTDCController is initialized.
@@ -216,20 +269,7 @@ void startFTDC(boost::filesystem::path& path,
     // These are collected on the period interval in FTDCConfig.
     // NOTE: For each command here, there must be an equivalent privilege check in
     // GetDiagnosticDataCommand
-
-    // CmdServerStatus
-    // The "sharding" section is filtered out because at this time it only consists of strings in
-    // migration status. This section triggers too many schema changes in the serverStatus which
-    // hurt ftdc compression efficiency, because its output varies depending on the list of active
-    // migrations.
-    // "timing" is filtered out because it triggers frequent schema changes.
-    // TODO: do we need to enable "sharding" on MongoS?
-    controller->addPeriodicCollector(std::make_unique<FTDCSimpleInternalCommandCollector>(
-        "serverStatus",
-        "serverStatus",
-        "",
-        BSON("serverStatus" << 1 << "tcMalloc" << true << "sharding" << false << "timing" << false
-                            << "defaultRWConcern" << false)));
+    controller->addPeriodicCollector(std::make_unique<FTDCServerStatusCommandCollector>());
 
     registerCollectors(controller.get());
 

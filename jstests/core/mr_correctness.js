@@ -5,10 +5,8 @@
 //   does_not_support_stepdowns,
 //   requires_fastcount,
 //   requires_getmore,
+//   sbe_incompatible,
 //   uses_map_reduce_with_temp_collections,
-//   # Map Reduce before 4.4. does not support outputting to a sharded collection whose shard key is
-//   # {_id: "hashed"}.
-//   requires_fcv_44,
 // ]
 (function() {
 "use strict";

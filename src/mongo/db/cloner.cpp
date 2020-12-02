@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -48,7 +48,6 @@
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/list_collections_filter.h"
-#include "mongo/db/commands/rename_collection.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/dbdirectclient.h"
@@ -96,7 +95,7 @@ struct Cloner::Fun {
     void operator()(DBClientCursorBatchIterator& i) {
         boost::optional<Lock::DBLock> dbLock;
         dbLock.emplace(opCtx, _dbName, MODE_X);
-        uassert(ErrorCodes::NotMaster,
+        uassert(ErrorCodes::NotWritablePrimary,
                 str::stream() << "Not primary while cloning collection " << nss,
                 !opCtx->writesAreReplicated() ||
                     repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss));
@@ -104,7 +103,8 @@ struct Cloner::Fun {
         // Make sure database still exists after we resume from the temp release
         auto databaseHolder = DatabaseHolder::get(opCtx);
         auto db = databaseHolder->openDb(opCtx, _dbName);
-        auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
+        auto catalog = CollectionCatalog::get(opCtx);
+        auto collection = catalog->lookupCollectionByNamespace(opCtx, nss);
         if (!collection) {
             writeConflictRetry(opCtx, "createCollection", nss.ns(), [&] {
                 opCtx->checkForInterrupt();
@@ -118,7 +118,7 @@ struct Cloner::Fun {
                           str::stream()
                               << "collection creation failed during clone [" << nss << "]");
                 wunit.commit();
-                collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
+                collection = catalog->lookupCollectionByNamespace(opCtx, nss);
                 invariant(collection,
                           str::stream() << "Missing collection during clone [" << nss << "]");
             });
@@ -130,7 +130,7 @@ struct Cloner::Fun {
                 if (now - lastLog >= 60) {
                     // report progress
                     if (lastLog)
-                        LOGV2(20412, "clone", "ns"_attr = nss, "numSeen"_attr = numSeen);
+                        LOGV2(20412, "clone", logAttrs(nss), "numSeen"_attr = numSeen);
                     lastLog = now;
                 }
                 opCtx->checkForInterrupt();
@@ -154,25 +154,27 @@ struct Cloner::Fun {
                         str::stream() << "Database " << _dbName << " dropped while cloning",
                         db != nullptr);
 
-                collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
+                collection = catalog->lookupCollectionByNamespace(opCtx, nss);
                 uassert(28594,
                         str::stream() << "Collection " << nss << " dropped while cloning",
-                        collection != nullptr);
+                        collection);
             }
 
             BSONObj tmp = i.nextSafe();
 
             /* assure object is valid.  note this will slow us down a little. */
-            // Use the latest BSON validation version. We allow cloning of collections containing
-            // decimal data even if decimal is disabled.
-            const Status status = validateBSON(tmp.objdata(), tmp.objsize(), BSONVersion::kLatest);
+            // We allow cloning of collections containing decimal data even if decimal is disabled.
+            const Status status = validateBSON(tmp.objdata(), tmp.objsize());
             if (!status.isOK()) {
-                str::stream ss;
-                ss << "Cloner: found corrupt document in " << nss << ": " << redact(status);
                 if (gSkipCorruptDocumentsWhenCloning.load()) {
-                    LOGV2_WARNING(20423, "{ss_ss_str}; skipping", "ss_ss_str"_attr = ss.ss.str());
+                    LOGV2_WARNING(20423,
+                                  "Cloner: found corrupt document; skipping",
+                                  logAttrs(nss),
+                                  "error"_attr = redact(status));
                     continue;
                 }
+                str::stream ss;
+                ss << "Cloner: found corrupt document in " << nss << ": " << redact(status);
                 msgasserted(28531, ss);
             }
 
@@ -191,9 +193,10 @@ struct Cloner::Fun {
                 if (!status.isOK() && status.code() != ErrorCodes::DuplicateKey) {
                     LOGV2_ERROR(20424,
                                 "error: exception cloning object",
-                                "ns"_attr = nss,
-                                "status"_attr = redact(status),
-                                "doc"_attr = redact(doc));
+                                "Exception cloning document",
+                                logAttrs(nss),
+                                "error"_attr = redact(status),
+                                "document"_attr = redact(doc));
                     uassertStatusOK(status);
                 }
                 if (status.isOK()) {
@@ -204,9 +207,9 @@ struct Cloner::Fun {
             static Rarely sampler;
             if (sampler.tick() && (time(nullptr) - saveLast > 60)) {
                 LOGV2(20413,
-                      "objects cloned so far from collection",
-                      "numSeen"_attr = numSeen,
-                      "ns"_attr = nss);
+                      "Number of objects cloned so far from collection",
+                      "number"_attr = numSeen,
+                      logAttrs(nss));
                 saveLast = time(nullptr);
             }
         }
@@ -285,7 +288,7 @@ void Cloner::_copyIndexes(OperationContext* opCtx,
     if (from_indexes.empty())
         return;
 
-    auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
+    CollectionWriter collection(opCtx, nss);
     invariant(collection, str::stream() << "Missing collection " << nss << " (Cloner)");
 
     auto indexCatalog = collection->getIndexCatalog();
@@ -295,12 +298,11 @@ void Cloner::_copyIndexes(OperationContext* opCtx,
         return;
     }
 
-    auto collUUID = collection->uuid();
     auto fromMigrate = false;
     writeConflictRetry(opCtx, "_copyIndexes", nss.ns(), [&] {
         WriteUnitOfWork wunit(opCtx);
         IndexBuildsCoordinator::get(opCtx)->createIndexesOnEmptyCollection(
-            opCtx, collUUID, indexesToBuild, fromMigrate);
+            opCtx, collection, indexesToBuild, fromMigrate);
         wunit.commit();
     });
 }
@@ -348,6 +350,7 @@ Status Cloner::_createCollectionsForDb(
     auto db = databaseHolder->openDb(opCtx, dbName);
     invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_X));
 
+    auto catalog = CollectionCatalog::get(opCtx);
     auto collCount = 0;
     for (auto&& params : createCollectionParams) {
         if (MONGO_unlikely(movePrimaryFailPoint.shouldFail()) && collCount > 0) {
@@ -360,13 +363,12 @@ Status Cloner::_createCollectionsForDb(
 
         const NamespaceString nss(dbName, params.collectionName);
 
-        uassertStatusOK(userAllowedCreateNS(dbName, params.collectionName));
+        uassertStatusOK(userAllowedCreateNS(nss));
         Status status = writeConflictRetry(opCtx, "createCollection", nss.ns(), [&] {
             opCtx->checkForInterrupt();
             WriteUnitOfWork wunit(opCtx);
 
-            Collection* collection =
-                CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
+            CollectionPtr collection = catalog->lookupCollectionByNamespace(opCtx, nss);
             if (collection) {
                 if (!params.shardedColl) {
                     // If the collection is unsharded then we want to fail when a collection
@@ -527,7 +529,7 @@ Status Cloner::copyDb(OperationContext* opCtx,
     }
 
     uassert(
-        ErrorCodes::NotMaster,
+        ErrorCodes::NotWritablePrimary,
         str::stream() << "Not primary while cloning database " << dBName
                       << " (after getting list of collections to clone)",
         !opCtx->writesAreReplicated() ||
@@ -541,8 +543,9 @@ Status Cloner::copyDb(OperationContext* opCtx,
     // now build the secondary indexes
     for (auto&& params : createCollectionParams) {
         LOGV2(20422,
-              "copying indexes for: {params_collectionInfo}",
-              "params_collectionInfo"_attr = params.collectionInfo);
+              "copying indexes for: {collectionInfo}",
+              "Copying indexes",
+              "collectionInfo"_attr = params.collectionInfo);
 
         const NamespaceString nss(dBName, params.collectionName);
 

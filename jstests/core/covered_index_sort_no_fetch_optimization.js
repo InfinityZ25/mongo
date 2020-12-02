@@ -1,10 +1,17 @@
-// Confirms that blocking sorts are covered when the index contains the sort key.
-// For example, if we have an index on {a:1, b:1} and a sort on {b:1}, and a projection of only
-// field 'b', we can sort using only the existing index keys, without needing to do a fetch.
-
-// Queries on a sharded collection can't be covered when they aren't on the shard key. The document
-// must be fetched to support the SHARDING_FILTER stage.
-// @tags: [assumes_unsharded_collection]
+/**
+ * Confirms that blocking sorts are covered when the index contains the sort key. For example, if we
+ * have an index on {a:1, b:1} and a sort on {b:1}, and a projection of only field 'b', we can sort
+ * using only the existing index keys, without needing to do a fetch.
+ *
+ * Queries on a sharded collection can't be covered when they aren't on the shard key. The document
+ * must be fetched to support the SHARDING_FILTER stage.
+ * @tags: [
+ *   assumes_unsharded_collection,
+ *   # Sort optimizations added for hashed indexes in 4.7 can generate a different plan.
+ *   requires_fcv_47,
+ *   sbe_incompatible,
+ * ]
+ */
 (function() {
 "use strict";
 
@@ -180,7 +187,7 @@ findCmd = {
     hint: {a: 1, b: 1}
 };
 expected = [{a: 1, b: 2}, {a: 2, b: 2}];
-assertExpectedResult(findCmd, expected, kIsCovered, kBlockingSort);
+assertExpectedResult(findCmd, expected, kIsCovered, kNonBlockingSort);
 
 // The index does not have a special collation, but the query asks for one. The no-fetch
 // optimization will be applied in this case. The server must correctly respect the collation

@@ -6,19 +6,15 @@
  * solution to this problem is to synchronize index build commits.
  *
  * @tags: [
- *     uses_transactions,
- *     uses_prepare_transaction,
- *     requires_fcv_44,
+ *   uses_prepare_transaction,
+ *   uses_transactions,
  * ]
  */
 (function() {
 "use strict";
 load("jstests/core/txns/libs/prepare_helpers.js");
 
-// This test create indexes with fail point enabled on secondary which prevents secondary from
-// voting. So, disabling index build commit quorum.
-const replTest =
-    new ReplSetTest({nodes: 2, nodeOptions: {setParameter: "enableIndexBuildCommitQuorum=false"}});
+const replTest = new ReplSetTest({nodes: 2});
 replTest.startSet();
 replTest.initiate();
 
@@ -42,10 +38,13 @@ assert.commandWorked(bulk.execute());
 secondary.getDB("admin").runCommand(
     {configureFailPoint: 'hangAfterStartingIndexBuild', mode: 'alwaysOn'});
 
+// This test create indexes with fail point enabled on secondary which prevents secondary from
+// voting. So, disabling index build commit quorum.
 jsTestLog("Starting a background index build.");
 assert.commandWorked(testDB.runCommand({
     createIndexes: collName,
     indexes: [{key: {x: 1}, name: 'x_1'}],
+    commitQuorum: 0,
 }));
 
 const session = primary.startSession({causalConsistency: false});
@@ -58,7 +57,7 @@ session.startTransaction();
 assert.commandWorked(sessionColl.insert({x: 1000}));
 
 const prepareTimestamp = PrepareHelpers.prepareTransaction(session, {w: 1});
-jsTestLog("Prepared a transaction at " + prepareTimestamp);
+jsTestLog("Prepared a transaction at " + tojson(prepareTimestamp));
 
 jsTestLog("Unblocking index build.");
 

@@ -41,32 +41,39 @@
 #include "mongo/unittest/death_test.h"
 
 namespace mongo {
-template std::ostream& operator<<(std::ostream& os,
-                                  const std::vector<mongo::sdam::ServerAddress>& s);
 
 bool operator==(const TopologyVersion& a, const TopologyVersion& b) {
     return a.getProcessId() == b.getProcessId() && a.getCounter() == b.getCounter();
 }
 
 namespace sdam {
-using mongo::operator<<;
-
 
 class TopologyDescriptionTestFixture : public SdamTestFixture {
 protected:
     void assertDefaultConfig(const TopologyDescription& topologyDescription);
 
+    SdamConfiguration makeSdamConfig(std::vector<HostAndPort> servers,
+                                     TopologyType topologyType,
+                                     boost::optional<std::string> setName) {
+        return SdamConfiguration(
+            servers, topologyType, kNotUsedMs, kNotUsedMs, kNotUsedMs, setName);
+    }
+
     static inline const auto kSetName = std::string("mySetName");
 
-    static inline const std::vector<ServerAddress> kOneServer{"foo:1234"};
-    static inline const std::vector<ServerAddress> kTwoServersVaryCase{"FoO:1234", "BaR:1234"};
-    static inline const std::vector<ServerAddress> kTwoServersNormalCase{"foo:1234", "bar:1234"};
-    static inline const std::vector<ServerAddress> kThreeServers{
-        "foo:1234", "bar:1234", "baz:1234"};
+    static inline const std::vector<HostAndPort> kOneServer{HostAndPort("foo:1234")};
+    static inline const std::vector<HostAndPort> kTwoServersVaryCase{HostAndPort("FoO:1234"),
+                                                                     HostAndPort("BaR:1234")};
+    static inline const std::vector<HostAndPort> kTwoServersNormalCase{HostAndPort("foo:1234"),
+                                                                       HostAndPort("bar:1234")};
+    static inline const std::vector<HostAndPort> kThreeServers{
+        HostAndPort("foo:1234"), HostAndPort("bar:1234"), HostAndPort("baz:1234")};
 
     static inline const auto kDefaultConfig = SdamConfiguration();
     static inline const auto kSingleSeedConfig =
         SdamConfiguration(kOneServer, TopologyType::kSingle);
+
+    static inline const auto kNotUsedMs = Milliseconds{1000};
 };
 
 void TopologyDescriptionTestFixture::assertDefaultConfig(
@@ -74,7 +81,7 @@ void TopologyDescriptionTestFixture::assertDefaultConfig(
     ASSERT_EQUALS(boost::none, topologyDescription.getSetName());
     ASSERT_EQUALS(boost::none, topologyDescription.getMaxElectionId());
 
-    auto expectedDefaultServer = ServerDescription("localhost:27017");
+    auto expectedDefaultServer = ServerDescription(HostAndPort("localhost:27017"));
     ASSERT_EQUALS(expectedDefaultServer, *topologyDescription.getServers().front());
     ASSERT_EQUALS(static_cast<std::size_t>(1), topologyDescription.getServers().size());
 
@@ -96,7 +103,7 @@ TEST_F(TopologyDescriptionTestFixture, ShouldHaveCorrectDefaultValues) {
 //
 //    auto expectedAddresses = kTwoServersNormalCase;
 //
-//    auto serverAddresses = map<ServerDescriptionPtr, ServerAddress>(
+//    auto serverAddresses = map(
 //        topologyDescription.getServers(),
 //        [](const ServerDescriptionPtr& description) { return description->getAddress(); });
 //
@@ -108,10 +115,9 @@ TEST_F(TopologyDescriptionTestFixture, ShouldAllowTypeSingleWithASingleSeed) {
 
     ASSERT(TopologyType::kSingle == topologyDescription.getType());
 
-    auto servers = map<ServerDescriptionPtr, ServerAddress>(
-        topologyDescription.getServers(),
-        [](const ServerDescriptionPtr& desc) { return desc->getAddress(); });
-    ASSERT_EQUALS(kOneServer, servers);
+    auto servers =
+        map(topologyDescription.getServers(), [](const auto& desc) { return desc->getAddress(); });
+    ASSERT_EQUALS(adaptForAssert(kOneServer), adaptForAssert(servers));
 }
 
 TEST_F(TopologyDescriptionTestFixture, DoesNotAllowMultipleSeedsWithSingle) {
@@ -123,25 +129,22 @@ TEST_F(TopologyDescriptionTestFixture, DoesNotAllowMultipleSeedsWithSingle) {
 
 TEST_F(TopologyDescriptionTestFixture, ShouldSetTheReplicaSetName) {
     auto expectedSetName = kSetName;
-    auto config = SdamConfiguration(
-        kOneServer, TopologyType::kReplicaSetNoPrimary, mongo::Seconds(10), expectedSetName);
-    TopologyDescription topologyDescription(config);
+    TopologyDescription topologyDescription(
+        makeSdamConfig(kOneServer, TopologyType::kReplicaSetNoPrimary, expectedSetName));
     ASSERT_EQUALS(expectedSetName, *topologyDescription.getSetName());
 }
 
 TEST_F(TopologyDescriptionTestFixture, ShouldNotAllowSettingTheReplicaSetNameWithWrongType) {
-    ASSERT_THROWS_CODE(TopologyDescription(SdamConfiguration(
-                           kOneServer, TopologyType::kUnknown, mongo::Seconds(10), kSetName)),
-                       DBException,
-                       ErrorCodes::InvalidTopologyType);
+    ASSERT_THROWS_CODE(
+        TopologyDescription(makeSdamConfig(kOneServer, TopologyType::kUnknown, kSetName)),
+        DBException,
+        ErrorCodes::InvalidTopologyType);
 }
 
 TEST_F(TopologyDescriptionTestFixture, ShouldNotAllowTopologyTypeRSNoPrimaryWithoutSetName) {
-    ASSERT_THROWS_CODE(
-        SdamConfiguration(
-            kOneServer, TopologyType::kReplicaSetNoPrimary, mongo::Seconds(10), boost::none),
-        DBException,
-        ErrorCodes::TopologySetNameRequired);
+    ASSERT_THROWS_CODE(makeSdamConfig(kOneServer, TopologyType::kReplicaSetNoPrimary, boost::none),
+                       DBException,
+                       ErrorCodes::TopologySetNameRequired);
 }
 
 TEST_F(TopologyDescriptionTestFixture, ShouldOnlyAllowSingleAndRsNoPrimaryWithSetName) {
@@ -159,16 +162,15 @@ TEST_F(TopologyDescriptionTestFixture, ShouldOnlyAllowSingleAndRsNoPrimaryWithSe
               "Check TopologyType {topologyType} with setName value.",
               "Check TopologyType with setName value",
               "topologyType"_attr = topologyType);
-        ASSERT_THROWS_CODE(
-            SdamConfiguration(kOneServer, topologyType, mongo::Seconds(10), kSetName),
-            DBException,
-            ErrorCodes::InvalidTopologyType);
+        ASSERT_THROWS_CODE(makeSdamConfig(kOneServer, topologyType, kSetName),
+                           DBException,
+                           ErrorCodes::InvalidTopologyType);
     }
 }
 
 TEST_F(TopologyDescriptionTestFixture, ShouldDefaultHeartbeatToTenSecs) {
     SdamConfiguration config;
-    ASSERT_EQUALS(SdamConfiguration::kDefaultHeartbeatFrequencyMs, config.getHeartBeatFrequency());
+    ASSERT_EQUALS(Seconds{10}, config.getHeartBeatFrequency());
 }
 
 TEST_F(TopologyDescriptionTestFixture, ShouldAllowSettingTheHeartbeatFrequency) {
@@ -179,7 +181,7 @@ TEST_F(TopologyDescriptionTestFixture, ShouldAllowSettingTheHeartbeatFrequency) 
 
 TEST_F(TopologyDescriptionTestFixture, ShouldNotAllowChangingTheHeartbeatFrequencyBelow500Ms) {
     auto belowThresholdFrequency =
-        mongo::Milliseconds(SdamConfiguration::kMinHeartbeatFrequencyMS.count() - 1);
+        mongo::Milliseconds(SdamConfiguration::kMinHeartbeatFrequency.count() - 1);
     ASSERT_THROWS_CODE(
         SdamConfiguration(boost::none, TopologyType::kUnknown, belowThresholdFrequency),
         DBException,
@@ -188,8 +190,8 @@ TEST_F(TopologyDescriptionTestFixture, ShouldNotAllowChangingTheHeartbeatFrequen
 
 TEST_F(TopologyDescriptionTestFixture,
        ShouldSetWireCompatibilityErrorForMinWireVersionWhenMinWireVersionIsGreater) {
-    const auto outgoingMaxWireVersion = WireSpec::instance().outgoing.maxWireVersion;
-    const auto config = SdamConfiguration(kOneServer, TopologyType::kUnknown, mongo::Seconds(10));
+    const auto outgoingMaxWireVersion = WireSpec::instance().get()->outgoing.maxWireVersion;
+    const auto config = SdamConfiguration(kOneServer, TopologyType::kUnknown);
     const auto topologyDescription = std::make_shared<TopologyDescription>(config);
     const auto serverDescriptionMinVersion = ServerDescriptionBuilder()
                                                  .withAddress(kOneServer[0])
@@ -205,8 +207,8 @@ TEST_F(TopologyDescriptionTestFixture,
 
 TEST_F(TopologyDescriptionTestFixture,
        ShouldSetWireCompatibilityErrorForMinWireVersionWhenMaxWireVersionIsLess) {
-    const auto outgoingMinWireVersion = WireSpec::instance().outgoing.minWireVersion;
-    const auto config = SdamConfiguration(kOneServer, TopologyType::kUnknown, mongo::Seconds(10));
+    const auto outgoingMinWireVersion = WireSpec::instance().get()->outgoing.minWireVersion;
+    const auto config = SdamConfiguration(kOneServer, TopologyType::kUnknown);
     const auto topologyDescription = std::make_shared<TopologyDescription>(config);
     const auto serverDescriptionMaxVersion = ServerDescriptionBuilder()
                                                  .withAddress(kOneServer[0])
@@ -221,8 +223,8 @@ TEST_F(TopologyDescriptionTestFixture,
 }
 
 TEST_F(TopologyDescriptionTestFixture, ShouldNotSetWireCompatibilityErrorWhenServerTypeIsUnknown) {
-    const auto outgoingMinWireVersion = WireSpec::instance().outgoing.minWireVersion;
-    const auto config = SdamConfiguration(kOneServer, TopologyType::kUnknown, mongo::Seconds(10));
+    const auto outgoingMinWireVersion = WireSpec::instance().get()->outgoing.minWireVersion;
+    const auto config = SdamConfiguration(kOneServer, TopologyType::kUnknown);
     const auto topologyDescription = std::make_shared<TopologyDescription>(config);
     const auto serverDescriptionMaxVersion =
         ServerDescriptionBuilder().withMaxWireVersion(outgoingMinWireVersion - 1).instance();
@@ -238,7 +240,7 @@ TEST_F(TopologyDescriptionTestFixture, ShouldSetLogicalSessionTimeoutToMinOfAllS
 
     const auto logicalSessionTimeouts = std::vector{300, 100, 200};
     auto timeoutIt = logicalSessionTimeouts.begin();
-    const auto serverDescriptionsWithTimeouts = map<ServerDescriptionPtr, ServerDescriptionPtr>(
+    const auto serverDescriptionsWithTimeouts = map(
         topologyDescription->getServers(), [&timeoutIt](const ServerDescriptionPtr& description) {
             auto newInstanceBuilder = ServerDescriptionBuilder()
                                           .withType(ServerType::kRSSecondary)
@@ -268,8 +270,8 @@ TEST_F(TopologyDescriptionTestFixture,
     const auto logicalSessionTimeouts = std::vector{300, 100, 200};
     auto timeoutIt = logicalSessionTimeouts.begin();
 
-    const auto serverDescriptionsWithTimeouts = map<ServerDescriptionPtr, ServerDescriptionPtr>(
-        topologyDescription->getServers(), [&](const ServerDescriptionPtr& description) {
+    const auto serverDescriptionsWithTimeouts =
+        map(topologyDescription->getServers(), [&](const ServerDescriptionPtr& description) {
             auto timeoutValue = (timeoutIt == logicalSessionTimeouts.begin())
                 ? boost::none
                 : boost::make_optional(*timeoutIt);
@@ -335,5 +337,5 @@ TEST_F(TopologyDescriptionTestFixture, ShouldNotUpdateTopologyVersionOnError) {
     auto topologyVersion = topologyDescription->getServers()[1]->getTopologyVersion();
     ASSERT(topologyVersion == boost::none);
 }
-};  // namespace sdam
-};  // namespace mongo
+}  // namespace sdam
+}  // namespace mongo

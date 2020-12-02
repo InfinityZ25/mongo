@@ -40,9 +40,14 @@ namespace mongo {
 class InternalSchemaMaxItemsMatchExpression final
     : public InternalSchemaNumArrayItemsMatchExpression {
 public:
-    InternalSchemaMaxItemsMatchExpression(StringData path, long long numItems)
-        : InternalSchemaNumArrayItemsMatchExpression(
-              INTERNAL_SCHEMA_MAX_ITEMS, path, numItems, "$_internalSchemaMaxItems"_sd) {}
+    InternalSchemaMaxItemsMatchExpression(StringData path,
+                                          long long numItems,
+                                          clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : InternalSchemaNumArrayItemsMatchExpression(INTERNAL_SCHEMA_MAX_ITEMS,
+                                                     path,
+                                                     numItems,
+                                                     "$_internalSchemaMaxItems"_sd,
+                                                     std::move(annotation)) {}
 
     bool matchesArray(const BSONObj& anArray, MatchDetails* details) const final {
         return (anArray.nFields() <= numItems());
@@ -50,11 +55,20 @@ public:
 
     std::unique_ptr<MatchExpression> shallowClone() const final {
         std::unique_ptr<InternalSchemaMaxItemsMatchExpression> maxItems =
-            std::make_unique<InternalSchemaMaxItemsMatchExpression>(path(), numItems());
+            std::make_unique<InternalSchemaMaxItemsMatchExpression>(
+                path(), numItems(), _errorAnnotation);
         if (getTag()) {
             maxItems->setTag(getTag()->clone());
         }
-        return std::move(maxItems);
+        return maxItems;
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
     }
 };
 }  // namespace mongo

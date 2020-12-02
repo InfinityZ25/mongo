@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authz_manager_external_state_d.h"
@@ -88,6 +86,13 @@ Status AuthzManagerExternalStateMongod::findOne(OperationContext* opCtx,
     return Status(ErrorCodes::NoMatchingDocument,
                   str::stream() << "No document in " << collectionName.ns() << " matches "
                                 << query);
+}
+
+bool AuthzManagerExternalStateMongod::hasOne(OperationContext* opCtx,
+                                             const NamespaceString& collectionName,
+                                             const BSONObj& query) {
+    AutoGetCollectionForReadCommand ctx(opCtx, collectionName);
+    return !Helpers::findOne(opCtx, ctx.getCollection(), query, false).isNull();
 }
 
 namespace {

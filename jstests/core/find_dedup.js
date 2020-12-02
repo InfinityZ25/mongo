@@ -1,6 +1,8 @@
 // Test that duplicate query results are not returned.
 //
-// @tags: [requires_fastcount]
+// @tags: [
+//   requires_fastcount,
+// ]
 
 (function() {
 "use strict";
@@ -19,7 +21,7 @@ function checkDedup(query, idArray) {
 
 // Deduping $or
 coll.drop();
-coll.ensureIndex({a: 1, b: 1});
+coll.createIndex({a: 1, b: 1});
 assert.commandWorked(coll.insert({_id: 1, a: 1, b: 1}));
 assert.commandWorked(coll.insert({_id: 2, a: 1, b: 1}));
 assert.commandWorked(coll.insert({_id: 3, a: 2, b: 2}));

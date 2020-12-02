@@ -1,19 +1,14 @@
 // @tags: [
 //   assumes_superuser_permissions,
 //   does_not_support_stepdowns,
+//   requires_emptycapped,
 //   requires_fastcount,
-//   requires_fcv_44,
 //   requires_getmore,
 //   requires_non_retryable_commands,
 //   requires_non_retryable_writes,
+//   sbe_incompatible,
 //   uses_map_reduce_with_temp_collections,
-//   requires_emptycapped,
 // ]
-//
-// Tagged as 'requires_fcv_44', since this test cannot run against versions less then 4.4. This is
-// because 'planCacheListPlans' and 'planCacheListQueryShapes' were deleted in 4.4, and thus not
-// tested here. But this test asserts that all commands are covered, so will fail against a version
-// of the server which implements these commands.
 
 /*
  * Declaratively-defined tests for views for all database commands. This file contains a map of test
@@ -70,15 +65,15 @@
 (function() {
 "use strict";
 
+load('jstests/sharding/libs/last_lts_mongod_commands.js');
+
 // Pre-written reasons for skipping a test.
 const isAnInternalCommand = "internal command";
 const isUnrelated = "is unrelated";
-const wasRemovedInBinaryVersion44 =
-    "must define test coverage for the multiversion passthrough suite";
 
 let viewsCommandTests = {
     _addShard: {skip: isAnInternalCommand},
-    _cloneCatalogData: {skip: wasRemovedInBinaryVersion44},
+    _cloneCatalogData: {skip: isAnInternalCommand},
     _cloneCollectionOptionsFromPrimaryShard: {skip: isAnInternalCommand},
     _configsvrAddShard: {skip: isAnInternalCommand},
     _configsvrAddShardToZone: {skip: isAnInternalCommand},
@@ -102,10 +97,12 @@ let viewsCommandTests = {
     _configsvrRenameCollection: {skip: isAnInternalCommand},
     _configsvrRemoveShard: {skip: isAnInternalCommand},
     _configsvrRemoveShardFromZone: {skip: isAnInternalCommand},
+    _configsvrReshardCollection: {skip: isAnInternalCommand},
     _configsvrShardCollection: {skip: isAnInternalCommand},
     _configsvrUpdateZoneKeyRange: {skip: isAnInternalCommand},
     _flushDatabaseCacheUpdates: {skip: isUnrelated},
     _flushRoutingTableCacheUpdates: {skip: isUnrelated},
+    _flushRoutingTableCacheUpdatesWithWriteConcern: {skip: isUnrelated},
     _getNextSessionMods: {skip: isAnInternalCommand},
     _getUserCacheGeneration: {skip: isAnInternalCommand},
     _hashBSONElement: {skip: isAnInternalCommand},
@@ -113,16 +110,19 @@ let viewsCommandTests = {
     _killOperations: {skip: isUnrelated},
     _mergeAuthzCollections: {skip: isAnInternalCommand},
     _migrateClone: {skip: isAnInternalCommand},
-    _movePrimary: {skip: wasRemovedInBinaryVersion44},
+    _movePrimary: {skip: isAnInternalCommand},
     _recvChunkAbort: {skip: isAnInternalCommand},
     _recvChunkCommit: {skip: isAnInternalCommand},
     _recvChunkStart: {skip: isAnInternalCommand},
     _recvChunkStatus: {skip: isAnInternalCommand},
     _shardsvrCloneCatalogData: {skip: isAnInternalCommand},
+    _shardsvrDropCollection: {skip: isAnInternalCommand},
     _shardsvrMovePrimary: {skip: isAnInternalCommand},
     _shardsvrRenameCollection: {skip: isAnInternalCommand},
     _shardsvrShardCollection: {skip: isAnInternalCommand},
+    _shardsvrDropDatabase: {skip: isAnInternalCommand},
     _transferMods: {skip: isAnInternalCommand},
+    _vectorClockPersist: {skip: isAnInternalCommand},
     abortTransaction: {skip: isUnrelated},
     addShard: {skip: isUnrelated},
     addShardToZone: {skip: isUnrelated},
@@ -165,7 +165,6 @@ let viewsCommandTests = {
         expectedErrorCode: ErrorCodes.NamespaceNotSharded,
     },
     clearLog: {skip: isUnrelated},
-    cloneCollection: {skip: wasRemovedInBinaryVersion44},
     cloneCollectionAsCapped: {
         command: {cloneCollectionAsCapped: "view", toCollection: "testcapped", size: 10240},
         expectFailure: true,
@@ -233,6 +232,9 @@ let viewsCommandTests = {
     dbStats: {command: {dbStats: 1}},
     delete: {command: {delete: "view", deletes: [{q: {x: 1}, limit: 1}]}, expectFailure: true},
     distinct: {command: {distinct: "view", key: "_id"}},
+    donorForgetMigration: {skip: isUnrelated},
+    donorStartMigration: {skip: isUnrelated},
+    donorWaitForMigrationToCommit: {skip: isUnrelated},
     driverOIDTest: {skip: isUnrelated},
     drop: {command: {drop: "view"}},
     dropAllRolesFromDatabase: {skip: isUnrelated},
@@ -270,14 +272,6 @@ let viewsCommandTests = {
     fsync: {skip: isUnrelated},
     fsyncUnlock: {skip: isUnrelated},
     getDatabaseVersion: {skip: isUnrelated},
-    geoSearch: {
-        command: {
-            geoSearch: "view",
-            search: {},
-            near: [-50, 37],
-        },
-        expectFailure: true
-    },
     getCmdLineOpts: {skip: isUnrelated},
     getDefaultRWConcern: {skip: isUnrelated},
     getDiagnosticData: {skip: isUnrelated},
@@ -334,8 +328,11 @@ let viewsCommandTests = {
     grantRolesToRole: {skip: isUnrelated},
     grantRolesToUser: {skip: isUnrelated},
     handshake: {skip: isUnrelated},
+    hello: {skip: isUnrelated},
     hostInfo: {skip: isUnrelated},
     httpClientRequest: {skip: isAnInternalCommand},
+    exportCollection: {skip: isUnrelated},
+    importCollection: {skip: isUnrelated},
     insert: {command: {insert: "view", documents: [{x: 1}]}, expectFailure: true},
     internalRenameIfOptionsAndIndexesMatch: {skip: isAnInternalCommand},
     invalidateUserCache: {skip: isUnrelated},
@@ -384,6 +381,7 @@ let viewsCommandTests = {
     listShards: {skip: isUnrelated},
     lockInfo: {skip: isUnrelated},
     logApplicationMessage: {skip: isUnrelated},
+    logMessage: {skip: isUnrelated},
     logRotate: {skip: isUnrelated},
     logout: {skip: isUnrelated},
     makeSnapshot: {skip: isAnInternalCommand},
@@ -419,6 +417,8 @@ let viewsCommandTests = {
     refineCollectionShardKey: {skip: isUnrelated},
     refreshLogicalSessionCacheNow: {skip: isAnInternalCommand},
     reapLogicalSessionCacheNow: {skip: isAnInternalCommand},
+    recipientForgetMigration: {skip: isUnrelated},
+    recipientSyncData: {skip: isUnrelated},
     refreshSessions: {skip: isUnrelated},
     reIndex: {
         command: {reIndex: "view"},
@@ -442,7 +442,6 @@ let viewsCommandTests = {
             skipSharded: true,
         }
     ],
-    repairCursor: {skip: wasRemovedInBinaryVersion44},
     repairDatabase: {skip: isUnrelated},
     replSetAbortPrimaryCatchUp: {skip: isUnrelated},
     replSetFreeze: {skip: isUnrelated},
@@ -461,6 +460,16 @@ let viewsCommandTests = {
     replSetTestEgress: {skip: isUnrelated},
     replSetUpdatePosition: {skip: isUnrelated},
     replSetResizeOplog: {skip: isUnrelated},
+    reshardCollection: {
+        command: {reshardCollection: "test.view", key: {_id: 1}},
+        setup: function(conn) {
+            assert.commandWorked(conn.adminCommand({enableSharding: "test"}));
+        },
+        expectedErrorCode: ErrorCodes.NamespaceNotSharded,
+        skipStandalone: true,
+        expectFailure: true,
+        isAdminCommand: true,
+    },
     resetError: {skip: isUnrelated},
     revokePrivilegesFromRole: {
         command: {
@@ -478,8 +487,10 @@ let viewsCommandTests = {
     revokeRolesFromRole: {skip: isUnrelated},
     revokeRolesFromUser: {skip: isUnrelated},
     rolesInfo: {skip: isUnrelated},
+    rotateCertificates: {skip: isUnrelated},
     saslContinue: {skip: isUnrelated},
     saslStart: {skip: isUnrelated},
+    sbe: {skip: isAnInternalCommand},
     serverStatus: {command: {serverStatus: 1}, skip: isUnrelated},
     setIndexCommitQuorum: {skip: isUnrelated},
     setCommittedSnapshot: {skip: isAnInternalCommand},
@@ -535,8 +546,13 @@ let viewsCommandTests = {
     startRecordingTraffic: {skip: isUnrelated},
     startSession: {skip: isAnInternalCommand},
     stopRecordingTraffic: {skip: isUnrelated},
+    testDeprecation: {skip: isAnInternalCommand},
+    testDeprecationInVersion2: {skip: isAnInternalCommand},
+    testRemoval: {skip: isAnInternalCommand},
+    testReshardCloneCollection: {skip: isAnInternalCommand},
+    testVersion2: {skip: isAnInternalCommand},
+    testVersions1And2: {skip: isAnInternalCommand},
     top: {skip: "tested in views/views_stats.js"},
-    touch: {skip: wasRemovedInBinaryVersion44},
     unsetSharding: {skip: isAnInternalCommand},
     update: {command: {update: "view", updates: [{q: {x: 1}, u: {x: 2}}]}, expectFailure: true},
     updateRole: {
@@ -557,6 +573,7 @@ let viewsCommandTests = {
     usersInfo: {skip: isUnrelated},
     validate: {command: {validate: "view"}, expectFailure: true},
     waitForOngoingChunkSplits: {skip: isUnrelated},
+    voteCommitImportCollection: {skip: isUnrelated},
     voteCommitIndexBuild: {skip: isUnrelated},
     voteCommitTransaction: {skip: isUnrelated},
     voteAbortTransaction: {skip: isUnrelated},
@@ -564,6 +581,10 @@ let viewsCommandTests = {
     whatsmyuri: {skip: isUnrelated},
     whatsmysni: {skip: isUnrelated}
 };
+
+commandsRemovedFromMongodSinceLastLTS.forEach(function(cmd) {
+    viewsCommandTests[cmd] = {skip: "must define test coverage for 4.4 backwards compatibility"};
+});
 
 /**
  * Helper function for failing commands or writes that checks the result 'res' of either.
@@ -580,9 +601,9 @@ let assertCommandOrWriteFailed = function(res, code, msg) {
 };
 
 // Are we on a mongos?
-var isMaster = db.runCommand("ismaster");
-assert.commandWorked(isMaster);
-var isMongos = (isMaster.msg === "isdbgrid");
+var hello = db.runCommand("hello");
+assert.commandWorked(hello);
+var isMongos = (hello.msg === "isdbgrid");
 
 // Obtain a list of all commands.
 let res = db.runCommand({listCommands: 1});

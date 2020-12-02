@@ -126,10 +126,12 @@ assert.commandWorked(secondary.adminCommand(
 
 // Wait for the secondary to complete initial sync.
 replTest.awaitSecondaryNodes();
+// Wait for the commit point to advance past the "prepare" oplog entry for transaction four.
+replTest.awaitLastOpCommitted();
 
 jsTestLog("Initial sync completed");
 
-secondary.setSlaveOk();
+secondary.setSecondaryOk();
 const secondaryColl = secondary.getDB(dbName).getCollection(collName);
 
 // Make sure that while reading from the node that went through initial sync, we can't read
@@ -172,9 +174,7 @@ jsTestLog("Stepping up the secondary");
 
 // Step up the secondary after initial sync is done and make sure the other two transactions are
 // properly prepared.
-replTest.stepUp(secondary);
-replTest.waitForState(secondary, ReplSetTest.State.PRIMARY);
-const newPrimary = replTest.getPrimary();
+const newPrimary = replTest.stepUp(secondary, {awaitReplicationBeforeStepUp: false});
 testDB = newPrimary.getDB(dbName);
 testColl = testDB.getCollection(collName);
 

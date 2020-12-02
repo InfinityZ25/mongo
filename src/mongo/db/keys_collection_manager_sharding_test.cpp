@@ -37,9 +37,9 @@
 #include "mongo/db/keys_collection_client_sharded.h"
 #include "mongo/db/keys_collection_document.h"
 #include "mongo/db/keys_collection_manager.h"
-#include "mongo/db/logical_clock.h"
+#include "mongo/db/s/config/config_server_test_fixture.h"
+#include "mongo/db/vector_clock_mutable.h"
 #include "mongo/s/catalog/dist_lock_manager_mock.h"
-#include "mongo/s/config_server_test_fixture.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
 #include "mongo/util/fail_point.h"
@@ -261,7 +261,7 @@ TEST_F(KeysManagerShardedTest, ShouldCreateKeysIfKeyGeneratorEnabled) {
     keyManager()->startMonitoring(getServiceContext());
 
     const LogicalTime currentTime(LogicalTime(Timestamp(100, 0)));
-    LogicalClock::get(operationContext())->setClusterTimeFromTrustedSource(currentTime);
+    VectorClockMutable::get(operationContext())->tickClusterTimeTo(currentTime);
 
     keyManager()->enableKeyGenerator(operationContext(), true);
     keyManager()->refreshNow(operationContext());
@@ -277,7 +277,7 @@ TEST_F(KeysManagerShardedTest, EnableModeFlipFlopStressTest) {
     keyManager()->startMonitoring(getServiceContext());
 
     const LogicalTime currentTime(LogicalTime(Timestamp(100, 0)));
-    LogicalClock::get(operationContext())->setClusterTimeFromTrustedSource(currentTime);
+    VectorClockMutable::get(operationContext())->tickClusterTimeTo(currentTime);
 
     bool doEnable = true;
 
@@ -303,7 +303,7 @@ TEST_F(KeysManagerShardedTest, ShouldStillBeAbleToUpdateCacheEvenIfItCantCreateK
 
     // Set the time to be very ahead so the updater will be forced to create new keys.
     const LogicalTime fakeTime(Timestamp(20000, 0));
-    LogicalClock::get(operationContext())->setClusterTimeFromTrustedSource(fakeTime);
+    VectorClockMutable::get(operationContext())->tickClusterTimeTo(fakeTime);
 
     FailPointEnableBlock failWriteBlock("failCollectionInserts");
 
@@ -325,7 +325,7 @@ TEST_F(KeysManagerShardedTest, ShouldStillBeAbleToUpdateCacheEvenIfItCantCreateK
 
 TEST_F(KeysManagerShardedTest, ShouldNotCreateKeysWithDisableKeyGenerationFailPoint) {
     const LogicalTime currentTime(Timestamp(100, 0));
-    LogicalClock::get(operationContext())->setClusterTimeFromTrustedSource(currentTime);
+    VectorClockMutable::get(operationContext())->tickClusterTimeTo(currentTime);
 
     {
         FailPointEnableBlock failKeyGenerationBlock("disableKeyGeneration");
@@ -346,7 +346,7 @@ TEST_F(KeysManagerShardedTest, ShouldNotCreateKeysWithDisableKeyGenerationFailPo
 
 TEST_F(KeysManagerShardedTest, HasSeenKeysIsFalseUntilKeysAreFound) {
     const LogicalTime currentTime(Timestamp(100, 0));
-    LogicalClock::get(operationContext())->setClusterTimeFromTrustedSource(currentTime);
+    VectorClockMutable::get(operationContext())->tickClusterTimeTo(currentTime);
 
     ASSERT_EQ(false, keyManager()->hasSeenKeys());
 
@@ -369,6 +369,33 @@ TEST_F(KeysManagerShardedTest, HasSeenKeysIsFalseUntilKeysAreFound) {
     ASSERT_OK(keyStatus.getStatus());
 
     ASSERT_EQ(true, keyManager()->hasSeenKeys());
+}
+
+LogicalTime addSeconds(const LogicalTime& logicalTime, const Seconds& seconds) {
+    auto asTimestamp = logicalTime.asTimestamp();
+    return LogicalTime(Timestamp(asTimestamp.getSecs() + seconds.count(), asTimestamp.getInc()));
+}
+
+TEST(KeysCollectionManagerUtilTest, HowMuchSleepNeededForCalculationDoesNotOverflow) {
+    auto secondsSinceEpoch = durationCount<Seconds>(Date_t::now().toDurationSinceEpoch());
+    auto defaultKeysIntervalSeconds = Seconds(KeysRotationIntervalSec);
+
+    // Mock inputs that would have caused an overflow without the changes from SERVER-48709.
+    // "currentTime" is the current clusterTime in the VectorClock, which will typically be close
+    // to a timestamp constructed from the number of seconds since the unix epoch. "latestExpiredAt"
+    // is the highest expiration logical time of any key, which will at most be currentTime +
+    // (default key rotation interval * 2) because two valid keys are kept at a time. "interval" is
+    // the duration a key is valid for, which defaults to 90 days = 7,776,000 seconds.
+    auto currentTime = LogicalTime(Timestamp(secondsSinceEpoch, 0));
+    auto latestExpiredAt = addSeconds(currentTime, defaultKeysIntervalSeconds * 2);
+    auto interval = Milliseconds(defaultKeysIntervalSeconds);
+
+    // Despite the default rotation interval seconds * 1000 not fitting in a 32 bit unsigned
+    // integer (7,776,000,000 vs. 4,294,967,295), the calculation should not overflow, and the next
+    // wakeup should correctly be the default interval.
+    auto nextWakeupMillis =
+        keys_collection_manager_util::howMuchSleepNeedFor(currentTime, latestExpiredAt, interval);
+    ASSERT_EQ(nextWakeupMillis, interval);
 }
 
 }  // namespace

@@ -36,7 +36,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/pipeline/runtime_constants_gen.h"
+#include "mongo/db/pipeline/legacy_runtime_constants_gen.h"
 #include "mongo/db/query/tailable_mode.h"
 
 namespace mongo {
@@ -52,40 +52,42 @@ class StatusWith;
  */
 class QueryRequest {
 public:
-    static const char kFilterField[];
-    static const char kProjectionField[];
-    static const char kSortField[];
-    static const char kHintField[];
-    static const char kCollationField[];
-    static const char kSkipField[];
-    static const char kLimitField[];
-    static const char kBatchSizeField[];
-    static const char kNToReturnField[];
-    static const char kSingleBatchField[];
-    static const char kMaxField[];
-    static const char kMinField[];
-    static const char kReturnKeyField[];
-    static const char kShowRecordIdField[];
-    static const char kTailableField[];
-    static const char kOplogReplayField[];
-    static const char kNoCursorTimeoutField[];
-    static const char kAwaitDataField[];
-    static const char kPartialResultsField[];
-    static const char kRuntimeConstantsField[];
-    static const char kTermField[];
-    static const char kOptionsField[];
-    static const char kReadOnceField[];
-    static const char kAllowSpeculativeMajorityReadField[];
-    static const char kInternalReadAtClusterTimeField[];
-    static const char kRequestResumeTokenField[];
-    static const char kResumeAfterField[];
-    static const char kUse44SortKeys[];
-    static const char kMaxTimeMSOpOnlyField[];
+    // Find command field names.
+    static constexpr auto kFilterField = "filter";
+    static constexpr auto kProjectionField = "projection";
+    static constexpr auto kSortField = "sort";
+    static constexpr auto kHintField = "hint";
+    static constexpr auto kCollationField = "collation";
+    static constexpr auto kSkipField = "skip";
+    static constexpr auto kLimitField = "limit";
+    static constexpr auto kBatchSizeField = "batchSize";
+    static constexpr auto kNToReturnField = "ntoreturn";
+    static constexpr auto kSingleBatchField = "singleBatch";
+    static constexpr auto kMaxField = "max";
+    static constexpr auto kMinField = "min";
+    static constexpr auto kReturnKeyField = "returnKey";
+    static constexpr auto kShowRecordIdField = "showRecordId";
+    static constexpr auto kTailableField = "tailable";
+    static constexpr auto kOplogReplayField = "oplogReplay";
+    static constexpr auto kNoCursorTimeoutField = "noCursorTimeout";
+    static constexpr auto kAwaitDataField = "awaitData";
+    static constexpr auto kPartialResultsField = "allowPartialResults";
+    static constexpr auto kLegacyRuntimeConstantsField = "runtimeConstants";
+    static constexpr auto kLetField = "let";
+    static constexpr auto kTermField = "term";
+    static constexpr auto kOptionsField = "options";
+    static constexpr auto kReadOnceField = "readOnce";
+    static constexpr auto kAllowSpeculativeMajorityReadField = "allowSpeculativeMajorityRead";
+    static constexpr auto kRequestResumeTokenField = "$_requestResumeToken";
+    static constexpr auto kResumeAfterField = "$_resumeAfter";
+    static constexpr auto kUse44SortKeys = "_use44SortKeys";
+    static constexpr auto kMaxTimeMSOpOnlyField = "maxTimeMSOpOnly";
 
-    static const char kNaturalSortField[];
+    // Field names for sorting options.
+    static constexpr auto kNaturalSortField = "$natural";
 
-    static const char kFindCommandName[];
-    static const char kShardVersionField[];
+    static constexpr auto kFindCommandName = "find";
+    static constexpr auto kShardVersionField = "shardVersion";
 
     explicit QueryRequest(NamespaceStringOrUUID nss);
 
@@ -109,11 +111,9 @@ public:
                                                                          bool isExplain);
 
     /**
-     * If _uuid exists for this QueryRequest, use it to update the value of _nss via the
-     * CollectionCatalog associated with opCtx. This should only be called when we hold a DBLock
-     * on the database to which _uuid belongs, if the _uuid is present in the CollectionCatalog.
+     * If _uuid exists for this QueryRequest, update the value of _nss.
      */
-    void refreshNSS(OperationContext* opCtx);
+    void refreshNSS(const NamespaceString& nss);
 
     /**
      * Converts this QR into a find command.
@@ -132,6 +132,14 @@ public:
 
     /**
      * Parses maxTimeMS from the BSONElement containing its value.
+     * The field name of the 'maxTimeMSElt' is used to determine what maximum value to enforce for
+     * the provided max time. 'maxTimeMSOpOnly' needs a slightly higher max value than regular
+     * 'maxTimeMS' to account for the case where a user provides the max possible value for
+     * 'maxTimeMS' to one server process (mongod or mongos), then that server process passes the max
+     * time on to another server as 'maxTimeMSOpOnly', but after adding a small amount to the max
+     * time to account for clock precision.  This can push the 'maxTimeMSOpOnly' sent to the mongod
+     * over the max value allowed for users to provide. This is safe because 'maxTimeMSOpOnly' is
+     * only allowed to be provided for internal intra-cluster requests.
      */
     static StatusWith<int> parseMaxTimeMS(BSONElement maxTimeMSElt);
 
@@ -147,26 +155,36 @@ public:
     // However, mongos internally "unwraps" the read preference and adds it as a parameter to the
     // command, e.g.
     //  { <cmd>: ... , <kUnwrappedReadPrefField>: { <kWrappedReadPrefField>: { ... } } }
-    static const std::string kWrappedReadPrefField;
-    static const std::string kUnwrappedReadPrefField;
+    static constexpr auto kWrappedReadPrefField = "$readPreference";
+    static constexpr auto kUnwrappedReadPrefField = "$queryOptions";
 
     // Names of the maxTimeMS command and query option.
     // Char arrays because they are used in static initialization.
-    static const char cmdOptionMaxTimeMS[];
-    static const char queryOptionMaxTimeMS[];
+    static constexpr auto cmdOptionMaxTimeMS = "maxTimeMS";
+    static constexpr auto queryOptionMaxTimeMS = "$maxTimeMS";
 
     // Names of the $meta projection values.
-    static const std::string metaGeoNearDistance;
-    static const std::string metaGeoNearPoint;
-    static const std::string metaRecordId;
-    static const std::string metaSortKey;
-    static const std::string metaTextScore;
+    static constexpr auto metaGeoNearDistance = "geoNearDistance";
+    static constexpr auto metaGeoNearPoint = "geoNearPoint";
+    static constexpr auto metaRecordId = "recordId";
+    static constexpr auto metaSortKey = "sortKey";
+    static constexpr auto metaTextScore = "textScore";
 
     // Allow using disk during the find command.
-    static const std::string kAllowDiskUseField;
+    static constexpr auto kAllowDiskUseField = "allowDiskUse";
+
+    // A constant by which 'maxTimeMSOpOnly' values are allowed to exceed the max allowed value for
+    // 'maxTimeMS'.  This is because mongod and mongos server processes add a small amount to the
+    // 'maxTimeMS' value they are given before passing it on as 'maxTimeMSOpOnly', to allow for
+    // clock precision.
+    static constexpr auto kMaxTimeMSOpOnlyMaxPadding = 100LL;
 
     const NamespaceString& nss() const {
         return _nss;
+    }
+
+    boost::optional<UUID> uuid() const {
+        return _uuid;
     }
 
     const BSONObj& getFilter() const {
@@ -222,7 +240,7 @@ public:
         _collation = collation.getOwned();
     }
 
-    static const long long kDefaultBatchSize;
+    static constexpr auto kDefaultBatchSize = 101ll;
 
     boost::optional<long long> getSkip() const {
         return _skip;
@@ -359,12 +377,20 @@ public:
         return _tailableMode;
     }
 
-    void setRuntimeConstants(RuntimeConstants runtimeConstants) {
-        _runtimeConstants = std::move(runtimeConstants);
+    void setLegacyRuntimeConstants(LegacyRuntimeConstants runtimeConstants) {
+        _legacyRuntimeConstants = std::move(runtimeConstants);
     }
 
-    const boost::optional<RuntimeConstants>& getRuntimeConstants() const {
-        return _runtimeConstants;
+    const boost::optional<LegacyRuntimeConstants>& getLegacyRuntimeConstants() const {
+        return _legacyRuntimeConstants;
+    }
+
+    void setLetParameters(BSONObj letParams) {
+        _letParameters = std::move(letParams);
+    }
+
+    const boost::optional<BSONObj>& getLetParameters() const {
+        return _letParameters;
     }
 
     bool isSlaveOk() const {
@@ -421,10 +447,6 @@ public:
 
     bool allowSpeculativeMajorityRead() const {
         return _allowSpeculativeMajorityRead;
-    }
-
-    boost::optional<Timestamp> getReadAtClusterTime() const {
-        return _internalReadAtClusterTime;
     }
 
     bool getRequestResumeToken() const {
@@ -563,7 +585,11 @@ private:
     bool _hasReadPref = false;
 
     // Runtime constants which may be referenced by $expr, if present.
-    boost::optional<RuntimeConstants> _runtimeConstants;
+    boost::optional<LegacyRuntimeConstants> _legacyRuntimeConstants;
+
+    // A document containing user-specified constants. For a find query, these are accessed only
+    // inside $expr.
+    boost::optional<BSONObj> _letParameters;
 
     // Options that can be specified in the OP_QUERY 'flags' header.
     TailableModeEnum _tailableMode = TailableModeEnum::kNormal;
@@ -575,10 +601,6 @@ private:
     bool _allowSpeculativeMajorityRead = false;
 
     boost::optional<long long> _replicationTerm;
-
-    // The Timestamp that RecoveryUnit::setTimestampReadSource() should be called with. The optional
-    // should only ever be engaged when testing commands are enabled.
-    boost::optional<Timestamp> _internalReadAtClusterTime;
 };
 
 }  // namespace mongo

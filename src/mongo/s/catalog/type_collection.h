@@ -29,20 +29,11 @@
 
 #pragma once
 
-#include <boost/optional.hpp>
-#include <string>
-
-#include "mongo/db/jsobj.h"
-#include "mongo/db/keypattern.h"
-#include "mongo/db/namespace_string.h"
-#include "mongo/util/uuid.h"
+#include "mongo/s/catalog/type_collection_gen.h"
 
 namespace mongo {
 
-class Status;
-template <typename T>
-class StatusWith;
-
+using ReshardingFields = TypeCollectionReshardingFields;
 
 /**
  * This class represents the layout and contents of documents contained in the config server's
@@ -64,148 +55,104 @@ class StatusWith;
  *      "unique" : false,
  *      "uuid" : UUID,
  *      "noBalance" : false,
- *      "distributionMode" : "unsharded|sharded",
+ *      // Only populated if the collection is currently undergoing a resharding operation.
+ *      "reshardingFields" : {
+ *          "uuid" : UUID,
+ *          "state" : CoordinatorState<kInitialized>,
+ *          // Only populated if the collection is currently undergoing a resharding operation,
+ *          // and this collection is the original sharded collection.
+ *          "donorFields" : {
+ *              "reshardingKey" : {
+ *                  "_notTheID" : 1
+ *              }
+ *          },
+ *          // Only populated if this collection is the temporary resharding collection in a
+ *          // resharding operation.
+ *          "recipientFields" : {
+ *              "fetchTimestamp" : Timestamp(3, 4),
+ *              "originalNamespace" : "foo.bar",
+ *          }
+ *      }
  *   }
  *
  */
-class CollectionType {
+class CollectionType : private CollectionTypeBase {
 public:
+    // Make field names accessible.
+    static constexpr auto kDefaultCollationFieldName =
+        CollectionTypeBase::kPre50CompatibleDefaultCollationFieldName;
+    static constexpr auto kEpochFieldName = CollectionTypeBase::kPre22CompatibleEpochFieldName;
+    static constexpr auto kKeyPatternFieldName =
+        CollectionTypeBase::kPre50CompatibleKeyPatternFieldName;
+    static constexpr auto kUuidFieldName = CollectionTypeBase::kPre50CompatibleUuidFieldName;
+    using CollectionTypeBase::kAllowMigrationsFieldName;
+    using CollectionTypeBase::kNssFieldName;
+    using CollectionTypeBase::kReshardingFieldsFieldName;
+    using CollectionTypeBase::kTimestampFieldName;
+    using CollectionTypeBase::kUniqueFieldName;
+    using CollectionTypeBase::kUpdatedAtFieldName;
+
+    // Make getters and setters accessible.
+    using CollectionTypeBase::getAllowMigrations;
+    using CollectionTypeBase::getNss;
+    using CollectionTypeBase::getReshardingFields;
+    using CollectionTypeBase::getTimestamp;
+    using CollectionTypeBase::getUnique;
+    using CollectionTypeBase::getUpdatedAt;
+    using CollectionTypeBase::setAllowMigrations;
+    using CollectionTypeBase::setNss;
+    using CollectionTypeBase::setReshardingFields;
+    using CollectionTypeBase::setTimestamp;
+    using CollectionTypeBase::setUnique;
+    using CollectionTypeBase::setUpdatedAt;
+    using CollectionTypeBase::toBSON;
+
     // Name of the collections collection in the config server.
     static const NamespaceString ConfigNS;
 
-    static const BSONField<std::string> fullNs;
-    static const BSONField<OID> epoch;
-    static const BSONField<Date_t> updatedAt;
-    static const BSONField<BSONObj> keyPattern;
-    static const BSONField<BSONObj> defaultCollation;
-    static const BSONField<bool> unique;
-    static const BSONField<UUID> uuid;
-    static const BSONField<std::string> distributionMode;
+    CollectionType(NamespaceString nss, OID epoch, Date_t updatedAt, UUID uuid);
 
-    /**
-     * Constructs a new CollectionType object from BSON. Also does validation of the contents.
-     *
-     * Dropped collections accumulate in the collections list, through 3.6, so that
-     * mongos <= 3.4.x, when it retrieves the list from the config server, can delete its
-     * cache entries for dropped collections.  See SERVER-27475, SERVER-27474
-     */
-    static StatusWith<CollectionType> fromBSON(const BSONObj& source);
+    CollectionType(NamespaceString nss,
+                   OID epoch,
+                   boost::optional<Timestamp> creationTime,
+                   Date_t updatedAt,
+                   UUID uuid);
 
-    enum class DistributionMode {
-        kUnsharded,
-        kSharded,
-    };
+    explicit CollectionType(const BSONObj& obj);
 
-    /**
-     * Returns OK if all fields have been set. Otherwise returns NoSuchKey and information
-     * about what is the first field which is missing.
-     */
-    Status validate() const;
+    CollectionType() = default;
 
-    /**
-     * Returns the BSON representation of the entry.
-     */
-    BSONObj toBSON() const;
-
-    /**
-     * Returns a std::string representation of the current internal state.
-     */
     std::string toString() const;
 
-    const NamespaceString& getNs() const {
-        return _fullNs.get();
-    }
-    void setNs(const NamespaceString& fullNs);
-
-    OID getEpoch() const {
-        return _epoch.get();
+    const OID& getEpoch() const {
+        return *getPre22CompatibleEpoch();
     }
     void setEpoch(OID epoch);
 
-    Date_t getUpdatedAt() const {
-        return _updatedAt.get();
+    const UUID& getUuid() const {
+        return *getPre50CompatibleUuid();
     }
-    void setUpdatedAt(Date_t updatedAt);
+    void setUuid(UUID uuid);
 
     bool getDropped() const {
-        return _dropped.get_value_or(false);
-    }
-    void setDropped(bool dropped) {
-        _dropped = dropped;
+        return getPre50CompatibleDropped().get_value_or(false);
     }
 
     const KeyPattern& getKeyPattern() const {
-        return _keyPattern.get();
+        return *getPre50CompatibleKeyPattern();
     }
-    void setKeyPattern(const KeyPattern& keyPattern);
+    void setKeyPattern(KeyPattern keyPattern);
 
-    const BSONObj& getDefaultCollation() const {
-        return _defaultCollation;
+    BSONObj getDefaultCollation() const {
+        return getPre50CompatibleDefaultCollation().get_value_or(BSONObj());
     }
-    void setDefaultCollation(const BSONObj& collation) {
-        _defaultCollation = collation.getOwned();
-    }
-
-    bool getUnique() const {
-        return _unique.get_value_or(false);
-    }
-    void setUnique(bool unique) {
-        _unique = unique;
-    }
-
-    boost::optional<UUID> getUUID() const {
-        return _uuid;
-    }
-
-    void setUUID(UUID uuid) {
-        _uuid = uuid;
-    }
+    void setDefaultCollation(const BSONObj& defaultCollation);
 
     bool getAllowBalance() const {
-        return _allowBalance.get_value_or(true);
-    }
-
-    void setDistributionMode(DistributionMode distributionMode) {
-        _distributionMode = distributionMode;
-    }
-
-    DistributionMode getDistributionMode() const {
-        return _distributionMode.get_value_or(DistributionMode::kSharded);
+        return !getNoBalance();
     }
 
     bool hasSameOptions(const CollectionType& other) const;
-
-private:
-    // Required full namespace (with the database prefix).
-    boost::optional<NamespaceString> _fullNs;
-
-    // Required to disambiguate collection namespace incarnations.
-    boost::optional<OID> _epoch;
-
-    // Required last updated time.
-    boost::optional<Date_t> _updatedAt;
-
-    // New field in v4.4; optional in v4.4 for backwards compatibility with v4.2. Whether the
-    // collection is unsharded or sharded. If missing, implies sharded.
-    boost::optional<DistributionMode> _distributionMode;
-
-    // Optional, whether the collection has been dropped. If missing, implies false.
-    boost::optional<bool> _dropped;
-
-    // Sharding key. Required, if collection is not dropped.
-    boost::optional<KeyPattern> _keyPattern;
-
-    // Optional collection default collation. If empty, implies simple collation.
-    BSONObj _defaultCollation;
-
-    // Optional uniqueness of the sharding key. If missing, implies false.
-    boost::optional<bool> _unique;
-
-    // Optional in 3.6 binaries, because UUID does not exist in featureCompatibilityVersion=3.4.
-    boost::optional<UUID> _uuid;
-
-    // Optional whether balancing is allowed for this collection. If missing, implies true.
-    boost::optional<bool> _allowBalance;
 };
 
 }  // namespace mongo

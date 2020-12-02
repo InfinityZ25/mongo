@@ -82,19 +82,11 @@ assert.soon(
     1000);
 
 reconnect(secondary);
-replSet.stepUpNoAwaitReplication(secondary);
+replSet.stepUp(secondary, {awaitReplicationBeforeStepUp: false, awaitWritablePrimary: false});
 
 // Secondary doesn't allow writes yet.
-var res = secondary.getDB("admin").runCommand({"isMaster": 1});
-assert(!res.ismaster);
-
-assert.commandFailedWithCode(
-    secondary.adminCommand({
-        replSetTest: 1,
-        waitForDrainFinish: 5000,
-    }),
-    ErrorCodes.ExceededTimeLimit,
-    'replSetTest waitForDrainFinish should time out when draining is not allowed to complete');
+var res = secondary.getDB("admin").runCommand({"hello": 1});
+assert(!res.isWritablePrimary);
 
 // Prevent the current primary from stepping down
 jsTest.log("disallowing heartbeat stepdown " + secondary.host);
@@ -119,34 +111,24 @@ assert.soon(function() {
     return secondary.getDB("foo").foo.find().itcount() == numDocuments;
 });
 
-// Even though it finished draining its buffer, it shouldn't be able to exit drain mode due to
-// pending stepdown.
-assert.commandFailedWithCode(
-    secondary.adminCommand({
-        replSetTest: 1,
-        waitForDrainFinish: 5000,
-    }),
-    ErrorCodes.ExceededTimeLimit,
-    'replSetTest waitForDrainFinish should time out when in the middle of stepping down');
-
-jsTestLog("Checking that node is PRIMARY but not master");
+jsTestLog("Checking that node is PRIMARY but not writable");
 assert.eq(ReplSetTest.State.PRIMARY, secondary.adminCommand({replSetGetStatus: 1}).myState);
-assert(!secondary.adminCommand('ismaster').ismaster);
+assert(!secondary.adminCommand('hello').isWritablePrimary);
 
 jsTest.log("allowing heartbeat stepdown " + secondary.host);
 blockHeartbeatStepdownFailPoint.off();
 
 jsTestLog("Checking that node successfully stepped down");
 replSet.waitForState(secondary, ReplSetTest.State.SECONDARY);
-assert(!secondary.adminCommand('ismaster').ismaster);
+assert(!secondary.adminCommand('hello').isWritablePrimary);
 
 // Now ensure that the node can successfully become primary again.
 replSet.restart(0);
 replSet.restart(2);
-replSet.stepUpNoAwaitReplication(secondary);
+replSet.stepUp(secondary, {awaitReplicationBeforeStepUp: false, awaitWritablePrimary: false});
 
 assert.soon(function() {
-    return secondary.adminCommand('ismaster').ismaster;
+    return secondary.adminCommand('hello').isWritablePrimary;
 });
 
 jsTestLog('Ensure new primary is writable.');

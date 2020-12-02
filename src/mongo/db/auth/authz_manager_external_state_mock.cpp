@@ -46,7 +46,6 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/update/update_driver.h"
-#include "mongo/util/map_util.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -113,7 +112,13 @@ void AuthzManagerExternalStateMock::setAuthzVersion(int version) {
 
 std::unique_ptr<AuthzSessionExternalState>
 AuthzManagerExternalStateMock::makeAuthzSessionExternalState(AuthorizationManager* authzManager) {
-    return std::make_unique<AuthzSessionExternalStateMock>(authzManager);
+    auto ret = std::make_unique<AuthzSessionExternalStateMock>(authzManager);
+    if (!authzManager->isAuthEnabled()) {
+        // Construct a `AuthzSessionExternalStateMock` structure that represents the default no-auth
+        // state of a running mongod.
+        ret->setReturnValueForShouldIgnoreAuthChecks(true);
+    }
+    return ret;
 }
 
 Status AuthzManagerExternalStateMock::findOne(OperationContext* opCtx,
@@ -126,6 +131,14 @@ Status AuthzManagerExternalStateMock::findOne(OperationContext* opCtx,
         return status;
     *result = iter->copy();
     return Status::OK();
+}
+
+
+bool AuthzManagerExternalStateMock::hasOne(OperationContext* opCtx,
+                                           const NamespaceString& collectionName,
+                                           const BSONObj& query) {
+    BSONObjCollection::iterator iter;
+    return _findOneIter(opCtx, collectionName, query, &iter).isOK();
 }
 
 Status AuthzManagerExternalStateMock::query(
@@ -190,7 +203,8 @@ Status AuthzManagerExternalStateMock::updateOne(OperationContext* opCtx,
         new ExpressionContext(opCtx, std::unique_ptr<CollatorInterface>(nullptr), collectionName));
     UpdateDriver driver(std::move(expCtx));
     std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
-    driver.parse(updatePattern, arrayFilters);
+    driver.parse(write_ops::UpdateModification::parseFromClassicUpdate(updatePattern),
+                 arrayFilters);
 
     BSONObjCollection::iterator iter;
     Status status = _findOneIter(opCtx, collectionName, query, &iter);
@@ -201,8 +215,13 @@ Status AuthzManagerExternalStateMock::updateOne(OperationContext* opCtx,
         const FieldRefSet emptyImmutablePaths;
         const bool isInsert = false;
         BSONObj logObj;
-        status = driver.update(
-            StringData(), &document, validateForStorage, emptyImmutablePaths, isInsert, &logObj);
+        status = driver.update(opCtx,
+                               StringData(),
+                               &document,
+                               validateForStorage,
+                               emptyImmutablePaths,
+                               isInsert,
+                               &logObj);
         if (!status.isOK())
             return status;
         BSONObj newObj = document.getObject().copy();
@@ -230,7 +249,7 @@ Status AuthzManagerExternalStateMock::updateOne(OperationContext* opCtx,
         const FieldRefSet emptyImmutablePaths;
         const bool isInsert = false;
         status = driver.update(
-            StringData(), &document, validateForStorage, emptyImmutablePaths, isInsert);
+            opCtx, StringData(), &document, validateForStorage, emptyImmutablePaths, isInsert);
         if (!status.isOK()) {
             return status;
         }
@@ -274,7 +293,10 @@ Status AuthzManagerExternalStateMock::remove(OperationContext* opCtx,
 
 std::vector<BSONObj> AuthzManagerExternalStateMock::getCollectionContents(
     const NamespaceString& collectionName) {
-    return mapFindWithDefault(_documents, collectionName, std::vector<BSONObj>());
+    auto iter = _documents.find(collectionName);
+    if (iter != _documents.end())
+        return iter->second;
+    return {};
 }
 
 Status AuthzManagerExternalStateMock::_findOneIter(OperationContext* opCtx,

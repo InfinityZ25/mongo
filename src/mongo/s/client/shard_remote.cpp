@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -95,9 +95,9 @@ BSONObj appendMaxTimeToCmdObj(Milliseconds maxTimeMSOverride, const BSONObj& cmd
 }  // unnamed namespace
 
 ShardRemote::ShardRemote(const ShardId& id,
-                         const ConnectionString& originalConnString,
+                         const ConnectionString& connString,
                          std::unique_ptr<RemoteCommandTargeter> targeter)
-    : Shard(id), _originalConnString(originalConnString), _targeter(targeter.release()) {}
+    : Shard(id), _connString(connString), _targeter(std::move(targeter)) {}
 
 ShardRemote::~ShardRemote() = default;
 
@@ -116,15 +116,11 @@ bool ShardRemote::isRetriableError(ErrorCodes::Error code, RetryPolicy options) 
         } break;
 
         case RetryPolicy::kNotIdempotent: {
-            return ErrorCodes::isNotMasterError(code);
+            return ErrorCodes::isNotPrimaryError(code);
         } break;
     }
 
     MONGO_UNREACHABLE;
-}
-
-const ConnectionString ShardRemote::getConnString() const {
-    return _targeter->connectionString();
 }
 
 // Any error code changes should possibly also be made to Shard::shouldErrorBePropagated!
@@ -133,12 +129,14 @@ void ShardRemote::updateReplSetMonitor(const HostAndPort& remoteHost,
     if (remoteCommandStatus.isOK())
         return;
 
-    if (ErrorCodes::isNotMasterError(remoteCommandStatus.code())) {
-        _targeter->markHostNotMaster(remoteHost, remoteCommandStatus);
+    if (ErrorCodes::isNotPrimaryError(remoteCommandStatus.code())) {
+        _targeter->markHostNotPrimary(remoteHost, remoteCommandStatus);
     } else if (ErrorCodes::isNetworkError(remoteCommandStatus.code())) {
         _targeter->markHostUnreachable(remoteHost, remoteCommandStatus);
     } else if (remoteCommandStatus == ErrorCodes::NetworkInterfaceExceededTimeLimit) {
         _targeter->markHostUnreachable(remoteHost, remoteCommandStatus);
+    } else if (ErrorCodes::isShutdownError(remoteCommandStatus.code())) {
+        _targeter->markHostShuttingDown(remoteHost, remoteCommandStatus);
     }
 }
 
@@ -157,7 +155,7 @@ LogicalTime ShardRemote::getLastCommittedOpTime() const {
 }
 
 std::string ShardRemote::toString() const {
-    return getId().toString() + ":" + _originalConnString.toString();
+    return getId().toString() + ":" + _connString.toString();
 }
 
 BSONObj ShardRemote::_appendMetadataForCommand(OperationContext* opCtx,
@@ -283,7 +281,7 @@ StatusWith<Shard::QueryResponse> ShardRemote::_runExhaustiveCursorCommand(
         const auto& data = dataStatus.getValue();
 
         if (data.otherFields.metadata.hasField(rpc::kReplSetMetadataFieldName)) {
-            // Sharding users of ReplSetMetadata do not require the wall clock time field to be set
+            // Sharding users of ReplSetMetadata do not require the wall clock time field to be set.
             auto replParseStatus =
                 rpc::ReplSetMetadata::readFromMetadata(data.otherFields.metadata);
             if (!replParseStatus.isOK()) {
@@ -354,13 +352,10 @@ StatusWith<Shard::QueryResponse> ShardRemote::_exhaustiveFindOnConfig(
     invariant(isConfig());
     auto const grid = Grid::get(opCtx);
 
-    ReadPreferenceSetting readPrefWithMinOpTime(readPref);
-    readPrefWithMinOpTime.minOpTime = grid->configOpTime();
-
     BSONObj readConcernObj;
     {
         invariant(readConcernLevel == repl::ReadConcernLevel::kMajorityReadConcern);
-        const repl::ReadConcernArgs readConcern(grid->configOpTime(), readConcernLevel);
+        const auto readConcern = grid->readConcernWithConfigTime(readConcernLevel);
         BSONObjBuilder bob;
         readConcern.appendInfo(&bob);
         readConcernObj =
@@ -368,7 +363,9 @@ StatusWith<Shard::QueryResponse> ShardRemote::_exhaustiveFindOnConfig(
     }
 
     const Milliseconds maxTimeMS =
-        std::min(opCtx->getRemainingMaxTimeMillis(), kDefaultConfigCommandTimeout);
+        std::min(opCtx->getRemainingMaxTimeMillis(),
+                 nss == ChunkType::ConfigNS ? Milliseconds(gFindChunksOnConfigTimeoutMS.load())
+                                            : kDefaultConfigCommandTimeout);
 
     BSONObjBuilder findCmdBuilder;
 
@@ -386,8 +383,11 @@ StatusWith<Shard::QueryResponse> ShardRemote::_exhaustiveFindOnConfig(
         qr.asFindCommand(&findCmdBuilder);
     }
 
-    return _runExhaustiveCursorCommand(
-        opCtx, readPrefWithMinOpTime, nss.db().toString(), maxTimeMS, findCmdBuilder.done());
+    return _runExhaustiveCursorCommand(opCtx,
+                                       grid->readPreferenceWithConfigTime(readPref),
+                                       nss.db().toString(),
+                                       maxTimeMS,
+                                       findCmdBuilder.done());
 }
 
 Status ShardRemote::createIndexOnConfig(OperationContext* opCtx,
@@ -411,6 +411,91 @@ void ShardRemote::runFireAndForgetCommand(OperationContext* opCtx,
         .ignore();
 }
 
+Status ShardRemote::runAggregation(
+    OperationContext* opCtx,
+    const AggregationRequest& aggRequest,
+    std::function<bool(const std::vector<BSONObj>& batch)> callback) {
+
+    BSONObj readPrefMetadata;
+
+    ReadPreferenceSetting readPreference =
+        uassertStatusOK(ReadPreferenceSetting::fromContainingBSON(
+            aggRequest.getUnwrappedReadPref(), ReadPreference::SecondaryPreferred));
+
+    auto swHost = _targeter->findHost(opCtx, readPreference);
+    if (!swHost.isOK()) {
+        return swHost.getStatus();
+    }
+    HostAndPort host = swHost.getValue();
+
+    BSONObjBuilder builder;
+    readPreference.toContainingBSON(&builder);
+    readPrefMetadata = builder.obj();
+
+    Status status =
+        Status(ErrorCodes::InternalError, "Internal error running cursor callback in command");
+    auto fetcherCallback = [&status, callback](const Fetcher::QueryResponseStatus& dataStatus,
+                                               Fetcher::NextAction* nextAction,
+                                               BSONObjBuilder* getMoreBob) {
+        // Throw out any accumulated results on error
+        if (!dataStatus.isOK()) {
+            status = dataStatus.getStatus();
+            return;
+        }
+
+        const auto& data = dataStatus.getValue();
+
+        if (data.otherFields.metadata.hasField(rpc::kReplSetMetadataFieldName)) {
+            // Sharding users of ReplSetMetadata do not require the wall clock time field to be set.
+            auto replParseStatus =
+                rpc::ReplSetMetadata::readFromMetadata(data.otherFields.metadata);
+            if (!replParseStatus.isOK()) {
+                status = replParseStatus.getStatus();
+                return;
+            }
+        }
+
+        if (!callback(data.documents)) {
+            *nextAction = Fetcher::NextAction::kNoAction;
+        }
+
+        status = Status::OK();
+
+        if (!getMoreBob) {
+            return;
+        }
+        getMoreBob->append("getMore", data.cursorId);
+        getMoreBob->append("collection", data.nss.coll());
+    };
+
+    Milliseconds requestTimeout(-1);
+    if (aggRequest.getMaxTimeMS()) {
+        requestTimeout = Milliseconds(aggRequest.getMaxTimeMS());
+    }
+
+    auto executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
+    Fetcher fetcher(executor.get(),
+                    host,
+                    aggRequest.getNamespaceString().db().toString(),
+                    aggRequest.serializeToCommandObj().toBson(),
+                    fetcherCallback,
+                    readPrefMetadata,
+                    requestTimeout, /* command network timeout */
+                    requestTimeout /* getMore network timeout */);
+
+    Status scheduleStatus = fetcher.schedule();
+    if (!scheduleStatus.isOK()) {
+        return scheduleStatus;
+    }
+
+    fetcher.join();
+
+    updateReplSetMonitor(host, status);
+
+    return status;
+}
+
+
 StatusWith<ShardRemote::AsyncCmdHandle> ShardRemote::_scheduleCommand(
     OperationContext* opCtx,
     const ReadPreferenceSetting& readPref,
@@ -418,13 +503,16 @@ StatusWith<ShardRemote::AsyncCmdHandle> ShardRemote::_scheduleCommand(
     Milliseconds maxTimeMSOverride,
     const BSONObj& cmdObj,
     const TaskExecutor::RemoteCommandCallbackFn& cb) {
-    ReadPreferenceSetting readPrefWithMinOpTime(readPref);
+    const auto readPrefWithConfigTime = [&]() -> ReadPreferenceSetting {
+        if (isConfig()) {
+            auto const grid = Grid::get(opCtx);
+            return grid->readPreferenceWithConfigTime(readPref);
+        } else {
+            return {readPref};
+        }
+    }();
 
-    if (isConfig()) {
-        readPrefWithMinOpTime.minOpTime = Grid::get(opCtx)->configOpTime();
-    }
-
-    const auto swHost = _targeter->findHost(opCtx, readPrefWithMinOpTime);
+    const auto swHost = _targeter->findHost(opCtx, readPrefWithConfigTime);
     if (!swHost.isOK()) {
         return swHost.getStatus();
     }
@@ -439,7 +527,7 @@ StatusWith<ShardRemote::AsyncCmdHandle> ShardRemote::_scheduleCommand(
         asyncHandle.hostTargetted,
         dbName.toString(),
         appendMaxTimeToCmdObj(requestTimeout, cmdObj),
-        _appendMetadataForCommand(opCtx, readPrefWithMinOpTime),
+        _appendMetadataForCommand(opCtx, readPrefWithConfigTime),
         opCtx,
         requestTimeout < Milliseconds::max() ? requestTimeout : RemoteCommandRequest::kNoTimeout);
 

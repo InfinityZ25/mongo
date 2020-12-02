@@ -3,11 +3,11 @@ error_categories:
     - NetworkError
     - NetworkTimeoutError
     - Interruption
-    # isNotMasterError() includes all codes that indicate that the node that received the request
-    # was not master at some point during command processing,regardless of whether some write may
+    # isNotPrimaryError() includes all codes that indicate that the node that received the request
+    # was not primary at some point during command processing,regardless of whether some write may
     # have happened. If you care about whether a write could have happened,check for individual
     # codes.
-    - NotMasterError
+    - NotPrimaryError
     - StaleShardVersionError
     - NeedRetargettingError
     - WriteConcernError
@@ -25,6 +25,11 @@ error_categories:
     # desirable to maintain a connection with the client. The server will close the connection to
     # get the client to through server selection again.
     - CloseConnectionError
+    - VersionedAPIError
+    - ValidationError
+    # Codes for internal use only that must never be returned in a network response.
+    - InternalOnly
+    - TenantMigrationError
 
 error_codes:
     - {code: 0,name: OK}
@@ -42,14 +47,14 @@ error_codes:
     - {code: 12,name: UnsupportedFormat}
     - {code: 13,name: Unauthorized}
     - {code: 14,name: TypeMismatch}
-    - {code: 15,name: Overflow}
+    - {code: 15,name: Overflow,categories: [ValidationError]}
     - {code: 16,name: InvalidLength}
     - {code: 17,name: ProtocolError}
     - {code: 18,name: AuthenticationFailed}
     - {code: 19,name: CannotReuseObject}
     - {code: 20,name: IllegalOperation}
     - {code: 21,name: EmptyArrayOperation}
-    - {code: 22,name: InvalidBSON}
+    - {code: 22,name: InvalidBSON,categories: [ValidationError]}
     - {code: 23,name: AlreadyInitialized}
     - {code: 24,name: LockTimeout,categories: [Interruption]}
     - {code: 25,name: RemoteValidationError}
@@ -110,14 +115,17 @@ error_codes:
     - {code: 81,name: NoMatchParseContext}
     - {code: 82,name: NoProgressMade}
     - {code: 83,name: RemoteResultsUnavailable}
-    - {code: 84,name: DuplicateKeyValue}
+    - {code: 84,name: OBSOLETE_DuplicateKeyValue}
     - {code: 85,name: IndexOptionsConflict}
     - {code: 86,name: IndexKeySpecsConflict}
     - {code: 87,name: CannotSplit}
-    - {code: 88,name: SplitFailed_OBSOLETE}
+    - {code: 88,name: OBSOLETE_SplitFailed}
     - {code: 89,name: NetworkTimeout,categories: [NetworkError,RetriableError,NetworkTimeoutError]}
     - {code: 90,name: CallbackCanceled,categories: [CancelationError]}
-    - {code: 91,name: ShutdownInProgress,categories: [ShutdownError,CancelationError,RetriableError]}
+    - {code: 91,name: ShutdownInProgress,
+                       extra: ShutdownInProgressQuiesceInfo,
+                       categories: [ShutdownError,CancelationError,RetriableError],
+                       extraIsOptional: True}
     - {code: 92,name: SecondaryAheadOfPrimary}
     - {code: 93,name: InvalidReplicaSetConfig}
     - {code: 94,name: NotYetInitialized}
@@ -146,7 +154,11 @@ error_codes:
     - {code: 118,name: NamespaceNotSharded}
     - {code: 119,name: InvalidSyncSource}
     - {code: 120,name: OplogStartMissing}
-    - {code: 121,name: DocumentValidationFailure} # Only for the document validator on collections.
+    # Error code 121 is only for the document validator on collections.
+    - {code: 121,name: DocumentValidationFailure,
+                extra: 'doc_validation_error::DocumentValidationFailureInfo',
+                # TODO SERVER-50524: Make extra info mandatory when 5.0 becomes last-lts.
+                extraIsOptional: True}
     - {code: 122,name: OBSOLETE_ReadAfterOptimeTimeout}
     - {code: 123,name: NotAReplicaSet}
     - {code: 124,name: IncompatibleElectionProtocol}
@@ -174,7 +186,7 @@ error_codes:
     - {code: 146,name: ExceededMemoryLimit}
     - {code: 147,name: ZLibError}
     - {code: 148,name: ReadConcernMajorityNotEnabled,categories: [VoteAbortError]}
-    - {code: 149,name: NoConfigMaster}
+    - {code: 149,name: NoConfigPrimary}
     - {code: 150,name: StaleEpoch,categories: [StaleShardVersionError,NeedRetargettingError]}
     - {code: 151,name: OperationCannotBeBatched}
     - {code: 152,name: OplogOutOfOrder}
@@ -214,7 +226,7 @@ error_codes:
     - {code: 186,name: ClientMetadataCannotBeMutated}
     - {code: 187,name: LinearizableReadConcernError}
     - {code: 188,name: IncompatibleServerVersion}
-    - {code: 189,name: PrimarySteppedDown,categories: [NotMasterError,RetriableError]}
+    - {code: 189,name: PrimarySteppedDown,categories: [NotPrimaryError,RetriableError]}
     - {code: 190,name: MasterSlaveConnectionFailure}
     - {code: 191,name: OBSOLETE_BalancerLostDistributedLock}
     - {code: 192,name: FailPointEnabled}
@@ -291,7 +303,7 @@ error_codes:
     - {code: 260,name: InvalidResumeToken}
     - {code: 261,name: TooManyLogicalSessions}
     - {code: 262,name: ExceededTimeLimit,categories: [Interruption,ExceededTimeLimitError,RetriableError]}
-    - {code: 263,name: OperationNotSupportedInTransaction}
+    - {code: 263,name: OperationNotSupportedInTransaction,categories: [VoteAbortError]}
     - {code: 264,name: TooManyFilesOpen}
     - {code: 265,name: OrphanedRangeCleanUpFailed}
     - {code: 266,name: FailPointSetFailed}
@@ -310,10 +322,9 @@ error_codes:
     - {code: 279,name: ClientDisconnect,categories: [Interruption]}
     - {code: 280,name: ChangeStreamFatalError,categories: [NonResumableChangeStreamError]}
 
-    # The two codes below are for internal use only and must never be returned in a network response
     # TransactionCoordinatorSteppingDown gets converted to InterruptedDueToReplStateChange
-    - {code: 281,name: TransactionCoordinatorSteppingDown,categories: [Interruption]}
-    - {code: 282,name: TransactionCoordinatorReachedAbortDecision}
+    - {code: 281,name: TransactionCoordinatorSteppingDown,categories: [Interruption,InternalOnly]}
+    - {code: 282,name: TransactionCoordinatorReachedAbortDecision,categories: [InternalOnly]}
 
     - {code: 283,name: WouldChangeOwningShard,extra: WouldChangeOwningShardInfo}
     - {code: 284,name: ForTestingErrorExtraInfoWithExtraInfoInNamespace,
@@ -321,13 +332,11 @@ error_codes:
     - {code: 285,name: IndexBuildAlreadyInProgress}
     - {code: 286,name: ChangeStreamHistoryLost,categories: [NonResumableChangeStreamError]}
 
-    # The code below is for internal use only and must never be returned in a network response
-    - {code: 287,name: TransactionCoordinatorDeadlineTaskCanceled}
+    - {code: 287,name: TransactionCoordinatorDeadlineTaskCanceled,categories: [InternalOnly]}
 
     - {code: 288,name: ChecksumMismatch,categories: [ConnectionFatalMessageParseError]}
 
-    # Internal only code used by WaitForMajorityService.
-    - {code: 289,name: WaitForMajorityServiceEarlierOpTimeAvailable}
+    - {code: 289,name: WaitForMajorityServiceEarlierOpTimeAvailable,categories: [InternalOnly]}
 
     - {code: 290,name: TransactionExceededLifetimeLimitSeconds,
                  categories: [Interruption,ExceededTimeLimitError]}
@@ -350,15 +359,51 @@ error_codes:
     # NeedRetargettingError categories.
     - {code: 304,name: ShardInvalidatedForTargeting,extra: ShardInvalidatedForTargetingInfo}
 
-    # Internal only codes used by the ReadThroughCache and must never be returned in a network
-    # response
-    - {code: 305,name: ReadThroughCacheKeyNotFound}
-    - {code: 306,name: ReadThroughCacheLookupCanceled}
+    - {code: 306,name: ReadThroughCacheLookupCanceled,categories: [InternalOnly]}
 
     - {code: 307,name: RangeDeletionAbandonedBecauseTaskDocumentDoesNotExist}
     - {code: 308,name: CurrentConfigNotCommittedYet}
     - {code: 309,name: ExhaustCommandFinished}
     - {code: 310,name: PeriodicJobIsStopped,categories: [CancelationError]}
+
+    - {code: 311,name: TransactionCoordinatorCanceled,categories: [InternalOnly]}
+    - {code: 312,name: OperationIsKilledAndDelisted,categories: [CancelationError,InternalOnly]}
+
+    - {code: 313,name: ResumableRangeDeleterDisabled}
+    - {code: 314,name: ObjectIsBusy}
+
+
+    - {code: 315,name: TooStaleToSyncFromSource,categories: [InternalOnly]}
+
+    - {code: 316,name: QueryTrialRunCompleted,categories: [InternalOnly]}
+
+    - {code: 317,name: ConnectionPoolExpired,categories: [NetworkError,RetriableError,InternalOnly]}
+
+    - {code: 318,name: ForTestingOptionalErrorExtraInfo,extra: OptionalErrorExtraInfoExample,extraIsOptional: True}
+    - {code: 319,name: MovePrimaryInProgress}
+
+    - {code: 320, name: TenantMigrationConflict,extra: TenantMigrationConflictInfo,categories: [TenantMigrationError]}
+    - {code: 321, name: TenantMigrationCommitted,extra: TenantMigrationCommittedInfo,categories: [TenantMigrationError]}
+
+    - {code: 322, name: APIVersionError, categories: [VersionedAPIError]}
+    - {code: 323, name: APIStrictError, categories: [VersionedAPIError]}
+    - {code: 324, name: APIDeprecationError, categories: [VersionedAPIError]}
+
+    - {code: 325, name: TenantMigrationAborted,categories: [TenantMigrationError]}
+
+    - {code: 326, name: OplogQueryMinTsMissing}
+
+    - {code: 327, name: NoSuchTenantMigration}
+
+    - {code: 328, name: TenantMigrationAccessBlockerShuttingDown, categories: [InternalOnly]}
+
+    - {code: 329, name: TenantMigrationInProgress}
+
+    - {code: 330, name: SkipCommandExecution}
+
+    - {code: 331, name: FailedToRunWithReplyBuilder}
+
+    - {code: 332, name: CannotDowngrade}
 
     # Error codes 4000-8999 are reserved.
 
@@ -366,12 +411,12 @@ error_codes:
     - {code: 9001,name: SocketException,categories: [NetworkError,RetriableError]}
     - {code: 9996,name: OBSOLETE_RecvStaleConfig}
     - {code: 10003,name: CannotGrowDocumentInCappedNamespace}
-    - {code: 10107,name: NotMaster,categories: [NotMasterError,RetriableError]}
+    - {code: 10107,name: NotWritablePrimary,categories: [NotPrimaryError,RetriableError]}
     - {code: 10334,name: BSONObjectTooLarge}
     - {code: 11000,name: DuplicateKey,extra: DuplicateKeyErrorInfo}
     - {code: 11600,name: InterruptedAtShutdown,categories: [Interruption,ShutdownError,CancelationError,RetriableError]}
     - {code: 11601,name: Interrupted,categories: [Interruption]}
-    - {code: 11602,name: InterruptedDueToReplStateChange,categories: [Interruption,NotMasterError,RetriableError]}
+    - {code: 11602,name: InterruptedDueToReplStateChange,categories: [Interruption,NotPrimaryError,RetriableError]}
     - {code: 12586,name: BackgroundOperationInProgressForDatabase}
     - {code: 12587,name: BackgroundOperationInProgressForNamespace}
     - {code: 13104,name: OBSOLETE_PrepareConfigsFailed}
@@ -380,9 +425,9 @@ error_codes:
     - {code: 13388,name: StaleConfig,
                     extra: StaleConfigInfo,
                     categories: [StaleShardVersionError,NeedRetargettingError]}
-    - {code: 13435,name: NotMasterNoSlaveOk,categories: [NotMasterError,RetriableError]}
-    - {code: 13436,name: NotMasterOrSecondary,categories: [NotMasterError,RetriableError]}
+    - {code: 13435,name: NotPrimaryNoSecondaryOk,categories: [NotPrimaryError,RetriableError]}
+    - {code: 13436,name: NotPrimaryOrSecondary,categories: [NotPrimaryError,RetriableError]}
     - {code: 14031,name: OutOfDiskSpace}
-    - {code: 17280,name: OSBELETE_KeyTooLong}
+    - {code: 17280,name: OBSOLETE_KeyTooLong}
     - {code: 46841,name: ClientMarkedKilled,categories: [Interruption,CancelationError]}
 

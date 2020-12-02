@@ -16,7 +16,7 @@ sh._checkFullName = function(fullName) {
 sh._adminCommand = function(cmd, skipCheck) {
     if (!skipCheck)
         sh._checkMongos();
-    return db.getSisterDB("admin").runCommand(cmd);
+    return db.getSiblingDB("admin").runCommand(cmd);
 };
 
 sh._getConfigDB = function() {
@@ -156,13 +156,16 @@ sh.setBalancerState = function(isOn) {
     }
 };
 
-sh.getBalancerState = function(configDB) {
-    if (configDB === undefined)
+sh.getBalancerState = function(configDB, balancerStatus) {
+    if (configDB === undefined) {
         configDB = sh._getConfigDB();
-    var x = configDB.settings.findOne({_id: "balancer"});
-    if (x == null)
-        return true;
-    return !x.stopped;
+    }
+
+    if (balancerStatus === undefined) {
+        balancerStatus = assert.commandWorked(configDB.adminCommand({balancerStatus: 1}));
+    }
+
+    return balancerStatus.mode !== "off" && balancerStatus.mode !== "autoSplitOnly";
 };
 
 sh.isBalancerRunning = function(configDB) {
@@ -276,7 +279,7 @@ sh.disableBalancing = function(coll) {
         sh._checkMongos();
     }
 
-    return assert.commandWorked(dbase.getSisterDB("config").collections.update(
+    return assert.commandWorked(dbase.getSiblingDB("config").collections.update(
         {_id: coll + ""},
         {$set: {"noBalance": true}},
         {writeConcern: {w: 'majority', wtimeout: 60000}}));
@@ -293,7 +296,7 @@ sh.enableBalancing = function(coll) {
         sh._checkMongos();
     }
 
-    return assert.commandWorked(dbase.getSisterDB("config").collections.update(
+    return assert.commandWorked(dbase.getSiblingDB("config").collections.update(
         {_id: coll + ""},
         {$set: {"noBalance": false}},
         {writeConcern: {w: 'majority', wtimeout: 60000}}));
@@ -309,13 +312,13 @@ sh._lastMigration = function(ns) {
     var config = null;
 
     if (!ns) {
-        config = db.getSisterDB("config");
+        config = db.getSiblingDB("config");
     } else if (ns instanceof DBCollection) {
         coll = ns;
-        config = coll.getDB().getSisterDB("config");
+        config = coll.getDB().getSiblingDB("config");
     } else if (ns instanceof DB) {
         dbase = ns;
-        config = dbase.getSisterDB("config");
+        config = dbase.getSiblingDB("config");
     } else if (ns instanceof ShardingTest) {
         config = ns.s.getDB("config");
     } else if (ns instanceof Mongo) {
@@ -324,11 +327,11 @@ sh._lastMigration = function(ns) {
         // String namespace
         ns = ns + "";
         if (ns.indexOf(".") > 0) {
-            config = db.getSisterDB("config");
+            config = db.getSiblingDB("config");
             coll = db.getMongo().getCollection(ns);
         } else {
-            config = db.getSisterDB("config");
-            dbase = db.getSisterDB(ns);
+            config = db.getSiblingDB("config");
+            dbase = db.getSiblingDB(ns);
         }
     }
 
@@ -554,7 +557,7 @@ function printShardingStatus(configDB, verbose) {
     // configDB is a DB object that contains the sharding metadata of interest.
     // Defaults to the db named "config" on the current connection.
     if (configDB === undefined)
-        configDB = db.getSisterDB('config');
+        configDB = db.getSiblingDB('config');
 
     var version = configDB.getCollection("version").findOne();
     if (version == null) {
@@ -628,16 +631,28 @@ function printShardingStatus(configDB, verbose) {
 
     output(1, "balancer:");
 
+    let balancerEnabledString;
+    let balancerRunning;
+
+    const balancerStatus = configDB.adminCommand({balancerStatus: 1});
+    if (!balancerStatus.ok) {
+        // If the call to balancerStatus returns CommandNotFound, we indicate that the balancer
+        // being enabled is currently unknown, since CommandNotFound implies we're running this
+        // command on a standalone mongod. All other error statuses return "no" for historical
+        // reasons.
+        balancerEnabledString =
+            (balancerStatus.code == ErrorCodes.CommandNotFound) ? "unknown" : "no";
+        balancerRunning = false;
+    } else {
+        balancerEnabledString = sh.getBalancerState(configDB, balancerStatus) ? "yes" : "no";
+        balancerRunning = balancerStatus.inBalancerRound;
+    }
+
     // Is the balancer currently enabled
-    output(2, "Currently enabled:  " + (sh.getBalancerState(configDB) ? "yes" : "no"));
+    output(2, "Currently enabled:  " + balancerEnabledString);
 
     // Is the balancer currently active
-    var balancerRunning = "unknown";
-    var balancerStatus = configDB.adminCommand({balancerStatus: 1});
-    if (balancerStatus.code != ErrorCodes.CommandNotFound) {
-        balancerRunning = balancerStatus.inBalancerRound ? "yes" : "no";
-    }
-    output(2, "Currently running:  " + balancerRunning);
+    output(2, "Currently running:  " + balancerRunning ? "yes" : "no");
 
     // Output the balancer window
     var balSettings = sh.getBalancerWindow(configDB);
@@ -785,7 +800,7 @@ function printShardingSizes(configDB) {
     // configDB is a DB object that contains the sharding metadata of interest.
     // Defaults to the db named "config" on the current connection.
     if (configDB === undefined)
-        configDB = db.getSisterDB('config');
+        configDB = db.getSiblingDB('config');
 
     var version = configDB.getCollection("version").findOne();
     if (version == null) {

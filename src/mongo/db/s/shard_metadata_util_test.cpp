@@ -35,11 +35,10 @@
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/s/shard_server_test_fixture.h"
+#include "mongo/db/s/type_shard_collection.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/s/catalog/type_shard_collection.h"
-#include "mongo/s/shard_server_test_fixture.h"
-#include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace {
@@ -61,16 +60,13 @@ struct ShardMetadataUtilTest : public ShardServerTestFixture {
      * Inserts a collections collection entry for 'kNss'.
      */
     ShardCollectionType setUpCollection() {
-        BSONObjBuilder builder;
-        builder.append(ShardCollectionType::kNssFieldName, kNss.ns());
-        builder.append(ShardCollectionType::kEpochFieldName, maxCollVersion.epoch());
-        builder.append(ShardCollectionType::kKeyPatternFieldName, keyPattern.toBSON());
-        builder.append(ShardCollectionType::kDefaultCollationFieldName, defaultCollation);
-        builder.append(ShardCollectionType::kUniqueFieldName, kUnique);
-
-        ShardCollectionType shardCollectionType =
-            assertGet(ShardCollectionType::fromBSON(builder.obj()));
-        shardCollectionType.setUuid(uuid);
+        ShardCollectionType shardCollectionType(
+            BSON(ShardCollectionType::kNssFieldName
+                 << kNss.ns() << ShardCollectionType::kEpochFieldName << maxCollVersion.epoch()
+                 << ShardCollectionType::kUuidFieldName << uuid
+                 << ShardCollectionType::kKeyPatternFieldName << keyPattern.toBSON()
+                 << ShardCollectionType::kDefaultCollationFieldName << defaultCollation
+                 << ShardCollectionType::kUniqueFieldName << kUnique));
         shardCollectionType.setRefreshing(true);
 
         ASSERT_OK(updateShardCollectionsEntry(operationContext(),
@@ -176,8 +172,7 @@ TEST_F(ShardMetadataUtilTest, UpdateAndReadCollectionsEntry) {
     ShardCollectionType readShardCollectionType =
         assertGet(readShardCollectionsEntry(operationContext(), kNss));
 
-    ASSERT(readShardCollectionType.getUuid());
-    ASSERT_EQUALS(*updateShardCollectionType.getUuid(), *readShardCollectionType.getUuid());
+    ASSERT_EQUALS(updateShardCollectionType.getUuid(), readShardCollectionType.getUuid());
     ASSERT_EQUALS(updateShardCollectionType.getNss(), readShardCollectionType.getNss());
     ASSERT_EQUALS(updateShardCollectionType.getEpoch(), readShardCollectionType.getEpoch());
     ASSERT_BSONOBJ_EQ(updateShardCollectionType.getKeyPattern().toBSON(),
@@ -199,7 +194,7 @@ TEST_F(ShardMetadataUtilTest, PersistedRefreshSignalStartAndFinish) {
     ShardCollectionType shardCollectionsEntry =
         assertGet(readShardCollectionsEntry(operationContext(), kNss));
 
-    ASSERT_EQUALS(*shardCollectionsEntry.getUuid(), uuid);
+    ASSERT_EQUALS(shardCollectionsEntry.getUuid(), uuid);
     ASSERT_EQUALS(shardCollectionsEntry.getNss().ns(), kNss.ns());
     ASSERT_EQUALS(shardCollectionsEntry.getEpoch(), maxCollVersion.epoch());
     ASSERT_BSONOBJ_EQ(shardCollectionsEntry.getKeyPattern().toBSON(), keyPattern.toBSON());
@@ -326,6 +321,36 @@ TEST_F(ShardMetadataUtilTest, DropChunksAndDeleteCollectionsEntry) {
     checkCollectionIsEmpty(kChunkMetadataNss);
     // Collections collection should be empty because it only had one entry.
     checkCollectionIsEmpty(NamespaceString::kShardConfigCollectionsNamespace);
+}
+
+TEST_F(ShardMetadataUtilTest, DowngradeShardConfigCollectionEntriesTo44) {
+    setUpShardChunkMetadata();
+
+    const auto checkShardCollectionAllowMigrationsFlag = [&](bool expectedValue) {
+        ShardCollectionType readShardCollectionType =
+            assertGet(readShardCollectionsEntry(operationContext(), kNss));
+
+        ASSERT_EQUALS(readShardCollectionType.getAllowMigrations(), expectedValue);
+    };
+
+    // allowMigrations is an optional field. If it is not present -> allowMigrations = true
+    checkShardCollectionAllowMigrationsFlag(/* expectedValue */ true);
+
+    ASSERT_OK(updateShardCollectionsEntry(
+        operationContext(),
+        BSON(ShardCollectionType::kNssFieldName << kNss.ns()),
+        BSON(ShardCollectionType::kPre50CompatibleAllowMigrationsFieldName << false),
+        BSONObj(),
+        /* upsert */ false));
+
+    // allowMigrations was explicitly defined to false by the previous statement
+    checkShardCollectionAllowMigrationsFlag(/* expectedValue */ false);
+
+    downgradeShardConfigCollectionEntriesToPre49(operationContext());
+
+    // The downgrade process to prior 4.9 removes the allowMigration flag from all collections.
+    // Thus, this flag will not be present which implies that its value is true
+    checkShardCollectionAllowMigrationsFlag(/* expectedValue */ true);
 }
 
 }  // namespace

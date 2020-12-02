@@ -33,6 +33,7 @@ namespace mongo {
 
 class OperationContext;
 class ServiceContext;
+class Status;
 
 /**
  * Helper functions to manipulate independent processes that perform actions against the storage
@@ -41,42 +42,32 @@ class ServiceContext;
 namespace StorageControl {
 
 /**
- * Responsible for initializing independent processes for replication that and interact with the
- * storage layer.
+ * Responsible for initializing independent processes for replication that interact with the storage
+ * layer.
  *
- * Instantiates the JournalFlusher to periodically, and upon request, flush writes to disk.
+ * Instantiates the JournalFlusher to flush writes to disk periodically and upon request. If
+ * 'forTestOnly' is set, then the JournalFlusher will only run upon request so as not to disrupt
+ * unit test expectations. If stopStorageControls() has been called with forRestart set, this
+ * resumes the paused JournalFlusher.
  *
- * Safe to call again after stopStorageControls has been called, to restart any processes that were
- * stopped.
+ * Safe to call again after stopStorageControls() has been called, to restart any processes that
+ * were stopped.
  */
-void startStorageControls(ServiceContext* serviceContext);
+void startStorageControls(ServiceContext* serviceContext, bool forTestOnly = false);
 
 /**
- * Stops the processes begun by startStorageControls.
+ * Stops the processes begun by startStorageControls() and relays the reason to them.
+ * Call this with forRestart set when we need to stop and restart storage controls without shutting
+ * down the server. Using forRestart avoids destroying and recreating the JournalFlusher instance
+ * which is a decoration on the global service context and is expected to be valid for the
+ * lifetime of the service context.
  *
- * The OplogCapMaintainerThread is unowned and therefore ignored; the JournalFlusher is shut
- * down.
+ * The JournalFlusher is paused when forRestart is set or shut down otherwise.
  *
- * Safe to call multiple times.
+ * Safe to call multiple times, whether or not startStorageControls() has been called.
+ * startStorageControls() must be called after to resume the JournalFlusher if forRestart is used.
  */
-void stopStorageControls(ServiceContext* serviceContext);
-
-/**
- * Prompts an immediate journal flush and returns without waiting for it.
- */
-void triggerJournalFlush(ServiceContext* serviceContext);
-
-/**
- * Initiates if needed and waits for a complete round of journal flushing to execute.
- *
- * Can throw ShutdownInProgress if the storage engine is being closed.
- */
-void waitForJournalFlush(OperationContext* opCtx);
-
-/**
- * Ensures interruption of the JournalFlusher if it is or will be acquiring a lock.
- */
-void interruptJournalFlusherForReplStateChange(ServiceContext* serviceContext);
+void stopStorageControls(ServiceContext* serviceContext, const Status& reason, bool forRestart);
 
 }  // namespace StorageControl
 

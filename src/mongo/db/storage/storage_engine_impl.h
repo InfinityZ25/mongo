@@ -58,30 +58,24 @@ struct StorageEngineOptions {
     bool directoryPerDB = false;
     bool directoryForIndexes = false;
     bool forRepair = false;
+    bool lockFileCreatedByUncleanShutdown = false;
 };
 
 class StorageEngineImpl final : public StorageEngineInterface, public StorageEngine {
 public:
-    /**
-     * @param engine - ownership passes to me.
-     */
-    StorageEngineImpl(KVEngine* engine, StorageEngineOptions options = StorageEngineOptions());
+    StorageEngineImpl(OperationContext* opCtx,
+                      std::unique_ptr<KVEngine> engine,
+                      StorageEngineOptions options = StorageEngineOptions());
 
     virtual ~StorageEngineImpl();
 
     virtual void finishInit() override;
 
+    virtual void notifyStartupComplete() override;
+
     virtual RecoveryUnit* newRecoveryUnit() override;
 
     virtual std::vector<std::string> listDatabases() const override;
-
-    virtual bool supportsDocLocking() const override {
-        return _supportsDocLocking;
-    }
-
-    virtual bool supportsDBLocking() const override {
-        return _supportsDBLocking;
-    }
 
     virtual bool supportsCappedCollections() const override {
         return _supportsCappedCollections;
@@ -99,7 +93,7 @@ public:
 
     virtual Status disableIncrementalBackup(OperationContext* opCtx) override;
 
-    virtual StatusWith<BackupInformation> beginNonBlockingBackup(
+    virtual StatusWith<std::unique_ptr<StreamingCursor>> beginNonBlockingBackup(
         OperationContext* opCtx, const BackupOptions& options) override;
 
     virtual void endNonBlockingBackup(OperationContext* opCtx) override;
@@ -120,22 +114,30 @@ public:
     virtual std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStore(
         OperationContext* opCtx) override;
 
+    virtual std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStoreForResumableIndexBuild(
+        OperationContext* opCtx) override;
+
+    virtual std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStoreFromExistingIdent(
+        OperationContext* opCtx, StringData ident) override;
+
     virtual void cleanShutdown() override;
 
     virtual void setStableTimestamp(Timestamp stableTimestamp, bool force = false) override;
 
+    virtual Timestamp getStableTimestamp() const override;
+
     virtual void setInitialDataTimestamp(Timestamp initialDataTimestamp) override;
+
+    virtual Timestamp getInitialDataTimestamp() const override;
 
     virtual void setOldestTimestampFromStable() override;
 
     virtual void setOldestTimestamp(Timestamp newOldestTimestamp) override;
 
+    virtual Timestamp getOldestTimestamp() const override;
+
     virtual void setOldestActiveTransactionTimestampCallback(
         StorageEngine::OldestActiveTransactionTimestampCallback) override;
-
-    virtual bool isCacheUnderPressure(OperationContext* opCtx) const override;
-
-    virtual void setCachePressureForTest(int pressure) override;
 
     virtual bool supportsRecoverToStableTimestamp() const override;
 
@@ -149,8 +151,6 @@ public:
 
     virtual Timestamp getAllDurableTimestamp() const override;
 
-    virtual Timestamp getOldestOpenReadTimestamp() const override;
-
     boost::optional<Timestamp> getOplogNeededForCrashRecovery() const final;
 
     bool supportsReadConcernSnapshot() const final;
@@ -159,11 +159,11 @@ public:
 
     bool supportsOplogStones() const final;
 
+    bool supportsResumableIndexBuilds() const final;
+
     bool supportsPendingDrops() const final;
 
     void clearDropPendingState() final;
-
-    bool supportsTwoPhaseIndexBuild() const final;
 
     SnapshotManager* getSnapshotManager() const final;
 
@@ -192,6 +192,9 @@ public:
          *
          * The TimestampListener must be registered in the TimestampMonitor in order to be notified
          * of timestamp changes and react to changes for the duration it's part of the monitor.
+         *
+         * Listeners expected to run in standalone mode should handle Timestamp::min() notifications
+         * appropriately.
          */
         class TimestampListener {
         public:
@@ -253,15 +256,10 @@ public:
         ~TimestampMonitor();
 
         /**
-         * Monitor changes in timestamps and to notify the listeners on change.
+         * Monitor changes in timestamps and to notify the listeners on change. Notifies all
+         * listeners on Timestamp::min() in order to support standalone mode that is untimestamped.
          */
         void startup();
-
-        /**
-         * Notify all of the listeners listening for the given TimestampType when a change for that
-         * timestamp has occured.
-         */
-        void notifyAll(TimestampType type, Timestamp newTimestamp);
 
         /**
          * Adds a new listener to the monitor if it isn't already registered. A listener can only be
@@ -320,7 +318,10 @@ public:
 
     void addDropPendingIdent(const Timestamp& dropTimestamp,
                              const NamespaceString& nss,
-                             StringData ident) override;
+                             std::shared_ptr<Ident> ident,
+                             DropIdentCallback&& onDrop) override;
+
+    void checkpoint() override;
 
     DurableCatalog* getCatalog() override {
         return _catalog.get();
@@ -330,31 +331,16 @@ public:
         return _catalog.get();
     }
 
-    std::unique_ptr<CheckpointLock> getCheckpointLock(OperationContext* opCtx) override {
-        return _engine->getCheckpointLock(opCtx);
-    }
-
-    void addIndividuallyCheckpointedIndexToList(const std::string& ident) override {
-        return _engine->addIndividuallyCheckpointedIndexToList(ident);
-    }
-
-    void clearIndividuallyCheckpointedIndexesList() override {
-        return _engine->clearIndividuallyCheckpointedIndexesList();
-    }
-
-    bool isInIndividuallyCheckpointedIndexesList(const std::string& ident) const override {
-        return _engine->isInIndividuallyCheckpointedIndexesList(ident);
-    }
-
-    StatusWith<ReconcileResult> reconcileCatalogAndIdents(OperationContext* opCtx) override;
+    StatusWith<ReconcileResult> reconcileCatalogAndIdents(
+        OperationContext* opCtx,
+        InternalIdentReconcilePolicy internalIdentReconcilePolicy) override;
 
     std::string getFilesystemPathForDb(const std::string& dbName) const override;
 
     /**
-     * When loading after an unclean shutdown, this performs cleanup on the DurableCatalogImpl and
-     * unsets the startingAfterUncleanShutdown decoration on the global ServiceContext.
+     * When loading after an unclean shutdown, this performs cleanup on the DurableCatalogImpl.
      */
-    void loadCatalog(OperationContext* opCtx) final;
+    void loadCatalog(OperationContext* opCtx, bool loadingFromUncleanShutdown) final;
 
     void closeCatalog(OperationContext* opCtx) final;
 
@@ -363,7 +349,7 @@ public:
     }
 
     std::set<std::string> getDropPendingIdents() const override {
-        return _dropPendingIdentReaper.getAllIdents();
+        return _dropPendingIdentReaper.getAllIdentNames();
     }
 
     Status currentFilesCompatible(OperationContext* opCtx) const override {
@@ -372,6 +358,10 @@ public:
     }
 
     int64_t sizeOnDiskForDb(OperationContext* opCtx, StringData dbName) override;
+
+    bool isUsingDirectoryPerDb() const override {
+        return _options.directoryPerDB;
+    }
 
 private:
     using CollIter = std::list<std::string>::iterator;
@@ -407,6 +397,17 @@ private:
      */
     void _onMinOfCheckpointAndOldestTimestampChanged(const Timestamp& timestamp);
 
+    /**
+     * Returns whether the given ident is an internal ident and if it should be dropped or used to
+     * resume an index build.
+     */
+    bool _handleInternalIdent(OperationContext* opCtx,
+                              const std::string& ident,
+                              InternalIdentReconcilePolicy internalIdentReconcilePolicy,
+                              ReconcileResult* reconcileResult,
+                              std::set<std::string>* internalIdentsToDrop,
+                              std::set<std::string>* allInternalIdents);
+
     class RemoveDBChange;
 
     // This must be the first member so it is destroyed last.
@@ -420,10 +421,7 @@ private:
     // Listener for min of checkpoint and oldest timestamp changes.
     TimestampMonitor::TimestampListener _minOfCheckpointAndOldestTimestampListener;
 
-    const bool _supportsDocLocking;
-    const bool _supportsDBLocking;
     const bool _supportsCappedCollections;
-    Timestamp _initialDataTimestamp = Timestamp::kAllowUnstableCheckpointsSentinel;
 
     std::unique_ptr<RecordStore> _catalogRecordStore;
     std::unique_ptr<DurableCatalogImpl> _catalog;

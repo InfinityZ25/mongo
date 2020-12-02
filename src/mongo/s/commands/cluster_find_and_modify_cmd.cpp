@@ -34,6 +34,7 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/find_and_modify_common.h"
+#include "mongo/db/commands/update_metrics.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/storage/duplicate_key_error_info.h"
 #include "mongo/executor/task_executor_pool.h"
@@ -58,15 +59,16 @@ namespace mongo {
 namespace {
 
 const ReadPreferenceSetting kPrimaryOnlyReadPreference(ReadPreference::PrimaryOnly);
-const char kRuntimeConstantsField[] = "runtimeConstants";
+const char kLegacyRuntimeConstantsField[] = "runtimeConstants";
 
-BSONObj appendRuntimeConstantsToCommandObject(OperationContext* opCtx, const BSONObj& origCmdObj) {
+BSONObj appendLegacyRuntimeConstantsToCommandObject(OperationContext* opCtx,
+                                                    const BSONObj& origCmdObj) {
     uassert(51196,
             "Cannot specify runtime constants option to a mongos",
-            !origCmdObj.getField(kRuntimeConstantsField));
+            !origCmdObj.getField(kLegacyRuntimeConstantsField));
     auto rtcBSON =
-        BSON(kRuntimeConstantsField << Variables::generateRuntimeConstants(opCtx).toBSON());
-    return origCmdObj.addField(rtcBSON.getField(kRuntimeConstantsField));
+        BSON(kLegacyRuntimeConstantsField << Variables::generateRuntimeConstants(opCtx).toBSON());
+    return origCmdObj.addField(rtcBSON.getField(kLegacyRuntimeConstantsField));
 }
 
 BSONObj getCollation(const BSONObj& cmdObj) {
@@ -81,12 +83,36 @@ BSONObj getCollation(const BSONObj& cmdObj) {
     return BSONObj();
 }
 
+boost::optional<BSONObj> getLet(const BSONObj& cmdObj) {
+    if (auto letElem = cmdObj.getField("let"_sd); letElem.type() == BSONType::Object) {
+        auto bob = BSONObjBuilder();
+        bob.appendElementsUnique(letElem.embeddedObject());
+        return bob.obj();
+    }
+    return boost::none;
+}
+
+boost::optional<LegacyRuntimeConstants> getLegacyRuntimeConstants(const BSONObj& cmdObj) {
+    if (auto rcElem = cmdObj.getField("runtimeConstants"_sd); rcElem.type() == BSONType::Object) {
+        IDLParserErrorContext ctx("internalLegacyRuntimeConstants");
+        return LegacyRuntimeConstants::parse(ctx, rcElem.embeddedObject());
+    }
+    return boost::none;
+}
+
 BSONObj getShardKey(OperationContext* opCtx,
                     const ChunkManager& chunkMgr,
                     const NamespaceString& nss,
-                    const BSONObj& query) {
+                    const BSONObj& query,
+                    const BSONObj& collation,
+                    const boost::optional<ExplainOptions::Verbosity> verbosity,
+                    const boost::optional<BSONObj>& let,
+                    const boost::optional<LegacyRuntimeConstants>& runtimeConstants) {
+    auto expCtx = makeExpressionContextWithDefaultsForTargeter(
+        opCtx, nss, collation, verbosity, let, runtimeConstants);
+
     BSONObj shardKey =
-        uassertStatusOK(chunkMgr.getShardKeyPattern().extractShardKeyFromQuery(opCtx, nss, query));
+        uassertStatusOK(chunkMgr.getShardKeyPattern().extractShardKeyFromQuery(expCtx, query));
     uassert(ErrorCodes::ShardKeyNotFound,
             "Query for sharded findAndModify must contain the shard key",
             !shardKey.isEmpty());
@@ -142,7 +168,12 @@ void updateShardKeyValueOnWouldChangeOwningShardError(OperationContext* opCtx,
 
 class FindAndModifyCmd : public BasicCommand {
 public:
-    FindAndModifyCmd() : BasicCommand("findAndModify", "findandmodify") {}
+    FindAndModifyCmd()
+        : BasicCommand("findAndModify", "findandmodify"), _updateMetrics{"findAndModify"} {}
+
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
@@ -178,37 +209,38 @@ public:
         const BSONObj& cmdObj = request.body;
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
 
-        auto routingInfo =
+        const auto cm =
             uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
 
-        std::shared_ptr<ChunkManager> chunkMgr;
         std::shared_ptr<Shard> shard;
 
-        if (!routingInfo.cm()) {
-            shard = routingInfo.db().primary();
-        } else {
-            chunkMgr = routingInfo.cm();
-
+        if (cm.isSharded()) {
             const BSONObj query = cmdObj.getObjectField("query");
             const BSONObj collation = getCollation(cmdObj);
-            const BSONObj shardKey = getShardKey(opCtx, *chunkMgr, nss, query);
-            const auto chunk = chunkMgr->findIntersectingChunk(shardKey, collation);
+            const auto let = getLet(cmdObj);
+            const auto rc = getLegacyRuntimeConstants(cmdObj);
+            const BSONObj shardKey =
+                getShardKey(opCtx, cm, nss, query, collation, verbosity, let, rc);
+            const auto chunk = cm.findIntersectingChunk(shardKey, collation);
 
             shard = uassertStatusOK(
                 Grid::get(opCtx)->shardRegistry()->getShard(opCtx, chunk.getShardId()));
+        } else {
+            shard =
+                uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, cm.dbPrimary()));
         }
 
         const auto explainCmd = ClusterExplain::wrapAsExplain(
-            appendRuntimeConstantsToCommandObject(opCtx, cmdObj), verbosity);
+            appendLegacyRuntimeConstantsToCommandObject(opCtx, cmdObj), verbosity);
 
         // Time how long it takes to run the explain command on the shard.
         Timer timer;
         BSONObjBuilder bob;
 
-        if (chunkMgr) {
+        if (cm.isSharded()) {
             _runCommand(opCtx,
                         shard->getId(),
-                        chunkMgr->getVersion(shard->getId()),
+                        cm.getVersion(shard->getId()),
                         boost::none,
                         nss,
                         applyReadWriteConcern(opCtx, false, false, explainCmd),
@@ -217,7 +249,7 @@ public:
             _runCommand(opCtx,
                         shard->getId(),
                         ChunkVersion::UNSHARDED(),
-                        routingInfo.db().databaseVersion(),
+                        cm.dbVersion(),
                         nss,
                         applyReadWriteConcern(opCtx, false, false, explainCmd),
                         &bob);
@@ -233,8 +265,12 @@ public:
             shard->getId(), response, shard->getConnString().getServers().front()};
 
         auto bodyBuilder = result->getBodyBuilder();
-        return ClusterExplain::buildExplainResult(
-            opCtx, {arsResponse}, ClusterExplain::kSingleShard, millisElapsed, &bodyBuilder);
+        return ClusterExplain::buildExplainResult(opCtx,
+                                                  {arsResponse},
+                                                  ClusterExplain::kSingleShard,
+                                                  millisElapsed,
+                                                  cmdObj,
+                                                  &bodyBuilder);
     }
 
     bool run(OperationContext* opCtx,
@@ -243,35 +279,40 @@ public:
              BSONObjBuilder& result) override {
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
 
+        // Collect metrics.
+        _updateMetrics.collectMetrics(cmdObj);
+
         // findAndModify should only be creating database if upsert is true, but this would require
         // that the parsing be pulled into this function.
         createShardDatabase(opCtx, nss.db());
 
         // Append mongoS' runtime constants to the command object before forwarding it to the shard.
-        auto cmdObjForShard = appendRuntimeConstantsToCommandObject(opCtx, cmdObj);
+        auto cmdObjForShard = appendLegacyRuntimeConstantsToCommandObject(opCtx, cmdObj);
 
-        const auto routingInfo = uassertStatusOK(getCollectionRoutingInfoForTxnCmd(opCtx, nss));
-        if (!routingInfo.cm()) {
+        const auto cm = uassertStatusOK(getCollectionRoutingInfoForTxnCmd(opCtx, nss));
+        if (!cm.isSharded()) {
             _runCommand(opCtx,
-                        routingInfo.db().primaryId(),
+                        cm.dbPrimary(),
                         ChunkVersion::UNSHARDED(),
-                        routingInfo.db().databaseVersion(),
+                        cm.dbVersion(),
                         nss,
                         applyReadWriteConcern(opCtx, this, cmdObjForShard),
                         &result);
             return true;
         }
 
-        const auto chunkMgr = routingInfo.cm();
-
         const BSONObj query = cmdObjForShard.getObjectField("query");
         const BSONObj collation = getCollation(cmdObjForShard);
-        const BSONObj shardKey = getShardKey(opCtx, *chunkMgr, nss, query);
-        auto chunk = chunkMgr->findIntersectingChunk(shardKey, collation);
+        const auto let = getLet(cmdObjForShard);
+        const auto rc = getLegacyRuntimeConstants(cmdObjForShard);
+        const BSONObj shardKey =
+            getShardKey(opCtx, cm, nss, query, collation, boost::none, let, rc);
+
+        auto chunk = cm.findIntersectingChunk(shardKey, collation);
 
         _runCommand(opCtx,
                     chunk.getShardId(),
-                    chunkMgr->getVersion(chunk.getShardId()),
+                    cm.getVersion(chunk.getShardId()),
                     boost::none,
                     nss,
                     applyReadWriteConcern(opCtx, this, cmdObjForShard),
@@ -383,6 +424,9 @@ private:
         result->appendElementsUnique(
             CommandHelpers::filterCommandReplyForPassthrough(response.data));
     }
+
+    // Update related command execution metrics.
+    UpdateMetrics _updateMetrics;
 } findAndModifyCmd;
 
 }  // namespace

@@ -71,16 +71,20 @@ public:
         return Status::OK();
     }
 
-    virtual std::unique_ptr<SortedDataInterface> getSortedDataInterface(
-        OperationContext* opCtx, StringData ident, const IndexDescriptor* desc);
-
-    virtual Status dropIdent(OperationContext* opCtx, RecoveryUnit* ru, StringData ident) {
+    virtual Status dropGroupedSortedDataInterface(OperationContext* opCtx, StringData ident) {
         return Status::OK();
     }
 
-    virtual bool supportsDocLocking() const {
-        return true;
+    virtual std::unique_ptr<SortedDataInterface> getSortedDataInterface(
+        OperationContext* opCtx, StringData ident, const IndexDescriptor* desc);
+
+    virtual Status dropIdent(RecoveryUnit* ru,
+                             StringData ident,
+                             StorageEngine::DropIdentCallback&& onDrop) {
+        return Status::OK();
     }
+
+    virtual void dropIdentForImport(OperationContext* opCtx, StringData ident) {}
 
     virtual bool supportsDirectoryPerDB() const {
         return false;
@@ -96,10 +100,6 @@ public:
     virtual bool isEphemeral() const {
         return true;
     }
-
-    virtual bool isCacheUnderPressure(OperationContext* opCtx) const override;
-
-    virtual void setCachePressureForTest(int pressure) override;
 
     virtual int64_t getIdentSize(OperationContext* opCtx, StringData ident) {
         return 1;
@@ -125,10 +125,6 @@ public:
         return Timestamp();
     }
 
-    virtual Timestamp getOldestOpenReadTimestamp() const override {
-        return Timestamp();
-    }
-
     boost::optional<Timestamp> getOplogNeededForCrashRecovery() const final {
         return boost::none;
     }
@@ -139,7 +135,7 @@ public:
 
     virtual void endBackup(OperationContext* opCtx) {}
 
-    virtual StatusWith<StorageEngine::BackupInformation> beginNonBlockingBackup(
+    virtual StatusWith<std::unique_ptr<StorageEngine::StreamingCursor>> beginNonBlockingBackup(
         OperationContext* opCtx, const StorageEngine::BackupOptions& options) override;
 
     virtual void endNonBlockingBackup(OperationContext* opCtx) override {}

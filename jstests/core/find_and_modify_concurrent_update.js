@@ -6,6 +6,7 @@
 //   # Uses $where operator
 //   requires_scripting,
 //   uses_multiple_connections,
+//   uses_parallel_shell,
 // ]
 
 // Ensures that find and modify will not apply an update to a document which, due to a concurrent
@@ -18,8 +19,8 @@ for (var i = 0; i < 3; i++) {
     var t = db.find_and_modify_concurrent;
     t.drop();
 
-    assert.commandWorked(t.ensureIndex({a: 1}));
-    assert.commandWorked(t.ensureIndex({b: 1}));
+    assert.commandWorked(t.createIndex({a: 1}));
+    assert.commandWorked(t.createIndex({b: 1}));
     assert.commandWorked(t.insert({_id: 1, a: 1, b: 1}));
 
     var join =

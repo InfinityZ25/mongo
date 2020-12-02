@@ -47,11 +47,14 @@ public:
     ReplicationCoordinatorNoOp(ReplicationCoordinatorNoOp&) = delete;
     ReplicationCoordinatorNoOp& operator=(ReplicationCoordinatorNoOp&) = delete;
 
-    void startup(OperationContext* opCtx) final;
+    void startup(OperationContext* opCtx,
+                 LastStorageEngineShutdownState lastStorageEngineShutdownState) final;
 
     void enterTerminalShutdown() final;
 
-    void enterQuiesceMode() final;
+    bool enterQuiesceModeIfSecondary(Milliseconds quiesceTime) final;
+
+    bool inQuiesceMode() const final;
 
     void shutdown(OperationContext* opCtx) final;
 
@@ -67,7 +70,7 @@ public:
     bool getMaintenanceMode() final;
 
     bool isReplEnabled() const final;
-    bool isMasterForReportingPurposes() final;
+    bool isWritablePrimaryForReportingPurposes() final;
     bool isInPrimaryOrSecondaryState(OperationContext* opCtx) const final;
     bool isInPrimaryOrSecondaryState_UNSAFE() const final;
 
@@ -80,10 +83,10 @@ public:
 
     Status checkCanServeReadsFor(OperationContext* opCtx,
                                  const NamespaceString& ns,
-                                 bool slaveOk) final;
+                                 bool secondaryOk) final;
     Status checkCanServeReadsFor_UNSAFE(OperationContext* opCtx,
                                         const NamespaceString& ns,
-                                        bool slaveOk) final;
+                                        bool secondaryOk) final;
 
     bool shouldRelaxIndexConstraints(OperationContext* opCtx, const NamespaceString& ns) final;
 
@@ -101,7 +104,7 @@ public:
 
     Status waitForMemberState(MemberState, Milliseconds) final;
 
-    Seconds getSlaveDelaySecs() const final;
+    Seconds getSecondaryDelaySecs() const final;
 
     void clearSyncSourceBlacklist() final;
 
@@ -120,8 +123,7 @@ public:
 
     void setMyLastAppliedOpTimeAndWallTime(const OpTimeAndWallTime& opTimeAndWallTime) final;
     void setMyLastDurableOpTimeAndWallTime(const OpTimeAndWallTime& opTimeAndWallTime) final;
-    void setMyLastAppliedOpTimeAndWallTimeForward(const OpTimeAndWallTime& opTimeAndWallTime,
-                                                  DataConsistency consistency) final;
+    void setMyLastAppliedOpTimeAndWallTimeForward(const OpTimeAndWallTime& opTimeAndWallTime) final;
     void setMyLastDurableOpTimeAndWallTimeForward(const OpTimeAndWallTime& opTimeAndWallTime) final;
 
     void resetMyLastOpTimes() final;
@@ -129,10 +131,14 @@ public:
     void setMyHeartbeatMessage(const std::string&) final;
 
     OpTime getMyLastAppliedOpTime() const final;
-    OpTimeAndWallTime getMyLastAppliedOpTimeAndWallTime() const final;
+    OpTimeAndWallTime getMyLastAppliedOpTimeAndWallTime(bool rollbackSafe = false) const final;
 
     OpTime getMyLastDurableOpTime() const final;
     OpTimeAndWallTime getMyLastDurableOpTimeAndWallTime() const final;
+
+    Status waitUntilMajorityOpTime(OperationContext* opCtx,
+                                   OpTime targetOpTime,
+                                   boost::optional<Date_t> deadline) final;
 
     Status waitUntilOpTimeForReadUntil(OperationContext*,
                                        const ReadConcernArgs&,
@@ -155,19 +161,19 @@ public:
 
     void signalDrainComplete(OperationContext*, long long) final;
 
-    Status waitForDrainFinish(Milliseconds) final;
-
     void signalUpstreamUpdater() final;
 
     StatusWith<BSONObj> prepareReplSetUpdatePositionCommand() const final;
 
     Status processReplSetGetStatus(BSONObjBuilder*, ReplSetGetStatusResponseStyle) final;
 
-    void appendSlaveInfoData(BSONObjBuilder*) final;
+    void appendSecondaryInfoData(BSONObjBuilder*) final;
 
     ReplSetConfig getConfig() const final;
 
-    void processReplSetGetConfig(BSONObjBuilder*, bool commitmentStatus = false) final;
+    void processReplSetGetConfig(BSONObjBuilder*,
+                                 bool commitmentStatus = false,
+                                 bool includeNewlyAdded = false) final;
 
     void processReplSetMetadata(const rpc::ReplSetMetadata&) final;
 
@@ -194,7 +200,7 @@ public:
 
     Status processReplSetInitiate(OperationContext*, const BSONObj&, BSONObjBuilder*) final;
 
-    Status processReplSetUpdatePosition(const UpdatePositionArgs&, long long*) final;
+    Status processReplSetUpdatePosition(const UpdatePositionArgs&) final;
 
     std::vector<HostAndPort> getHostsWrittenTo(const OpTime&, bool) final;
 
@@ -204,12 +210,13 @@ public:
 
     void blacklistSyncSource(const HostAndPort&, Date_t) final;
 
-    void resetLastOpTimesFromOplog(OperationContext*, DataConsistency) final;
+    void resetLastOpTimesFromOplog(OperationContext*) final;
 
-    bool shouldChangeSyncSource(const HostAndPort&,
-                                const rpc::ReplSetMetadata&,
-                                const rpc::OplogQueryMetadata&,
-                                const OpTime&) final;
+    ChangeSyncSourceAction shouldChangeSyncSource(const HostAndPort&,
+                                                  const rpc::ReplSetMetadata&,
+                                                  const rpc::OplogQueryMetadata&,
+                                                  const OpTime&,
+                                                  const OpTime&) final;
 
     OpTime getLastCommittedOpTime() const final;
 
@@ -225,15 +232,13 @@ public:
 
     bool getWriteConcernMajorityShouldJournal() final;
 
-    void dropAllSnapshots() final;
+    void clearCommittedSnapshot() final;
 
     long long getTerm() const final;
 
     Status updateTerm(OperationContext*, long long) final;
 
     OpTime getCurrentCommittedSnapshotOpTime() const final;
-
-    OpTimeAndWallTime getCurrentCommittedSnapshotOpTimeAndWallTime() const final;
 
     void waitUntilSnapshotCommitted(OperationContext*, const Timestamp&) final;
 
@@ -255,6 +260,8 @@ public:
 
     bool setContainsArbiter() const final;
 
+    bool replSetContainsNewlyAddedMembers() const final;
+
     void attemptToAdvanceStableTimestamp() final;
 
     void finishRecoveryIfEligible(OperationContext* opCtx) final;
@@ -268,17 +275,17 @@ public:
 
     TopologyVersion getTopologyVersion() const final;
 
-    std::shared_ptr<const IsMasterResponse> awaitIsMasterResponse(
+    std::shared_ptr<const HelloResponse> awaitHelloResponse(
         OperationContext* opCtx,
         const SplitHorizon::Parameters& horizonParams,
         boost::optional<TopologyVersion> clientTopologyVersion,
         boost::optional<Date_t> deadline) final;
 
-    SharedSemiFuture<std::shared_ptr<const IsMasterResponse>> getIsMasterResponseFuture(
+    SharedSemiFuture<std::shared_ptr<const HelloResponse>> getHelloResponseFuture(
         const SplitHorizon::Parameters& horizonParams,
         boost::optional<TopologyVersion> clientTopologyVersion) final;
 
-    OpTime getLatestWriteOpTime(OperationContext* opCtx) const override;
+    StatusWith<OpTime> getLatestWriteOpTime(OperationContext* opCtx) const noexcept override;
 
     HostAndPort getCurrentPrimaryHostAndPort() const override;
 
@@ -290,7 +297,7 @@ public:
                                             OnRemoteCmdScheduledFn onRemoteCmdScheduled,
                                             OnRemoteCmdCompleteFn onRemoteCmdComplete) override;
 
-    virtual void restartHeartbeats_forTest() final;
+    virtual void restartScheduledHeartbeats_forTest() final;
 
 private:
     ServiceContext* const _service;

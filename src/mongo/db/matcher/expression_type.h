@@ -54,9 +54,13 @@ public:
     explicit TypeMatchExpressionBase(MatchType matchType,
                                      StringData path,
                                      ElementPath::LeafArrayBehavior leafArrBehavior,
-                                     MatcherTypeSet typeSet)
-        : LeafMatchExpression(
-              matchType, path, leafArrBehavior, ElementPath::NonLeafArrayBehavior::kTraverse),
+                                     MatcherTypeSet typeSet,
+                                     clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : LeafMatchExpression(matchType,
+                              path,
+                              leafArrBehavior,
+                              ElementPath::NonLeafArrayBehavior::kTraverse,
+                              std::move(annotation)),
           _typeSet(std::move(typeSet)) {}
 
     virtual ~TypeMatchExpressionBase() = default;
@@ -67,11 +71,11 @@ public:
     virtual StringData name() const = 0;
 
     std::unique_ptr<MatchExpression> shallowClone() const final {
-        auto expr = std::make_unique<T>(path(), _typeSet);
+        auto expr = std::make_unique<T>(path(), _typeSet, _errorAnnotation);
         if (getTag()) {
             expr->setTag(getTag()->clone());
         }
-        return std::move(expr);
+        return expr;
     }
 
     bool matchesSingleElement(const BSONElement& elem, MatchDetails* details = nullptr) const {
@@ -131,14 +135,25 @@ class TypeMatchExpression final : public TypeMatchExpressionBase<TypeMatchExpres
 public:
     static constexpr StringData kName = "$type"_sd;
 
-    TypeMatchExpression(StringData path, MatcherTypeSet typeSet)
+    TypeMatchExpression(StringData path,
+                        MatcherTypeSet typeSet,
+                        clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : TypeMatchExpressionBase(MatchExpression::TYPE_OPERATOR,
                                   path,
                                   ElementPath::LeafArrayBehavior::kTraverse,
-                                  typeSet) {}
+                                  typeSet,
+                                  std::move(annotation)) {}
 
     StringData name() const final {
         return kName;
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
     }
 };
 
@@ -152,11 +167,14 @@ class InternalSchemaTypeExpression final
 public:
     static constexpr StringData kName = "$_internalSchemaType"_sd;
 
-    InternalSchemaTypeExpression(StringData path, MatcherTypeSet typeSet)
+    InternalSchemaTypeExpression(StringData path,
+                                 MatcherTypeSet typeSet,
+                                 clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : TypeMatchExpressionBase(MatchExpression::INTERNAL_SCHEMA_TYPE,
                                   path,
                                   ElementPath::LeafArrayBehavior::kNoTraversal,
-                                  typeSet) {}
+                                  typeSet,
+                                  std::move(annotation)) {}
 
     StringData name() const final {
         return kName;
@@ -165,17 +183,28 @@ public:
     MatchCategory getCategory() const final {
         return MatchCategory::kOther;
     }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
 };
 
 class InternalSchemaBinDataSubTypeExpression final : public LeafMatchExpression {
 public:
     static constexpr StringData kName = "$_internalSchemaBinDataSubType"_sd;
 
-    InternalSchemaBinDataSubTypeExpression(StringData path, BinDataType binDataSubType)
+    InternalSchemaBinDataSubTypeExpression(StringData path,
+                                           BinDataType binDataSubType,
+                                           clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : LeafMatchExpression(MatchExpression::INTERNAL_SCHEMA_BIN_DATA_SUBTYPE,
                               path,
                               ElementPath::LeafArrayBehavior::kNoTraversal,
-                              ElementPath::NonLeafArrayBehavior::kTraverse),
+                              ElementPath::NonLeafArrayBehavior::kTraverse,
+                              std::move(annotation)),
           _binDataSubType(binDataSubType) {}
 
     StringData name() const {
@@ -188,12 +217,12 @@ public:
     }
 
     std::unique_ptr<MatchExpression> shallowClone() const final {
-        auto expr =
-            std::make_unique<InternalSchemaBinDataSubTypeExpression>(path(), _binDataSubType);
+        auto expr = std::make_unique<InternalSchemaBinDataSubTypeExpression>(
+            path(), _binDataSubType, _errorAnnotation);
         if (getTag()) {
             expr->setTag(getTag()->clone());
         }
-        return std::move(expr);
+        return expr;
     }
 
     void debugString(StringBuilder& debug, int indentationLevel) const final {
@@ -227,6 +256,14 @@ public:
         return _binDataSubType == realOther->_binDataSubType;
     }
 
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
 private:
     ExpressionOptimizerFunc getOptimizer() const final {
         return [](std::unique_ptr<MatchExpression> expression) { return expression; };
@@ -245,11 +282,14 @@ class InternalSchemaBinDataEncryptedTypeExpression final
 public:
     static constexpr StringData kName = "$_internalSchemaBinDataEncryptedType"_sd;
 
-    InternalSchemaBinDataEncryptedTypeExpression(StringData path, MatcherTypeSet typeSet)
+    InternalSchemaBinDataEncryptedTypeExpression(StringData path,
+                                                 MatcherTypeSet typeSet,
+                                                 clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : TypeMatchExpressionBase(MatchExpression::INTERNAL_SCHEMA_BIN_DATA_ENCRYPTED_TYPE,
                                   path,
                                   ElementPath::LeafArrayBehavior::kNoTraversal,
-                                  typeSet) {}
+                                  typeSet,
+                                  std::move(annotation)) {}
 
     StringData name() const {
         return kName;
@@ -286,6 +326,14 @@ public:
                           str::stream() << "unexpected subtype " << static_cast<int>(fleBlobSubType)
                                         << " of encrypted binary data (0, 1 and 2 are allowed)");
         }
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
     }
 };
 }  // namespace mongo

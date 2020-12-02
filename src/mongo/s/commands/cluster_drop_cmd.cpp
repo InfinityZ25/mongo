@@ -27,16 +27,20 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/base/status.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/drop_gen.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/request_types/sharded_ddl_commands_gen.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -45,6 +49,10 @@ namespace {
 class DropCmd : public BasicCommand {
 public:
     DropCmd() : BasicCommand("drop") {}
+
+    virtual const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
@@ -70,8 +78,8 @@ public:
              const std::string& dbname,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-
-        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
+        auto parsed = Drop::parse(IDLParserErrorContext("drop"), cmdObj);
+        const auto& nss = parsed.getNamespace();
 
         uassert(ErrorCodes::IllegalOperation,
                 "Cannot drop collection in config database",
@@ -81,24 +89,41 @@ public:
                 "Cannot drop collection in admin database",
                 nss.db() != NamespaceString::kAdminDb);
 
-        // Invalidate the routing table cache entry for this collection so that we reload it the
-        // next time it is accessed, even if sending the command to the config server fails due
-        // to e.g. a NetworkError.
-        ON_BLOCK_EXIT([opCtx, nss] { Grid::get(opCtx)->catalogCache()->onEpochChange(nss); });
+        try {
+            // Invalidate the routing table cache entry for this collection so that we reload it the
+            // next time it is accessed, even if sending the command to the config server fails due
+            // to e.g. a NetworkError.
+            ON_BLOCK_EXIT([opCtx, nss] {
+                Grid::get(opCtx)->catalogCache()->invalidateCollectionEntry_LINEARIZABLE(nss);
+            });
 
-        auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
-        auto cmdResponse = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
-            opCtx,
-            ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-            "admin",
-            CommandHelpers::appendMajorityWriteConcern(
-                CommandHelpers::appendPassthroughFields(
-                    cmdObj, BSON("_configsvrDropCollection" << nss.toString())),
-                opCtx->getWriteConcern()),
-            Shard::RetryPolicy::kIdempotent));
+            const auto dbInfo =
+                uassertStatusOK(Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, dbname));
 
-        CommandHelpers::filterCommandReplyForPassthrough(cmdResponse.response, &result);
-        return true;
+            // Send it to the primary shard
+            ShardsvrDropCollection dropCollectionCommand(nss);
+            dropCollectionCommand.setDbName(dbname);
+
+            auto cmdResponse = executeCommandAgainstDatabasePrimary(
+                opCtx,
+                dbname,
+                dbInfo,
+                CommandHelpers::appendMajorityWriteConcern(dropCollectionCommand.toBSON({}),
+                                                           opCtx->getWriteConcern()),
+                ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                Shard::RetryPolicy::kIdempotent);
+
+            const auto remoteResponse = uassertStatusOK(cmdResponse.swResponse);
+
+            CommandHelpers::filterCommandReplyForPassthrough(remoteResponse.data, &result);
+
+            return true;
+        } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+            // If the namespace isn't found, treat the drop as a success but inform about the
+            // failure.
+            result.append("info", "database does not exist");
+            return true;
+        }
     }
 
 } clusterDropCmd;

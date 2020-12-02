@@ -48,6 +48,7 @@ configs:
         short_name: bind_ip_all
         arg_vartype: Switch
         canonicalize: canonicalizeNetBindIpAll
+        conflicts: 'net.bindIp'
 
     noauth:
         description: 'Run without security'
@@ -77,3 +78,7 @@ configs:
         short_name: slowOpSampleRate
         arg_vartype: Double
         default: 1.0
+    'operationProfiling.filter':
+        description: 'Query predicate to control which operations are logged and profiled'
+        short_name: profileFilter
+        arg_vartype: String

@@ -27,12 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/rpc/metadata/tracking_metadata.h"
 #include "mongo/s/catalog/type_chunk.h"
@@ -41,7 +42,6 @@
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/config_server_test_fixture.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -49,8 +49,6 @@ namespace {
 
 using executor::RemoteCommandRequest;
 using executor::RemoteCommandResponse;
-using std::string;
-using std::vector;
 using unittest::assertGet;
 
 class DropColl2ShardTest : public ConfigServerTestFixture {
@@ -82,9 +80,7 @@ public:
         shard2Targeter->setFindHostReturnValue(HostAndPort(_shard2.getHost()));
 
         // insert documents into the config database
-        CollectionType shardedCollection;
-        shardedCollection.setNs(dropNS());
-        shardedCollection.setEpoch(OID::gen());
+        CollectionType shardedCollection(dropNS(), OID::gen(), Date_t::now(), UUID::gen());
         shardedCollection.setKeyPattern(BSON(_shardKey << 1));
         ASSERT_OK(insertToConfigCollection(
             operationContext(), CollectionType::ConfigNS, shardedCollection.toBSON()));
@@ -107,11 +103,35 @@ public:
             operationContext(), ChunkType::ConfigNS, chunkDocBuilder.obj()));
     }
 
-    void expectDrop(const ShardType& shard) {
+    void expectStaleConfig(const ShardType& shard) {
         onCommand([this, shard](const RemoteCommandRequest& request) {
+            BSONObjBuilder builder;
+            builder.append("drop", _dropNS.coll());
+            ChunkVersion::IGNORED().appendToCommand(&builder);
+
             ASSERT_EQ(HostAndPort(shard.getHost()), request.target);
             ASSERT_EQ(_dropNS.db(), request.dbname);
-            ASSERT_BSONOBJ_EQ(BSON("drop" << _dropNS.coll()), request.cmdObj);
+            ASSERT_BSONOBJ_EQ(builder.obj(), request.cmdObj);
+
+            StaleConfigInfo sci(
+                _dropNS, ChunkVersion::IGNORED(), boost::none, ShardId(shard.getName()));
+            BSONObjBuilder responseBuilder;
+            responseBuilder.append("ok", 0);
+            responseBuilder.append("code", ErrorCodes::StaleShardVersion);
+            sci.serialize(&responseBuilder);
+            return responseBuilder.obj();
+        });
+    }
+
+    void expectDrop(const ShardType& shard) {
+        onCommand([this, shard](const RemoteCommandRequest& request) {
+            BSONObjBuilder builder;
+            builder.append("drop", _dropNS.coll());
+            ChunkVersion::IGNORED().appendToCommand(&builder);
+
+            ASSERT_EQ(HostAndPort(shard.getHost()), request.target);
+            ASSERT_EQ(_dropNS.db(), request.dbname);
+            ASSERT_BSONOBJ_EQ(builder.obj(), request.cmdObj);
 
             ASSERT_BSONOBJ_EQ(rpc::makeEmptyMetadata(),
                               rpc::TrackingMetadata::removeTrackingData(request.metadata));
@@ -122,14 +142,13 @@ public:
 
     void expectSetShardVersionZero(const ShardType& shard) {
         expectSetShardVersion(
-            HostAndPort(shard.getHost()), shard, dropNS(), ChunkVersion::DROPPED());
+            HostAndPort(shard.getHost()), shard, dropNS(), ChunkVersion::UNSHARDED());
     }
 
-    void expectCollectionDocMarkedAsDropped() {
+    void expectNoCollectionDocs() {
         auto findStatus =
             findOneOnConfigCollection(operationContext(), CollectionType::ConfigNS, BSONObj());
-        ASSERT_OK(findStatus.getStatus());
-        ASSERT_TRUE(findStatus.getValue().getField("dropped"));
+        ASSERT_EQ(ErrorCodes::NoMatchingDocument, findStatus);
     }
 
     void expectNoChunkDocs() {
@@ -166,12 +185,13 @@ public:
         return _shard2;
     }
 
+protected:
 private:
     const NamespaceString _dropNS{"test.user"};
     ShardType _shard1;
     ShardType _shard2;
-    string _zoneName;
-    string _shardKey;
+    std::string _zoneName;
+    std::string _shardKey;
     BSONObj _min;
     BSONObj _max;
 };
@@ -187,7 +207,7 @@ TEST_F(DropColl2ShardTest, Basic) {
 
     future.default_timed_get();
 
-    expectCollectionDocMarkedAsDropped();
+    expectNoCollectionDocs();
     expectNoChunkDocs();
     expectNoTagDocs();
 }
@@ -196,9 +216,13 @@ TEST_F(DropColl2ShardTest, NSNotFound) {
     auto future = launchAsync([this] { doDrop(); });
 
     onCommand([this](const RemoteCommandRequest& request) {
+        BSONObjBuilder builder;
+        builder.append("drop", dropNS().coll());
+        ChunkVersion::IGNORED().appendToCommand(&builder);
+
         ASSERT_EQ(HostAndPort(shard1().getHost()), request.target);
         ASSERT_EQ(dropNS().db(), request.dbname);
-        ASSERT_BSONOBJ_EQ(BSON("drop" << dropNS().coll()), request.cmdObj);
+        ASSERT_BSONOBJ_EQ(builder.obj(), request.cmdObj);
 
         ASSERT_BSONOBJ_EQ(rpc::makeEmptyMetadata(),
                           rpc::TrackingMetadata::removeTrackingData(request.metadata));
@@ -207,9 +231,13 @@ TEST_F(DropColl2ShardTest, NSNotFound) {
     });
 
     onCommand([this](const RemoteCommandRequest& request) {
+        BSONObjBuilder builder;
+        builder.append("drop", dropNS().coll());
+        ChunkVersion::IGNORED().appendToCommand(&builder);
+
         ASSERT_EQ(HostAndPort(shard2().getHost()), request.target);
         ASSERT_EQ(dropNS().db(), request.dbname);
-        ASSERT_BSONOBJ_EQ(BSON("drop" << dropNS().coll()), request.cmdObj);
+        ASSERT_BSONOBJ_EQ(builder.obj(), request.cmdObj);
 
         ASSERT_BSONOBJ_EQ(rpc::makeEmptyMetadata(),
                           rpc::TrackingMetadata::removeTrackingData(request.metadata));
@@ -222,7 +250,7 @@ TEST_F(DropColl2ShardTest, NSNotFound) {
 
     future.default_timed_get();
 
-    expectCollectionDocMarkedAsDropped();
+    expectNoCollectionDocs();
     expectNoChunkDocs();
     expectNoTagDocs();
 }
@@ -306,7 +334,7 @@ TEST_F(DropColl2ShardTest, CleanupChunkError) {
 
     future.default_timed_get();
 
-    expectCollectionDocMarkedAsDropped();
+    expectNoCollectionDocs();
     expectNoChunkDocs();
     expectNoTagDocs();
 }
@@ -325,7 +353,7 @@ TEST_F(DropColl2ShardTest, SSVCmdErrorOnShard1) {
 
     future.default_timed_get();
 
-    expectCollectionDocMarkedAsDropped();
+    expectNoCollectionDocs();
     expectNoChunkDocs();
     expectNoTagDocs();
 }
@@ -344,7 +372,7 @@ TEST_F(DropColl2ShardTest, SSVErrorOnShard1) {
 
     future.default_timed_get();
 
-    expectCollectionDocMarkedAsDropped();
+    expectNoCollectionDocs();
     expectNoChunkDocs();
     expectNoTagDocs();
 }
@@ -365,7 +393,7 @@ TEST_F(DropColl2ShardTest, SSVCmdErrorOnShard2) {
 
     future.default_timed_get();
 
-    expectCollectionDocMarkedAsDropped();
+    expectNoCollectionDocs();
     expectNoChunkDocs();
     expectNoTagDocs();
 }
@@ -386,7 +414,7 @@ TEST_F(DropColl2ShardTest, SSVErrorOnShard2) {
 
     future.default_timed_get();
 
-    expectCollectionDocMarkedAsDropped();
+    expectNoCollectionDocs();
     expectNoChunkDocs();
     expectNoTagDocs();
 }
@@ -406,7 +434,7 @@ TEST_F(DropColl2ShardTest, AfterSuccessRetryWillStillSendDropSSV) {
 
     firstDropFuture.default_timed_get();
 
-    expectCollectionDocMarkedAsDropped();
+    expectNoCollectionDocs();
     expectNoChunkDocs();
     expectNoTagDocs();
 
@@ -420,7 +448,7 @@ TEST_F(DropColl2ShardTest, AfterSuccessRetryWillStillSendDropSSV) {
 
     secondDropFuture.default_timed_get();
 
-    expectCollectionDocMarkedAsDropped();
+    expectNoCollectionDocs();
     expectNoChunkDocs();
     expectNoTagDocs();
 }
@@ -445,7 +473,7 @@ TEST_F(DropColl2ShardTest, AfterFailedDropRetryWillStillSendDropSSV) {
 
     secondDropFuture.default_timed_get();
 
-    expectCollectionDocMarkedAsDropped();
+    expectNoCollectionDocs();
     expectNoChunkDocs();
     expectNoTagDocs();
     expectNoTagDocs();
@@ -474,10 +502,41 @@ TEST_F(DropColl2ShardTest, AfterFailedSSVRetryWillStillSendDropSSV) {
 
     secondDropFuture.default_timed_get();
 
-    expectCollectionDocMarkedAsDropped();
+    expectNoCollectionDocs();
     expectNoChunkDocs();
     expectNoTagDocs();
     expectNoTagDocs();
 }
+
+TEST_F(DropColl2ShardTest, SSVisRetried) {
+    auto dropFuture = launchAsync([this] { doDrop(); });
+
+    expectStaleConfig(shard1());
+    expectDrop(shard1());
+    expectDrop(shard2());
+
+    expectSetShardVersionZero(shard1());
+    expectSetShardVersionZero(shard2());
+
+    dropFuture.default_timed_get();
+
+    expectNoCollectionDocs();
+    expectNoChunkDocs();
+    expectNoTagDocs();
+    expectNoTagDocs();
+}
+
+TEST_F(DropColl2ShardTest, maxSSVRetries) {
+    auto dropFuture = launchAsync([this] {
+        ASSERT_THROWS_CODE(doDrop(), AssertionException, ErrorCodes::StaleShardVersion);
+    });
+
+    for (int i = 0; i < 10; ++i) {
+        expectStaleConfig(shard1());
+    }
+
+    dropFuture.default_timed_get();
+}
+
 }  // unnamed namespace
 }  // namespace mongo

@@ -24,15 +24,12 @@ const sessionOptions = {
 const session = db.getMongo().startSession(sessionOptions);
 const sessionDb = session.getDatabase(dbName);
 
-const isMongos = assert.commandWorked(db.runCommand("ismaster")).msg === "isdbgrid";
+const isMongos = assert.commandWorked(db.runCommand("hello")).msg === "isdbgrid";
 
 assert.commandWorked(testDB.createCollection(testColl.getName(), {writeConcern: {w: "majority"}}));
 assert.commandWorked(testDB.runCommand({
     createIndexes: collName,
-    indexes: [
-        {name: "geo_2d", key: {geo: "2d"}},
-        {key: {haystack: "geoHaystack", a: 1}, name: "haystack_geo", bucketSize: 1}
-    ],
+    indexes: [{name: "geo_2d", key: {geo: "2d"}}],
     writeConcern: {w: "majority"}
 }));
 

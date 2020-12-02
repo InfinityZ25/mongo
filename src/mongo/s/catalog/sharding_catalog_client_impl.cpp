@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -60,7 +60,7 @@
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/client/shard.h"
-#include "mongo/s/database_version_helpers.h"
+#include "mongo/s/database_version.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/set_shard_version_request.h"
 #include "mongo/s/shard_key_pattern.h"
@@ -93,8 +93,6 @@ const ReadPreferenceSetting kConfigPrimaryPreferredSelector(ReadPreference::Prim
                                                             TagSet{});
 const int kMaxReadRetry = 3;
 const int kMaxWriteRetry = 3;
-
-const int kRetryableBatchWriteBSONSizeOverhead = kWriteCommandBSONArrayPerElementOverheadBytes * 2;
 
 const NamespaceString kSettingsNamespace("config", "settings");
 
@@ -169,84 +167,73 @@ Status ShardingCatalogClientImpl::updateShardingCatalogEntryForCollection(
     const NamespaceString& nss,
     const CollectionType& coll,
     const bool upsert) {
-    fassert(28634, coll.validate());
-
     auto status = _updateConfigDocument(opCtx,
                                         CollectionType::ConfigNS,
-                                        BSON(CollectionType::fullNs(nss.ns())),
+                                        BSON(CollectionType::kNssFieldName << nss.ns()),
                                         coll.toBSON(),
                                         upsert,
                                         ShardingCatalogClient::kMajorityWriteConcern);
     return status.getStatus().withContext(str::stream() << "Collection metadata write failed");
 }
 
-StatusWith<repl::OpTimeWith<DatabaseType>> ShardingCatalogClientImpl::getDatabase(
-    OperationContext* opCtx, const std::string& dbName, repl::ReadConcernLevel readConcernLevel) {
-    if (!NamespaceString::validDBName(dbName, NamespaceString::DollarInDbNameBehavior::Allow)) {
-        return {ErrorCodes::InvalidNamespace, stream() << dbName << " is not a valid db name"};
-    }
+DatabaseType ShardingCatalogClientImpl::getDatabase(OperationContext* opCtx,
+                                                    StringData dbName,
+                                                    repl::ReadConcernLevel readConcernLevel) {
+    uassert(ErrorCodes::InvalidNamespace,
+            stream() << dbName << " is not a valid db name",
+            NamespaceString::validDBName(dbName, NamespaceString::DollarInDbNameBehavior::Allow));
 
     // The admin database is always hosted on the config server.
-    if (dbName == NamespaceString::kAdminDb) {
-        DatabaseType dbt(
-            dbName, ShardRegistry::kConfigServerShardId, false, databaseVersion::makeFixed());
-        return repl::OpTimeWith<DatabaseType>(dbt);
-    }
+    if (dbName == NamespaceString::kAdminDb)
+        return DatabaseType(dbName.toString(),
+                            ShardRegistry::kConfigServerShardId,
+                            false,
+                            DatabaseVersion::makeFixed());
 
     // The config database's primary shard is always config, and it is always sharded.
-    if (dbName == NamespaceString::kConfigDb) {
-        DatabaseType dbt(
-            dbName, ShardRegistry::kConfigServerShardId, true, databaseVersion::makeFixed());
-        return repl::OpTimeWith<DatabaseType>(dbt);
-    }
+    if (dbName == NamespaceString::kConfigDb)
+        return DatabaseType(dbName.toString(),
+                            ShardRegistry::kConfigServerShardId,
+                            true,
+                            DatabaseVersion::makeFixed());
 
-    auto result = _fetchDatabaseMetadata(opCtx, dbName, kConfigReadSelector, readConcernLevel);
+    auto result =
+        _fetchDatabaseMetadata(opCtx, dbName.toString(), kConfigReadSelector, readConcernLevel);
     if (result == ErrorCodes::NamespaceNotFound) {
         // If we failed to find the database metadata on the 'nearest' config server, try again
         // against the primary, in case the database was recently created.
-        result = _fetchDatabaseMetadata(
-            opCtx, dbName, ReadPreferenceSetting{ReadPreference::PrimaryOnly}, readConcernLevel);
-        if (!result.isOK() && (result != ErrorCodes::NamespaceNotFound)) {
-            return result.getStatus().withContext(
-                str::stream() << "Could not confirm non-existence of database " << dbName);
-        }
+        return uassertStatusOK(
+                   _fetchDatabaseMetadata(opCtx,
+                                          dbName.toString(),
+                                          ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                          readConcernLevel))
+            .value;
     }
 
-    return result;
+    return uassertStatusOK(std::move(result)).value;
 }
 
-StatusWith<repl::OpTimeWith<std::vector<DatabaseType>>> ShardingCatalogClientImpl::getAllDBs(
-    OperationContext* opCtx, repl::ReadConcernLevel readConcern) {
+std::vector<DatabaseType> ShardingCatalogClientImpl::getAllDBs(OperationContext* opCtx,
+                                                               repl::ReadConcernLevel readConcern) {
     std::vector<DatabaseType> databases;
-    auto findStatus = _exhaustiveFindOnConfig(opCtx,
-                                              kConfigReadSelector,
-                                              readConcern,
-                                              DatabaseType::ConfigNS,
-                                              BSONObj(),     // no query filter
-                                              BSONObj(),     // no sort
-                                              boost::none);  // no limit
-    if (!findStatus.isOK()) {
-        return findStatus.getStatus();
+    auto dbs = uassertStatusOK(_exhaustiveFindOnConfig(opCtx,
+                                                       kConfigReadSelector,
+                                                       readConcern,
+                                                       DatabaseType::ConfigNS,
+                                                       BSONObj(),
+                                                       BSONObj(),
+                                                       boost::none))
+                   .value;
+    for (const BSONObj& doc : dbs) {
+        auto db = uassertStatusOKWithContext(
+            DatabaseType::fromBSON(doc), stream() << "Failed to parse database document " << doc);
+        uassertStatusOKWithContext(db.validate(),
+                                   stream() << "Failed to validate database document " << doc);
+
+        databases.emplace_back(std::move(db));
     }
 
-    for (const BSONObj& doc : findStatus.getValue().value) {
-        auto dbRes = DatabaseType::fromBSON(doc);
-        if (!dbRes.isOK()) {
-            return dbRes.getStatus().withContext(stream()
-                                                 << "Failed to parse database document " << doc);
-        }
-
-        Status validateStatus = dbRes.getValue().validate();
-        if (!validateStatus.isOK()) {
-            return validateStatus.withContext(stream()
-                                              << "Failed to validate database document " << doc);
-        }
-
-        databases.push_back(dbRes.getValue());
-    }
-
-    return repl::OpTimeWith<std::vector<DatabaseType>>{std::move(databases),
-                                                       findStatus.getValue().opTime};
+    return databases;
 }
 
 StatusWith<repl::OpTimeWith<DatabaseType>> ShardingCatalogClientImpl::_fetchDatabaseMetadata(
@@ -282,102 +269,63 @@ StatusWith<repl::OpTimeWith<DatabaseType>> ShardingCatalogClientImpl::_fetchData
     return repl::OpTimeWith<DatabaseType>(parseStatus.getValue(), docsWithOpTime.opTime);
 }
 
-StatusWith<repl::OpTimeWith<CollectionType>> ShardingCatalogClientImpl::getCollection(
-    OperationContext* opCtx, const NamespaceString& nss, repl::ReadConcernLevel readConcernLevel) {
-    auto statusFind = _exhaustiveFindOnConfig(opCtx,
-                                              kConfigReadSelector,
-                                              readConcernLevel,
-                                              CollectionType::ConfigNS,
-                                              BSON(CollectionType::fullNs(nss.ns())),
-                                              BSONObj(),
-                                              1);
-    if (!statusFind.isOK()) {
-        return statusFind.getStatus();
-    }
+CollectionType ShardingCatalogClientImpl::getCollection(OperationContext* opCtx,
+                                                        const NamespaceString& nss,
+                                                        repl::ReadConcernLevel readConcernLevel) {
+    auto collDoc =
+        uassertStatusOK(_exhaustiveFindOnConfig(opCtx,
+                                                kConfigReadSelector,
+                                                readConcernLevel,
+                                                CollectionType::ConfigNS,
+                                                BSON(CollectionType::kNssFieldName << nss.ns()),
+                                                BSONObj(),
+                                                1))
+            .value;
+    uassert(ErrorCodes::NamespaceNotFound,
+            stream() << "collection " << nss.ns() << " not found",
+            !collDoc.empty());
 
-    const auto& retOpTimePair = statusFind.getValue();
-    const auto& retVal = retOpTimePair.value;
-    if (retVal.empty()) {
-        return Status(ErrorCodes::NamespaceNotFound,
-                      stream() << "collection " << nss.ns() << " not found");
-    }
-
-    invariant(retVal.size() == 1);
-
-    auto parseStatus = CollectionType::fromBSON(retVal.front());
-    if (!parseStatus.isOK()) {
-        return parseStatus.getStatus();
-    }
-
-    auto collType = parseStatus.getValue();
-    if (collType.getDropped()) {
-        return Status(ErrorCodes::NamespaceNotFound,
-                      stream() << "collection " << nss.ns() << " was dropped");
-    }
-
-    return repl::OpTimeWith<CollectionType>(collType, retOpTimePair.opTime);
+    CollectionType coll(collDoc[0]);
+    uassert(ErrorCodes::NamespaceNotFound,
+            stream() << "collection " << nss.ns() << " was dropped",
+            !coll.getDropped());
+    return coll;
 }
 
-StatusWith<std::vector<CollectionType>> ShardingCatalogClientImpl::getCollections(
-    OperationContext* opCtx,
-    const std::string* dbName,
-    OpTime* opTime,
-    repl::ReadConcernLevel readConcernLevel) {
+std::vector<CollectionType> ShardingCatalogClientImpl::getCollections(
+    OperationContext* opCtx, StringData dbName, repl::ReadConcernLevel readConcernLevel) {
     BSONObjBuilder b;
-    if (dbName) {
-        invariant(!dbName->empty());
-        b.appendRegex(CollectionType::fullNs(),
-                      string(str::stream() << "^" << pcrecpp::RE::QuoteMeta(*dbName) << "\\."));
-    }
+    if (!dbName.empty())
+        b.appendRegex(CollectionType::kNssFieldName,
+                      std::string(str::stream()
+                                  << "^" << pcrecpp::RE::QuoteMeta(dbName.toString()) << "\\."));
 
-    auto findStatus = _exhaustiveFindOnConfig(opCtx,
-                                              kConfigReadSelector,
-                                              readConcernLevel,
-                                              CollectionType::ConfigNS,
-                                              b.obj(),
-                                              BSONObj(),
-                                              boost::none);  // no limit
-    if (!findStatus.isOK()) {
-        return findStatus.getStatus();
-    }
-
-    const auto& docsOpTimePair = findStatus.getValue();
-
+    auto collDocs = uassertStatusOK(_exhaustiveFindOnConfig(opCtx,
+                                                            kConfigReadSelector,
+                                                            readConcernLevel,
+                                                            CollectionType::ConfigNS,
+                                                            b.obj(),
+                                                            BSONObj(),
+                                                            boost::none))
+                        .value;
     std::vector<CollectionType> collections;
-    for (const BSONObj& obj : docsOpTimePair.value) {
-        const auto collectionResult = CollectionType::fromBSON(obj);
-        if (!collectionResult.isOK()) {
-            return {ErrorCodes::FailedToParse,
-                    str::stream() << "error while parsing " << CollectionType::ConfigNS.ns()
-                                  << " document: " << obj << " : "
-                                  << collectionResult.getStatus().toString()};
-        }
-
-        collections.push_back(collectionResult.getValue());
-    }
-
-    if (opTime) {
-        *opTime = docsOpTimePair.opTime;
-    }
+    for (const BSONObj& obj : collDocs)
+        collections.emplace_back(obj);
 
     return collections;
 }
 
 std::vector<NamespaceString> ShardingCatalogClientImpl::getAllShardedCollectionsForDb(
     OperationContext* opCtx, StringData dbName, repl::ReadConcernLevel readConcern) {
-    const auto dbNameStr = dbName.toString();
-
-    const std::vector<CollectionType> collectionsOnConfig =
-        uassertStatusOK(getCollections(opCtx, &dbNameStr, nullptr, readConcern));
+    auto collectionsOnConfig = getCollections(opCtx, dbName, readConcern);
 
     std::vector<NamespaceString> collectionsToReturn;
     for (const auto& coll : collectionsOnConfig) {
-        if (coll.getDropped() ||
-            coll.getDistributionMode() == CollectionType::DistributionMode::kUnsharded) {
+        if (coll.getDropped()) {
             continue;
         }
 
-        collectionsToReturn.push_back(coll.getNs());
+        collectionsToReturn.push_back(coll.getNss());
     }
 
     return collectionsToReturn;
@@ -580,11 +528,11 @@ StatusWith<repl::OpTimeWith<std::vector<ShardType>>> ShardingCatalogClientImpl::
                                                     findStatus.getValue().opTime};
 }
 
-bool ShardingCatalogClientImpl::runUserManagementWriteCommand(OperationContext* opCtx,
-                                                              const std::string& commandName,
-                                                              const std::string& dbname,
-                                                              const BSONObj& cmdObj,
-                                                              BSONObjBuilder* result) {
+Status ShardingCatalogClientImpl::runUserManagementWriteCommand(OperationContext* opCtx,
+                                                                StringData commandName,
+                                                                StringData dbname,
+                                                                const BSONObj& cmdObj,
+                                                                BSONObjBuilder* result) {
     BSONObj cmdToRun = cmdObj;
     {
         // Make sure that if the command has a write concern that it is w:1 or w:majority, and
@@ -596,18 +544,16 @@ bool ShardingCatalogClientImpl::runUserManagementWriteCommand(OperationContext* 
         if (initialCmdHadWriteConcern) {
             auto sw = WriteConcernOptions::parse(writeConcernElement.Obj());
             if (!sw.isOK()) {
-                return CommandHelpers::appendCommandStatusNoThrow(*result, sw.getStatus());
+                return sw.getStatus();
             }
             writeConcern = sw.getValue();
 
-            if (!(writeConcern.wNumNodes == 1 ||
-                  writeConcern.wMode == WriteConcernOptions::kMajority)) {
-                return CommandHelpers::appendCommandStatusNoThrow(
-                    *result,
-                    {ErrorCodes::InvalidOptions,
-                     str::stream() << "Invalid replication write concern. User management write "
-                                      "commands may only use w:1 or w:'majority', got: "
-                                   << writeConcern.toBSON()});
+            if ((writeConcern.wNumNodes != 1) &&
+                (writeConcern.wMode != WriteConcernOptions::kMajority)) {
+                return {ErrorCodes::InvalidOptions,
+                        str::stream() << "Invalid replication write concern. User management write "
+                                         "commands may only use w:1 or w:'majority', got: "
+                                      << writeConcern.toBSON()};
             }
         }
 
@@ -631,29 +577,31 @@ bool ShardingCatalogClientImpl::runUserManagementWriteCommand(OperationContext* 
         cmdToRun = modifiedCmd.obj();
     }
 
-    auto response =
+    auto swResponse =
         Grid::get(opCtx)->shardRegistry()->getConfigShard()->runCommandWithFixedRetryAttempts(
             opCtx,
             ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-            dbname,
+            dbname.toString(),
             cmdToRun,
             Shard::kDefaultConfigCommandTimeout,
             Shard::RetryPolicy::kNotIdempotent);
 
-    if (!response.isOK()) {
-        return CommandHelpers::appendCommandStatusNoThrow(*result, response.getStatus());
-    }
-    if (!response.getValue().commandStatus.isOK()) {
-        return CommandHelpers::appendCommandStatusNoThrow(*result,
-                                                          response.getValue().commandStatus);
-    }
-    if (!response.getValue().writeConcernStatus.isOK()) {
-        return CommandHelpers::appendCommandStatusNoThrow(*result,
-                                                          response.getValue().writeConcernStatus);
+    if (!swResponse.isOK()) {
+        return swResponse.getStatus();
     }
 
-    CommandHelpers::filterCommandReplyForPassthrough(response.getValue().response, result);
-    return true;
+    auto response = std::move(swResponse.getValue());
+
+    if (!response.commandStatus.isOK()) {
+        return response.commandStatus;
+    }
+
+    if (!response.writeConcernStatus.isOK()) {
+        return response.writeConcernStatus;
+    }
+
+    CommandHelpers::filterCommandReplyForPassthrough(response.response, result);
+    return Status::OK();
 }
 
 bool ShardingCatalogClientImpl::runUserManagementReadCommand(OperationContext* opCtx,
@@ -869,7 +817,8 @@ void ShardingCatalogClientImpl::insertConfigDocumentsAsRetryableWrite(
         BSONObj toAdd = docs.back();
         docs.pop_back();
 
-        const int docSizePlusOverhead = toAdd.objsize() + kRetryableBatchWriteBSONSizeOverhead;
+        const int docSizePlusOverhead =
+            toAdd.objsize() + write_ops::kRetryableAndTxnBatchWriteBSONSizeOverhead;
         // Check if pushing this object will exceed the batch size limit or the max object size
         if ((workingBatchItemSize + 1 > write_ops::kMaxWriteBatchSize) ||
             (workingBatchDocSize + docSizePlusOverhead > BSONObjMaxUserSize)) {
@@ -917,7 +866,7 @@ StatusWith<bool> ShardingCatalogClientImpl::_updateConfigDocument(
         updateOp.setUpdates({[&] {
             write_ops::UpdateOpEntry entry;
             entry.setQ(query);
-            entry.setU(update);
+            entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(update));
             entry.setUpsert(upsert);
             entry.setMulti(false);
             return entry;

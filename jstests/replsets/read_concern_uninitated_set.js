@@ -6,20 +6,13 @@
  */
 (function() {
 "use strict";
-// For supportsMajorityReadConcern().
-load("jstests/multiVersion/libs/causal_consistency_helpers.js");
-
-if (!supportsMajorityReadConcern()) {
-    jsTestLog("Skipping test since storage engine doesn't support majority read concern.");
-    return;
-}
 
 const rst = new ReplSetTest({nodes: 1});
 rst.startSet();
 const localDB = rst.nodes[0].getDB('local');
 assert.commandWorked(localDB.test.insert({_id: 0}));
 assert.commandWorked(localDB.runCommand({
-    isMaster: 1,
+    hello: 1,
     "$clusterTime": {
         "clusterTime": Timestamp(1, 1),
         "signature": {"hash": BinData(0, "AAAAAAAAAAAAAAAAAAAAAAAAAAA="), "keyId": NumberLong(0)}

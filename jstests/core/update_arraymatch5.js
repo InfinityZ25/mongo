@@ -1,10 +1,13 @@
-// @tags: [requires_non_retryable_writes, requires_fastcount]
+// @tags: [
+//   requires_fastcount,
+//   requires_non_retryable_writes,
+// ]
 
 t = db.update_arraymatch5;
 t.drop();
 
 t.insert({abc: {visible: true}, testarray: [{foobar_id: 316, visible: true, xxx: 1}]});
-t.ensureIndex({'abc.visible': 1, 'testarray.visible': 1, 'testarray.xxx': 1});
+t.createIndex({'abc.visible': 1, 'testarray.visible': 1, 'testarray.xxx': 1});
 assert(t.findOne({'abc.visible': true, testarray: {'$elemMatch': {visible: true, xxx: 1}}}), "A1");
 assert(t.findOne({testarray: {'$elemMatch': {visible: true, xxx: 1}}}), "A2");
 

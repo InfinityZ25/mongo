@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -40,11 +40,6 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/s/database_sharding_state.h"
-#include "mongo/db/s/migration_source_manager.h"
-#include "mongo/db/s/operation_sharding_state.h"
-#include "mongo/db/s/shard_filtering_metadata_refresh.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/idl/idl_parser.h"
 #include "mongo/s/catalog_cache_loader.h"
 #include "mongo/s/grid.h"

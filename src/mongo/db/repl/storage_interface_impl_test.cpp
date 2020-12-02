@@ -38,6 +38,7 @@
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/validate_results.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -129,13 +130,12 @@ void createCollection(OperationContext* opCtx,
  */
 int _createIndexOnEmptyCollection(OperationContext* opCtx, NamespaceString nss, BSONObj indexSpec) {
     Lock::DBLock dbLock(opCtx, nss.db(), MODE_X);
-    AutoGetCollection autoColl(opCtx, nss, MODE_X);
-    auto coll = autoColl.getCollection();
-
-    auto indexCatalog = coll->getIndexCatalog();
-    ASSERT(indexCatalog);
+    AutoGetCollection coll(opCtx, nss, MODE_X);
 
     WriteUnitOfWork wunit(opCtx);
+    auto indexCatalog = coll.getWritableCollection()->getIndexCatalog();
+    ASSERT(indexCatalog);
+
     ASSERT_OK(indexCatalog->createIndexOnEmptyCollection(opCtx, indexSpec).getStatus());
     wunit.commit();
 
@@ -155,10 +155,12 @@ TimestampedBSONObj makeOplogEntry(OpTime opTime) {
 /**
  * Counts the number of keys in an index using an IndexAccessMethod::validate call.
  */
-int64_t getIndexKeyCount(OperationContext* opCtx, IndexCatalog* cat, const IndexDescriptor* desc) {
+int64_t getIndexKeyCount(OperationContext* opCtx,
+                         const IndexCatalog* cat,
+                         const IndexDescriptor* desc) {
     auto idx = cat->getEntry(desc)->accessMethod();
     int64_t numKeys;
-    ValidateResults fullRes;
+    IndexValidateResults fullRes;
     idx->validate(opCtx, &numKeys, &fullRes);
     return numKeys;
 }
@@ -382,7 +384,7 @@ TEST_F(StorageInterfaceImplTest, GetRollbackIDReturnsBadStatusIfRollbackIDIsNotI
 
 TEST_F(StorageInterfaceImplTest, SnapshotSupported) {
     auto opCtx = getOperationContext();
-    Status status = opCtx->recoveryUnit()->obtainMajorityCommittedSnapshot();
+    Status status = opCtx->recoveryUnit()->majorityCommittedSnapshotAvailable();
     ASSERT(status.isOK());
 }
 
@@ -571,8 +573,7 @@ TEST_F(StorageInterfaceImplTest, CreateCollectionWithIDIndexCommits) {
     ASSERT_OK(loader->insertDocuments(docs.begin(), docs.end()));
     ASSERT_OK(loader->commit());
 
-    AutoGetCollectionForReadCommand autoColl(opCtx, nss);
-    auto coll = autoColl.getCollection();
+    AutoGetCollectionForReadCommand coll(opCtx, nss);
     ASSERT(coll);
     ASSERT_EQ(coll->getRecordStore()->numRecords(opCtx), 2LL);
     auto collIdxCat = coll->getIndexCatalog();
@@ -599,8 +600,7 @@ void _testDestroyUncommitedCollectionBulkLoader(
     // Collection and ID index should not exist after 'loader' is destroyed.
     destroyLoaderFn(std::move(loader));
 
-    AutoGetCollectionForReadCommand autoColl(opCtx, nss);
-    auto coll = autoColl.getCollection();
+    AutoGetCollectionForReadCommand coll(opCtx, nss);
 
     // Bulk loader is used to create indexes. The collection is not dropped when the bulk loader is
     // destroyed.
@@ -2607,7 +2607,7 @@ TEST_F(StorageInterfaceImplTest, SetIndexIsMultikeyReturnsNamespaceNotFoundForMi
     StorageInterfaceImpl storage;
     auto nss = makeNamespace(_agent);
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound,
-                  storage.setIndexIsMultikey(opCtx, nss, "foo", {}, Timestamp(3, 3)));
+                  storage.setIndexIsMultikey(opCtx, nss, "foo", {}, {}, Timestamp(3, 3)));
 }
 
 TEST_F(StorageInterfaceImplTest, SetIndexIsMultikeyReturnsNamespaceNotFoundForMissingCollection) {
@@ -2617,7 +2617,7 @@ TEST_F(StorageInterfaceImplTest, SetIndexIsMultikeyReturnsNamespaceNotFoundForMi
     NamespaceString wrongColl(nss.db(), "wrongColl"_sd);
     ASSERT_OK(storage.createCollection(opCtx, nss, CollectionOptions()));
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound,
-                  storage.setIndexIsMultikey(opCtx, wrongColl, "foo", {}, Timestamp(3, 3)));
+                  storage.setIndexIsMultikey(opCtx, wrongColl, "foo", {}, {}, Timestamp(3, 3)));
 }
 
 TEST_F(StorageInterfaceImplTest, SetIndexIsMultikeyReturnsIndexNotFoundForMissingIndex) {
@@ -2626,7 +2626,7 @@ TEST_F(StorageInterfaceImplTest, SetIndexIsMultikeyReturnsIndexNotFoundForMissin
     auto nss = makeNamespace(_agent);
     ASSERT_OK(storage.createCollection(opCtx, nss, CollectionOptions()));
     ASSERT_EQUALS(ErrorCodes::IndexNotFound,
-                  storage.setIndexIsMultikey(opCtx, nss, "foo", {}, Timestamp(3, 3)));
+                  storage.setIndexIsMultikey(opCtx, nss, "foo", {}, {}, Timestamp(3, 3)));
 }
 
 TEST_F(StorageInterfaceImplTest, SetIndexIsMultikeyReturnsInvalidOptionsForNullTimestamp) {
@@ -2635,7 +2635,7 @@ TEST_F(StorageInterfaceImplTest, SetIndexIsMultikeyReturnsInvalidOptionsForNullT
     auto nss = makeNamespace(_agent);
     ASSERT_OK(storage.createCollection(opCtx, nss, CollectionOptions()));
     ASSERT_EQUALS(ErrorCodes::InvalidOptions,
-                  storage.setIndexIsMultikey(opCtx, nss, "foo", {}, Timestamp()));
+                  storage.setIndexIsMultikey(opCtx, nss, "foo", {}, {}, Timestamp()));
 }
 
 TEST_F(StorageInterfaceImplTest, SetIndexIsMultikeySucceeds) {
@@ -2650,13 +2650,13 @@ TEST_F(StorageInterfaceImplTest, SetIndexIsMultikeySucceeds) {
     ASSERT_EQUALS(_createIndexOnEmptyCollection(opCtx, nss, indexSpec), 2);
 
     MultikeyPaths paths = {{1}};
-    ASSERT_OK(storage.setIndexIsMultikey(opCtx, nss, indexName, paths, Timestamp(3, 3)));
+    ASSERT_OK(storage.setIndexIsMultikey(opCtx, nss, indexName, {}, paths, Timestamp(3, 3)));
     AutoGetCollectionForReadCommand autoColl(opCtx, nss);
     ASSERT_TRUE(autoColl.getCollection());
     auto indexCatalog = autoColl.getCollection()->getIndexCatalog();
-    ASSERT(indexCatalog->isMultikey(indexCatalog->findIndexByName(opCtx, indexName)));
-    ASSERT(paths ==
-           indexCatalog->getMultikeyPaths(opCtx, indexCatalog->findIndexByName(opCtx, indexName)));
+    auto entry = indexCatalog->findIndexByName(opCtx, indexName)->getEntry();
+    ASSERT(entry->isMultikey());
+    ASSERT(paths == entry->getMultikeyPaths(opCtx));
 }
 
 }  // namespace

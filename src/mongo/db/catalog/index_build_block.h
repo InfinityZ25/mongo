@@ -41,8 +41,7 @@ class IndexBuildBlock {
     IndexBuildBlock& operator=(const IndexBuildBlock&) = delete;
 
 public:
-    IndexBuildBlock(IndexCatalog* indexCatalog,
-                    const NamespaceString& nss,
+    IndexBuildBlock(const NamespaceString& nss,
                     const BSONObj& spec,
                     IndexBuildMethod method,
                     // The index build UUID is only required for persisting to the catalog.
@@ -52,11 +51,12 @@ public:
 
     /**
      * Must be called before the object is destructed if init() has been called.
-     * Cleans up the temporary tables that are created for an index build.
+     * Cleans up or keeps the temporary tables that are created for an index build.
      *
      * Being called in a 'WriteUnitOfWork' has no effect.
      */
-    void deleteTemporaryTables(OperationContext* opCtx);
+    void finalizeTemporaryTables(OperationContext* opCtx,
+                                 TemporaryRecordStore::FinalizationAction action);
 
     /**
      * Initializes a new entry for the index in the IndexCatalog.
@@ -67,6 +67,16 @@ public:
      * Must be called from within a `WriteUnitOfWork`
      */
     Status init(OperationContext* opCtx, Collection* collection);
+
+    /**
+     * Makes sure that an entry for the index was created at startup in the IndexCatalog. Returns
+     * an error status if we are resuming from the bulk load phase and the index ident was unable
+     * to be dropped or recreated in the storage engine.
+     */
+    Status initForResume(OperationContext* opCtx,
+                         Collection* collection,
+                         const IndexStateInfo& stateInfo,
+                         IndexBuildPhaseEnum phase);
 
     /**
      * Marks the state of the index as 'ready' and commits the index to disk.
@@ -80,16 +90,16 @@ public:
      *
      * Must be called from within a `WriteUnitOfWork`
      */
-    void fail(OperationContext* opCtx, const Collection* collection);
+    void fail(OperationContext* opCtx, Collection* collection);
 
     /**
      * Returns the IndexCatalogEntry that was created in init().
      *
      * This entry is owned by the IndexCatalog.
      */
-    IndexCatalogEntry* getEntry() {
-        return _indexCatalogEntry;
-    }
+    const IndexCatalogEntry* getEntry(OperationContext* opCtx,
+                                      const CollectionPtr& collection) const;
+    IndexCatalogEntry* getEntry(OperationContext* opCtx, Collection* collection);
 
     /**
      * Returns the name of the index managed by this index builder.
@@ -106,7 +116,8 @@ public:
     }
 
 private:
-    IndexCatalog* const _indexCatalog;
+    void _completeInit(OperationContext* opCtx, Collection* collection);
+
     const NamespaceString _nss;
 
     BSONObj _spec;
@@ -115,8 +126,6 @@ private:
 
     std::string _indexName;
     std::string _indexNamespace;
-
-    IndexCatalogEntry* _indexCatalogEntry;
 
     std::unique_ptr<IndexBuildInterceptor> _indexBuildInterceptor;
 };

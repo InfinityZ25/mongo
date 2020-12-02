@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
 
 #include "mongo/platform/basic.h"
 
@@ -70,6 +70,10 @@ public:
     CmdSaslStart();
     virtual ~CmdSaslStart();
 
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
+
     virtual void addRequiredPrivileges(const std::string&,
                                        const BSONObj&,
                                        std::vector<Privilege>*) const {}
@@ -100,6 +104,9 @@ public:
     CmdSaslContinue();
     virtual ~CmdSaslContinue();
 
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
     virtual void addRequiredPrivileges(const std::string&,
                                        const BSONObj&,
                                        std::vector<Privilege>*) const {}
@@ -195,7 +202,7 @@ Status doSaslStep(OperationContext* opCtx,
               "mechanism"_attr = mechanism.mechanismName(),
               "principalName"_attr = mechanism.getPrincipalName(),
               "authenticationDatabase"_attr = mechanism.getAuthenticationDatabase(),
-              "client"_attr = opCtx->getClient()->getRemote().toString(),
+              "remote"_attr = opCtx->getClient()->getRemote(),
               "result"_attr = redact(swResponse.getStatus()));
 
         sleepmillis(saslGlobalParams.authFailedDelay.load());
@@ -224,7 +231,7 @@ Status doSaslStep(OperationContext* opCtx,
                   "mechanism"_attr = mechanism.mechanismName(),
                   "principalName"_attr = mechanism.getPrincipalName(),
                   "authenticationDatabase"_attr = mechanism.getAuthenticationDatabase(),
-                  "client"_attr = opCtx->getClient()->session()->remote());
+                  "remote"_attr = opCtx->getClient()->session()->remote());
         }
         if (session->isSpeculative()) {
             status = authCounter.incSpeculativeAuthenticateSuccessful(
@@ -328,18 +335,26 @@ bool runSaslStart(OperationContext* opCtx,
     }
 
     std::string principalName;
-    auto swSession = doSaslStart(opCtx, db, cmdObj, &result, &principalName, speculative);
-
-    if (!swSession.isOK() || swSession.getValue()->getMechanism().isSuccess()) {
-        audit::logAuthentication(
-            client, mechanismName, UserName(principalName, db), swSession.getStatus().code());
-        uassertStatusOK(swSession.getStatus());
-        if (swSession.getValue()->getMechanism().isSuccess()) {
-            uassertStatusOK(authCounter.incAuthenticateSuccessful(mechanismName));
+    try {
+        auto session =
+            uassertStatusOK(doSaslStart(opCtx, db, cmdObj, &result, &principalName, speculative));
+        const bool isClusterMember = session->getMechanism().isClusterMember();
+        if (isClusterMember) {
+            uassertStatusOK(authCounter.incClusterAuthenticateReceived(mechanismName));
         }
-    } else {
-        auto session = std::move(swSession.getValue());
-        AuthenticationSession::swap(client, session);
+        if (session->getMechanism().isSuccess()) {
+            uassertStatusOK(authCounter.incAuthenticateSuccessful(mechanismName));
+            if (isClusterMember) {
+                uassertStatusOK(authCounter.incClusterAuthenticateSuccessful(mechanismName));
+            }
+            audit::logAuthentication(
+                client, mechanismName, UserName(principalName, db), Status::OK().code());
+        } else {
+            AuthenticationSession::swap(client, session);
+        }
+    } catch (const AssertionException& ex) {
+        audit::logAuthentication(client, mechanismName, UserName(principalName, db), ex.code());
+        throw;
     }
 
     return true;
@@ -401,6 +416,10 @@ bool CmdSaslContinue::run(OperationContext* opCtx,
         if (mechanism.isSuccess()) {
             uassertStatusOK(
                 authCounter.incAuthenticateSuccessful(mechanism.mechanismName().toString()));
+            if (mechanism.isClusterMember()) {
+                uassertStatusOK(authCounter.incClusterAuthenticateSuccessful(
+                    mechanism.mechanismName().toString()));
+            }
         }
     } else {
         AuthenticationSession::swap(client, sessionGuard);

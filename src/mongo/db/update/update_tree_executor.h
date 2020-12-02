@@ -33,6 +33,8 @@
 
 #include "mongo/db/update/update_node.h"
 #include "mongo/db/update/update_object_node.h"
+#include "mongo/db/update/v1_log_builder.h"
+#include "mongo/db/update/v2_log_builder.h"
 
 namespace mongo {
 
@@ -42,8 +44,40 @@ public:
         : _updateTree(std::move(node)) {}
 
     ApplyResult applyUpdate(ApplyParams applyParams) const final {
+        mutablebson::Document logDocument;
+        boost::optional<V1LogBuilder> optV1LogBuilder;
+        boost::optional<v2_log_builder::V2LogBuilder> optV2LogBuilder;
+
         UpdateNode::UpdateNodeApplyParams updateNodeApplyParams;
-        return _updateTree->apply(applyParams, updateNodeApplyParams);
+
+        if (applyParams.logMode == ApplyParams::LogMode::kGenerateOnlyV1OplogEntry) {
+            // In versions since 3.6, the absence of a $v field indicates either a
+            // replacement-style update or a "classic" modifier-style update.
+            //
+            // Since 3.6, the presence of a $v field with value 1 may also indicate that the oplog
+            // entry is a "classic" modifier-style update.
+            //
+            // While we could elide this $v field when providing a value of 1, we continue to log
+            // it because:
+            // (a) It avoids an unnecessary oplog format change.
+            // (b) It is easy to distinguish from $v: 2 delta-style oplog entries.
+            const bool includeVersionField = true;
+
+            optV1LogBuilder.emplace(logDocument.root(), includeVersionField);
+            updateNodeApplyParams.logBuilder = optV1LogBuilder.get_ptr();
+        } else if (applyParams.logMode == ApplyParams::LogMode::kGenerateOplogEntry) {
+            optV2LogBuilder.emplace();
+            updateNodeApplyParams.logBuilder = optV2LogBuilder.get_ptr();
+        }
+
+        auto ret = _updateTree->apply(applyParams, updateNodeApplyParams);
+
+        invariant(ret.oplogEntry.isEmpty());
+        if (auto logBuilder = updateNodeApplyParams.logBuilder) {
+            ret.oplogEntry = logBuilder->serialize();
+        }
+
+        return ret;
     }
 
     UpdateNode* getUpdateTree() {

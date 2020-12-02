@@ -2,6 +2,8 @@
  * Test that the reindex command only runs on a node in standalone mode. First it will make sure
  * that the command can't be run on a primary or a secondary. Then it will make sure that the
  * reindex command can be successfully run on a standalone node.
+ *
+ * @tags: [requires_fcv_47]
  */
 
 (function() {
@@ -24,10 +26,10 @@ const secondaryDB = secondary.getDB(dbName);
 const secondaryColl = secondaryDB.getCollection(collName);
 
 assert.commandWorked(primaryColl.insert({a: 1000}));
-assert.commandWorked(primaryColl.ensureIndex({a: 1}));
+assert.commandWorked(primaryColl.createIndex({a: 1}));
 
 replTest.awaitReplication();
-replTest.waitForAllIndexBuildsToFinish(dbName, collName);
+replTest.awaitReplication();
 
 assert.eq(2,
           primaryColl.getIndexes().length,
@@ -57,10 +59,14 @@ const testDB = standalone.getDB(dbName);
 const testColl = testDB.getCollection(collName);
 
 assert.commandWorked(testColl.insert({a: 1000}));
-assert.commandWorked(testColl.ensureIndex({a: 1}));
+assert.commandWorked(testColl.createIndex({a: 1}));
 assert.eq(2, testColl.getIndexes().length, "Standalone didn't have proper indexes before reindex");
 
 assert.commandWorked(testColl.reIndex());
+
+const nonExistentDb = standalone.getDB('does_not_exist');
+assert.commandFailedWithCode(nonExistentDb.getCollection('test').reIndex(),
+                             ErrorCodes.NamespaceNotFound);
 
 assert.eq(2, testColl.getIndexes().length, "Standalone didn't have proper indexes after reindex");
 

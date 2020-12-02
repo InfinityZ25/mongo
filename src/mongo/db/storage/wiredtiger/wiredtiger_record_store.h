@@ -225,10 +225,6 @@ public:
         return _uri;
     }
 
-    const std::string& getIdent() const override {
-        return _ident;
-    }
-
     uint64_t tableId() const {
         return _tableId;
     }
@@ -243,6 +239,16 @@ public:
     void setSizeStorer(WiredTigerSizeStorer* ss) {
         _sizeStorer = ss;
     }
+
+    /**
+     * Sets the new number of records and flushes the size storer.
+     */
+    void setNumRecords(long long numRecords);
+
+    /**
+     * Sets the new data size and flushes the size storer.
+     */
+    void setDataSize(long long dataSize);
 
     bool isOpHidden_forTest(const RecordId& id) const;
 
@@ -343,7 +349,6 @@ private:
     int64_t _cappedDeleteAsNeeded_inlock(OperationContext* opCtx, const RecordId& justInserted);
 
     const std::string _uri;
-    const std::string _ident;
     const uint64_t _tableId;  // not persisted
 
     // Canonical engine name to use for retrieving options

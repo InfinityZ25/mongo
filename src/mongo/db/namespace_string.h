@@ -38,6 +38,7 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/logv2/log_attr.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/uuid.h"
 
@@ -64,9 +65,19 @@ public:
     // Name for the system views collection
     static constexpr StringData kSystemDotViewsCollectionName = "system.views"_sd;
 
+    // Names of privilege document collections
+    static constexpr StringData kSystemUsers = "system.users"_sd;
+    static constexpr StringData kSystemRoles = "system.roles"_sd;
+
     // Prefix for orphan collections
     static constexpr StringData kOrphanCollectionPrefix = "orphan."_sd;
     static constexpr StringData kOrphanCollectionDb = "local"_sd;
+
+    // Prefix for temporary resharding collection.
+    static constexpr StringData kTemporaryReshardingCollectionPrefix = "system.resharding."_sd;
+
+    // Prefix for time-series buckets collection.
+    static constexpr StringData kTimeseriesBucketsCollectionPrefix = "system.buckets."_sd;
 
     // Namespace for storing configuration data, which needs to be replicated if the server is
     // running as a replica set. Documents in this collection should represent some configuration
@@ -101,6 +112,12 @@ public:
     // Namespace for storing the persisted state of migration coordinators.
     static const NamespaceString kMigrationCoordinatorsNamespace;
 
+    // Namespace for storing the persisted state of tenant migration donors.
+    static const NamespaceString kTenantMigrationDonorsNamespace;
+
+    // Namespace for storing the persisted state of tenant migration recipient service instances.
+    static const NamespaceString kTenantMigrationRecipientsNamespace;
+
     // Namespace for replica set configuration settings.
     static const NamespaceString kSystemReplSetNamespace;
 
@@ -110,8 +127,26 @@ public:
     // Namespace for pending range deletions.
     static const NamespaceString kRangeDeletionNamespace;
 
+    // Namespace for the coordinator's resharding operation state.
+    static const NamespaceString kConfigReshardingOperationsNamespace;
+
+    // Namespace for the donor shard's local resharding operation state.
+    static const NamespaceString kDonorReshardingOperationsNamespace;
+
+    // Namespace for the recipient shard's local resharding operation state.
+    static const NamespaceString kRecipientReshardingOperationsNamespace;
+
     // Namespace for balancer settings and default read and write concerns.
     static const NamespaceString kConfigSettingsNamespace;
+
+    // Namespace for vector clock state.
+    static const NamespaceString kVectorClockNamespace;
+
+    // Namespace for storing oplog applier progress for resharding.
+    static const NamespaceString kReshardingApplierProgressNamespace;
+
+    // Namespace for storing config.transactions cloner progress for resharding.
+    static const NamespaceString kReshardingTxnClonerProgressNamespace;
 
     /**
      * Constructs an empty NamespaceString.
@@ -136,10 +171,10 @@ public:
     NamespaceString(StringData dbName, StringData collectionName)
         : _ns(dbName.size() + collectionName.size() + 1, '\0') {
         uassert(ErrorCodes::InvalidNamespace,
-                "'.' is an invalid character in a database name",
+                "'.' is an invalid character in the database name: " + dbName,
                 dbName.find('.') == std::string::npos);
         uassert(ErrorCodes::InvalidNamespace,
-                "Collection names cannot start with '.'",
+                "Collection names cannot start with '.': " + collectionName,
                 collectionName.empty() || collectionName[0] != '.');
 
         std::string::iterator it = std::copy(dbName.begin(), dbName.end(), _ns.begin());
@@ -233,6 +268,12 @@ public:
     bool isServerConfigurationCollection() const {
         return (db() == kAdminDb) && (coll() == "system.version");
     }
+    bool isPrivilegeCollection() const {
+        if (!isAdminDB()) {
+            return false;
+        }
+        return (coll() == kSystemUsers) || (coll() == kSystemRoles);
+    }
     bool isConfigDB() const {
         return db() == kConfigDb;
     }
@@ -261,6 +302,26 @@ public:
      * never be marked as anything other than UNSHARDED.
      */
     bool isNamespaceAlwaysUnsharded() const;
+
+    /**
+     * Returns whether the specified namespace is config.cache.chunks.<>.
+     */
+    bool isConfigDotCacheDotChunks() const;
+
+    /**
+     * Returns whether the specified namespace is <database>.system.resharding.<>.
+     */
+    bool isTemporaryReshardingCollection() const;
+
+    /**
+     * Returns whether the specified namespace is <database>.system.buckets.<>.
+     */
+    bool isTimeseriesBucketsCollection() const;
+
+    /**
+     * Returns the time-series buckets namespace for this view.
+     */
+    NamespaceString makeTimeseriesBucketsNamespace() const;
 
     /**
      * Returns whether a namespace is replicated, based only on its string value. One notable
@@ -299,6 +360,11 @@ public:
     bool isDropPendingNamespace() const;
 
     /**
+     * Returns true if operations on this namespace must be applied in their own oplog batch.
+     */
+    bool mustBeAppliedInOwnOplogBatch() const;
+
+    /**
      * Returns the drop-pending namespace name for this namespace, provided the given optime.
      *
      * Example:
@@ -316,8 +382,8 @@ public:
      * Returns true if the namespace is valid. Special namespaces for internal use are considered as
      * valid.
      */
-    bool isValid() const {
-        return validDBName(db(), DollarInDbNameBehavior::Allow) && !coll().empty();
+    bool isValid(DollarInDbNameBehavior behavior = DollarInDbNameBehavior::Allow) const {
+        return validDBName(db(), behavior) && !coll().empty();
     }
 
     /**
@@ -407,9 +473,13 @@ public:
         return H::combine(std::move(h), nss._ns);
     }
 
+    friend auto logAttrs(const NamespaceString& nss) {
+        return "namespace"_attr = nss;
+    }
+
 private:
     std::string _ns;
-    size_t _dotIndex;
+    size_t _dotIndex = 0;
 };
 
 /**

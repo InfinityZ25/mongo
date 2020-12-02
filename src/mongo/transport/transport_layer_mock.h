@@ -30,9 +30,11 @@
 #pragma once
 
 #include "mongo/base/status.h"
+#include "mongo/config.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer.h"
+#include "mongo/util/net/ssl_peer_info.h"
 #include "mongo/util/net/ssl_types.h"
 #include "mongo/util/time_support.h"
 
@@ -47,7 +49,8 @@ class TransportLayerMock : public TransportLayer {
     TransportLayerMock& operator=(const TransportLayerMock&) = delete;
 
 public:
-    TransportLayerMock();
+    explicit TransportLayerMock(const WireSpec& wireSpec = WireSpec::instance())
+        : TransportLayer(wireSpec), _shutdown(false) {}
     ~TransportLayerMock();
 
     SessionHandle createSession();
@@ -57,10 +60,12 @@ public:
     StatusWith<SessionHandle> connect(HostAndPort peer,
                                       ConnectSSLMode sslMode,
                                       Milliseconds timeout) override;
-    Future<SessionHandle> asyncConnect(HostAndPort peer,
-                                       ConnectSSLMode sslMode,
-                                       const ReactorHandle& reactor,
-                                       Milliseconds timeout) override;
+    Future<SessionHandle> asyncConnect(
+        HostAndPort peer,
+        ConnectSSLMode sslMode,
+        const ReactorHandle& reactor,
+        Milliseconds timeout,
+        std::shared_ptr<const SSLConnectionContext> transientSSLContext = nullptr) override;
 
     Status setup() override;
     Status start() override;
@@ -72,6 +77,17 @@ public:
 
     // Set to a factory function to use your own session type.
     std::function<SessionHandle(TransportLayer*)> createSessionHook;
+
+#ifdef MONGO_CONFIG_SSL
+    Status rotateCertificates(std::shared_ptr<SSLManagerInterface> manager,
+                              bool asyncOCSPStaple) override {
+        return Status::OK();
+    }
+
+    StatusWith<std::shared_ptr<const transport::SSLConnectionContext>> createTransientSSLContext(
+        const TransientSSLParams& transientSSLParams,
+        const SSLManagerInterface* optionalManager) override;
+#endif
 
 private:
     friend class MockSession;

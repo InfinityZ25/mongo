@@ -37,6 +37,7 @@
 #include "mongo/db/keys_collection_cache.h"
 #include "mongo/db/keys_collection_document.h"
 #include "mongo/db/keys_collection_manager_gen.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/concurrency/notification.h"
@@ -48,6 +49,17 @@ class OperationContext;
 class LogicalTime;
 class ServiceContext;
 class KeysCollectionClient;
+
+namespace keys_collection_manager_util {
+
+/**
+ * Returns the amount of time to wait until the monitoring thread should attempt to refresh again.
+ */
+Milliseconds howMuchSleepNeedFor(const LogicalTime& currentTime,
+                                 const LogicalTime& latestExpiredAt,
+                                 const Milliseconds& interval);
+
+}  // namespace keys_collection_manager_util
 
 /**
  * The KeysCollectionManager queries the config servers for keys that can be used for
@@ -162,12 +174,14 @@ private:
         /**
          * Returns true if keys have ever successfully been returned from the config server.
          */
-        bool hasSeenKeys();
+        bool hasSeenKeys() const noexcept;
 
     private:
         void _doPeriodicRefresh(ServiceContext* service,
                                 std::string threadName,
                                 Milliseconds refreshInterval);
+
+        AtomicWord<bool> _hasSeenKeys{false};
 
         // protects all the member variables below.
         Mutex _mutex = MONGO_MAKE_LATCH("PeriodicRunner::_mutex");
@@ -177,7 +191,6 @@ private:
         stdx::thread _backgroundThread;
         std::shared_ptr<RefreshFunc> _doRefresh;
 
-        bool _hasSeenKeys = false;
         bool _inShutdown = false;
     };
 

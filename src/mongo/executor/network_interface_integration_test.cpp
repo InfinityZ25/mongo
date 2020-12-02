@@ -37,7 +37,6 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/client/connection_string.h"
-#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/connection_pool_stats.h"
 #include "mongo/executor/network_connection_hook.h"
@@ -152,6 +151,12 @@ public:
     constexpr static Milliseconds kNoTimeout = RemoteCommandRequest::kNoTimeout;
     constexpr static Milliseconds kMaxWait = Milliseconds(Minutes(1));
 
+    void resetIsInternalClient(bool isInternalClient) {
+        WireSpec::Specification newSpec = *WireSpec::instance().get();
+        newSpec.isInternalClient = isInternalClient;
+        WireSpec::instance().reset(std::move(newSpec));
+    }
+
     void assertNumOps(uint64_t canceled, uint64_t timedOut, uint64_t failed, uint64_t succeeded) {
         auto counters = net().getCounters();
         ASSERT_EQ(canceled, counters.canceled);
@@ -161,9 +166,12 @@ public:
     }
 
     void setUp() override {
-        setTestCommandsEnabled(true);
         startNet(std::make_unique<WaitForIsMasterHook>(this));
     }
+
+    // NetworkInterfaceIntegrationFixture::tearDown() shuts down the NetworkInterface. We always
+    // need to do it even if we have additional tearDown tasks.
+    using NetworkInterfaceIntegrationFixture::tearDown;
 
     RemoteCommandRequest makeTestCommand(
         Milliseconds timeout,
@@ -295,6 +303,19 @@ private:
     boost::optional<IsMasterData> _isMasterResult;
 };
 
+class NetworkInterfaceInternalClientTest : public NetworkInterfaceTest {
+public:
+    void setUp() override {
+        resetIsInternalClient(true);
+        NetworkInterfaceTest::setUp();
+    }
+
+    void tearDown() override {
+        NetworkInterfaceTest::tearDown();
+        resetIsInternalClient(false);
+    }
+};
+
 TEST_F(NetworkInterfaceTest, CancelMissingOperation) {
     // This is just a sanity check, this action should have no effect.
     net().cancelCommand(makeCallbackHandle());
@@ -322,7 +343,7 @@ TEST_F(NetworkInterfaceTest, CancelLocally) {
     // Wait for op to complete, assert that it was canceled.
     auto result = deferred.get();
     ASSERT_EQ(ErrorCodes::CallbackCanceled, result.status);
-    ASSERT(result.elapsedMillis);
+    ASSERT(result.elapsed);
 
     assertNumOps(1u, 0u, 0u, 0u);
 }
@@ -373,7 +394,7 @@ TEST_F(NetworkInterfaceTest, CancelRemotely) {
     // Wait for the command to return, assert that it was canceled.
     auto result = deferred.get();
     ASSERT_EQ(ErrorCodes::CallbackCanceled, result.status);
-    ASSERT(result.elapsedMillis);
+    ASSERT(result.elapsed);
 
     // Wait for the operation to be killed on the remote host.
     numCurrentOpRan += waitForCommandToStop("echo", kMaxWait);
@@ -439,7 +460,7 @@ TEST_F(NetworkInterfaceTest, CancelRemotelyTimedOut) {
     // Wait for the command to return, assert that it was canceled.
     auto result = deferred.get();
     ASSERT_EQ(ErrorCodes::CallbackCanceled, result.status);
-    ASSERT(result.elapsedMillis);
+    ASSERT(result.elapsed);
 
     // We have one canceled operation (echo), one timedout operation (_killOperations),
     // and one succeeded operation on top of the currentOp operations (configureFailPoint).
@@ -467,7 +488,7 @@ TEST_F(NetworkInterfaceTest, ImmediateCancel) {
     // Wait for op to complete, assert that it was canceled.
     auto result = deferred.get();
     ASSERT_EQ(ErrorCodes::CallbackCanceled, result.status);
-    ASSERT(result.elapsedMillis);
+    ASSERT(result.elapsed);
     assertNumOps(1u, 0u, 0u, 0u);
 }
 
@@ -481,7 +502,7 @@ TEST_F(NetworkInterfaceTest, LateCancel) {
     net().cancelCommand(cbh);
 
     ASSERT_OK(result.status);
-    ASSERT(result.elapsedMillis);
+    ASSERT(result.elapsed);
     assertNumOps(0u, 0u, 0u, 1u);
 }
 
@@ -499,7 +520,7 @@ TEST_F(NetworkInterfaceTest, AsyncOpTimeout) {
     // check that we've timed out.
     if (!pingCommandMissing(result)) {
         ASSERT_EQ(ErrorCodes::NetworkInterfaceExceededTimeLimit, result.status);
-        ASSERT(result.elapsedMillis);
+        ASSERT(result.elapsed);
         assertNumOps(0u, 1u, 0u, 0u);
     }
 }
@@ -530,12 +551,12 @@ TEST_F(NetworkInterfaceTest, AsyncOpTimeoutWithOpCtxDeadlineSooner) {
         return;
     }
 
-    ASSERT_EQ(ErrorCodes::NetworkInterfaceExceededTimeLimit, result.status);
-    ASSERT(result.elapsedMillis);
+    ASSERT_EQ(ErrorCodes::ExceededTimeLimit, result.status);
+    ASSERT(result.elapsed);
     // check that the request timeout uses the smaller of the operation context deadline and
     // the timeout specified in the request constructor.
-    ASSERT_GTE(result.elapsedMillis.value(), opCtxDeadline);
-    ASSERT_LT(result.elapsedMillis.value(), requestTimeout);
+    ASSERT_GTE(result.elapsed.value(), opCtxDeadline);
+    ASSERT_LT(result.elapsed.value(), requestTimeout);
     assertNumOps(0u, 1u, 0u, 0u);
 }
 
@@ -565,11 +586,12 @@ TEST_F(NetworkInterfaceTest, AsyncOpTimeoutWithOpCtxDeadlineLater) {
     }
 
     ASSERT_EQ(ErrorCodes::NetworkInterfaceExceededTimeLimit, result.status);
-    ASSERT(result.elapsedMillis);
+    ASSERT(result.elapsed);
     // check that the request timeout uses the smaller of the operation context deadline and
     // the timeout specified in the request constructor.
-    ASSERT_GTE(result.elapsedMillis.value(), requestTimeout);
-    ASSERT_LT(result.elapsedMillis.value(), opCtxDeadline);
+    ASSERT_GTE(duration_cast<Milliseconds>(result.elapsed.value()), requestTimeout);
+    ASSERT_LT(duration_cast<Milliseconds>(result.elapsed.value()), opCtxDeadline);
+
     assertNumOps(0u, 1u, 0u, 0u);
 }
 
@@ -581,7 +603,7 @@ TEST_F(NetworkInterfaceTest, StartCommand) {
 
     auto res = deferred.get();
 
-    ASSERT(res.elapsedMillis);
+    ASSERT(res.elapsed);
     uassertStatusOK(res.status);
 
     // This opmsg request expect the following reply, which is generated below
@@ -629,7 +651,7 @@ TEST_F(NetworkInterfaceTest, FireAndForget) {
 
     for (auto& future : futures) {
         auto result = future.get();
-        ASSERT(result.elapsedMillis);
+        ASSERT(result.elapsed);
         uassertStatusOK(result.status);
         ASSERT_EQ(1, result.data.getIntField("ok"));
     }
@@ -637,14 +659,20 @@ TEST_F(NetworkInterfaceTest, FireAndForget) {
     // Run a non-fireAndForget command and verify that we get a CommandFailed response.
     auto nonFireAndForgetRequest = makeTestCommand(kNoTimeout, makeEchoCmdObj());
     auto result = runCommandSync(nonFireAndForgetRequest);
-    ASSERT(result.elapsedMillis);
+    ASSERT(result.elapsed);
     uassertStatusOK(result.status);
     ASSERT_EQ(0, result.data.getIntField("ok"));
     ASSERT_EQ(ErrorCodes::CommandFailed, result.data.getIntField("code"));
     assertNumOps(0u, 0u, 0u, 5u);
 }
 
-TEST_F(NetworkInterfaceTest, StartCommandOnAny) {
+TEST_F(NetworkInterfaceInternalClientTest, StartCommandOnAny) {
+    // The echo command below uses hedging so after a response is returned, we will issue
+    // a _killOperations command to kill the pending operation. As a result, the number of
+    // successful commands can sometimes be 2 (echo and _killOperations) instead 1 when the
+    // num ops assertion below runs.
+    FailPointEnableBlock fpb("networkInterfaceShouldNotKillPendingRequests");
+
     auto commandRequest = makeEchoCmdObj();
     auto request = [&] {
         auto cs = fixture();
@@ -663,8 +691,8 @@ TEST_F(NetworkInterfaceTest, StartCommandOnAny) {
     auto deferred = runCommandOnAny(makeCallbackHandle(), std::move(request));
     auto res = deferred.get();
 
-    auto cmdObj = res.data.getObjectField("echo");
     uassertStatusOK(res.status);
+    auto cmdObj = res.data.getObjectField("echo");
     ASSERT_EQ(1, cmdObj.getIntField("echo"));
     ASSERT_EQ("bar"_sd, cmdObj.getStringField("foo"));
     ASSERT_EQ("admin"_sd, cmdObj.getStringField("$db"));
@@ -705,30 +733,30 @@ TEST_F(NetworkInterfaceTest, SetAlarm) {
     ASSERT_FALSE(swResult.isOK());
 }
 
-TEST_F(NetworkInterfaceTest, IsMasterRequestContainsOutgoingWireVersionInternalClientInfo) {
-    WireSpec::instance().isInternalClient = true;
-
+TEST_F(NetworkInterfaceInternalClientTest,
+       IsMasterRequestContainsOutgoingWireVersionInternalClientInfo) {
     auto deferred = runCommand(makeCallbackHandle(), makeTestCommand(kNoTimeout, makeEchoCmdObj()));
     auto isMasterHandshake = waitForIsMaster();
 
     // Verify that the isMaster reply has the expected internalClient data.
+    auto wireSpec = WireSpec::instance().get();
     auto internalClientElem = isMasterHandshake.request["internalClient"];
     ASSERT_EQ(internalClientElem.type(), BSONType::Object);
     auto minWireVersionElem = internalClientElem.Obj()["minWireVersion"];
     auto maxWireVersionElem = internalClientElem.Obj()["maxWireVersion"];
     ASSERT_EQ(minWireVersionElem.type(), BSONType::NumberInt);
     ASSERT_EQ(maxWireVersionElem.type(), BSONType::NumberInt);
-    ASSERT_EQ(minWireVersionElem.numberInt(), WireSpec::instance().outgoing.minWireVersion);
-    ASSERT_EQ(maxWireVersionElem.numberInt(), WireSpec::instance().outgoing.maxWireVersion);
+    ASSERT_EQ(minWireVersionElem.numberInt(), wireSpec->outgoing.minWireVersion);
+    ASSERT_EQ(maxWireVersionElem.numberInt(), wireSpec->outgoing.maxWireVersion);
 
     // Verify that the ping op is counted as a success.
     auto res = deferred.get();
-    ASSERT(res.elapsedMillis);
+    ASSERT(res.elapsed);
     assertNumOps(0u, 0u, 0u, 1u);
 }
 
 TEST_F(NetworkInterfaceTest, IsMasterRequestMissingInternalClientInfoWhenNotInternalClient) {
-    WireSpec::instance().isInternalClient = false;
+    resetIsInternalClient(false);
 
     auto deferred = runCommand(makeCallbackHandle(), makeTestCommand(kNoTimeout, makeEchoCmdObj()));
     auto isMasterHandshake = waitForIsMaster();
@@ -737,7 +765,7 @@ TEST_F(NetworkInterfaceTest, IsMasterRequestMissingInternalClientInfoWhenNotInte
     ASSERT_FALSE(isMasterHandshake.request["internalClient"]);
     // Verify that the ping op is counted as a success.
     auto res = deferred.get();
-    ASSERT(res.elapsedMillis);
+    ASSERT(res.elapsed);
     assertNumOps(0u, 0u, 0u, 1u);
 }
 

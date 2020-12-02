@@ -1,22 +1,15 @@
 /**
- *
  * Test read committed functionality following a following a rollback. Currently we require that all
  * snapshots be dropped during rollback, therefore committed reads will block until a new committed
  * snapshot is available.
+ *
+ * @tags: [requires_majority_read_concern]
  */
-
-load("jstests/replsets/rslib.js");  // For startSetIfSupportsReadMajority.
 
 (function() {
 "use strict";
 
-function assertCommittedReadsBlock(coll) {
-    var res = coll.runCommand('find', {"readConcern": {"level": "majority"}, "maxTimeMS": 3000});
-    assert.commandFailedWithCode(
-        res,
-        ErrorCodes.MaxTimeMSExpired,
-        "Expected read of " + coll.getFullName() + ' on ' + coll.getMongo().host + " to block");
-}
+load("jstests/libs/write_concern_util.js");
 
 function doCommittedRead(coll) {
     var res = coll.runCommand('find', {"readConcern": {"level": "majority"}, "maxTimeMS": 10000});
@@ -34,12 +27,7 @@ function doDirtyRead(coll) {
 var name = "read_committed_after_rollback";
 var replTest = new ReplSetTest(
     {name: name, nodes: 5, useBridge: true, nodeOptions: {enableMajorityReadConcern: ''}});
-
-if (!startSetIfSupportsReadMajority(replTest)) {
-    jsTest.log("skipping test since storage engine doesn't support committed reads");
-    replTest.stopSet();
-    return;
-}
+replTest.startSet();
 
 var nodes = replTest.nodeList();
 var config = {
@@ -60,9 +48,7 @@ replTest.initiate(config);
 
 // Get connections.
 var oldPrimary = replTest.getPrimary();
-var newPrimary = replTest._slaves[0];
-var pureSecondary = replTest._slaves[1];
-var arbiters = [replTest.nodes[3], replTest.nodes[4]];
+var [newPrimary, pureSecondary, ...arbiters] = replTest.getSecondaries();
 
 // This is the collection that all of the tests will use.
 var collName = name + '.collection';
@@ -91,21 +77,22 @@ assert.eq(doDirtyRead(oldPrimaryColl), 'INVALID');
 assert.eq(doCommittedRead(oldPrimaryColl), 'old');
 
 // Change the partitioning so that oldPrimary is isolated, and newPrimary can be elected.
-oldPrimary.setSlaveOk();
+oldPrimary.setSecondaryOk();
 oldPrimary.disconnect(arbiters);
 newPrimary.reconnect(arbiters);
-assert.soon(() => newPrimary.adminCommand('isMaster').ismaster, '', 60 * 1000);
+assert.soon(() => newPrimary.adminCommand('hello').isWritablePrimary, '', 60 * 1000);
 assert.soon(function() {
     try {
-        return !oldPrimary.adminCommand('isMaster').ismaster;
+        return !oldPrimary.adminCommand('hello').isWritablePrimary;
     } catch (e) {
         return false;  // ignore disconnect errors.
     }
 });
 
-// Stop applier on pureSecondary to ensure that writes to newPrimary won't become committed yet.
-assert.commandWorked(
-    pureSecondary.adminCommand({configureFailPoint: "rsSyncApplyStop", mode: "alwaysOn"}));
+// Stop oplog fetcher on pureSecondary to ensure that writes to newPrimary won't become committed
+// yet. As there isn't anything in the oplog buffer at this time, it is safe to pause the oplog
+// fetcher.
+stopServerReplication(pureSecondary);
 assert.commandWorked(newPrimaryColl.save({_id: 1, state: 'new'}));
 assert.eq(doDirtyRead(newPrimaryColl), 'new');
 // Note that we still can't do a committed read from the new primary and reliably get anything,
@@ -121,18 +108,16 @@ assert.eq(doCommittedRead(oldPrimaryColl), 'old');
 oldPrimary.reconnect(newPrimary);
 assert.soon(function() {
     try {
-        return oldPrimary.adminCommand('isMaster').secondary &&
-            doDirtyRead(oldPrimaryColl) == 'new';
+        return oldPrimary.adminCommand('hello').secondary && doDirtyRead(oldPrimaryColl) == 'new';
     } catch (e) {
         return false;  // ignore disconnect errors.
     }
 }, '', 60 * 1000);
 assert.eq(doDirtyRead(oldPrimaryColl), 'new');
 
-// Resume oplog application on pureSecondary to allow the 'new' write to be committed. It should
+// Resume oplog fetcher on pureSecondary to allow the 'new' write to be committed. It should
 // now be visible as a committed read to both oldPrimary and newPrimary.
-assert.commandWorked(
-    pureSecondary.adminCommand({configureFailPoint: "rsSyncApplyStop", mode: "off"}));
+restartServerReplication(pureSecondary);
 // Do a write to the new primary so that the old primary can establish a sync source to learn
 // about the new commit.
 assert.commandWorked(newPrimary.getDB(name).unrelatedCollection.insert(

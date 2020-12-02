@@ -85,13 +85,12 @@ StatusWith<std::unique_ptr<CanonicalQuery>> canonicalize(OperationContext* opCtx
     }
 
     // Create canonical query
-    const NamespaceString nss(ns);
-    auto qr = std::make_unique<QueryRequest>(std::move(nss));
+    auto qr = std::make_unique<QueryRequest>(NamespaceString{ns});
     qr->setFilter(queryObj);
     qr->setSort(sortObj);
     qr->setProj(projObj);
     qr->setCollation(collationObj);
-    const ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
+    const ExtensionsCallbackReal extensionsCallback(opCtx, &qr->nss());
     const boost::intrusive_ptr<ExpressionContext> expCtx;
     auto statusWithCQ =
         CanonicalQuery::canonicalize(opCtx,

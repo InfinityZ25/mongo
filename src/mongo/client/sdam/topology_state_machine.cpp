@@ -26,16 +26,19 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 #include "mongo/client/sdam/topology_state_machine.h"
 
-#include <functional>
 #include <ostream>
 
 #include "mongo/client/sdam/sdam_test_base.h"
 #include "mongo/logv2/log.h"
 
 namespace mongo::sdam {
+namespace {
+static constexpr auto kLogLevel = 2;
+}  // namespace
+
 TopologyStateMachine::TopologyStateMachine(const SdamConfiguration& config) : _config(config) {
     initTransitionTable();
 }
@@ -52,18 +55,17 @@ inline int idx(T enumType) {
  * https://github.com/mongodb/specifications/blob/master/source/server-discovery-and-monitoring/server-discovery-and-monitoring.rst#topologytype-table
  */
 void mongo::sdam::TopologyStateMachine::initTransitionTable() {
-    using namespace std::placeholders;
+    auto bindThis = [&](auto&& pmf) { return [=](auto&&... a) { (this->*pmf)(a...); }; };
 
     // init the table to No-ops
-    const TransitionAction NO_OP([](const TopologyDescription&, const ServerDescriptionPtr&) {});
     _stt.resize(allTopologyTypes().size() + 1);
     for (auto& row : _stt) {
-        row.resize(allServerTypes().size() + 1, NO_OP);
+        row.resize(allServerTypes().size() + 1, [](auto&&...) {});
     }
 
     // From TopologyType: Unknown
     _stt[idx(TopologyType::kUnknown)][idx(ServerType::kStandalone)] =
-        std::bind(&TopologyStateMachine::updateUnknownWithStandalone, this, _1, _2);
+        bindThis(&TopologyStateMachine::updateUnknownWithStandalone);
     _stt[idx(TopologyType::kUnknown)][idx(ServerType::kMongos)] =
         setTopologyTypeAction(TopologyType::kSharded);
     _stt[idx(TopologyType::kUnknown)][idx(ServerType::kRSPrimary)] =
@@ -73,8 +75,8 @@ void mongo::sdam::TopologyStateMachine::initTransitionTable() {
         const auto serverTypes = std::vector<ServerType>{
             ServerType::kRSSecondary, ServerType::kRSArbiter, ServerType::kRSOther};
         for (auto newServerType : serverTypes) {
-            _stt[idx(TopologyType::kUnknown)][idx(newServerType)] = std::bind(
-                &TopologyStateMachine::setTopologyTypeAndUpdateRSWithoutPrimary, this, _1, _2);
+            _stt[idx(TopologyType::kUnknown)][idx(newServerType)] =
+                bindThis(&TopologyStateMachine::setTopologyTypeAndUpdateRSWithoutPrimary);
         }
     }
 
@@ -88,7 +90,7 @@ void mongo::sdam::TopologyStateMachine::initTransitionTable() {
                                                          ServerType::kRSGhost};
         for (auto newServerType : serverTypes) {
             _stt[idx(TopologyType::kSharded)][idx(newServerType)] =
-                std::bind(&TopologyStateMachine::removeAndStopMonitoring, this, _1, _2);
+                bindThis(&TopologyStateMachine::removeAndStopMonitoring);
         }
     }
 
@@ -98,7 +100,7 @@ void mongo::sdam::TopologyStateMachine::initTransitionTable() {
             std::vector<ServerType>{ServerType::kStandalone, ServerType::kMongos};
         for (auto serverType : serverTypes) {
             _stt[idx(TopologyType::kReplicaSetNoPrimary)][idx(serverType)] =
-                std::bind(&TopologyStateMachine::removeAndStopMonitoring, this, _1, _2);
+                bindThis(&TopologyStateMachine::removeAndStopMonitoring);
         }
     }
 
@@ -110,7 +112,7 @@ void mongo::sdam::TopologyStateMachine::initTransitionTable() {
             ServerType::kRSSecondary, ServerType::kRSArbiter, ServerType::kRSOther};
         for (auto serverType : serverTypes) {
             _stt[idx(TopologyType::kReplicaSetNoPrimary)][idx(serverType)] =
-                std::bind(&TopologyStateMachine::updateRSWithoutPrimary, this, _1, _2);
+                bindThis(&TopologyStateMachine::updateRSWithoutPrimary);
         }
     }
 
@@ -120,28 +122,27 @@ void mongo::sdam::TopologyStateMachine::initTransitionTable() {
             std::vector<ServerType>{ServerType::kUnknown, ServerType::kRSGhost};
         for (auto serverType : serverTypes) {
             _stt[idx(TopologyType::kReplicaSetWithPrimary)][idx(serverType)] =
-                std::bind(&TopologyStateMachine::checkIfHasPrimary, this, _1, _2);
+                bindThis(&TopologyStateMachine::checkIfHasPrimary);
         }
     }
 
     {
-        const auto serverTypes =
-            std::vector<ServerType>{ServerType::kStandalone, ServerType::kMongos};
+        const auto serverTypes = std::vector<ServerType>{ServerType::kMongos};
         for (auto serverType : serverTypes) {
             _stt[idx(TopologyType::kReplicaSetWithPrimary)][idx(serverType)] =
-                std::bind(&TopologyStateMachine::removeAndCheckIfHasPrimary, this, _1, _2);
+                bindThis(&TopologyStateMachine::removeAndCheckIfHasPrimary);
         }
     }
 
     _stt[idx(TopologyType::kReplicaSetWithPrimary)][idx(ServerType::kRSPrimary)] =
-        std::bind(&TopologyStateMachine::updateRSFromPrimary, this, _1, _2);
+        bindThis(&TopologyStateMachine::updateRSFromPrimary);
 
     {
         const auto serverTypes = std::vector<ServerType>{
             ServerType::kRSSecondary, ServerType::kRSArbiter, ServerType::kRSOther};
         for (auto serverType : serverTypes) {
             _stt[idx(TopologyType::kReplicaSetWithPrimary)][idx(serverType)] =
-                std::bind(&TopologyStateMachine::updateRSWithPrimaryFromMember, this, _1, _2);
+                bindThis(&TopologyStateMachine::updateRSWithPrimaryFromMember);
         }
     }
 }
@@ -149,19 +150,32 @@ void mongo::sdam::TopologyStateMachine::initTransitionTable() {
 void TopologyStateMachine::onServerDescription(TopologyDescription& topologyDescription,
                                                const ServerDescriptionPtr& serverDescription) {
     if (!topologyDescription.containsServerAddress(serverDescription->getAddress())) {
-        LOGV2(20219,
-              "{kLogPrefix}ignoring ismaster reply from server that is not in the topology: "
-              "{serverDescription_getAddress}",
-              "kLogPrefix"_attr = kLogPrefix,
-              "serverDescription_getAddress"_attr = serverDescription->getAddress());
+        LOGV2_DEBUG(20219,
+                    kLogLevel,
+                    "Ignoring isMaster reply from server that is not in the topology: "
+                    "{serverAddress}",
+                    "Ignoring isMaster reply from server that is not in the topology",
+                    "serverAddress"_attr = serverDescription->getAddress());
         return;
     }
 
-    installServerDescription(topologyDescription, serverDescription, false);
+    ServerDescriptionPtr descriptionToInstall;
+    if (topologyDescription.getType() != TopologyType::kSingle &&
+        serverDescription->getType() == ServerType::kStandalone) {
+        // Create unknown server description with same address
+        descriptionToInstall =
+            std::make_shared<ServerDescription>(serverDescription, ServerType::kUnknown);
+    } else {
+        descriptionToInstall = serverDescription;
+    }
+
+    installServerDescription(topologyDescription, descriptionToInstall, false);
 
     if (topologyDescription.getType() != TopologyType::kSingle) {
-        auto& action = _stt[idx(topologyDescription.getType())][idx(serverDescription->getType())];
-        action(topologyDescription, serverDescription);
+        auto& action =
+            _stt[idx(topologyDescription.getType())][idx(descriptionToInstall->getType())];
+
+        action(topologyDescription, descriptionToInstall);
     }
 }
 
@@ -202,9 +216,9 @@ void TopologyStateMachine::updateRSWithoutPrimary(TopologyDescription& topologyD
 
 void TopologyStateMachine::addUnknownServers(TopologyDescription& topologyDescription,
                                              const ServerDescriptionPtr& serverDescription) {
-    const std::set<ServerAddress>* addressSets[3]{&serverDescription->getHosts(),
-                                                  &serverDescription->getPassives(),
-                                                  &serverDescription->getArbiters()};
+    const std::set<HostAndPort>* addressSets[3]{&serverDescription->getHosts(),
+                                                &serverDescription->getPassives(),
+                                                &serverDescription->getArbiters()};
     for (const auto addresses : addressSets) {
         for (const auto& addressFromSet : *addresses) {
             if (!topologyDescription.containsServerAddress(addressFromSet)) {
@@ -296,7 +310,7 @@ void TopologyStateMachine::updateRSFromPrimary(TopologyDescription& topologyDesc
 
     addUnknownServers(topologyDescription, serverDescription);
 
-    std::vector<ServerAddress> toRemove;
+    std::vector<HostAndPort> toRemove;
     for (const auto& currentServerDescription : topologyDescription.getServers()) {
         const auto currentServerAddress = currentServerDescription->getAddress();
         auto hosts = serverDescription->getHosts().find(currentServerAddress);
@@ -365,61 +379,38 @@ void TopologyStateMachine::setTopologyTypeAndUpdateRSWithoutPrimary(
 }
 
 void TopologyStateMachine::removeServerDescription(TopologyDescription& topologyDescription,
-                                                   const ServerAddress serverAddress) {
+                                                   const HostAndPort serverAddress) {
     topologyDescription.removeServerDescription(serverAddress);
-    LOGV2(20220,
-          "{kLogPrefix}server '{serverAddress}' was removed from the topology.",
-          "kLogPrefix"_attr = kLogPrefix,
-          "serverAddress"_attr = serverAddress);
+    LOGV2_DEBUG(20220,
+                kLogLevel,
+                "Server '{serverAddress}' was removed from the topology",
+                "Server was removed from the topology",
+                "serverAddress"_attr = serverAddress);
 }
 
 void TopologyStateMachine::modifyTopologyType(TopologyDescription& topologyDescription,
                                               TopologyType topologyType) {
     topologyDescription._type = topologyType;
-    LOGV2(20221,
-          "{kLogPrefix}the topology type was set to {topologyType}",
-          "kLogPrefix"_attr = kLogPrefix,
-          "topologyType"_attr = toString(topologyType));
 }
 
 void TopologyStateMachine::modifySetName(TopologyDescription& topologyDescription,
                                          const boost::optional<std::string>& setName) {
     topologyDescription._setName = setName;
-    LOGV2(20222,
-          "{kLogPrefix}the topology setName was set to {setName_setName_null}",
-          "kLogPrefix"_attr = kLogPrefix,
-          "setName_setName_null"_attr = ((setName) ? *setName : "[null]"));
 }
 
 void TopologyStateMachine::installServerDescription(TopologyDescription& topologyDescription,
                                                     ServerDescriptionPtr newServerDescription,
                                                     bool newServer) {
     topologyDescription.installServerDescription(newServerDescription);
-    LOGV2_DEBUG(20223,
-                1,
-                "{kLogPrefix}{newServer_installed_new_updated_existing} server description: "
-                "{newServerDescription}",
-                "kLogPrefix"_attr = kLogPrefix,
-                "newServer_installed_new_updated_existing"_attr =
-                    ((newServer) ? "installed new" : "updated existing"),
-                "newServerDescription"_attr = newServerDescription->toString());
 }
 
 void TopologyStateMachine::modifyMaxElectionId(TopologyDescription& topologyDescription,
                                                const OID& newMaxElectionId) {
     topologyDescription._maxElectionId = newMaxElectionId;
-    LOGV2(20224,
-          "{kLogPrefix}topology max election id set to {newMaxElectionId}",
-          "kLogPrefix"_attr = kLogPrefix,
-          "newMaxElectionId"_attr = newMaxElectionId);
 }
 
 void TopologyStateMachine::modifyMaxSetVersion(TopologyDescription& topologyDescription,
                                                int& newMaxSetVersion) {
     topologyDescription._maxSetVersion = newMaxSetVersion;
-    LOGV2(20225,
-          "{kLogPrefix}topology max set version set to {newMaxSetVersion}",
-          "kLogPrefix"_attr = kLogPrefix,
-          "newMaxSetVersion"_attr = newMaxSetVersion);
 }
 }  // namespace mongo::sdam

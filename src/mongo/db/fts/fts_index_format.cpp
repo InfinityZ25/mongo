@@ -110,7 +110,8 @@ MONGO_INITIALIZER(FTSIndexFormat)(InitializerContext* context) {
     return Status::OK();
 }
 
-void FTSIndexFormat::getKeys(const FTSSpec& spec,
+void FTSIndexFormat::getKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                             const FTSSpec& spec,
                              const BSONObj& obj,
                              KeyStringSet* keys,
                              KeyString::Version keyStringVersion,
@@ -137,11 +138,12 @@ void FTSIndexFormat::getKeys(const FTSSpec& spec,
     TermFrequencyMap term_freqs;
     spec.scoreDocument(obj, &term_freqs);
 
+    auto sequence = keys->extract_sequence();
     for (TermFrequencyMap::const_iterator i = term_freqs.begin(); i != term_freqs.end(); ++i) {
         const string& term = i->first;
         double weight = i->second;
 
-        KeyString::Builder keyString(keyStringVersion, ordering);
+        KeyString::PooledBuilder keyString(pooledBufferBuilder, keyStringVersion, ordering);
         for (const auto& elem : extrasBefore) {
             keyString.appendBSONElement(elem);
         }
@@ -154,11 +156,9 @@ void FTSIndexFormat::getKeys(const FTSSpec& spec,
             keyString.appendRecordId(*id);
         }
 
-        /*
-         * Insert a copy to only allocate as much buffer space as necessary.
-         */
-        keys->insert(keyString.getValueCopy());
+        sequence.push_back(keyString.release());
     }
+    keys->adopt_sequence(std::move(sequence));
 }
 
 BSONObj FTSIndexFormat::getIndexKey(double weight,
@@ -179,7 +179,8 @@ BSONObj FTSIndexFormat::getIndexKey(double weight,
     return b.appendElements(key).obj();
 }
 
-void FTSIndexFormat::_appendIndexKey(KeyString::Builder& keyString,
+template <typename KeyStringBuilder>
+void FTSIndexFormat::_appendIndexKey(KeyStringBuilder& keyString,
                                      double weight,
                                      const string& term,
                                      TextIndexVersion textIndexVersion) {
@@ -200,7 +201,7 @@ void FTSIndexFormat::_appendIndexKey(KeyString::Builder& keyString,
             } t;
             uint32_t seed = 0;
             MurmurHash3_x64_128(term.data(), term.size(), seed, t.hash);
-            string keySuffix = mongo::toHexLower(t.data, sizeof(t.data));
+            string keySuffix = hexblob::encodeLower(t.data, sizeof(t.data));
             invariant(termKeySuffixLengthV2 == keySuffix.size());
             keyString.appendString(term.substr(0, termKeyPrefixLengthV2) + keySuffix);
         }

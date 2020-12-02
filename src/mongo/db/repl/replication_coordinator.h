@@ -41,6 +41,7 @@
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/split_horizon.h"
 #include "mongo/db/repl/sync_source_selector.h"
+#include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/rpc/topology_version_gen.h"
 #include "mongo/util/net/hostandport.h"
@@ -72,7 +73,7 @@ class ReplSetMetadata;
 namespace repl {
 
 class BackgroundSync;
-class IsMasterResponse;
+class HelloResponse;
 class OpTime;
 class OpTimeAndWallTime;
 class ReadConcernArgs;
@@ -115,7 +116,8 @@ public:
      * components of the replication system to start up whatever threads and do whatever
      * initialization they need.
      */
-    virtual void startup(OperationContext* opCtx) = 0;
+    virtual void startup(OperationContext* opCtx,
+                         LastStorageEngineShutdownState lastStorageEngineShutdownState) = 0;
 
     /**
      * Start terminal shutdown.  This causes the topology coordinator to refuse to vote in any
@@ -128,11 +130,20 @@ public:
 
     /**
      * We enter quiesce mode during the shutdown process if we are in secondary mode. While in
-     * quiesce mode, we allow reads to continue and accept new reads, but we fail isMaster requests
+     * quiesce mode, we allow reads to continue and accept new reads, but we fail hello requests
      * with ShutdownInProgress. This function causes us to increment the topologyVersion and start
-     * failing isMaster requests with ShutdownInProgress.
+     * failing hello requests with ShutdownInProgress. Returns true if the server entered quiesce
+     * mode.
+     *
+     * We take in quiesceTime only for reporting purposes. The waiting during quiesce mode happens
+     * external to the ReplicationCoordinator.
      */
-    virtual void enterQuiesceMode() = 0;
+    virtual bool enterQuiesceModeIfSecondary(Milliseconds quiesceTime) = 0;
+
+    /**
+     * Returns whether the server is in quiesce mode.
+     */
+    virtual bool inQuiesceMode() const = 0;
 
     /**
      * Does whatever cleanup is required to stop replication, including instructing the other
@@ -204,10 +215,10 @@ public:
     virtual bool isInPrimaryOrSecondaryState_UNSAFE() const = 0;
 
     /**
-     * Returns how slave delayed this node is configured to be, or 0 seconds if this node is not a
-     * member of the current replica set configuration.
+     * Returns how secondary delayed this node is configured to be, or 0 seconds if this node is not
+     * a member of the current replica set configuration.
      */
-    virtual Seconds getSlaveDelaySecs() const = 0;
+    virtual Seconds getSecondaryDelaySecs() const = 0;
 
     /**
      * Blocks the calling thread for up to writeConcern.wTimeout millis, or until "opTime" has
@@ -218,7 +229,7 @@ public:
      *     the data has been sufficiently replicated
      * ErrorCodes::ExceededTimeLimit if the opCtx->getMaxTimeMicrosRemaining is reached before
      *     the data has been sufficiently replicated
-     * ErrorCodes::NotMaster if the node is not Primary/Master
+     * ErrorCodes::NotWritablePrimary if the node is not a writable primary
      * ErrorCodes::UnknownReplWriteConcern if the writeConcern.wMode contains a write concern
      *     mode that is not known
      * ErrorCodes::ShutdownInProgress if we are mid-shutdown
@@ -239,10 +250,10 @@ public:
                           const Milliseconds& stepdownTime) = 0;
 
     /**
-     * Returns true if the node can be considered master for the purpose of introspective
-     * commands such as isMaster() and rs.status().
+     * Returns true if the primary can be considered writable for the purpose of introspective
+     * commands such as hello() and rs.status().
      */
-    virtual bool isMasterForReportingPurposes() = 0;
+    virtual bool isWritablePrimaryForReportingPurposes() = 0;
 
     /**
      * Returns true if it is valid for this node to accept writes on the given database.  Currently
@@ -311,7 +322,7 @@ public:
      */
     virtual Status checkCanServeReadsFor(OperationContext* opCtx,
                                          const NamespaceString& ns,
-                                         bool slaveOk) = 0;
+                                         bool secondaryOk) = 0;
 
     /**
      * Version which does not check for the RSTL.  Do not use in new code. Without the RSTL held,
@@ -319,7 +330,7 @@ public:
      */
     virtual Status checkCanServeReadsFor_UNSAFE(OperationContext* opCtx,
                                                 const NamespaceString& ns,
-                                                bool slaveOk) = 0;
+                                                bool secondaryOk) = 0;
 
     /**
      * Returns true if this node should ignore index constraints for idempotency reasons.
@@ -355,20 +366,9 @@ public:
     virtual void setMyLastDurableOpTimeAndWallTime(const OpTimeAndWallTime& opTimeAndWallTime) = 0;
 
     /**
-     * This type is used to represent the "consistency" of a current database state. In
-     * replication, there may be times when our database data is not represented by a single optime,
-     * because we have fetched remote data from different points in time. For example, when we are
-     * in RECOVERING following a refetch based rollback. We never allow external clients to read
-     * from the database if it is not consistent.
-     */
-    enum class DataConsistency { Consistent, Inconsistent };
-
-    /**
      * Updates our internal tracking of the last OpTime applied to this node, but only
      * if the supplied optime is later than the current last OpTime known to the replication
-     * coordinator. The 'consistency' argument must tell whether or not the optime argument
-     * represents a consistent database state. Also updates the wall clock time corresponding to
-     * that operation.
+     * coordinator.
      *
      * This function is used by logOp() on a primary, since the ops in the oplog do not
      * necessarily commit in sequential order. It is also used when we finish oplog batch
@@ -376,7 +376,7 @@ public:
      * applied optime from more than one thread.
      */
     virtual void setMyLastAppliedOpTimeAndWallTimeForward(
-        const OpTimeAndWallTime& opTimeAndWallTime, DataConsistency consistency) = 0;
+        const OpTimeAndWallTime& opTimeAndWallTime) = 0;
 
     /**
      * Updates our internal tracking of the last OpTime durable to this node, but only
@@ -408,8 +408,13 @@ public:
     /*
      * Returns the same as getMyLastAppliedOpTime() and additionally returns the wall clock time
      * corresponding to that OpTime.
+     *
+     * When rollbackSafe is true, this returns an empty OpTimeAndWallTime if the node is in ROLLBACK
+     * state. The lastAppliedOpTime during ROLLBACK might be temporarily pointing to an oplog entry
+     * in the divergent branch of history which would become invalid after the rollback finishes.
      */
-    virtual OpTimeAndWallTime getMyLastAppliedOpTimeAndWallTime() const = 0;
+    virtual OpTimeAndWallTime getMyLastAppliedOpTimeAndWallTime(
+        bool rollbackSafe = false) const = 0;
 
     /**
      * Returns the last optime recorded by setMyLastDurableOpTime.
@@ -421,6 +426,13 @@ public:
      * corresponding to that OpTime.
      */
     virtual OpTimeAndWallTime getMyLastDurableOpTimeAndWallTime() const = 0;
+
+    /**
+     * Waits until the majority committed snapshot is at least the 'targetOpTime'.
+     */
+    virtual Status waitUntilMajorityOpTime(OperationContext* opCtx,
+                                           OpTime targetOpTime,
+                                           boost::optional<Date_t> deadline = boost::none) = 0;
 
     /**
      * Waits until the optime of the current node is at least the opTime specified in 'settings'.
@@ -520,14 +532,14 @@ public:
      *      |
      *      | applier signals drain is complete
      *      V
-     * - primary is in master mode
+     * - primary is in writable mode
      * (producer: Stopped, applier: Stopped)
      *
      *
      * Step-down
      * =========
      * The state transitions become:
-     * - primary is in master mode
+     * - primary is in writable mode
      * (producer: Stopped, applier: Stopped)
      *      |
      *      | step down
@@ -573,15 +585,6 @@ public:
     virtual void signalDrainComplete(OperationContext* opCtx, long long termWhenBufferIsEmpty) = 0;
 
     /**
-     * Waits duration of 'timeout' for applier to finish draining its buffer of operations.
-     * Returns OK if we are not in drain mode.
-     * Returns ErrorCodes::ExceededTimeLimit if we timed out waiting for the applier to drain its
-     * buffer.
-     * Returns ErrorCodes::BadValue if timeout is negative.
-     */
-    virtual Status waitForDrainFinish(Milliseconds timeout) = 0;
-
-    /**
      * Signals the sync source feedback thread to wake up and send a handshake and
      * replSetUpdatePosition command to our sync source.
      */
@@ -603,10 +606,10 @@ public:
                                            ReplSetGetStatusResponseStyle responseStyle) = 0;
 
     /**
-     * Adds to "result" a description of the slaveInfo data structure used to map RIDs to their
+     * Adds to "result" a description of the memberData data structure used to map RIDs to their
      * last known optimes.
      */
-    virtual void appendSlaveInfoData(BSONObjBuilder* result) = 0;
+    virtual void appendSecondaryInfoData(BSONObjBuilder* result) = 0;
 
     /**
      * Returns a copy of the current ReplSetConfig.
@@ -618,8 +621,12 @@ public:
      *
      * If commitmentStatus is true, adds a boolean 'commitmentStatus' field to 'result' indicating
      * whether the current config is committed.
+     *
+     * If includeNewlyAdded is true, does not omit 'newlyAdded' fields from the config.
      */
-    virtual void processReplSetGetConfig(BSONObjBuilder* result, bool commitmentStatus = false) = 0;
+    virtual void processReplSetGetConfig(BSONObjBuilder* result,
+                                         bool commitmentStatus = false,
+                                         bool includeNewlyAdded = false) = 0;
 
     /**
      * Processes the ReplSetMetadata returned from a command run against another
@@ -731,15 +738,14 @@ public:
      * Returns Status::OK() if all updates are processed correctly, NodeNotFound
      * if any updating node cannot be found in the config, InvalidReplicaSetConfig if the
      * "configVersion" sent in any of the updates doesn't match our config version, or
-     * NotMasterOrSecondary if we are in state REMOVED or otherwise don't have a valid
+     * NotPrimaryOrSecondary if we are in state REMOVED or otherwise don't have a valid
      * replica set config.
      * If a non-OK status is returned, it is unspecified whether none or some of the updates
      * were applied.
      * "configVersion" will be populated with our config version if and only if we return
      * InvalidReplicaSetConfig.
      */
-    virtual Status processReplSetUpdatePosition(const UpdatePositionArgs& updates,
-                                                long long* configVersion) = 0;
+    virtual Status processReplSetUpdatePosition(const UpdatePositionArgs& updates) = 0;
 
     /**
      * Returns a bool indicating whether or not this node builds indexes.
@@ -769,11 +775,9 @@ public:
 
     /**
      * Loads the optime from the last op in the oplog into the coordinator's lastAppliedOpTime and
-     * lastDurableOpTime values. The 'consistency' argument must tell whether or not the optime of
-     * the op in the oplog represents a consistent database state.
+     * lastDurableOpTime values.
      */
-    virtual void resetLastOpTimesFromOplog(OperationContext* opCtx,
-                                           DataConsistency consistency) = 0;
+    virtual void resetLastOpTimesFromOplog(OperationContext* opCtx) = 0;
 
     /**
      * Returns the OpTime of the latest replica set-committed op known to this server.
@@ -843,19 +847,14 @@ public:
                                             const Timestamp& untilSnapshot) = 0;
 
     /**
-     * Resets all information related to snapshotting.
+     * Clears the current committed snapshot.
      */
-    virtual void dropAllSnapshots() = 0;
+    virtual void clearCommittedSnapshot() = 0;
 
     /**
      * Gets the latest OpTime of the currentCommittedSnapshot.
      */
     virtual OpTime getCurrentCommittedSnapshotOpTime() const = 0;
-
-    /**
-     * Gets the latest OpTime of the currentCommittedSnapshot and its corresponding wall clock time.
-     */
-    virtual OpTimeAndWallTime getCurrentCommittedSnapshotOpTimeAndWallTime() const = 0;
 
     /**
      * Appends diagnostics about the replication subsystem.
@@ -935,6 +934,12 @@ public:
     virtual bool setContainsArbiter() const = 0;
 
     /**
+     * Returns true if the current replica set config has at least one member with 'newlyAdded'
+     * field set to true.
+     */
+    virtual bool replSetContainsNewlyAddedMembers() const = 0;
+
+    /**
      * Instructs the ReplicationCoordinator to recalculate the stable timestamp and advance it for
      * storage if needed.
      */
@@ -972,43 +977,43 @@ public:
 
     /**
      * Increment the server TopologyVersion and fulfill the promise of any currently waiting
-     * isMaster request.
+     * hello request.
      */
     virtual void incrementTopologyVersion() = 0;
 
     /**
-     * Constructs and returns an IsMasterResponse. Will block until the given deadline waiting for a
+     * Constructs and returns a HelloResponse. Will block until the given deadline waiting for a
      * significant topology change if the 'counter' field of 'clientTopologyVersion' is equal to the
      * current TopologyVersion 'counter' from the TopologyCoordinator. Returns immediately if
      * 'clientTopologyVersion' < TopologyVersion of the TopologyCoordinator or if the processId
      * differs.
      */
-    virtual std::shared_ptr<const IsMasterResponse> awaitIsMasterResponse(
+    virtual std::shared_ptr<const HelloResponse> awaitHelloResponse(
         OperationContext* opCtx,
         const SplitHorizon::Parameters& horizonParams,
         boost::optional<TopologyVersion> clientTopologyVersion,
         boost::optional<Date_t> deadline) = 0;
 
     /**
-     * The futurized version of `awaitIsMasterResponse()`:
-     * * The future is ready for all cases that `awaitIsMasterResponse()` returns immediately.
-     * * For cases that `awaitIsMasterResponse()` blocks, calling `get()` on the future is blocking.
+     * The futurized version of `awaitHelloResponse()`:
+     * * The future is ready for all cases that `awaitHelloResponse()` returns immediately.
+     * * For cases that `awaitHelloResponse()` blocks, calling `get()` on the future is blocking.
      */
-    virtual SharedSemiFuture<std::shared_ptr<const IsMasterResponse>> getIsMasterResponseFuture(
+    virtual SharedSemiFuture<std::shared_ptr<const HelloResponse>> getHelloResponseFuture(
         const SplitHorizon::Parameters& horizonParams,
         boost::optional<TopologyVersion> clientTopologyVersion) = 0;
 
     /**
      * Returns the OpTime that consists of the timestamp of the latest oplog entry and the current
      * term.
-     * This function throws if:
+     * This function returns a non-ok status if:
      * 1. It is called on secondaries.
      * 2. OperationContext times out or is interrupted.
      * 3. Oplog collection does not exist.
      * 4. Oplog collection is empty.
      * 5. Getting latest oplog timestamp is not supported by the storage engine.
      */
-    virtual OpTime getLatestWriteOpTime(OperationContext* opCtx) const = 0;
+    virtual StatusWith<OpTime> getLatestWriteOpTime(OperationContext* opCtx) const noexcept = 0;
 
     /**
      * Returns the HostAndPort of the current primary, or an empty HostAndPort if there is no
@@ -1042,7 +1047,7 @@ public:
     /**
      * A testing only function that cancels and reschedules replication heartbeats immediately.
      */
-    virtual void restartHeartbeats_forTest() = 0;
+    virtual void restartScheduledHeartbeats_forTest() = 0;
 
 protected:
     ReplicationCoordinator();

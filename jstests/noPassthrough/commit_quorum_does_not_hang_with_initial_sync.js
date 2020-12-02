@@ -34,6 +34,12 @@ const rst = new ReplSetTest({
                 priority: 0,
             },
         },
+        {
+            // Disallow elections on secondary.
+            rsConfig: {
+                priority: 0,
+            },
+        },
     ]
 });
 
@@ -43,14 +49,6 @@ rst.initiate();
 const primary = rst.getPrimary();
 const db = primary.getDB(dbName);
 const coll = db.getCollection(collName);
-
-if (!(IndexBuildTest.supportsTwoPhaseIndexBuild(primary) &&
-      IndexBuildTest.indexBuildCommitQuorumEnabled(primary))) {
-    jsTestLog(
-        'Skipping test because two phase index build and index build commit quorum are not supported.');
-    rst.stopSet();
-    return;
-}
 
 assert.commandWorked(coll.insert({a: 1, b: 1, c: 1, d: 1, e: 1, f: 1, g: 1}));
 assert.commandWorked(coll.createIndex({a: 1}, {}, "votingMembers"));
@@ -111,10 +109,6 @@ function checkForIndexes(indexes) {
     }
 }
 checkForIndexes(["b_1", "c_1", "d_1", "e_1", "f_1", "g_1"]);
-
-// Checks that the index specs have the proper grouping by ensuring that we only start 3 index
-// builder threads.
-checkLog.containsWithCount(secondary, "Index build initialized", 3);
 
 assert.commandWorked(
     secondary.adminCommand({configureFailPoint: "initialSyncHangAfterDataCloning", mode: "off"}));

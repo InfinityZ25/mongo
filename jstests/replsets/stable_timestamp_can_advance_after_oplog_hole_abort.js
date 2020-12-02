@@ -1,12 +1,15 @@
 /**
  * Test that the stable timestamp can advance after an oplog hole is released via an abort.
  *
- * @tags: [uses_transactions,requires_fcv_44]
+ * @tags: [
+ *   uses_transactions,
+ * ]
  */
 
 (function() {
 "use strict";
 load("jstests/libs/fail_point_util.js");
+load("jstests/libs/parallelTester.js");  // For Thread.
 
 const replTest = new ReplSetTest({nodes: 1});
 replTest.startSet();

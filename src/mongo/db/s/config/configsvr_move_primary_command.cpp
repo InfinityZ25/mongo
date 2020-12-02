@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -149,10 +149,7 @@ public:
             opCtx, dbname, "movePrimary", DistLockManager::kDefaultLockTimeout));
 
         auto dbType =
-            uassertStatusOK(catalogClient->getDatabase(
-                                opCtx, dbname, repl::ReadConcernArgs::get(opCtx).getLevel()))
-                .value;
-
+            catalogClient->getDatabase(opCtx, dbname, repl::ReadConcernArgs::get(opCtx).getLevel());
         const auto fromShard = uassertStatusOK(shardRegistry->getShard(opCtx, dbType.getPrimary()));
 
         const auto toShard = [&]() {
@@ -192,7 +189,7 @@ public:
             ReadPreferenceSetting(ReadPreference::PrimaryOnly),
             "admin",
             CommandHelpers::appendMajorityWriteConcern(
-                CommandHelpers::appendPassthroughFields(cmdObj, shardMovePrimaryRequest.toBSON())),
+                CommandHelpers::appendGenericCommandArgs(cmdObj, shardMovePrimaryRequest.toBSON())),
             Shard::RetryPolicy::kIdempotent));
 
         CommandHelpers::filterCommandReplyForPassthrough(cmdResponse.response, &result);

@@ -32,7 +32,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/all_database_cloner.h"
-#include "mongo/db/repl/cloner_test_fixture.h"
+#include "mongo/db/repl/initial_sync_cloner_test_fixture.h"
 #include "mongo/db/repl/replication_consistency_markers_impl.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_mock.h"
@@ -46,13 +46,13 @@
 namespace mongo {
 namespace repl {
 
-class AllDatabaseClonerTest : public ClonerTestFixture {
+class AllDatabaseClonerTest : public InitialSyncClonerTestFixture {
 public:
     AllDatabaseClonerTest() {}
 
 protected:
     std::unique_ptr<AllDatabaseCloner> makeAllDatabaseCloner() {
-        return std::make_unique<AllDatabaseCloner>(_sharedData.get(),
+        return std::make_unique<AllDatabaseCloner>(getSharedData(),
                                                    _source,
                                                    _mockClient.get(),
                                                    &_storageInterface,
@@ -88,14 +88,14 @@ TEST_F(AllDatabaseClonerTest, RetriesConnect) {
     beforeRetryFailPoint->waitForTimesEntered(timesEnteredRetry + 1);
 
     // At this point we should have failed, but not recorded the failure yet.
-    ASSERT_EQ(0, _sharedData->getRetryingOperationsCount(WithLock::withoutLock()));
-    ASSERT_EQ(0, _sharedData->getTotalRetries(WithLock::withoutLock()));
+    ASSERT_EQ(0, getSharedData()->getRetryingOperationsCount(WithLock::withoutLock()));
+    ASSERT_EQ(0, getSharedData()->getTotalRetries(WithLock::withoutLock()));
 
     beforeRetryFailPoint->setMode(FailPoint::off, 0);
     beforeRBIDFailPoint->waitForTimesEntered(timesEnteredRBID + 1);
     // Now the failure should be recorded.
-    ASSERT_EQ(1, _sharedData->getRetryingOperationsCount(WithLock::withoutLock()));
-    ASSERT_EQ(1, _sharedData->getTotalRetries(WithLock::withoutLock()));
+    ASSERT_EQ(1, getSharedData()->getRetryingOperationsCount(WithLock::withoutLock()));
+    ASSERT_EQ(1, getSharedData()->getTotalRetries(WithLock::withoutLock()));
 
     _clock.advance(Minutes(60));
 
@@ -105,8 +105,8 @@ TEST_F(AllDatabaseClonerTest, RetriesConnect) {
     beforeRetryFailPoint->waitForTimesEntered(timesEnteredRetry + 1);
 
     // Only first failure is recorded.
-    ASSERT_EQ(1, _sharedData->getRetryingOperationsCount(WithLock::withoutLock()));
-    ASSERT_EQ(1, _sharedData->getTotalRetries(WithLock::withoutLock()));
+    ASSERT_EQ(1, getSharedData()->getRetryingOperationsCount(WithLock::withoutLock()));
+    ASSERT_EQ(1, getSharedData()->getTotalRetries(WithLock::withoutLock()));
 
     timesEnteredRBID = beforeRBIDFailPoint->setMode(
         FailPoint::alwaysOn, 0, fromjson("{cloner: 'AllDatabaseCloner', stage: 'connect'}"));
@@ -114,8 +114,8 @@ TEST_F(AllDatabaseClonerTest, RetriesConnect) {
     beforeRBIDFailPoint->waitForTimesEntered(timesEnteredRBID + 1);
 
     // Second failure is recorded.
-    ASSERT_EQ(1, _sharedData->getRetryingOperationsCount(WithLock::withoutLock()));
-    ASSERT_EQ(2, _sharedData->getTotalRetries(WithLock::withoutLock()));
+    ASSERT_EQ(1, getSharedData()->getRetryingOperationsCount(WithLock::withoutLock()));
+    ASSERT_EQ(2, getSharedData()->getTotalRetries(WithLock::withoutLock()));
 
     // Bring the server up.
     LOGV2(21061, "Bringing mock server back up.");
@@ -126,9 +126,9 @@ TEST_F(AllDatabaseClonerTest, RetriesConnect) {
     clonerThread.join();
 
     // Total retries and outage time should be available.
-    ASSERT_EQ(0, _sharedData->getRetryingOperationsCount(WithLock::withoutLock()));
-    ASSERT_EQ(2, _sharedData->getTotalRetries(WithLock::withoutLock()));
-    ASSERT_EQ(Minutes(60), _sharedData->getTotalTimeUnreachable(WithLock::withoutLock()));
+    ASSERT_EQ(0, getSharedData()->getRetryingOperationsCount(WithLock::withoutLock()));
+    ASSERT_EQ(2, getSharedData()->getTotalRetries(WithLock::withoutLock()));
+    ASSERT_EQ(Minutes(60), getSharedData()->getTotalTimeUnreachable(WithLock::withoutLock()));
 }
 
 TEST_F(AllDatabaseClonerTest, RetriesConnectButFails) {
@@ -161,9 +161,10 @@ TEST_F(AllDatabaseClonerTest, RetriesConnectButFails) {
     _clock.advance(Minutes(1));
 
     // Total retries and outage time should be available.
-    ASSERT_EQ(0, _sharedData->getRetryingOperationsCount(WithLock::withoutLock()));
-    ASSERT_EQ(1, _sharedData->getTotalRetries(WithLock::withoutLock()));
-    ASSERT_EQ(Days(1) + Seconds(1), _sharedData->getTotalTimeUnreachable(WithLock::withoutLock()));
+    ASSERT_EQ(0, getSharedData()->getRetryingOperationsCount(WithLock::withoutLock()));
+    ASSERT_EQ(1, getSharedData()->getTotalRetries(WithLock::withoutLock()));
+    ASSERT_EQ(Days(1) + Seconds(1),
+              getSharedData()->getTotalTimeUnreachable(WithLock::withoutLock()));
 }
 
 // Note that the code for retrying listDatabases is the same for all stages except connect, so
@@ -203,14 +204,14 @@ TEST_F(AllDatabaseClonerTest, RetriesListDatabases) {
     beforeRetryFailPoint->waitForTimesEntered(timesEnteredRetry + 1);
 
     // At this point we should have failed, but not recorded the failure yet.
-    ASSERT_EQ(0, _sharedData->getRetryingOperationsCount(WithLock::withoutLock()));
-    ASSERT_EQ(0, _sharedData->getTotalRetries(WithLock::withoutLock()));
+    ASSERT_EQ(0, getSharedData()->getRetryingOperationsCount(WithLock::withoutLock()));
+    ASSERT_EQ(0, getSharedData()->getTotalRetries(WithLock::withoutLock()));
 
     beforeRetryFailPoint->setMode(FailPoint::off, 0);
     beforeRBIDFailPoint->waitForTimesEntered(timesEnteredRBID + 1);
     // Now the failure should be recorded.
-    ASSERT_EQ(1, _sharedData->getRetryingOperationsCount(WithLock::withoutLock()));
-    ASSERT_EQ(1, _sharedData->getTotalRetries(WithLock::withoutLock()));
+    ASSERT_EQ(1, getSharedData()->getRetryingOperationsCount(WithLock::withoutLock()));
+    ASSERT_EQ(1, getSharedData()->getTotalRetries(WithLock::withoutLock()));
 
     _clock.advance(Minutes(60));
 
@@ -220,8 +221,8 @@ TEST_F(AllDatabaseClonerTest, RetriesListDatabases) {
     beforeRetryFailPoint->waitForTimesEntered(timesEnteredRetry + 1);
 
     // Only first failure is recorded.
-    ASSERT_EQ(1, _sharedData->getRetryingOperationsCount(WithLock::withoutLock()));
-    ASSERT_EQ(1, _sharedData->getTotalRetries(WithLock::withoutLock()));
+    ASSERT_EQ(1, getSharedData()->getRetryingOperationsCount(WithLock::withoutLock()));
+    ASSERT_EQ(1, getSharedData()->getTotalRetries(WithLock::withoutLock()));
 
     timesEnteredRBID = beforeRBIDFailPoint->setMode(
         FailPoint::alwaysOn, 0, fromjson("{cloner: 'AllDatabaseCloner', stage: 'listDatabases'}"));
@@ -229,8 +230,8 @@ TEST_F(AllDatabaseClonerTest, RetriesListDatabases) {
     beforeRBIDFailPoint->waitForTimesEntered(timesEnteredRBID + 1);
 
     // Second failure is recorded.
-    ASSERT_EQ(1, _sharedData->getRetryingOperationsCount(WithLock::withoutLock()));
-    ASSERT_EQ(2, _sharedData->getTotalRetries(WithLock::withoutLock()));
+    ASSERT_EQ(1, getSharedData()->getRetryingOperationsCount(WithLock::withoutLock()));
+    ASSERT_EQ(2, getSharedData()->getTotalRetries(WithLock::withoutLock()));
 
     // Bring the server up.
     LOGV2(21062, "Bringing mock server back up.");
@@ -241,9 +242,9 @@ TEST_F(AllDatabaseClonerTest, RetriesListDatabases) {
     clonerThread.join();
 
     // Total retries and outage time should be available.
-    ASSERT_EQ(0, _sharedData->getRetryingOperationsCount(WithLock::withoutLock()));
-    ASSERT_EQ(2, _sharedData->getTotalRetries(WithLock::withoutLock()));
-    ASSERT_EQ(Minutes(60), _sharedData->getTotalTimeUnreachable(WithLock::withoutLock()));
+    ASSERT_EQ(0, getSharedData()->getRetryingOperationsCount(WithLock::withoutLock()));
+    ASSERT_EQ(2, getSharedData()->getTotalRetries(WithLock::withoutLock()));
+    ASSERT_EQ(Minutes(60), getSharedData()->getTotalTimeUnreachable(WithLock::withoutLock()));
 }
 
 TEST_F(AllDatabaseClonerTest, RetriesListDatabasesButRollBackIdChanges) {
@@ -289,9 +290,9 @@ TEST_F(AllDatabaseClonerTest, RetriesListDatabasesButRollBackIdChanges) {
     clonerThread.join();
 
     // Total retries and outage time should be available.
-    ASSERT_EQ(0, _sharedData->getRetryingOperationsCount(WithLock::withoutLock()));
-    ASSERT_EQ(1, _sharedData->getTotalRetries(WithLock::withoutLock()));
-    ASSERT_EQ(Minutes(60), _sharedData->getTotalTimeUnreachable(WithLock::withoutLock()));
+    ASSERT_EQ(0, getSharedData()->getRetryingOperationsCount(WithLock::withoutLock()));
+    ASSERT_EQ(1, getSharedData()->getTotalRetries(WithLock::withoutLock()));
+    ASSERT_EQ(Minutes(60), getSharedData()->getTotalTimeUnreachable(WithLock::withoutLock()));
 }
 
 TEST_F(AllDatabaseClonerTest, RetriesListDatabasesButSourceNodeIsDowngraded) {
@@ -338,9 +339,9 @@ TEST_F(AllDatabaseClonerTest, RetriesListDatabasesButSourceNodeIsDowngraded) {
     clonerThread.join();
 
     // Total retries and outage time should be available.
-    ASSERT_EQ(0, _sharedData->getRetryingOperationsCount(WithLock::withoutLock()));
-    ASSERT_EQ(1, _sharedData->getTotalRetries(WithLock::withoutLock()));
-    ASSERT_EQ(Minutes(60), _sharedData->getTotalTimeUnreachable(WithLock::withoutLock()));
+    ASSERT_EQ(0, getSharedData()->getRetryingOperationsCount(WithLock::withoutLock()));
+    ASSERT_EQ(1, getSharedData()->getTotalRetries(WithLock::withoutLock()));
+    ASSERT_EQ(Minutes(60), getSharedData()->getTotalTimeUnreachable(WithLock::withoutLock()));
 }
 
 TEST_F(AllDatabaseClonerTest, RetriesListDatabasesButInitialSyncIdChanges) {
@@ -395,9 +396,9 @@ TEST_F(AllDatabaseClonerTest, RetriesListDatabasesButInitialSyncIdChanges) {
     clonerThread.join();
 
     // Total retries and outage time should be available.
-    ASSERT_EQ(0, _sharedData->getRetryingOperationsCount(WithLock::withoutLock()));
-    ASSERT_EQ(1, _sharedData->getTotalRetries(WithLock::withoutLock()));
-    ASSERT_EQ(Minutes(60), _sharedData->getTotalTimeUnreachable(WithLock::withoutLock()));
+    ASSERT_EQ(0, getSharedData()->getRetryingOperationsCount(WithLock::withoutLock()));
+    ASSERT_EQ(1, getSharedData()->getTotalRetries(WithLock::withoutLock()));
+    ASSERT_EQ(Minutes(60), getSharedData()->getTotalTimeUnreachable(WithLock::withoutLock()));
 }
 
 TEST_F(AllDatabaseClonerTest, RetriesListDatabasesButTimesOut) {
@@ -438,9 +439,10 @@ TEST_F(AllDatabaseClonerTest, RetriesListDatabasesButTimesOut) {
     clonerThread.join();
 
     // Total retries and outage time should be available.
-    ASSERT_EQ(0, _sharedData->getRetryingOperationsCount(WithLock::withoutLock()));
-    ASSERT_EQ(1, _sharedData->getTotalRetries(WithLock::withoutLock()));
-    ASSERT_EQ(Days(1) + Seconds(1), _sharedData->getTotalTimeUnreachable(WithLock::withoutLock()));
+    ASSERT_EQ(0, getSharedData()->getRetryingOperationsCount(WithLock::withoutLock()));
+    ASSERT_EQ(1, getSharedData()->getTotalRetries(WithLock::withoutLock()));
+    ASSERT_EQ(Days(1) + Seconds(1),
+              getSharedData()->getTotalTimeUnreachable(WithLock::withoutLock()));
 }
 
 TEST_F(AllDatabaseClonerTest, FailsOnListDatabases) {

@@ -70,7 +70,7 @@ RoleName RoleName::parseFromBSON(const BSONElement& elem) {
     uassert(ErrorCodes::BadValue,
             str::stream() << "role name must contain a string field named: "
                           << AuthorizationManager::ROLE_DB_FIELD_NAME,
-            nameField.type() == String);
+            dbField.type() == String);
 
     return RoleName(nameField.valueStringData(), dbField.valueStringData());
 }
@@ -90,5 +90,10 @@ void RoleName::_serializeToSubObj(BSONObjBuilder* sub) const {
     sub->append(AuthorizationManager::ROLE_DB_FIELD_NAME, getDB());
 }
 
+BSONObj RoleName::toBSON() const {
+    BSONObjBuilder bob;
+    _serializeToSubObj(&bob);
+    return bob.obj();
+}
 
 }  // namespace mongo

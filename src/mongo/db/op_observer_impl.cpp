@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -36,11 +36,11 @@
 #include <limits>
 
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/commands/feature_compatibility_version.h"
-#include "mongo/db/commands/feature_compatibility_version_parser.h"
+#include "mongo/db/catalog/import_collection_oplog_entry_gen.h"
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -53,6 +53,8 @@
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_entry_gen.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/tenant_migration_decoration.h"
+#include "mongo/db/repl/tenant_migration_donor_util.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/session_catalog_mongod.h"
@@ -70,13 +72,18 @@
 namespace mongo {
 using repl::MutableOplogEntry;
 using repl::OplogEntry;
+const OperationContext::Decoration<boost::optional<OpObserverImpl::DocumentKey>>
+    documentKeyDecoration =
+        OperationContext::declareDecoration<boost::optional<OpObserverImpl::DocumentKey>>();
+
+const OperationContext::Decoration<boost::optional<ShardId>> destinedRecipientDecoration =
+    OperationContext::declareDecoration<boost::optional<ShardId>>();
 
 namespace {
 
 MONGO_FAIL_POINT_DEFINE(failCollectionUpdates);
 MONGO_FAIL_POINT_DEFINE(hangAndFailUnpreparedCommitAfterReservingOplogSlot);
-
-const auto documentKeyDecoration = OperationContext::declareDecoration<BSONObj>();
+MONGO_FAIL_POINT_DEFINE(hangAfterLoggingApplyOpsForTransaction);
 
 constexpr auto kNumRecordsFieldName = "numRecords"_sd;
 constexpr auto kMsgFieldName = "msg"_sd;
@@ -150,8 +157,9 @@ struct OpTimeBundle {
 /**
  * Write oplog entry(ies) for the update operation.
  */
-OpTimeBundle replLogUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) {
-    MutableOplogEntry oplogEntry;
+OpTimeBundle replLogUpdate(OperationContext* opCtx,
+                           const OplogUpdateEntryArgs& args,
+                           MutableOplogEntry oplogEntry) {
     oplogEntry.setNss(args.nss);
     oplogEntry.setUuid(args.uuid);
 
@@ -159,10 +167,14 @@ OpTimeBundle replLogUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& 
     repl::appendOplogEntryChainInfo(opCtx, &oplogEntry, &oplogLink, args.updateArgs.stmtId);
 
     OpTimeBundle opTimes;
+    // We never want to store pre- or post- images when we're migrating oplog entries from another
+    // replica set.
+    const auto& migrationRecipientInfo = repl::tenantMigrationRecipientInfo(opCtx);
     const auto storePreImageForRetryableWrite =
         (args.updateArgs.storeDocOption == CollectionUpdateArgs::StoreDocOption::PreImage &&
          opCtx->getTxnNumber());
-    if (storePreImageForRetryableWrite || args.updateArgs.preImageRecordingEnabledForCollection) {
+    if ((storePreImageForRetryableWrite || args.updateArgs.preImageRecordingEnabledForCollection) &&
+        !migrationRecipientInfo) {
         MutableOplogEntry noopEntry = oplogEntry;
         invariant(args.updateArgs.preImageDoc);
         noopEntry.setOpType(repl::OpTypeEnum::kNoop);
@@ -175,7 +187,7 @@ OpTimeBundle replLogUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& 
 
     // This case handles storing the post image for retryable findAndModify's.
     if (args.updateArgs.storeDocOption == CollectionUpdateArgs::StoreDocOption::PostImage &&
-        opCtx->getTxnNumber()) {
+        opCtx->getTxnNumber() && !migrationRecipientInfo) {
         MutableOplogEntry noopEntry = oplogEntry;
         noopEntry.setOpType(repl::OpTypeEnum::kNoop);
         noopEntry.setObject(args.updateArgs.updatedDoc);
@@ -190,6 +202,9 @@ OpTimeBundle replLogUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& 
     oplogEntry.setFromMigrateIfTrue(args.updateArgs.fromMigrate);
     // oplogLink could have been changed to include pre/postImageOpTime by the previous no-op write.
     repl::appendOplogEntryChainInfo(opCtx, &oplogEntry, &oplogLink, args.updateArgs.stmtId);
+    if (args.updateArgs.oplogSlot) {
+        oplogEntry.setOpTime(*args.updateArgs.oplogSlot);
+    }
     opTimes.writeOpTime = logOperation(opCtx, &oplogEntry);
     opTimes.wallClockTime = oplogEntry.getWallClockTime();
     return opTimes;
@@ -207,12 +222,16 @@ OpTimeBundle replLogDelete(OperationContext* opCtx,
     MutableOplogEntry oplogEntry;
     oplogEntry.setNss(nss);
     oplogEntry.setUuid(uuid);
+    oplogEntry.setDestinedRecipient(destinedRecipientDecoration(opCtx));
 
     repl::OplogLink oplogLink;
     repl::appendOplogEntryChainInfo(opCtx, &oplogEntry, &oplogLink, stmtId);
 
     OpTimeBundle opTimes;
-    if (deletedDoc) {
+    // We never want to store pre-images when we're migrating oplog entries from another
+    // replica set.
+    const auto& migrationRecipientInfo = repl::tenantMigrationRecipientInfo(opCtx);
+    if (deletedDoc && !migrationRecipientInfo) {
         MutableOplogEntry noopEntry = oplogEntry;
         noopEntry.setOpType(repl::OpTypeEnum::kNoop);
         noopEntry.setObject(*deletedDoc);
@@ -222,7 +241,7 @@ OpTimeBundle replLogDelete(OperationContext* opCtx,
     }
 
     oplogEntry.setOpType(repl::OpTypeEnum::kDelete);
-    oplogEntry.setObject(documentKeyDecoration(opCtx));
+    oplogEntry.setObject(documentKeyDecoration(opCtx).get().getShardKeyAndId());
     oplogEntry.setFromMigrateIfTrue(fromMigrate);
     // oplogLink could have been changed to include preImageOpTime by the previous no-op write.
     repl::appendOplogEntryChainInfo(opCtx, &oplogEntry, &oplogLink, stmtId);
@@ -233,11 +252,40 @@ OpTimeBundle replLogDelete(OperationContext* opCtx,
 
 }  // namespace
 
-BSONObj OpObserverImpl::getDocumentKey(OperationContext* opCtx,
-                                       NamespaceString const& nss,
-                                       BSONObj const& doc) {
-    auto collDesc = CollectionShardingState::get(opCtx, nss)->getCollectionDescription_DEPRECATED();
-    return collDesc.extractDocumentKey(doc).getOwned();
+BSONObj OpObserverImpl::DocumentKey::getId() const {
+    return _id;
+}
+
+BSONObj OpObserverImpl::DocumentKey::getShardKeyAndId() const {
+    if (_shardKey) {
+        BSONObjBuilder builder(_shardKey.get());
+        builder.appendElementsUnique(_id);
+        return builder.obj();
+    }
+
+    // _shardKey is not set so just return the _id.
+    return getId();
+}
+
+OpObserverImpl::DocumentKey OpObserverImpl::getDocumentKey(OperationContext* opCtx,
+                                                           NamespaceString const& nss,
+                                                           BSONObj const& doc) {
+    BSONObj id = doc["_id"] ? doc["_id"].wrap() : doc;
+    boost::optional<BSONObj> shardKey;
+
+    // Extract the shard key from the collection description in the CollectionShardingState
+    // if running on standalone or primary. Skip this completely on secondaries since they are
+    // not expected to have the collection metadata cached.
+    if (opCtx->writesAreReplicated()) {
+        auto collDesc = CollectionShardingState::get(opCtx, nss)->getCollectionDescription(opCtx);
+        if (collDesc.isSharded()) {
+            shardKey =
+                dotted_path_support::extractElementsBasedOnTemplate(doc, collDesc.getKeyPattern())
+                    .getOwned();
+        }
+    }
+
+    return {std::move(id), std::move(shardKey)};
 }
 
 void OpObserverImpl::onCreateIndex(OperationContext* opCtx,
@@ -321,6 +369,10 @@ void OpObserverImpl::onStartIndexBuildSinglePhase(OperationContext* opCtx,
         {},
         boost::none,
         BSON("msg" << std::string(str::stream() << "Creating indexes. Coll: " << nss)),
+        boost::none,
+        boost::none,
+        boost::none,
+        boost::none,
         boost::none);
 }
 
@@ -410,6 +462,7 @@ void OpObserverImpl::onInserts(OperationContext* opCtx,
 
         for (auto iter = first; iter != last; iter++) {
             auto operation = MutableOplogEntry::makeInsertOperation(nss, uuid.get(), iter->doc);
+            shardAnnotateOplogEntry(opCtx, nss, iter->doc, operation);
             txnParticipant.addTransactionOperation(opCtx, operation);
         }
     } else {
@@ -451,12 +504,6 @@ void OpObserverImpl::onInserts(OperationContext* opCtx,
         Scope::storedFuncMod(opCtx);
     } else if (nss.coll() == DurableViewCatalog::viewsCollectionName()) {
         DurableViewCatalog::onExternalChange(opCtx, nss);
-    } else if (nss == NamespaceString::kServerConfigurationNamespace) {
-        // We must check server configuration collection writes for featureCompatibilityVersion
-        // document changes.
-        for (auto it = first; it != last; it++) {
-            FeatureCompatibilityVersion::onInsertOrUpdate(opCtx, it->doc);
-        }
     } else if (nss == NamespaceString::kSessionTransactionsTableNamespace && !lastOpTime.isNull()) {
         for (auto it = first; it != last; it++) {
             MongoDSessionCatalog::observeDirectWriteToConfigTransactions(opCtx, it->doc);
@@ -497,6 +544,8 @@ void OpObserverImpl::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArg
         auto operation = MutableOplogEntry::makeUpdateOperation(
             args.nss, args.uuid, args.updateArgs.update, args.updateArgs.criteria);
 
+        shardAnnotateOplogEntry(opCtx, args.nss, args.updateArgs.updatedDoc, operation);
+
         if (args.updateArgs.preImageRecordingEnabledForCollection) {
             invariant(args.updateArgs.preImageDoc);
             operation.setPreImage(args.updateArgs.preImageDoc->getOwned());
@@ -504,7 +553,11 @@ void OpObserverImpl::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArg
 
         txnParticipant.addTransactionOperation(opCtx, operation);
     } else {
-        opTime = replLogUpdate(opCtx, args);
+        MutableOplogEntry oplogEntry;
+        shardAnnotateOplogEntry(
+            opCtx, args.nss, args.updateArgs.updatedDoc, oplogEntry.getDurableReplOperation());
+        opTime = replLogUpdate(opCtx, args, std::move(oplogEntry));
+
         SessionTxnRecord sessionTxnRecord;
         sessionTxnRecord.setLastWriteOpTime(opTime.writeOpTime);
         sessionTxnRecord.setLastWriteDate(opTime.wallClockTime);
@@ -527,10 +580,6 @@ void OpObserverImpl::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArg
         Scope::storedFuncMod(opCtx);
     } else if (args.nss.coll() == DurableViewCatalog::viewsCollectionName()) {
         DurableViewCatalog::onExternalChange(opCtx, args.nss);
-    } else if (args.nss == NamespaceString::kServerConfigurationNamespace) {
-        // We must check server configuration collection writes for featureCompatibilityVersion
-        // document changes.
-        FeatureCompatibilityVersion::onInsertOrUpdate(opCtx, args.updateArgs.updatedDoc);
     } else if (args.nss == NamespaceString::kSessionTransactionsTableNamespace &&
                !opTime.writeOpTime.isNull()) {
         MongoDSessionCatalog::observeDirectWriteToConfigTransactions(opCtx,
@@ -544,7 +593,11 @@ void OpObserverImpl::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArg
 void OpObserverImpl::aboutToDelete(OperationContext* opCtx,
                                    NamespaceString const& nss,
                                    BSONObj const& doc) {
-    documentKeyDecoration(opCtx) = getDocumentKey(opCtx, nss, doc);
+    documentKeyDecoration(opCtx).emplace(getDocumentKey(opCtx, nss, doc));
+
+    repl::DurableReplOperation op;
+    shardAnnotateOplogEntry(opCtx, nss, doc, op);
+    destinedRecipientDecoration(opCtx) = op.getDestinedRecipient();
 
     shardObserveAboutToDelete(opCtx, nss, doc);
 }
@@ -555,8 +608,9 @@ void OpObserverImpl::onDelete(OperationContext* opCtx,
                               StmtId stmtId,
                               bool fromMigrate,
                               const boost::optional<BSONObj>& deletedDoc) {
-    auto& documentKey = documentKeyDecoration(opCtx);
-    invariant(!documentKey.isEmpty());
+    auto optDocKey = documentKeyDecoration(opCtx);
+    invariant(optDocKey, nss.ns());
+    auto& documentKey = optDocKey.get();
 
     auto txnParticipant = TransactionParticipant::get(opCtx);
     const bool inMultiDocumentTransaction =
@@ -564,10 +618,13 @@ void OpObserverImpl::onDelete(OperationContext* opCtx,
 
     OpTimeBundle opTime;
     if (inMultiDocumentTransaction) {
-        auto operation = MutableOplogEntry::makeDeleteOperation(nss, uuid.get(), documentKey);
+        auto operation =
+            MutableOplogEntry::makeDeleteOperation(nss, uuid.get(), documentKey.getShardKeyAndId());
         if (deletedDoc) {
             operation.setPreImage(deletedDoc->getOwned());
         }
+
+        operation.setDestinedRecipient(destinedRecipientDecoration(opCtx));
 
         txnParticipant.addTransactionOperation(opCtx, operation);
     } else {
@@ -582,7 +639,7 @@ void OpObserverImpl::onDelete(OperationContext* opCtx,
         if (!fromMigrate) {
             shardObserveDeleteOp(opCtx,
                                  nss,
-                                 documentKey,
+                                 documentKey.getId(),
                                  opTime.writeOpTime,
                                  opTime.prePostImageOpTime,
                                  inMultiDocumentTransaction);
@@ -593,36 +650,42 @@ void OpObserverImpl::onDelete(OperationContext* opCtx,
         Scope::storedFuncMod(opCtx);
     } else if (nss.coll() == DurableViewCatalog::viewsCollectionName()) {
         DurableViewCatalog::onExternalChange(opCtx, nss);
-    } else if (nss.isServerConfigurationCollection()) {
-        auto _id = documentKey["_id"];
-        if (_id.type() == BSONType::String &&
-            _id.String() == FeatureCompatibilityVersionParser::kParameterName)
-            uasserted(40670, "removing FeatureCompatibilityVersion document is not allowed");
     } else if (nss == NamespaceString::kSessionTransactionsTableNamespace &&
                !opTime.writeOpTime.isNull()) {
-        MongoDSessionCatalog::observeDirectWriteToConfigTransactions(opCtx, documentKey);
+        MongoDSessionCatalog::observeDirectWriteToConfigTransactions(opCtx, documentKey.getId());
     } else if (nss == NamespaceString::kConfigSettingsNamespace) {
         ReadWriteConcernDefaults::get(opCtx).observeDirectWriteToConfigSettings(
-            opCtx, documentKey["_id"], boost::none);
+            opCtx, documentKey.getId().firstElement(), boost::none);
     }
 }
 
-void OpObserverImpl::onInternalOpMessage(OperationContext* opCtx,
-                                         const NamespaceString& nss,
-                                         const boost::optional<UUID> uuid,
-                                         const BSONObj& msgObj,
-                                         const boost::optional<BSONObj> o2MsgObj) {
+void OpObserverImpl::onInternalOpMessage(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const boost::optional<UUID> uuid,
+    const BSONObj& msgObj,
+    const boost::optional<BSONObj> o2MsgObj,
+    const boost::optional<repl::OpTime> preImageOpTime,
+    const boost::optional<repl::OpTime> postImageOpTime,
+    const boost::optional<repl::OpTime> prevWriteOpTimeInTransaction,
+    const boost::optional<OplogSlot> slot) {
     MutableOplogEntry oplogEntry;
     oplogEntry.setOpType(repl::OpTypeEnum::kNoop);
     oplogEntry.setNss(nss);
     oplogEntry.setUuid(uuid);
     oplogEntry.setObject(msgObj);
     oplogEntry.setObject2(o2MsgObj);
+    oplogEntry.setPreImageOpTime(preImageOpTime);
+    oplogEntry.setPostImageOpTime(postImageOpTime);
+    oplogEntry.setPrevWriteOpTimeInTransaction(prevWriteOpTimeInTransaction);
+    if (slot) {
+        oplogEntry.setOpTime(*slot);
+    }
     logOperation(opCtx, &oplogEntry);
 }
 
 void OpObserverImpl::onCreateCollection(OperationContext* opCtx,
-                                        Collection* coll,
+                                        const CollectionPtr& coll,
                                         const NamespaceString& collectionName,
                                         const CollectionOptions& options,
                                         const BSONObj& idIndex,
@@ -694,7 +757,8 @@ void OpObserverImpl::onCollMod(OperationContext* opCtx,
     if (!db) {
         return;
     }
-    Collection* coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
+    const CollectionPtr& coll =
+        CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss);
 
     invariant(coll->uuid() == uuid);
     invariant(DurableCatalog::get(opCtx)->isEqualToMetadataUUID(opCtx, coll->getCatalogId(), uuid));
@@ -738,6 +802,22 @@ repl::OpTime OpObserverImpl::onDropCollection(OperationContext* opCtx,
     if (collectionName.coll() == DurableViewCatalog::viewsCollectionName()) {
         DurableViewCatalog::onSystemViewsCollectionDrop(opCtx, collectionName);
     } else if (collectionName == NamespaceString::kSessionTransactionsTableNamespace) {
+        // Disallow this drop if there are currently prepared transactions.
+        const auto sessionCatalog = SessionCatalog::get(opCtx);
+        SessionKiller::Matcher matcherAllSessions(
+            KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)});
+        bool noPreparedTxns = true;
+        sessionCatalog->scanSessions(matcherAllSessions, [&](const ObservableSession& session) {
+            auto txnParticipant = TransactionParticipant::get(session);
+            if (txnParticipant.transactionIsPrepared()) {
+                noPreparedTxns = false;
+            }
+        });
+        uassert(4852500,
+                "Unable to drop transactions table (config.transactions) while prepared "
+                "transactions are present.",
+                noPreparedTxns);
+
         MongoDSessionCatalog::invalidateAllSessions(opCtx);
     } else if (collectionName == NamespaceString::kConfigSettingsNamespace) {
         ReadWriteConcernDefaults::get(opCtx).invalidate();
@@ -810,6 +890,24 @@ void OpObserverImpl::onRenameCollection(OperationContext* const opCtx,
     preRenameCollection(
         opCtx, fromCollection, toCollection, uuid, dropTargetUUID, numRecords, stayTemp);
     postRenameCollection(opCtx, fromCollection, toCollection, uuid, dropTargetUUID, stayTemp);
+}
+
+void OpObserverImpl::onImportCollection(OperationContext* opCtx,
+                                        const UUID& importUUID,
+                                        const NamespaceString& nss,
+                                        long long numRecords,
+                                        long long dataSize,
+                                        const BSONObj& catalogEntry,
+                                        const BSONObj& storageMetadata,
+                                        bool isDryRun) {
+    ImportCollectionOplogEntry importCollection(
+        nss, importUUID, numRecords, dataSize, catalogEntry, storageMetadata, isDryRun);
+
+    MutableOplogEntry oplogEntry;
+    oplogEntry.setOpType(repl::OpTypeEnum::kCommand);
+    oplogEntry.setNss(nss.getCommandNS());
+    oplogEntry.setObject(importCollection.toBSON());
+    logOperation(opCtx, &oplogEntry);
 }
 
 void OpObserverImpl::onApplyOps(OperationContext* opCtx,
@@ -965,8 +1063,11 @@ int logOplogEntriesForTransaction(OperationContext* opCtx,
 
     prevWriteOpTime.writeOpTime = txnParticipant.getLastWriteOpTime();
     auto currOplogSlot = oplogSlots.begin();
+    // We never want to store pre-images when we're migrating oplog entries from another
+    // replica set.
+    const auto& migrationRecipientInfo = repl::tenantMigrationRecipientInfo(opCtx);
 
-    if (numberOfPreImagesToWrite > 0) {
+    if (numberOfPreImagesToWrite > 0 && !migrationRecipientInfo) {
         for (auto& statement : *stmts) {
             if (statement.getPreImage().isEmpty()) {
                 continue;
@@ -1006,6 +1107,14 @@ int logOplogEntriesForTransaction(OperationContext* opCtx,
         auto implicitCommit = lastOp && !prepare;
         auto implicitPrepare = lastOp && prepare;
         auto isPartialTxn = !lastOp;
+        if (isPartialTxn) {
+            // Partial transactions create multiple oplog entries in the same WriteUnitOfWork.
+            // Because of this, partial transactions will set multiple timestamps, violating the
+            // multi timestamp constraint. It's safe to ignore the multi timestamp constraints here
+            // as additional rollback logic is in place for this case.
+            opCtx->recoveryUnit()->ignoreAllMultiTimestampConstraints();
+        }
+
         // A 'prepare' oplog entry should never include a 'partialTxn' field.
         invariant(!(isPartialTxn && implicitPrepare));
         if (implicitPrepare) {
@@ -1050,6 +1159,8 @@ int logOplogEntriesForTransaction(OperationContext* opCtx,
             : (implicitPrepare ? DurableTxnStateEnum::kPrepared : DurableTxnStateEnum::kCommitted);
         prevWriteOpTime =
             logApplyOpsForTransaction(opCtx, &oplogEntry, txnState, startOpTime, updateTxnTable);
+
+        hangAfterLoggingApplyOpsForTransaction.pauseWhileSet();
 
         // Advance the iterator to the beginning of the remaining unpacked statements.
         stmtsIter = nextStmt;
@@ -1116,6 +1227,11 @@ void OpObserverImpl::onUnpreparedTransactionCommit(OperationContext* opCtx,
     // Reserve all the optimes in advance, so we only need to get the optime mutex once.  We
     // reserve enough entries for all statements in the transaction.
     auto oplogSlots = repl::getNextOpTimes(opCtx, statements->size() + numberOfPreImagesToWrite);
+
+    // Throw TenantMigrationConflict error if the database for the transaction statements is being
+    // migrated. We only need check the namespace of the first statement since a transaction's
+    // statements must all be for the same tenant.
+    tenant_migration_donor::onWriteToDatabase(opCtx, statements->begin()->getNss().db());
 
     if (MONGO_unlikely(hangAndFailUnpreparedCommitAfterReservingOplogSlot.shouldFail())) {
         hangAndFailUnpreparedCommitAfterReservingOplogSlot.pauseWhileSet(opCtx);
@@ -1269,9 +1385,6 @@ void OpObserverImpl::onReplicationRollback(OperationContext* opCtx,
     // Force the default read/write concern cache to reload on next access in case the defaults
     // document was rolled back.
     ReadWriteConcernDefaults::get(opCtx).invalidate();
-
-    // Make sure the in-memory FCV matches the on-disk FCV.
-    FeatureCompatibilityVersion::onReplicationRollback(opCtx);
 }
 
 }  // namespace mongo

@@ -32,6 +32,7 @@
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 #include "mongo/client/sdam/topology_description.h"
+#include "mongo/db/wire_version.h"
 #include "mongo/logv2/log.h"
 #include "mongo/platform/random.h"
 #include "mongo/util/fail_point.h"
@@ -41,7 +42,7 @@ MONGO_FAIL_POINT_DEFINE(sdamServerSelectorIgnoreLatencyWindow);
 
 ServerSelector::~ServerSelector() {}
 
-SdamServerSelector::SdamServerSelector(const ServerSelectionConfiguration& config)
+SdamServerSelector::SdamServerSelector(const SdamConfiguration& config)
     : _config(config), _random(PseudoRandom(SecureRandom().nextInt64())) {}
 
 void SdamServerSelector::_getCandidateServers(std::vector<ServerDescriptionPtr>* result,
@@ -50,9 +51,7 @@ void SdamServerSelector::_getCandidateServers(std::vector<ServerDescriptionPtr>*
     // when querying the primary we don't need to consider tags
     bool shouldTagFilter = true;
 
-    // TODO SERVER-46499: check to see if we want to enforce minOpTime at all since
-    // it was effectively optional in the original implementation.
-    if (!criteria.minOpTime.isNull()) {
+    if (!criteria.minClusterTime.isNull()) {
         auto eligibleServers = topologyDescription->findServers([](const ServerDescriptionPtr& s) {
             return (s->getType() == ServerType::kRSPrimary ||
                     s->getType() == ServerType::kRSSecondary);
@@ -68,18 +67,21 @@ void SdamServerSelector::_getCandidateServers(std::vector<ServerDescriptionPtr>*
                                       });
         if (maxIt != endIt) {
             auto maxOpTime = (*maxIt)->getOpTime();
-            if (maxOpTime && maxOpTime < criteria.minOpTime) {
-                // ignore minOpTime
+            if (maxOpTime->getTimestamp() < criteria.minClusterTime) {
+                // ignore minClusterTime
                 const_cast<ReadPreferenceSetting&>(criteria) = ReadPreferenceSetting(criteria.pref);
-                LOGV2(46712001, "Ignoring minOpTime", "readPreference"_attr = criteria);
             }
         }
     }
 
     switch (criteria.pref) {
-        case ReadPreference::Nearest:
-            *result = topologyDescription->findServers(nearestFilter(criteria));
+        case ReadPreference::Nearest: {
+            auto filter = (topologyDescription->getType() != TopologyType::kSharded)
+                ? nearestFilter(criteria)
+                : shardedFilter(criteria);
+            *result = topologyDescription->findServers(filter);
             break;
+        }
 
         case ReadPreference::SecondaryOnly:
             *result = topologyDescription->findServers(secondaryFilter(criteria));
@@ -135,11 +137,25 @@ void SdamServerSelector::_getCandidateServers(std::vector<ServerDescriptionPtr>*
 
 boost::optional<std::vector<ServerDescriptionPtr>> SdamServerSelector::selectServers(
     const TopologyDescriptionPtr topologyDescription, const ReadPreferenceSetting& criteria) {
+    ReadPreferenceSetting effectiveCriteria = [&criteria](TopologyType topologyType) {
+        if (topologyType != TopologyType::kSharded) {
+            return criteria;
+        } else {
+            // Topology type Sharded should ignore read preference fields
+            return ReadPreferenceSetting(ReadPreference::Nearest);
+        };
+    }(topologyDescription->getType());
+
 
     // If the topology wire version is invalid, raise an error
     if (!topologyDescription->isWireVersionCompatible()) {
         uasserted(ErrorCodes::IncompatibleServerVersion,
                   *topologyDescription->getWireVersionCompatibleError());
+    }
+
+    if (criteria.maxStalenessSeconds.count()) {
+        _verifyMaxstalenessLowerBound(topologyDescription, effectiveCriteria.maxStalenessSeconds);
+        _verifyMaxstalenessWireVersions(topologyDescription, effectiveCriteria.maxStalenessSeconds);
     }
 
     if (topologyDescription->getType() == TopologyType::kUnknown) {
@@ -154,7 +170,7 @@ boost::optional<std::vector<ServerDescriptionPtr>> SdamServerSelector::selectSer
     }
 
     std::vector<ServerDescriptionPtr> results;
-    _getCandidateServers(&results, topologyDescription, criteria);
+    _getCandidateServers(&results, topologyDescription, effectiveCriteria);
 
     if (results.size()) {
         if (MONGO_unlikely(sdamServerSelectorIgnoreLatencyWindow.shouldFail())) {
@@ -165,12 +181,12 @@ boost::optional<std::vector<ServerDescriptionPtr>> SdamServerSelector::selectSer
             *std::min_element(results.begin(), results.end(), LatencyWindow::rttCompareFn);
 
         invariant(minServer->getRtt());
-        auto latencyWindow = LatencyWindow(*minServer->getRtt(), _config.getLocalThresholdMs());
+        auto latencyWindow = LatencyWindow(*minServer->getRtt(), _config.getLocalThreshold());
         latencyWindow.filterServers(&results);
 
         // latency window should always leave at least one result
         invariant(results.size());
-
+        std::shuffle(std::begin(results), std::end(results), _random.urbg());
         return results;
     }
 
@@ -219,7 +235,7 @@ void SdamServerSelector::filterTags(std::vector<ServerDescriptionPtr>* servers,
                 }
             } else {
                 LOGV2_WARNING(
-                    46712002,
+                    4671202,
                     "Invalid tags specified for server selection; tags should be specified as "
                     "bson Objects",
                     "tag"_attr = *it);
@@ -238,10 +254,8 @@ bool SdamServerSelector::recencyFilter(const ReadPreferenceSetting& readPref,
                                        const ServerDescriptionPtr& s) {
     bool result = true;
 
-    // TODO SERVER-46499: check to see if we want to enforce minOpTime at all since
-    // it was effectively optional in the original implementation.
-    if (!readPref.minOpTime.isNull()) {
-        result = result && (s->getOpTime() >= readPref.minOpTime);
+    if (!readPref.minClusterTime.isNull()) {
+        result = (s->getOpTime() && s->getOpTime()->getTimestamp() >= readPref.minClusterTime);
     }
 
     if (readPref.maxStalenessSeconds.count()) {
@@ -254,6 +268,33 @@ bool SdamServerSelector::recencyFilter(const ReadPreferenceSetting& readPref,
     return result;
 }
 
+void SdamServerSelector::_verifyMaxstalenessLowerBound(TopologyDescriptionPtr topologyDescription,
+                                                       Seconds maxStalenessSeconds) {
+    static const auto kIdleWritePeriodMs = Milliseconds{10000};
+    auto topologyType = topologyDescription->getType();
+    if (topologyType == TopologyType::kReplicaSetWithPrimary ||
+        topologyType == TopologyType::kReplicaSetNoPrimary) {
+        const auto lowerBoundMs =
+            sdamHeartBeatFrequencyMs + durationCount<Milliseconds>(kIdleWritePeriodMs);
+
+        if (durationCount<Milliseconds>(maxStalenessSeconds) < lowerBoundMs) {
+            // using if to avoid creating the string if there's no error
+            std::stringstream ss;
+            ss << "Parameter maxStalenessSeconds cannot be less than "
+               << durationCount<Seconds>(Milliseconds{lowerBoundMs});
+            uassert(ErrorCodes::MaxStalenessOutOfRange, ss.str(), false);
+        }
+    }
+}
+
+void SdamServerSelector::_verifyMaxstalenessWireVersions(TopologyDescriptionPtr topologyDescription,
+                                                         Seconds maxStalenessSeconds) {
+    for (auto& server : topologyDescription->getServers()) {
+        uassert(ErrorCodes::IncompatibleServerVersion,
+                "Incompatible wire version",
+                server->getMaxWireVersion() >= WireVersion::COMMANDS_ACCEPT_WRITE_CONCERN);
+    }
+}
 
 void LatencyWindow::filterServers(std::vector<ServerDescriptionPtr>* servers) {
     servers->erase(std::remove_if(servers->begin(),
@@ -268,7 +309,7 @@ void LatencyWindow::filterServers(std::vector<ServerDescriptionPtr>* servers) {
                    servers->end());
 }
 
-bool LatencyWindow::isWithinWindow(IsMasterRTT latency) {
+bool LatencyWindow::isWithinWindow(HelloRTT latency) {
     return lower <= latency && latency <= upper;
 }
 }  // namespace mongo::sdam

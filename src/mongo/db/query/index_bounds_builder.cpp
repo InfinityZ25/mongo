@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/db/query/index_bounds_builder.h"
 
@@ -51,6 +51,7 @@
 #include "mongo/db/query/planner_wildcard_helpers.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/logv2/log.h"
+#include "mongo/util/ctype.h"
 #include "mongo/util/str.h"
 #include "third_party/s2/s2cell.h"
 #include "third_party/s2/s2regioncoverer.h"
@@ -264,7 +265,7 @@ string IndexBoundsBuilder::simpleRegex(const char* regex,
             // comment
             r = ss;
             break;
-        } else if (extended && isspace(c)) {
+        } else if (extended && ctype::isSpace(c)) {
             continue;
         } else {
             // self-matching char
@@ -568,12 +569,14 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
             *tightnessOut = IndexBoundsBuilder::EXACT;
         }
 
-        // This disables indexed negation of array inequality.
-        // TODO: SERVER-45233 Perform correct behavior here once indexed array inequality without
-        // negation's semantics are correctly determined and implemented.
-        massert(ErrorCodes::InternalError,
-                "Indexed negation of array inequality not supported.",
-                *tightnessOut == IndexBoundsBuilder::EXACT);
+        // Generally speaking inverting bounds can only be done for exact bounds. Any looser bounds
+        // (like INEXACT_FETCH) would signal that inversion would be mistakenly excluding some
+        // values. One exception is for collation, whose index bounds are tracked as INEXACT_FETCH,
+        // but only because the index data is different than the user data, not because the range
+        // is imprecise.
+        tassert(4457011,
+                "Cannot invert inexact bounds",
+                *tightnessOut == IndexBoundsBuilder::EXACT || index.collator);
 
         // If the index is multikey on this path, it doesn't matter what the tightness of the child
         // is, we must return INEXACT_FETCH. Consider a multikey index on 'a' with document
@@ -888,14 +891,14 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
             *tightnessOut = IndexBoundsBuilder::INEXACT_FETCH;
         } else {
             LOGV2_WARNING(20934,
-                          "Planner error trying to build geo bounds for {elt} index element.",
-                          "elt"_attr = elt.toString());
+                          "Planner error trying to build geo bounds for an index element",
+                          "element"_attr = elt.toString());
             verify(0);
         }
     } else {
         LOGV2_WARNING(20935,
-                      "Planner error, trying to build bounds for expression: {expr_debugString}",
-                      "expr_debugString"_attr = redact(expr->debugString()));
+                      "Planner error while trying to build bounds for expression",
+                      "expression"_attr = redact(expr->debugString()));
         verify(0);
     }
 }
@@ -1201,11 +1204,59 @@ void IndexBoundsBuilder::alignBounds(IndexBounds* bounds, const BSONObj& kp, int
 
     if (!bounds->isValidFor(kp, scanDir)) {
         LOGV2(20933,
-              "INVALID BOUNDS: {bounds}\nkp = {kp}\nscanDir = {scanDir}",
+              "Invalid bounds",
               "bounds"_attr = redact(bounds->toString()),
-              "kp"_attr = redact(kp),
-              "scanDir"_attr = scanDir);
+              "keyPattern"_attr = redact(kp),
+              "scanDirection"_attr = scanDir);
         MONGO_UNREACHABLE;
+    }
+}
+
+void IndexBoundsBuilder::appendTrailingAllValuesInterval(const Interval& interval,
+                                                         bool startKeyInclusive,
+                                                         bool endKeyInclusive,
+                                                         BSONObjBuilder* startBob,
+                                                         BSONObjBuilder* endBob) {
+    invariant(startBob);
+    invariant(endBob);
+
+    // Must be min->max or max->min.
+    if (interval.isMinToMax()) {
+        // As an example for the logic below, consider the index {a:1, b:1} and a count for
+        // {a: {$gt: 2}}.  Our start key isn't inclusive (as it's $gt: 2) and looks like
+        // {"":2} so far.  If we move to the key greater than {"":2, "": MaxKey} we will get
+        // the first value of 'a' that is greater than 2.
+        if (!startKeyInclusive) {
+            startBob->appendMaxKey("");
+        } else {
+            // In this case, consider the index {a:1, b:1} and a count for {a:{$gte: 2}}.
+            // We want to look at all values where a is 2, so our start key is {"":2,
+            // "":MinKey}.
+            startBob->appendMinKey("");
+        }
+
+        // Same deal as above.  Consider the index {a:1, b:1} and a count for {a: {$lt: 2}}.
+        // Our end key isn't inclusive as ($lt: 2) and looks like {"":2} so far.  We can't
+        // look at any values where a is 2 so we have to stop at {"":2, "": MinKey} as
+        // that's the smallest key where a is still 2.
+        if (!endKeyInclusive) {
+            endBob->appendMinKey("");
+        } else {
+            endBob->appendMaxKey("");
+        }
+    } else if (interval.isMaxToMin()) {
+        // The reasoning here is the same as above but with the directions reversed.
+        if (!startKeyInclusive) {
+            startBob->appendMinKey("");
+        } else {
+            startBob->appendMaxKey("");
+        }
+
+        if (!endKeyInclusive) {
+            endBob->appendMaxKey("");
+        } else {
+            endBob->appendMinKey("");
+        }
     }
 }
 
@@ -1262,12 +1313,6 @@ bool IndexBoundsBuilder::isSingleInterval(const IndexBounds& bounds,
 
     ++fieldNo;
 
-    // Get some "all values" intervals for comparison's sake.
-    // TODO: make static?
-    Interval minMax = IndexBoundsBuilder::allValues();
-    Interval maxMin = minMax;
-    maxMin.reverse();
-
     // And after the non-point interval we can have any number of "all values" intervals.
     for (; fieldNo < bounds.fields.size(); ++fieldNo) {
         const OrderedIntervalList& oil = bounds.fields[fieldNo];
@@ -1276,42 +1321,9 @@ bool IndexBoundsBuilder::isSingleInterval(const IndexBounds& bounds,
             break;
         }
 
-        // Must be min->max or max->min.
-        if (oil.intervals[0].equals(minMax)) {
-            // As an example for the logic below, consider the index {a:1, b:1} and a count for
-            // {a: {$gt: 2}}.  Our start key isn't inclusive (as it's $gt: 2) and looks like
-            // {"":2} so far.  If we move to the key greater than {"":2, "": MaxKey} we will get
-            // the first value of 'a' that is greater than 2.
-            if (!*startKeyInclusive) {
-                startBob.appendMaxKey("");
-            } else {
-                // In this case, consider the index {a:1, b:1} and a count for {a:{$gte: 2}}.
-                // We want to look at all values where a is 2, so our start key is {"":2,
-                // "":MinKey}.
-                startBob.appendMinKey("");
-            }
-
-            // Same deal as above.  Consider the index {a:1, b:1} and a count for {a: {$lt: 2}}.
-            // Our end key isn't inclusive as ($lt: 2) and looks like {"":2} so far.  We can't
-            // look at any values where a is 2 so we have to stop at {"":2, "": MinKey} as
-            // that's the smallest key where a is still 2.
-            if (!*endKeyInclusive) {
-                endBob.appendMinKey("");
-            } else {
-                endBob.appendMaxKey("");
-            }
-        } else if (oil.intervals[0].equals(maxMin)) {
-            // The reasoning here is the same as above but with the directions reversed.
-            if (!*startKeyInclusive) {
-                startBob.appendMinKey("");
-            } else {
-                startBob.appendMaxKey("");
-            }
-            if (!*endKeyInclusive) {
-                endBob.appendMaxKey("");
-            } else {
-                endBob.appendMinKey("");
-            }
+        if (oil.intervals[0].isMinToMax() || oil.intervals[0].isMaxToMin()) {
+            IndexBoundsBuilder::appendTrailingAllValuesInterval(
+                oil.intervals[0], *startKeyInclusive, *endKeyInclusive, &startBob, &endBob);
         } else {
             // No dice.
             break;

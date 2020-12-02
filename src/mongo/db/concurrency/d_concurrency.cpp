@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -139,11 +139,13 @@ bool Lock::ResourceMutex::isAtLeastReadLocked(Locker* locker) {
 Lock::GlobalLock::GlobalLock(OperationContext* opCtx,
                              LockMode lockMode,
                              Date_t deadline,
-                             InterruptBehavior behavior)
+                             InterruptBehavior behavior,
+                             bool skipRSTLLock)
     : _opCtx(opCtx),
       _result(LOCK_INVALID),
       _pbwm(opCtx->lockState(), resourceIdParallelBatchWriterMode),
       _interruptBehavior(behavior),
+      _skipRSTLLock(skipRSTLLock),
       _isOutermostLock(!opCtx->lockState()->isLocked()) {
     _opCtx->lockState()->getFlowControlTicket(_opCtx, lockMode);
 
@@ -157,17 +159,14 @@ Lock::GlobalLock::GlobalLock(OperationContext* opCtx,
             }
         });
 
-        _opCtx->lockState()->lock(
-            _opCtx, resourceIdReplicationStateTransitionLock, MODE_IX, deadline);
-
-        auto unlockRSTL = makeGuard(
-            [this] { _opCtx->lockState()->unlock(resourceIdReplicationStateTransitionLock); });
-
         _result = LOCK_INVALID;
-        _opCtx->lockState()->lockGlobal(_opCtx, lockMode, deadline);
+        if (skipRSTLLock) {
+            _takeGlobalLockOnly(lockMode, deadline);
+        } else {
+            _takeGlobalAndRSTLLocks(lockMode, deadline);
+        }
         _result = LOCK_OK;
 
-        unlockRSTL.dismiss();
         unlockPBWM.dismiss();
     } catch (const ExceptionForCat<ErrorCategory::Interruption>&) {
         // The kLeaveUnlocked behavior suppresses this exception.
@@ -178,11 +177,26 @@ Lock::GlobalLock::GlobalLock(OperationContext* opCtx,
     _opCtx->lockState()->setGlobalLockTakenInMode(acquiredLockMode);
 }
 
+void Lock::GlobalLock::_takeGlobalLockOnly(LockMode lockMode, Date_t deadline) {
+    _opCtx->lockState()->lockGlobal(_opCtx, lockMode, deadline);
+}
+
+void Lock::GlobalLock::_takeGlobalAndRSTLLocks(LockMode lockMode, Date_t deadline) {
+    _opCtx->lockState()->lock(_opCtx, resourceIdReplicationStateTransitionLock, MODE_IX, deadline);
+    auto unlockRSTL = makeGuard(
+        [this] { _opCtx->lockState()->unlock(resourceIdReplicationStateTransitionLock); });
+
+    _opCtx->lockState()->lockGlobal(_opCtx, lockMode, deadline);
+
+    unlockRSTL.dismiss();
+}
+
 Lock::GlobalLock::GlobalLock(GlobalLock&& otherLock)
     : _opCtx(otherLock._opCtx),
       _result(otherLock._result),
       _pbwm(std::move(otherLock._pbwm)),
       _interruptBehavior(otherLock._interruptBehavior),
+      _skipRSTLLock(otherLock._skipRSTLLock),
       _isOutermostLock(otherLock._isOutermostLock) {
     // Mark as moved so the destructor doesn't invalidate the newly-constructed lock.
     otherLock._result = LOCK_INVALID;
@@ -201,12 +215,6 @@ Lock::DBLock::DBLock(OperationContext* opCtx, StringData db, LockMode mode, Date
       _globalLock(
           opCtx, isSharedLockMode(_mode) ? MODE_IS : MODE_IX, deadline, InterruptBehavior::kThrow) {
     massert(28539, "need a valid database name", !db.empty() && nsIsDbOnly(db));
-
-    // The check for the admin db is to ensure direct writes to auth collections
-    // are serialized (see SERVER-16092).
-    if ((_id == resourceIdAdminDB) && !isSharedLockMode(_mode)) {
-        _mode = MODE_X;
-    }
 
     _opCtx->lockState()->lock(_opCtx, _id, _mode, deadline);
     _result = LOCK_OK;
@@ -251,11 +259,6 @@ Lock::CollectionLock::CollectionLock(OperationContext* opCtx,
                                      LockMode mode,
                                      Date_t deadline)
     : _opCtx(opCtx) {
-    LockMode actualLockMode = mode;
-    if (!supportsDocLocking()) {
-        actualLockMode = isSharedLockMode(mode) ? MODE_S : MODE_X;
-    }
-
     if (nssOrUUID.nss()) {
         auto& nss = *nssOrUUID.nss();
         _id = {RESOURCE_COLLECTION, nss.ns()};
@@ -264,14 +267,13 @@ Lock::CollectionLock::CollectionLock(OperationContext* opCtx,
         dassert(_opCtx->lockState()->isDbLockedForMode(nss.db(),
                                                        isSharedLockMode(mode) ? MODE_IS : MODE_IX));
 
-        _opCtx->lockState()->lock(_opCtx, _id, actualLockMode, deadline);
+        _opCtx->lockState()->lock(_opCtx, _id, mode, deadline);
         return;
     }
 
     // 'nsOrUUID' must be a UUID and dbName.
 
-    auto& collectionCatalog = CollectionCatalog::get(opCtx);
-    auto nss = collectionCatalog.resolveNamespaceStringOrUUID(opCtx, nssOrUUID);
+    auto nss = CollectionCatalog::get(opCtx)->resolveNamespaceStringOrUUID(opCtx, nssOrUUID);
 
     // The UUID cannot move between databases so this one dassert is sufficient.
     dassert(_opCtx->lockState()->isDbLockedForMode(nss.db(),
@@ -288,13 +290,13 @@ Lock::CollectionLock::CollectionLock(OperationContext* opCtx,
         }
 
         _id = ResourceId(RESOURCE_COLLECTION, nss.ns());
-        _opCtx->lockState()->lock(_opCtx, _id, actualLockMode, deadline);
+        _opCtx->lockState()->lock(_opCtx, _id, mode, deadline);
         locked = true;
 
         // We looked up UUID without a collection lock so it's possible that the
         // collection name changed now. Look it up again.
         prevResolvedNss = nss;
-        nss = collectionCatalog.resolveNamespaceStringOrUUID(opCtx, nssOrUUID);
+        nss = CollectionCatalog::get(opCtx)->resolveNamespaceStringOrUUID(opCtx, nssOrUUID);
     } while (nss != prevResolvedNss);
 }
 

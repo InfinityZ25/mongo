@@ -1,7 +1,10 @@
 // Cannot implicitly shard accessed collections because queries on a sharded collection are not
 // able to be covered when they aren't on the shard key since the document needs to be fetched in
 // order to apply the SHARDING_FILTER stage.
-// @tags: [assumes_unsharded_collection, requires_fcv_44]
+// @tags: [
+//   assumes_unsharded_collection,
+//   sbe_incompatible,
+// ]
 
 /**
  * Tests for returnKey.
@@ -21,8 +24,8 @@ assert.commandWorked(coll.insert({a: 1, b: 3}));
 assert.commandWorked(coll.insert({a: 2, b: 2}));
 assert.commandWorked(coll.insert({a: 3, b: 1}));
 
-assert.commandWorked(coll.ensureIndex({a: 1}));
-assert.commandWorked(coll.ensureIndex({b: 1}));
+assert.commandWorked(coll.createIndex({a: 1}));
+assert.commandWorked(coll.createIndex({b: 1}));
 
 // Basic returnKey.
 results = coll.find().hint({a: 1}).sort({a: 1}).returnKey().toArray();

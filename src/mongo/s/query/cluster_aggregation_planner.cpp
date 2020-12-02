@@ -26,7 +26,7 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -87,7 +87,7 @@ AsyncRequestsSender::Response establishMergingShardCursor(OperationContext* opCt
                                                           const BSONObj mergeCmdObj,
                                                           const ShardId& mergingShardId) {
     if (MONGO_unlikely(shardedAggregateFailToEstablishMergingShardCursor.shouldFail())) {
-        LOGV2(22834, "shardedAggregateFailToEstablishMergingShardCursor fail point enabled.");
+        LOGV2(22834, "shardedAggregateFailToEstablishMergingShardCursor fail point enabled");
         uasserted(ErrorCodes::FailPointEnabled,
                   "Asserting on establishing merging shard cursor due to failpoint.");
     }
@@ -126,8 +126,8 @@ BSONObj createCommandForMergingShard(Document serializedCommand,
     mergeCmd["pipeline"] = Value(pipelineForMerging->serialize());
     mergeCmd[AggregationRequest::kFromMongosName] = Value(true);
 
-    mergeCmd[AggregationRequest::kRuntimeConstants] =
-        Value(mergeCtx->getRuntimeConstants().toBSON());
+    mergeCmd[AggregationRequest::kLetName] =
+        Value(mergeCtx->variablesParseState.serialize(mergeCtx->variables));
 
     // If the user didn't specify a collation already, make sure there's a collation attached to
     // the merge command, since the merging shard may not have the collection metadata.
@@ -146,17 +146,23 @@ BSONObj createCommandForMergingShard(Document serializedCommand,
         mergeCmd.remove("readConcern");
     }
 
+    // Attach the IGNORED chunk version to the command. On the shard, this will skip the actual
+    // version check but will nonetheless mark the operation as versioned, indicating that any
+    // internal operations executed by the pipeline should also be appropriately versioned.
+    auto mergeCmdObj = appendShardVersion(mergeCmd.freeze().toBson(), ChunkVersion::IGNORED());
+
+    // Attach the read and write concerns if needed, and return the final command object.
     return applyReadWriteConcern(mergeCtx->opCtx,
                                  !(txnRouter && mergingShardContributesData), /* appendRC */
                                  !mergeCtx->explain,                          /* appendWC */
-                                 mergeCmd.freeze().toBson());
+                                 mergeCmdObj);
 }
 
 Status dispatchMergingPipeline(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                const ClusterAggregate::Namespaces& namespaces,
                                Document serializedCommand,
                                long long batchSize,
-                               const boost::optional<CachedCollectionRoutingInfo>& routingInfo,
+                               const boost::optional<ChunkManager>& cm,
                                DispatchShardPipelineResults&& shardDispatchResults,
                                BSONObjBuilder* result,
                                const PrivilegeVector& privileges,
@@ -194,12 +200,10 @@ Status dispatchMergingPipeline(const boost::intrusive_ptr<ExpressionContext>& ex
 
     // If we are not merging on mongoS, then this is not a $changeStream aggregation, and we
     // therefore must have a valid routing table.
-    invariant(routingInfo);
+    invariant(cm);
 
-    const ShardId mergingShardId = pickMergingShard(opCtx,
-                                                    shardDispatchResults.needsPrimaryShardMerge,
-                                                    targetedShards,
-                                                    routingInfo->db().primaryId());
+    const ShardId mergingShardId = pickMergingShard(
+        opCtx, shardDispatchResults.needsPrimaryShardMerge, targetedShards, cm->dbPrimary());
     const bool mergingShardContributesData =
         std::find(targetedShards.begin(), targetedShards.end(), mergingShardId) !=
         targetedShards.end();
@@ -209,8 +213,8 @@ Status dispatchMergingPipeline(const boost::intrusive_ptr<ExpressionContext>& ex
 
     LOGV2_DEBUG(22835,
                 1,
-                "Dispatching merge pipeline {mergeCmdObj} to designated shard",
-                "mergeCmdObj"_attr = redact(mergeCmdObj));
+                "Dispatching merge pipeline to designated shard",
+                "command"_attr = redact(mergeCmdObj));
 
     // Dispatch $mergeCursors to the chosen shard, store the resulting cursor, and return.
     auto mergeResponse =
@@ -243,7 +247,10 @@ BSONObj establishMergingMongosCursor(OperationContext* opCtx,
                                      std::unique_ptr<Pipeline, PipelineDeleter> pipelineForMerging,
                                      const PrivilegeVector& privileges) {
 
-    ClusterClientCursorParams params(requestedNss, ReadPreferenceSetting::get(opCtx));
+    ClusterClientCursorParams params(requestedNss,
+                                     APIParameters::get(opCtx),
+                                     ReadPreferenceSetting::get(opCtx),
+                                     ReadConcernArgs::get(opCtx));
 
     params.originatingCommandObj = CurOp::get(opCtx)->opDescription().getOwned();
     params.tailableMode = pipelineForMerging->getContext()->tailableMode;
@@ -267,7 +274,9 @@ BSONObj establishMergingMongosCursor(OperationContext* opCtx,
     rpc::OpMsgReplyBuilder replyBuilder;
     CursorResponseBuilder::Options options;
     options.isInitialResponse = true;
-
+    if (!opCtx->inMultiDocumentTransaction()) {
+        options.atClusterTime = repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime();
+    }
     CursorResponseBuilder responseBuilder(&replyBuilder, options);
     bool stashedResult = false;
 
@@ -357,7 +366,7 @@ DispatchShardPipelineResults dispatchExchangeConsumerPipeline(
     auto opCtx = expCtx->opCtx;
 
     if (MONGO_unlikely(shardedAggregateFailToDispatchExchangeConsumerPipeline.shouldFail())) {
-        LOGV2(22836, "shardedAggregateFailToDispatchExchangeConsumerPipeline fail point enabled.");
+        LOGV2(22836, "shardedAggregateFailToDispatchExchangeConsumerPipeline fail point enabled");
         uasserted(ErrorCodes::FailPointEnabled,
                   "Asserting on exhange consumer pipeline dispatch due to failpoint.");
     }
@@ -470,8 +479,11 @@ ClusterClientCursorGuard convertPipelineToRouterStages(
 /**
  * Returns the output of the listCollections command filtered to the namespace 'nss'.
  */
-BSONObj getUnshardedCollInfo(const Shard* primaryShard, const NamespaceString& nss) {
-    ScopedDbConnection conn(primaryShard->getConnString());
+BSONObj getUnshardedCollInfo(OperationContext* opCtx,
+                             const ShardId& shardId,
+                             const NamespaceString& nss) {
+    auto shard = uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardId));
+    ScopedDbConnection conn(shard->getConnString());
     std::list<BSONObj> all =
         conn->getCollectionInfos(nss.db().toString(), BSON("name" << nss.coll()));
     if (all.empty()) {
@@ -480,7 +492,6 @@ BSONObj getUnshardedCollInfo(const Shard* primaryShard, const NamespaceString& n
     }
     return all.front();
 }
-
 
 /**
  * Returns the collection default collation or the simple collator if there is no default. If the
@@ -540,7 +551,7 @@ AggregationTargeter AggregationTargeter::make(
     OperationContext* opCtx,
     const NamespaceString& executionNss,
     const std::function<std::unique_ptr<Pipeline, PipelineDeleter>()> buildPipelineFn,
-    boost::optional<CachedCollectionRoutingInfo> routingInfo,
+    boost::optional<ChunkManager> cm,
     stdx::unordered_set<NamespaceString> involvedNamespaces,
     bool hasChangeStream,
     bool allowedToPassthrough) {
@@ -548,9 +559,9 @@ AggregationTargeter AggregationTargeter::make(
     // Check if any of the involved collections are sharded.
     bool involvesShardedCollections = [&]() {
         for (const auto& nss : involvedNamespaces) {
-            const auto resolvedNsRoutingInfo =
+            const auto resolvedNsCM =
                 uassertStatusOK(getCollectionRoutingInfoForTxnCmd(opCtx, nss));
-            if (resolvedNsRoutingInfo.cm()) {
+            if (resolvedNsCM.isSharded()) {
                 return true;
             }
         }
@@ -562,7 +573,7 @@ AggregationTargeter AggregationTargeter::make(
         sharded_agg_helpers::mustRunOnAllShards(executionNss, hasChangeStream);
 
     // If we don't have a routing table, then this is a $changeStream which must run on all shards.
-    invariant(routingInfo || (mustRunOnAll && hasChangeStream));
+    invariant(cm || (mustRunOnAll && hasChangeStream));
 
     // A pipeline is allowed to passthrough to the primary shard iff the following conditions are
     // met:
@@ -574,20 +585,20 @@ AggregationTargeter AggregationTargeter::make(
     //    $currentOp.
     // 4. Doesn't need transformation via DocumentSource::serialize(). For example, list sessions
     //    needs to include information about users that can only be deduced on mongos.
-    if (routingInfo && !routingInfo->cm() && !mustRunOnAll && allowedToPassthrough &&
+    if (cm && !cm->isSharded() && !mustRunOnAll && allowedToPassthrough &&
         !involvesShardedCollections) {
-        return AggregationTargeter{TargetingPolicy::kPassthrough, nullptr, routingInfo};
+        return AggregationTargeter{TargetingPolicy::kPassthrough, nullptr, cm};
     } else {
         auto pipeline = buildPipelineFn();
         auto policy = pipeline->requiredToRunOnMongos() ? TargetingPolicy::kMongosRequired
                                                         : TargetingPolicy::kAnyShard;
-        return AggregationTargeter{policy, std::move(pipeline), routingInfo};
+        return AggregationTargeter{policy, std::move(pipeline), cm};
     }
 }
 
 Status runPipelineOnPrimaryShard(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                  const ClusterAggregate::Namespaces& namespaces,
-                                 const CachedDatabaseInfo& dbInfo,
+                                 const ChunkManager& cm,
                                  boost::optional<ExplainOptions::Verbosity> explain,
                                  Document serializedCommand,
                                  const PrivilegeVector& privileges,
@@ -596,15 +607,15 @@ Status runPipelineOnPrimaryShard(const boost::intrusive_ptr<ExpressionContext>& 
 
     // Format the command for the shard. This adds the 'fromMongos' field, wraps the command as an
     // explain if necessary, and rewrites the result into a format safe to forward to shards.
-    BSONObj cmdObj = applyReadWriteConcern(
-        opCtx,
-        true,     /* appendRC */
-        !explain, /* appendWC */
-        CommandHelpers::filterCommandRequestForPassthrough(
-            sharded_agg_helpers::createPassthroughCommandForShard(
-                expCtx, serializedCommand, explain, boost::none, nullptr, BSONObj())));
+    BSONObj cmdObj =
+        applyReadWriteConcern(opCtx,
+                              true,     /* appendRC */
+                              !explain, /* appendWC */
+                              CommandHelpers::filterCommandRequestForPassthrough(
+                                  sharded_agg_helpers::createPassthroughCommandForShard(
+                                      expCtx, serializedCommand, explain, nullptr, BSONObj())));
 
-    const auto shardId = dbInfo.primary()->getId();
+    const auto shardId = cm.dbPrimary();
     const auto cmdObjWithShardVersion = (shardId != ShardRegistry::kConfigServerShardId)
         ? appendShardVersion(std::move(cmdObj), ChunkVersion::UNSHARDED())
         : std::move(cmdObj);
@@ -613,7 +624,7 @@ Status runPipelineOnPrimaryShard(const boost::intrusive_ptr<ExpressionContext>& 
         opCtx,
         Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(),
         namespaces.executionNss.db().toString(),
-        {{shardId, appendDbVersionIfPresent(cmdObjWithShardVersion, dbInfo)}},
+        {{shardId, appendDbVersionIfPresent(cmdObjWithShardVersion, cm.dbVersion())}},
         ReadPreferenceSetting::get(opCtx),
         Shard::RetryPolicy::kIdempotent);
     auto response = ars.next();
@@ -687,7 +698,6 @@ Status runPipelineOnMongoS(const ClusterAggregate::Namespaces& namespaces,
 }
 
 Status dispatchPipelineAndMerge(OperationContext* opCtx,
-                                std::shared_ptr<executor::TaskExecutor> executor,
                                 AggregationTargeter targeter,
                                 Document serializedCommand,
                                 long long batchSize,
@@ -713,7 +723,9 @@ Status dispatchPipelineAndMerge(OperationContext* opCtx,
 
     // If we sent the entire pipeline to a single shard, store the remote cursor and return.
     if (!shardDispatchResults.splitPipeline) {
-        invariant(shardDispatchResults.remoteCursors.size() == 1);
+        tassert(4457012,
+                "pipeline was split, but more than one remote cursor is present",
+                shardDispatchResults.remoteCursors.size() == 1);
         auto&& remoteCursor = std::move(shardDispatchResults.remoteCursors.front());
         const auto shardId = remoteCursor->getShardId().toString();
         const auto reply = uassertStatusOK(storePossibleCursor(opCtx,
@@ -735,7 +747,7 @@ Status dispatchPipelineAndMerge(OperationContext* opCtx,
                                    namespaces,
                                    serializedCommand,
                                    batchSize,
-                                   targeter.routingInfo,
+                                   targeter.cm,
                                    std::move(shardDispatchResults),
                                    result,
                                    privileges,
@@ -743,11 +755,12 @@ Status dispatchPipelineAndMerge(OperationContext* opCtx,
 }
 
 std::pair<BSONObj, boost::optional<UUID>> getCollationAndUUID(
-    const boost::optional<CachedCollectionRoutingInfo>& routingInfo,
+    OperationContext* opCtx,
+    const boost::optional<ChunkManager>& cm,
     const NamespaceString& nss,
     const BSONObj& collation) {
-    const bool collectionIsSharded = (routingInfo && routingInfo->cm());
-    const bool collectionIsNotSharded = (routingInfo && !routingInfo->cm());
+    const bool collectionIsSharded = (cm && cm->isSharded());
+    const bool collectionIsNotSharded = (cm && !cm->isSharded());
 
     // If this is a collectionless aggregation, we immediately return the user-
     // defined collation if one exists, or an empty BSONObj otherwise. Collectionless aggregations
@@ -759,14 +772,13 @@ std::pair<BSONObj, boost::optional<UUID>> getCollationAndUUID(
     }
 
     // If the collection is unsharded, obtain collInfo from the primary shard.
-    const auto unshardedCollInfo = collectionIsNotSharded
-        ? getUnshardedCollInfo(routingInfo->db().primary().get(), nss)
-        : BSONObj();
+    const auto unshardedCollInfo =
+        collectionIsNotSharded ? getUnshardedCollInfo(opCtx, cm->dbPrimary(), nss) : BSONObj();
 
     // Return the collection UUID if available, or boost::none otherwise.
     const auto getUUID = [&]() -> auto {
         if (collectionIsSharded) {
-            return routingInfo->cm()->getUUID();
+            return cm->getUUID();
         } else {
             return unshardedCollInfo["info"] && unshardedCollInfo["info"]["uuid"]
                 ? boost::optional<UUID>{uassertStatusOK(
@@ -785,9 +797,8 @@ std::pair<BSONObj, boost::optional<UUID>> getCollationAndUUID(
         if (collectionIsNotSharded) {
             return getDefaultCollationForUnshardedCollection(unshardedCollInfo);
         } else {
-            return routingInfo->cm()->getDefaultCollator()
-                ? routingInfo->cm()->getDefaultCollator()->getSpec().toBSON()
-                : CollationSpec::kSimpleSpec;
+            return cm->getDefaultCollator() ? cm->getDefaultCollator()->getSpec().toBSON()
+                                            : CollationSpec::kSimpleSpec;
         }
     };
 

@@ -43,39 +43,51 @@ namespace mongo {
 /**
  * The implementation of AuthzManagerExternalState functionality for mongos.
  */
-class AuthzManagerExternalStateMongos : public AuthzManagerExternalState {
+class AuthzManagerExternalStateMongos final : public AuthzManagerExternalState {
     AuthzManagerExternalStateMongos(const AuthzManagerExternalStateMongos&) = delete;
     AuthzManagerExternalStateMongos& operator=(const AuthzManagerExternalStateMongos&) = delete;
 
 public:
     AuthzManagerExternalStateMongos();
-    ~AuthzManagerExternalStateMongos() override;
+    ~AuthzManagerExternalStateMongos() final;
 
-    Status initialize(OperationContext* opCtx) override;
     std::unique_ptr<AuthzSessionExternalState> makeAuthzSessionExternalState(
-        AuthorizationManager* authzManager) override;
+        AuthorizationManager* authzManager) final;
     Status getStoredAuthorizationVersion(OperationContext* opCtx, int* outVersion) override;
+    Status rolesExist(OperationContext* opCtx, const std::vector<RoleName>& roleNames) final;
+    StatusWith<User> getUserObject(OperationContext* opCtx, const UserRequest& userReq) final;
     Status getUserDescription(OperationContext* opCtx,
                               const UserRequest& user,
-                              BSONObj* result) override;
-    Status getRoleDescription(OperationContext* opCtx,
-                              const RoleName& roleName,
-                              PrivilegeFormat showPrivileges,
-                              AuthenticationRestrictionsFormat,
-                              BSONObj* result) override;
+                              BSONObj* result) final;
+    StatusWith<ResolvedRoleData> resolveRoles(OperationContext* opCtx,
+                                              const std::vector<RoleName>& roleNames,
+                                              ResolveRoleOption option) final {
+        return {ErrorCodes::NotImplemented, "AuthzMongos::resolveRoles"};
+    }
+
     Status getRolesDescription(OperationContext* opCtx,
                                const std::vector<RoleName>& roles,
                                PrivilegeFormat showPrivileges,
                                AuthenticationRestrictionsFormat,
-                               BSONObj* result) override;
+                               std::vector<BSONObj>* result) final {
+        return {ErrorCodes::NotImplemented, "AuthzMongos::getRolesDescription"};
+    }
+    Status getRolesAsUserFragment(OperationContext* opCtx,
+                                  const std::vector<RoleName>& roles,
+                                  AuthenticationRestrictionsFormat,
+                                  BSONObj* result) final {
+        return {ErrorCodes::NotImplemented, "AuthzMongos::getRolesAsUserFragment"};
+    }
     Status getRoleDescriptionsForDB(OperationContext* opCtx,
                                     StringData dbname,
                                     PrivilegeFormat showPrivileges,
                                     AuthenticationRestrictionsFormat,
                                     bool showBuiltinRoles,
-                                    std::vector<BSONObj>* result) override;
+                                    std::vector<BSONObj>* result) final {
+        return {ErrorCodes::NotImplemented, "AuthzMongos::getRoleDescriptionsForDB"};
+    }
 
-    bool hasAnyPrivilegeDocuments(OperationContext* opCtx) override;
+    bool hasAnyPrivilegeDocuments(OperationContext* opCtx) final;
 };
 
 }  // namespace mongo

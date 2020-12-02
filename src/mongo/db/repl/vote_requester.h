@@ -51,7 +51,13 @@ class VoteRequester {
     VoteRequester& operator=(const VoteRequester&) = delete;
 
 public:
-    enum class Result { kSuccessfullyElected, kStaleTerm, kInsufficientVotes, kPrimaryRespondedNo };
+    enum class Result {
+        kSuccessfullyElected,
+        kStaleTerm,
+        kInsufficientVotes,
+        kPrimaryRespondedNo,
+        kCancelled
+    };
 
     class Algorithm : public ScatterGatherAlgorithm {
     public:
@@ -127,7 +133,6 @@ public:
 private:
     std::shared_ptr<Algorithm> _algorithm;
     std::unique_ptr<ScatterGatherRunner> _runner;
-    bool _isCanceled = false;
 };
 
 }  // namespace repl

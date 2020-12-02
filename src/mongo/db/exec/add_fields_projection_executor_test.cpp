@@ -114,12 +114,14 @@ TEST(AddFieldsProjectionExecutorSpec, ThrowsOnCreationWithInvalidObjectsOrExpres
                       expCtx, BSON("a" << false << "b" << BSON("$unknown" << BSON_ARRAY(4 << 2)))),
                   AssertionException);
 
-    // Empty specifications are not allowed.
-    ASSERT_THROWS(AddFieldsProjectionExecutor::create(expCtx, BSONObj()), AssertionException);
-
     // Empty nested objects are not allowed.
     ASSERT_THROWS(AddFieldsProjectionExecutor::create(expCtx, BSON("a" << BSONObj())),
                   AssertionException);
+}
+
+TEST(AddFieldsProjectionExecutor, DoesNotErrorOnEmptySpec) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    AddFieldsProjectionExecutor::create(expCtx, BSONObj());
 }
 
 TEST(AddFieldsProjectionExecutor, DoesNotErrorOnTwoNestedFields) {
@@ -140,6 +142,17 @@ TEST(AddFieldsProjectionExecutorDeps, RemovesReplaceFieldsFromDependencies) {
     ASSERT_EQ(deps.fields.size(), 0UL);
     ASSERT_EQ(deps.fields.count("_id"), 0UL);  // Not explicitly included.
     ASSERT_EQ(deps.fields.count("a"), 0UL);    // Set to true.
+}
+
+TEST(AddFieldsProjectionExecutor, ShouldNotIncludeDependenciesForEmptySpec) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    AddFieldsProjectionExecutor addition(expCtx);
+    addition.parse(BSON("a" << true));
+
+    DepsTracker deps;
+    addition.addDependencies(&deps);
+
+    ASSERT_EQ(deps.fields.size(), 0UL);
 }
 
 // Verify that adding nested fields keeps the top-level field as a dependency.
@@ -195,6 +208,17 @@ TEST(AddFieldsProjectionExecutorSerialize, SerializesToCorrectForm) {
                        addition.serializeTransformation(ExplainOptions::Verbosity::kExecStats));
     ASSERT_DOCUMENT_EQ(expectedSerialization,
                        addition.serializeTransformation(ExplainOptions::Verbosity::kExecAllPlans));
+}
+
+TEST(AddFieldsProjectionExecutorSerialize, EmptySpecSerializesToCorrectForm) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    AddFieldsProjectionExecutor addition(expCtx);
+    addition.parse(fromjson("{}"));
+
+    auto expectedSerialization = Document();
+
+    // Should be the same if we're serializing for explain or for internal use.
+    ASSERT_DOCUMENT_EQ(expectedSerialization, addition.serializeTransformation(boost::none));
 }
 
 // Verify that serialize treats the _id field as any other field: including when explicity included.
@@ -294,6 +318,22 @@ TEST(AddFieldsProjectionExecutorExecutionTest, AddsNewFieldToEndOfDocument) {
     expectedResult = Document{{"a", 1}, {"b", 2}, {"c", 3}};
     ASSERT_DOCUMENT_EQ(result, expectedResult);
 }
+
+TEST(AddFieldsProjectionExecutorExecutionTest, AddingEmptySpecResultsInNoOp) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    AddFieldsProjectionExecutor addition(expCtx);
+
+    // There are no fields in the document.
+    auto result = addition.applyProjection(Document{});
+    auto expectedResult = Document{{}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+
+    // There are fields in the document but none of them are the added field.
+    result = addition.applyProjection(Document{{"a", 1}, {"b", 2}});
+    expectedResult = Document{{"a", 1}, {"b", 2}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
 
 // Verify that an existing field is replaced and stays in the same order in the document.
 TEST(AddFieldsProjectionExecutorExecutionTest, ReplacesFieldThatAlreadyExistsInDocument) {
@@ -450,23 +490,22 @@ TEST(AddFieldsProjectionExecutorExecutionTest, AppliesDottedAdditionToEachElemen
     AddFieldsProjectionExecutor addition(expCtx);
     addition.parse(BSON("a.b" << true));
 
-    vector<Value> nestedValues = {Value(1),
-                                  Value(Document{}),
-                                  Value(Document{{"b", 1}}),
-                                  Value(Document{{"b", 1}, {"c", 2}}),
-                                  Value(vector<Value>{}),
-                                  Value(vector<Value>{Value(1), Value(Document{{"c", 1}})})};
 
+    auto result = addition.applyProjection(Document{{"a",
+                                                     {1,
+                                                      Document{},
+                                                      Document{{"b", 1}},
+                                                      Document{{"b", 1}, {"c", 2}},
+                                                      vector<Value>{},
+                                                      {1, Document{{"c", 1}}}}}});
     // Adds the field "b" to every object in the array. Recurses on non-empty nested arrays.
-    vector<Value> expectedNestedValues = {
-        Value(Document{{"b", true}}),
-        Value(Document{{"b", true}}),
-        Value(Document{{"b", true}}),
-        Value(Document{{"b", true}, {"c", 2}}),
-        Value(vector<Value>{}),
-        Value(vector<Value>{Value(Document{{"b", true}}), Value(Document{{"c", 1}, {"b", true}})})};
-    auto result = addition.applyProjection(Document{{"a", nestedValues}});
-    auto expectedResult = Document{{"a", expectedNestedValues}};
+    auto expectedResult = Document{{"a",
+                                    {Document{{"b", true}},
+                                     Document{{"b", true}},
+                                     Document{{"b", true}},
+                                     Document{{"b", true}, {"c", 2}},
+                                     vector<Value>{},
+                                     {Document{{"b", true}}, Document{{"c", 1}, {"b", true}}}}}};
     ASSERT_DOCUMENT_EQ(result, expectedResult);
 }
 

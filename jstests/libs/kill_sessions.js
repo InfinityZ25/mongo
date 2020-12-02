@@ -120,7 +120,7 @@ var _kill_sessions_api_module = (function() {
         // hosts.  We identify particular ops by secs sleeping.
         this.visit(function(client) {
             let admin = client.getDB("admin");
-            admin.getMongo().setSlaveOk();
+            admin.getMongo().setSecondaryOk();
 
             assert.soon(function() {
                 let inProgressOps = admin.aggregate([{$currentOp: {'allUsers': true}}]);
@@ -133,7 +133,7 @@ var _kill_sessions_api_module = (function() {
                 }
 
                 return false;
-            }, "never started sleep", 30000, 1);
+            }, "never started sleep with 'secs' " + id, 30000, 1);
         });
 
         return new HangingOpHandle(thread, lsid);
@@ -183,7 +183,7 @@ var _kill_sessions_api_module = (function() {
     Fixture.prototype.assertNoSessionsInCursors = function() {
         this.visit(function(client) {
             var db = client.getDB("admin");
-            db.setSlaveOk();
+            db.setSecondaryOk();
             assert.soon(() => {
                 let cursors = db.aggregate([
                                     {"$currentOp": {"idleCursors": true, "allUsers": true}}
@@ -205,7 +205,7 @@ var _kill_sessions_api_module = (function() {
             });
 
             var db = client.getDB("admin");
-            db.setSlaveOk();
+            db.setSecondaryOk();
             var cursors = db.aggregate([
                                 {"$currentOp": {"idleCursors": true, "allUsers": true}},
                                 {"$match": {type: "idleCursor"}}
@@ -253,7 +253,7 @@ var _kill_sessions_api_module = (function() {
                     assert(checkLog.checkContainsOnceJsonStringMatch(
                                hostToCheck,
                                20528,
-                               'id',
+                               'cursorId',
                                this._cursors[hostToCheck.host].exactValueString),
                            "cursor kill was not logged by " + hostToCheck.host);
                 } else {

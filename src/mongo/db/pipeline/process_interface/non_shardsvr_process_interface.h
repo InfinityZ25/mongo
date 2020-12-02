@@ -54,8 +54,7 @@ public:
     std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
         Pipeline* pipeline, bool allowTargetingShards) override;
 
-    BSONObj attachCursorSourceAndExplain(Pipeline* ownedPipeline,
-                                         ExplainOptions::Verbosity verbosity);
+    BSONObj preparePipelineAndExplain(Pipeline* ownedPipeline, ExplainOptions::Verbosity verbosity);
 
     std::unique_ptr<ShardFilterer> getShardFilterer(
         const boost::intrusive_ptr<ExpressionContext>& expCtx) const override {
@@ -110,6 +109,12 @@ public:
     void createIndexesOnEmptyCollection(OperationContext* opCtx,
                                         const NamespaceString& ns,
                                         const std::vector<BSONObj>& indexSpecs) override;
+
+    void setExpectedShardVersion(OperationContext* opCtx,
+                                 const NamespaceString& nss,
+                                 boost::optional<ChunkVersion> chunkVersion) override {
+        // Do nothing on a non-shardsvr mongoD.
+    }
 
 protected:
     // This constructor is marked as protected in order to prevent instantiation since this

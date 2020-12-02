@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -59,7 +59,7 @@ void updatePersistedDefaultRWConcernDocument(OperationContext* opCtx, const RWCo
             write_ops::UpdateOpEntry entry;
             entry.setQ(BSON("_id" << ReadWriteConcernDefaults::kPersistedDocumentId));
             // Note the _id is propagated from the query into the upserted document.
-            entry.setU(rw.toBSON());
+            entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(rw.toBSON()));
             entry.setUpsert(true);
             return entry;
         }()});
@@ -119,8 +119,9 @@ public:
 
             updatePersistedDefaultRWConcernDocument(opCtx, newDefaults);
             LOGV2(20498,
-                  "successfully set RWC defaults to {newDefaults}",
-                  "newDefaults"_attr = newDefaults.toBSON());
+                  "Successfully set RWC defaults to {value}",
+                  "Successfully set RWC defaults",
+                  "value"_attr = newDefaults);
 
             // Refresh to populate the cache with the latest defaults.
             rwcDefaults.refreshIfNecessary(opCtx);

@@ -59,7 +59,7 @@ public:
 
     ReplicationCoordinatorExternalStateMock();
     virtual ~ReplicationCoordinatorExternalStateMock();
-    virtual void startThreads(const ReplSettings& settings) override;
+    virtual void startThreads() override;
     virtual void startSteadyStateReplication(OperationContext* opCtx,
                                              ReplicationCoordinator* replCoord) override;
     virtual void stopDataReplication(OperationContext* opCtx) override;
@@ -68,11 +68,12 @@ public:
     virtual void shutdown(OperationContext* opCtx);
     virtual void clearAppliedThroughIfCleanShutdown(OperationContext* opCtx);
     virtual executor::TaskExecutor* getTaskExecutor() const override;
+    virtual std::shared_ptr<executor::TaskExecutor> getSharedTaskExecutor() const override;
     virtual ThreadPool* getDbWorkThreadPool() const override;
     virtual Status initializeReplSetStorage(OperationContext* opCtx, const BSONObj& config);
     void onDrainComplete(OperationContext* opCtx) override;
     OpTime onTransitionToPrimary(OperationContext* opCtx) override;
-    virtual void forwardSlaveProgress();
+    virtual void forwardSecondaryProgress();
     virtual bool isSelf(const HostAndPort& host, ServiceContext* service);
     virtual HostAndPort getClientHostAndPort(const OperationContext* opCtx);
     virtual StatusWith<BSONObj> loadLocalConfigDocument(OperationContext* opCtx);
@@ -91,9 +92,9 @@ public:
     virtual void stopProducer();
     virtual void startProducerIfStopped();
     virtual bool tooStale();
-    virtual void dropAllSnapshots();
+    virtual void clearCommittedSnapshot();
     virtual void updateCommittedSnapshot(const OpTime& newCommitPoint);
-    virtual void updateLocalSnapshot(const OpTime& optime);
+    virtual void updateLastAppliedSnapshot(const OpTime& optime);
     virtual bool snapshotsEnabled() const;
     virtual void notifyOplogMetadataWaiters(const OpTime& committedOpTime);
     boost::optional<OpTime> getEarliestDropPendingOpTime() const final;
@@ -108,6 +109,12 @@ public:
      * messages.
      */
     void addSelf(const HostAndPort& host);
+
+    /**
+     * Remove all hosts from the list of hosts that this mock will match when responding to "isSelf"
+     * messages.
+     */
+    void clearSelfHosts();
 
     /**
      * Sets the return value for subsequent calls to loadLocalConfigDocument().

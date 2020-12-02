@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -60,7 +60,7 @@ ReplicationCoordinatorExternalStateMock::ReplicationCoordinatorExternalStateMock
 
 ReplicationCoordinatorExternalStateMock::~ReplicationCoordinatorExternalStateMock() {}
 
-void ReplicationCoordinatorExternalStateMock::startThreads(const ReplSettings& settings) {
+void ReplicationCoordinatorExternalStateMock::startThreads() {
     _threadsStarted = true;
 }
 
@@ -88,11 +88,16 @@ executor::TaskExecutor* ReplicationCoordinatorExternalStateMock::getTaskExecutor
     return nullptr;
 }
 
+std::shared_ptr<executor::TaskExecutor>
+ReplicationCoordinatorExternalStateMock::getSharedTaskExecutor() const {
+    return nullptr;
+}
+
 ThreadPool* ReplicationCoordinatorExternalStateMock::getDbWorkThreadPool() const {
     return nullptr;
 }
 
-void ReplicationCoordinatorExternalStateMock::forwardSlaveProgress() {}
+void ReplicationCoordinatorExternalStateMock::forwardSecondaryProgress() {}
 
 bool ReplicationCoordinatorExternalStateMock::isSelf(const HostAndPort& host,
                                                      ServiceContext* const service) {
@@ -101,6 +106,10 @@ bool ReplicationCoordinatorExternalStateMock::isSelf(const HostAndPort& host,
 
 void ReplicationCoordinatorExternalStateMock::addSelf(const HostAndPort& host) {
     _selfHosts.push_back(host);
+}
+
+void ReplicationCoordinatorExternalStateMock::clearSelfHosts() {
+    _selfHosts.clear();
 }
 
 HostAndPort ReplicationCoordinatorExternalStateMock::getClientHostAndPort(
@@ -241,12 +250,12 @@ bool ReplicationCoordinatorExternalStateMock::tooStale() {
     return false;
 }
 
-void ReplicationCoordinatorExternalStateMock::dropAllSnapshots() {}
+void ReplicationCoordinatorExternalStateMock::clearCommittedSnapshot() {}
 
 void ReplicationCoordinatorExternalStateMock::updateCommittedSnapshot(
     const OpTime& newCommitPoint) {}
 
-void ReplicationCoordinatorExternalStateMock::updateLocalSnapshot(const OpTime& optime) {}
+void ReplicationCoordinatorExternalStateMock::updateLastAppliedSnapshot(const OpTime& optime) {}
 
 bool ReplicationCoordinatorExternalStateMock::snapshotsEnabled() const {
     return _areSnapshotsEnabled;

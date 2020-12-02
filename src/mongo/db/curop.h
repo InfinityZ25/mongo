@@ -31,11 +31,15 @@
 #pragma once
 
 #include "mongo/config.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/cursor_id.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/profile_filter.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/stats/resource_consumption_metrics.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/logv2/attribute_storage.h"
 #include "mongo/logv2/log_component.h"
@@ -112,6 +116,11 @@ public:
         void incrementNinserted(long long n);
 
         /**
+         * Increments nUpserted by n.
+         */
+        void incrementNUpserted(long long n);
+
+        /**
          * Increments prepareReadConflicts by n.
          */
         void incrementPrepareReadConflicts(long long n);
@@ -135,6 +144,7 @@ public:
         boost::optional<long long> nModified;
         boost::optional<long long> ninserted;
         boost::optional<long long> ndeleted;
+        boost::optional<long long> nUpserted;
 
         // Number of index keys inserted.
         boost::optional<long long> keysInserted;
@@ -157,6 +167,7 @@ public:
 
     void report(OperationContext* opCtx,
                 const SingleThreadedLockStats* lockStats,
+                const ResourceConsumption::OperationMetrics* operationMetrics,
                 logv2::DynamicAttributes* pAttrs) const;
 
     /**
@@ -170,6 +181,10 @@ public:
                 FlowControlTicketholder::CurOp flowControlStats,
                 BSONObjBuilder& builder) const;
 
+    static std::function<BSONObj(ProfileFilter::Args args)> appendStaged(StringSet requestedFields,
+                                                                         bool needWholeDocument);
+    static void appendUserInfo(const CurOp&, BSONObjBuilder&, AuthorizationSession*);
+
     /**
      * Copies relevant plan summary metrics to this OpDebug instance.
      */
@@ -178,7 +193,7 @@ public:
     /**
      * The resulting object has zeros omitted. As is typical in this file.
      */
-    BSONObj makeFlowControlObject(FlowControlTicketholder::CurOp flowControlStats) const;
+    static BSONObj makeFlowControlObject(FlowControlTicketholder::CurOp flowControlStats);
 
     /**
      * Make object from $search stats with non-populated values omitted.
@@ -217,7 +232,6 @@ public:
     // True if a replan was triggered during the execution of this operation.
     std::optional<std::string> replanReason;
 
-    bool upsert{false};  // true if the update actually did an insert
     bool cursorExhausted{
         false};  // true if the cursor has been closed at end a find/getMore operation
 
@@ -233,7 +247,7 @@ public:
     Status errInfo = Status::OK();
 
     // response info
-    long long executionTimeMicros{0};
+    Microseconds executionTime{0};
     long long nreturned{-1};
     int responseLength{-1};
 
@@ -263,7 +277,7 @@ public:
     boost::optional<WriteConcernOptions> writeConcern;
 
     // Whether this is an oplog getMore operation for replication oplog fetching.
-    bool isReplOplogFetching{false};
+    bool isReplOplogGetMore{false};
 };
 
 /**
@@ -365,7 +379,7 @@ public:
         return _originatingCommand;
     }
 
-    void enter_inlock(const char* ns, boost::optional<int> dbProfileLevel);
+    void enter_inlock(const char* ns, int dbProfileLevel);
 
     /**
      * Sets the type of the current network operation.
@@ -406,18 +420,29 @@ public:
     }
 
     /**
+     * Gets the name of the namespace on which the current operation operates.
+     */
+    NamespaceString getNSS() const {
+        return NamespaceString{_ns};
+    }
+
+    /**
      * Returns true if the elapsed time of this operation is such that it should be profiled or
      * profile level is set to 2. Uses total time if the operation is done, current elapsed time
-     * otherwise. The argument shouldSample prevents slow diagnostic logging at profile 1
-     * when set to false.
+     * otherwise.
+     *
+     * When a custom filter is set, we conservatively assume it would match this operation.
      */
-    bool shouldDBProfile(bool shouldSample = true) {
+    bool shouldDBProfile(OperationContext* opCtx) {
         // Profile level 2 should override any sample rate or slowms settings.
         if (_dbprofile >= 2)
             return true;
 
-        if (!shouldSample || _dbprofile <= 0)
+        if (_dbprofile <= 0)
             return false;
+
+        if (CollectionCatalog::get(opCtx)->getDatabaseProfileSettings(getNSS().db()).filter)
+            return true;
 
         return elapsedTimeExcludingPauses() >= Milliseconds{serverGlobalParams.slowMS};
     }
@@ -469,17 +494,13 @@ public:
     // negative, if the system time has been reset during the course of this operation.
     //
 
-    void ensureStarted();
+    void ensureStarted() {
+        static_cast<void>(startTime());
+    }
     bool isStarted() const {
-        return _start > 0;
+        return _start.load() != 0;
     }
-    long long startTime() {  // micros
-        ensureStarted();
-        return _start;
-    }
-    void done() {
-        _end = curTimeMicros64();
-    }
+    void done();
     bool isDone() const {
         return _end > 0;
     }
@@ -497,7 +518,7 @@ public:
     void pauseTimer() {
         invariant(isStarted());
         invariant(_lastPauseTime == 0);
-        _lastPauseTime = curTimeMicros64();
+        _lastPauseTime = _tickSource->getTicks();
     }
 
     /**
@@ -508,7 +529,7 @@ public:
         invariant(isStarted());
         invariant(_lastPauseTime > 0);
         _totalPausedDuration +=
-            Microseconds{static_cast<long long>(curTimeMicros64()) - _lastPauseTime};
+            _tickSource->ticksTo<Microseconds>(_tickSource->getTicks() - _lastPauseTime);
         _lastPauseTime = 0;
     }
 
@@ -556,8 +577,10 @@ public:
         if (_debug.remoteOpWaitTime) {
             Microseconds end = elapsedTimeTotal();
             invariant(_remoteOpStartTime);
-            invariant(*_remoteOpStartTime <= end);
-            Microseconds delta = end - *_remoteOpStartTime;
+            // On most systems a monotonic clock source will be used to measure time. When a
+            // monotonic clock is not available we fallback to using the realtime system clock. When
+            // used, a backward shift of the realtime system clock could lead to a negative delta.
+            Microseconds delta = std::max((end - *_remoteOpStartTime), Microseconds{0});
             *_debug.remoteOpWaitTime += delta;
             _remoteOpStartTime = boost::none;
         }
@@ -573,15 +596,12 @@ public:
      * If this op has not yet been started, returns 0.
      */
     Microseconds elapsedTimeTotal() {
-        if (!isStarted()) {
+        auto start = _start.load();
+        if (start == 0) {
             return Microseconds{0};
         }
 
-        if (!_end) {
-            return Microseconds{static_cast<long long>(curTimeMicros64() - startTime())};
-        } else {
-            return Microseconds{static_cast<long long>(_end - startTime())};
-        }
+        return computeElapsedTimeTotal(start, _end.load());
     }
 
     /**
@@ -595,11 +615,13 @@ public:
      */
     Microseconds elapsedTimeExcludingPauses() {
         invariant(!_lastPauseTime);
-        if (!isStarted()) {
+
+        auto start = _start.load();
+        if (start == 0) {
             return Microseconds{0};
         }
 
-        return elapsedTimeTotal() - _totalPausedDuration;
+        return computeElapsedTimeTotal(start, _end.load()) - _totalPausedDuration;
     }
 
     /**
@@ -686,15 +708,15 @@ public:
     }
 
     void yielded(int numYields = 1) {
-        _numYields += numYields;
-    }  // Should be _inlock()?
+        _numYields.fetchAndAdd(numYields);
+    }
 
     /**
      * Returns the number of times yielded() was called.  Callers on threads other
      * than the one executing the operation must lock the client.
      */
     int numYields() const {
-        return _numYields;
+        return _numYields.load();
     }
 
     /**
@@ -718,12 +740,25 @@ public:
 
     void setGenericCursor_inlock(GenericCursor gc);
 
-    const boost::optional<SingleThreadedLockStats> getLockStatsBase() {
+    boost::optional<SingleThreadedLockStats> getLockStatsBase() const {
         return _lockStatsBase;
+    }
+
+    void setTickSource_forTest(TickSource* tickSource) {
+        _tickSource = tickSource;
     }
 
 private:
     class CurOpStack;
+
+    TickSource::Tick startTime();
+    Microseconds computeElapsedTimeTotal(TickSource::Tick startTime,
+                                         TickSource::Tick endTime) const;
+
+    /**
+     * Adds 'this' to the stack of active CurOp objects.
+     */
+    void _finishInit(OperationContext* opCtx, CurOpStack* stack);
 
     static const OperationContext::Decoration<CurOpStack> _curopStack;
 
@@ -734,14 +769,14 @@ private:
     const Command* _command{nullptr};
 
     // The time at which this CurOp instance was marked as started.
-    long long _start{0};
+    std::atomic<TickSource::Tick> _start{0};  // NOLINT
 
-    // The time at which this CurOp instance was marked as done.
-    long long _end{0};
+    // The time at which this CurOp instance was marked as done or 0 if the CurOp is not yet done.
+    std::atomic<TickSource::Tick> _end{0};  // NOLINT
 
     // The time at which this CurOp instance had its timer paused, or 0 if the timer is not
     // currently paused.
-    long long _lastPauseTime{0};
+    TickSource::Tick _lastPauseTime{0};
 
     // The cumulative duration for which the timer has been paused.
     Microseconds _totalPausedDuration{0};
@@ -766,13 +801,15 @@ private:
     std::string _failPointMessage;  // Used to store FailPoint information.
     std::string _message;
     ProgressMeter _progressMeter;
-    int _numYields{0};
+    AtomicWord<int> _numYields{0};
     // A GenericCursor containing information about the active cursor for a getMore operation.
     boost::optional<GenericCursor> _genericCursor;
 
     std::string _planSummary;
     boost::optional<SingleThreadedLockStats>
         _lockStatsBase;  // This is the snapshot of lock stats taken when curOp is constructed.
+
+    TickSource* _tickSource = nullptr;
 };
 
 /**

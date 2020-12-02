@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kTransaction
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTransaction
 
 #include "mongo/platform/basic.h"
 
@@ -145,7 +145,7 @@ repl::OpTime persistParticipantListBlocking(OperationContext* opCtx,
             TransactionCoordinatorDocument doc;
             doc.setId(std::move(sessionInfo));
             doc.setParticipants(std::move(participantList));
-            entry.setU(doc.toBSON());
+            entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(doc.toBSON()));
 
             entry.setUpsert(true);
             return entry;
@@ -337,13 +337,14 @@ repl::OpTime persistDecisionBlocking(OperationContext* opCtx,
                             << buildParticipantListMatchesConditions(participantList) << "$or"
                             << BSON_ARRAY(noDecision << sameDecision)));
 
-            entry.setU([&] {
+            entry.setUpsert(true);
+            entry.setU(write_ops::UpdateModification::parseFromClassicUpdate([&] {
                 TransactionCoordinatorDocument doc;
                 doc.setId(sessionInfo);
                 doc.setParticipants(std::move(participantList));
                 doc.setDecision(decision);
                 return doc.toBSON();
-            }());
+            }()));
 
             return entry;
         }()});
@@ -677,11 +678,11 @@ Future<PrepareResponse> sendPrepareToShard(ServiceContext* service,
                     LOGV2_DEBUG(22479,
                                 3,
                                 "{sessionId}:{txnNumber} Coordinator shard received "
-                                "{status} from shard {shardId} for {command}",
+                                "{error} from shard {shardId} for {command}",
                                 "Coordinator shard received response from shard",
                                 "sessionId"_attr = lsid.getId(),
                                 "txnNumber"_attr = txnNumber,
-                                "status"_attr = status,
+                                "error"_attr = status,
                                 "shardId"_attr = shardId,
                                 "command"_attr = commandObj);
 
@@ -719,7 +720,10 @@ Future<PrepareResponse> sendPrepareToShard(ServiceContext* service,
                         "Prepare stopped retrying due to retrying being cancelled",
                         "sessionId"_attr = lsid.getId(),
                         "txnNumber"_attr = txnNumber);
-            return PrepareResponse{shardId, boost::none, boost::none, status};
+            return PrepareResponse{shardId,
+                                   boost::none,
+                                   boost::none,
+                                   Status(ErrorCodes::NoSuchTransaction, status.reason())};
         });
 }
 

@@ -26,7 +26,7 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 #include "mongo/client/streamable_replica_set_monitor_query_processor.h"
 
 #include <memory>
@@ -41,8 +41,7 @@ void StreamableReplicaSetMonitor::StreamableReplicaSetMonitorQueryProcessor::shu
 }
 
 void StreamableReplicaSetMonitor::StreamableReplicaSetMonitorQueryProcessor::
-    onTopologyDescriptionChangedEvent(UUID topologyId,
-                                      sdam::TopologyDescriptionPtr previousDescription,
+    onTopologyDescriptionChangedEvent(sdam::TopologyDescriptionPtr previousDescription,
                                       sdam::TopologyDescriptionPtr newDescription) {
     {
         stdx::lock_guard lock(_mutex);
@@ -57,7 +56,8 @@ void StreamableReplicaSetMonitor::StreamableReplicaSetMonitorQueryProcessor::
         if (!replicaSetMonitor) {
             LOGV2_DEBUG(4333215,
                         kLogLevel,
-                        "could not find rsm instance {replicaSet} for query processing.",
+                        "Could not find rsm instance {replicaSet} for query processing",
+                        "Could not find rsm instance for query processing",
                         "replicaSet"_attr = *setName);
             return;
         }

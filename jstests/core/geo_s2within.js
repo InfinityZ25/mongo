@@ -1,7 +1,10 @@
 // Test some cases that might be iffy with $within, mostly related to polygon w/holes.
+// @tags: [
+//   sbe_incompatible,
+// ]
 t = db.geo_s2within;
 t.drop();
-t.ensureIndex({geo: "2dsphere"});
+t.createIndex({geo: "2dsphere"});
 
 somepoly = {
     "type": "Polygon",
@@ -16,7 +19,7 @@ res = t.find({"geo": {"$within": {"$geometry": somepoly}}});
 assert.eq(res.itcount(), 1);
 
 t.drop();
-t.ensureIndex({geo: "2dsphere"});
+t.createIndex({geo: "2dsphere"});
 somepoly = {
     "type": "Polygon",
     "coordinates": [

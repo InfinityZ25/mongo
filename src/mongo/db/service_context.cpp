@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -94,12 +94,6 @@ void setGlobalServiceContext(ServiceContext::UniqueServiceContext&& serviceConte
     }
 
     globalServiceContext = serviceContext.release();
-}
-
-bool _supportsDocLocking = false;
-
-bool supportsDocLocking() {
-    return _supportsDocLocking;
 }
 
 ServiceContext::ServiceContext()
@@ -199,10 +193,6 @@ ServiceEntryPoint* ServiceContext::getServiceEntryPoint() const {
     return _serviceEntryPoint.get();
 }
 
-transport::ServiceExecutor* ServiceContext::getServiceExecutor() const {
-    return _serviceExecutor.get();
-}
-
 void ServiceContext::setStorageEngine(std::unique_ptr<StorageEngine> engine) {
     invariant(engine);
     invariant(!_storageEngine);
@@ -231,10 +221,6 @@ void ServiceContext::setServiceEntryPoint(std::unique_ptr<ServiceEntryPoint> sep
 
 void ServiceContext::setTransportLayer(std::unique_ptr<transport::TransportLayer> tl) {
     _transportLayer = std::move(tl);
-}
-
-void ServiceContext::setServiceExecutor(std::unique_ptr<transport::ServiceExecutor> exec) {
-    _serviceExecutor = std::move(exec);
 }
 
 void ServiceContext::ClientDeleter::operator()(Client* client) const {
@@ -267,9 +253,21 @@ ServiceContext::UniqueOperationContext ServiceContext::makeOperationContext(Clie
     } else {
         makeBaton(opCtx.get());
     }
+
     {
         stdx::lock_guard<Client> lk(*client);
-        client->setOperationContext(opCtx.get());
+
+        // If we have a previous operation context, it's not worth crashing the process in
+        // production. However, we do want to prevent it from doing more work and complain loudly.
+        auto lastOpCtx = client->getOperationContext();
+        if (lastOpCtx) {
+            killOperation(lk, lastOpCtx, ErrorCodes::Error(4946800));
+            tasserted(
+                4946801,
+                "Client has attempted to create a new OperationContext, but it already has one");
+        }
+
+        client->_setOperationContext(opCtx.get());
     }
 
     {
@@ -282,20 +280,12 @@ ServiceContext::UniqueOperationContext ServiceContext::makeOperationContext(Clie
 
 void ServiceContext::OperationContextDeleter::operator()(OperationContext* opCtx) const {
     auto client = opCtx->getClient();
-    if (client->session()) {
-        _numCurrentOps.subtractAndFetch(1);
-    }
+    invariant(client);
+
     auto service = client->getServiceContext();
+    invariant(service);
 
-    {
-        stdx::lock_guard lk(service->_mutex);
-        service->_clientByOperationId.erase(opCtx->getOpID());
-    }
-
-    {
-        stdx::lock_guard<Client> lk(*client);
-        client->resetOperationContext();
-    }
+    service->_delistOperation(opCtx);
     opCtx->getBaton()->detach();
 
     onDestroy(opCtx, service->_clientObservers);
@@ -327,7 +317,7 @@ Client* ServiceContext::LockedClientsCursor::next() {
     return result;
 }
 
-void ServiceContext::setKillAllOperations() {
+void ServiceContext::setKillAllOperations(const std::set<std::string>& excludedClients) {
     stdx::lock_guard<Latch> clientLock(_mutex);
 
     // Ensure that all newly created operation contexts will immediately be in the interrupted state
@@ -337,6 +327,12 @@ void ServiceContext::setKillAllOperations() {
     // Interrupt all active operations
     for (auto&& client : _clients) {
         stdx::lock_guard<Client> lk(*client);
+
+        // Do not kill operations from the excluded clients.
+        if (excludedClients.find(client->desc()) != excludedClients.end()) {
+            continue;
+        }
+
         auto opCtxToKill = client->getOperationContext();
         if (opCtxToKill) {
             killOperation(lk, opCtxToKill, ErrorCodes::InterruptedAtShutdown);
@@ -367,6 +363,49 @@ void ServiceContext::killOperation(WithLock, OperationContext* opCtx, ErrorCodes
             std::terminate();
         }
     }
+}
+
+void ServiceContext::_delistOperation(OperationContext* opCtx) noexcept {
+    // Removing `opCtx` from `_clientByOperationId` must always precede removing the `opCtx` from
+    // its client to prevent situations that another thread could use the service context to get a
+    // hold of an `opCtx` that has been removed from its client.
+    {
+        stdx::lock_guard lk(_mutex);
+        if (_clientByOperationId.erase(opCtx->getOpID()) != 1) {
+            // Another thread has already delisted this `opCtx`.
+            return;
+        }
+    }
+
+    auto client = opCtx->getClient();
+    stdx::lock_guard clientLock(*client);
+    // Reaching here implies this call was able to remove the `opCtx` from ServiceContext.
+
+    // Assigning a new opCtx to the client must never precede the destruction of any existing opCtx
+    // that references the client.
+    invariant(client->getOperationContext() == opCtx);
+    client->_setOperationContext({});
+
+    if (client->session()) {
+        _numCurrentOps.subtractAndFetch(1);
+    }
+
+    opCtx->releaseOperationKey();
+}
+
+void ServiceContext::killAndDelistOperation(OperationContext* opCtx,
+                                            ErrorCodes::Error killCode) noexcept {
+
+    auto client = opCtx->getClient();
+    invariant(client);
+
+    auto service = client->getServiceContext();
+    invariant(service == this);
+
+    _delistOperation(opCtx);
+
+    stdx::lock_guard clientLock(*client);
+    killOperation(clientLock, opCtx, killCode);
 }
 
 void ServiceContext::unsetKillAllOperations() {

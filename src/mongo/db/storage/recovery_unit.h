@@ -133,8 +133,8 @@ public:
      * Should be called through WriteUnitOfWork rather than directly.
      */
     void commitUnitOfWork() {
-        assignNextSnapshotId();
         doCommitUnitOfWork();
+        assignNextSnapshotId();
     }
 
     /**
@@ -145,8 +145,8 @@ public:
      * Should be called through WriteUnitOfWork rather than directly.
      */
     void abortUnitOfWork() {
-        assignNextSnapshotId();
         doAbortUnitOfWork();
+        assignNextSnapshotId();
     }
 
     /**
@@ -194,6 +194,8 @@ public:
      * true, unless the storage engine cannot guarantee durability, which should never happen when
      * isDurable() returned true. This cannot be called from inside a unit of work, and should
      * fail if it is. This method invariants if the caller holds any locks, except for repair.
+     *
+     * Can throw write interruption errors from the JournalListener.
      */
     virtual bool waitUntilDurable(OperationContext* opCtx) = 0;
 
@@ -215,8 +217,8 @@ public:
      * cannot be called inside of a WriteUnitOfWork, and should fail if it is.
      */
     void abandonSnapshot() {
-        assignNextSnapshotId();
         doAbandonSnapshot();
+        assignNextSnapshotId();
     }
 
     /**
@@ -228,20 +230,27 @@ public:
     virtual void preallocateSnapshot() {}
 
     /**
-     * Obtains a majority committed snapshot. Snapshots should still be separately acquired and
-     * newer committed snapshots should be used if available whenever implementations would normally
-     * change snapshots.
+     * Like preallocateSnapshot() above but also indicates that the snapshot will be used for
+     * reading the oplog.
      *
-     * If no snapshot has yet been marked as Majority Committed, returns a status with error code
+     * StorageEngines may not implement this in which case it works like preallocateSnapshot.
+     */
+    virtual void preallocateSnapshotForOplogRead() {
+        preallocateSnapshot();
+    }
+
+    /**
+     * Returns whether or not a majority commmitted snapshot is available. If no snapshot has yet
+     * been marked as Majority Committed, returns a status with error code
      * ReadConcernMajorityNotAvailableYet. After this returns successfully, at any point where
      * implementations attempt to acquire committed snapshot, if there are none available due to a
-     * call to SnapshotManager::dropAllSnapshots(), a AssertionException with the same code should
-     * be thrown.
+     * call to SnapshotManager::clearCommittedSnapshot(), a AssertionException with the same code
+     * should be thrown.
      *
      * StorageEngines that don't support a SnapshotManager should use the default
      * implementation.
      */
-    virtual Status obtainMajorityCommittedSnapshot() {
+    virtual Status majorityCommittedSnapshotAvailable() const {
         return {ErrorCodes::CommandNotSupported,
                 "Current storage engine does not support majority readConcerns"};
     }
@@ -253,15 +262,14 @@ public:
      *  - when using ReadSource::kNoOverlap, the timestamp chosen by the storage engine.
      *  - when using ReadSource::kAllDurableSnapshot, the timestamp chosen using the storage
      * engine's all_durable timestamp.
-     *  - when using ReadSource::kLastApplied, the timestamp chosen using the storage engine's last
-     * applied timestamp. Can return boost::none if no timestamp has been established.
+     *  - when using ReadSource::kLastAppplied, the last applied timestamp. Can return boost::none
+     * if no timestamp has been established.
      *  - when using ReadSource::kMajorityCommitted, the majority committed timestamp chosen by the
-     * storage engine after a transaction has been opened or after a call to
-     * obtainMajorityCommittedSnapshot().
+     * storage engine after a transaction has been opened.
      *
      * This may passively start a storage engine transaction to establish a read timestamp.
      */
-    virtual boost::optional<Timestamp> getPointInTimeReadTimestamp() {
+    virtual boost::optional<Timestamp> getPointInTimeReadTimestamp(OperationContext* opCtx) {
         return boost::none;
     }
 
@@ -290,6 +298,14 @@ public:
      */
     virtual Status setTimestamp(Timestamp timestamp) {
         return Status::OK();
+    }
+
+    /**
+     * Returns true if a commit timestamp has been assigned to writes in this transaction.
+     * Otherwise, returns false.
+     */
+    virtual bool isTimestamped() const {
+        return false;
     }
 
     /**
@@ -378,20 +394,22 @@ public:
     }
 
     /**
+     * Refreshes a read transaction by starting a new one at the same read timestamp and then ending
+     * the current one.
+     */
+    virtual void refreshSnapshot() {}
+
+    /**
      * The ReadSource indicates which external or provided timestamp to read from for future
      * transactions.
      */
     enum ReadSource {
         /**
-         * Do not read from a timestamp. This is the default.
-         */
-        kUnset,
-        /**
-         * Read without a timestamp explicitly.
+         * Read without a timestamp. This is the default.
          */
         kNoTimestamp,
         /**
-         * Read from the majority all-commmitted timestamp.
+         * Read from the majority all-committed timestamp.
          */
         kMajorityCommitted,
         /**
@@ -399,8 +417,7 @@ public:
          */
         kNoOverlap,
         /**
-         * Read from the last applied timestamp. New transactions start at the most up-to-date
-         * timestamp.
+         * Read from the lastApplied timestamp.
          */
         kLastApplied,
         /**
@@ -411,12 +428,26 @@ public:
         /**
          * Read from the timestamp provided to setTimestampReadSource.
          */
-        kProvided,
-        /**
-         * Read from the latest checkpoint.
-         */
-        kCheckpoint
+        kProvided
     };
+
+    static std::string toString(ReadSource rs) {
+        switch (rs) {
+            case ReadSource::kNoTimestamp:
+                return "kNoTimestamp";
+            case ReadSource::kMajorityCommitted:
+                return "kMajorityCommitted";
+            case ReadSource::kNoOverlap:
+                return "kNoOverlap";
+            case ReadSource::kLastApplied:
+                return "kLastApplied";
+            case ReadSource::kAllDurableSnapshot:
+                return "kAllDurableSnapshot";
+            case ReadSource::kProvided:
+                return "kProvided";
+        }
+        MONGO_UNREACHABLE;
+    }
 
     /**
      * Sets which timestamp to use for read transactions. If 'provided' is supplied, only kProvided
@@ -431,7 +462,7 @@ public:
                                         boost::optional<Timestamp> provided = boost::none) {}
 
     virtual ReadSource getTimestampReadSource() const {
-        return ReadSource::kUnset;
+        return ReadSource::kNoTimestamp;
     };
 
     /**
@@ -447,10 +478,21 @@ public:
     };
 
     /**
-     * Indicates whether a unit of work is active. Will be true after beginUnitOfWork
-     * is called and before either commitUnitOfWork or abortUnitOfWork gets called.
+     * Indicates whether the RecoveryUnit has an open snapshot. A snapshot can be opened inside or
+     * outside of a WriteUnitOfWork.
      */
-    virtual bool inActiveTxn() const = 0;
+    virtual bool isActive() const {
+        return _isActive();
+    };
+
+    /**
+     * When called, the WriteUnitOfWork ignores the multi timestamp constraint for the remainder of
+     * the WriteUnitOfWork, where if within a WriteUnitOfWork multiple timestamps are set, the first
+     * timestamp must be set prior to any writes.
+     *
+     * Must be reset when the WriteUnitOfWork is either committed or rolled back.
+     */
+    virtual void ignoreAllMultiTimestampConstraints(){};
 
     /**
      * Registers a callback to be called prior to a WriteUnitOfWork committing the storage
@@ -493,7 +535,19 @@ public:
      * The registerChange() method may only be called when a WriteUnitOfWork is active, and
      * may not be called during commit or rollback.
      */
-    virtual void registerChange(std::unique_ptr<Change> change);
+    void registerChange(std::unique_ptr<Change> change);
+
+    /**
+     * Like registerChange() above but should only be used to make new state visible in the
+     * in-memory catalog. Changes registered with this function will commit after the commit changes
+     * registered with registerChange and rollback will run before the rollback changes registered
+     * with registerChange.
+     *
+     * This separation ensures that regular Changes that can modify state are run before the Change
+     * to install the new state in the in-memory catalog, after which there should be no further
+     * changes.
+     */
+    void registerChangeForCatalogVisibility(std::unique_ptr<Change> change);
 
     /**
      * Registers a callback to be called if the current WriteUnitOfWork rolls back.
@@ -609,6 +663,21 @@ public:
         _mustBeTimestamped = true;
     }
 
+    void setNoEvictionAfterRollback() {
+        _noEvictionAfterRollback = true;
+    }
+
+    bool getNoEvictionAfterRollback() const {
+        return _noEvictionAfterRollback;
+    }
+
+    /**
+     * Returns true if this is an instance of RecoveryUnitNoop.
+     */
+    virtual bool isNoop() const {
+        return false;
+    }
+
 protected:
     RecoveryUnit();
 
@@ -647,7 +716,19 @@ protected:
         return State::kCommitting == _state || State::kAborting == _state;
     }
 
+    /**
+     * Executes all registered commit handlers and clears all registered changes
+     */
+    void _executeCommitHandlers(boost::optional<Timestamp> commitTimestamp);
+
+    /**
+     * Executes all registered rollback handlers and clears all registered changes
+     */
+    void _executeRollbackHandlers();
+
     bool _mustBeTimestamped = false;
+
+    bool _noEvictionAfterRollback = false;
 
 private:
     // Sets the snapshot associated with this RecoveryUnit to a new globally unique id number.
@@ -657,10 +738,13 @@ private:
     virtual void doCommitUnitOfWork() = 0;
     virtual void doAbortUnitOfWork() = 0;
 
+    virtual void validateInUnitOfWork() const;
+
     std::vector<std::function<void(OperationContext*)>> _preCommitHooks;
 
     typedef std::vector<std::unique_ptr<Change>> Changes;
     Changes _changes;
+    Changes _changesForCatalogVisibility;
     State _state = State::kInactive;
     uint64_t _mySnapshotId;
 };

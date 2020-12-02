@@ -37,9 +37,9 @@ namespace mongo {
 
 /**
  * A base class for plan stages which require access to a particular index within a particular
- * collection. Provides subclasses access to the index's Collection*, as well as to catalog types
- * representing the index itself such as the IndexDescriptor. This base class is responsible for
- * checking that the collection and index are still valid (e.g. have not been dropped) when
+ * collection. Provides subclasses access to the index's const CollectionPtr&, as well as to catalog
+ * types representing the index itself such as the IndexDescriptor. This base class is responsible
+ * for checking that the collection and index are still valid (e.g. have not been dropped) when
  * recovering from yield.
  *
  * Subclasses must implement doSaveStateRequiresIndex() and doRestoreStateRequiresIndex() in order
@@ -49,6 +49,7 @@ class RequiresIndexStage : public RequiresCollectionStage {
 public:
     RequiresIndexStage(const char* stageType,
                        ExpressionContext* expCtx,
+                       const CollectionPtr& collection,
                        const IndexDescriptor* indexDescriptor,
                        WorkingSet* workingSet);
 

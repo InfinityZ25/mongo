@@ -32,7 +32,7 @@ env.Library(
 env.Library(
     target='sharding_runtime_d_params',
     source=[
-        env.Idlc('sharding_runtime_d_params.idl')[0],
+        'sharding_runtime_d_params.idl',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/idl/server_parameter',
@@ -54,6 +54,7 @@ env.Library(
         'metadata_manager.cpp',
         'migration_chunk_cloner_source_legacy.cpp',
         'migration_chunk_cloner_source.cpp',
+        'migration_coordinator_document.idl',
         'migration_coordinator.cpp',
         'migration_destination_manager.cpp',
         'migration_session_id.cpp',
@@ -62,16 +63,34 @@ env.Library(
         'move_primary_source_manager.cpp',
         'move_timing_helper.cpp',
         'namespace_metadata_change_notifications.cpp',
+        'op_observer_sharding_impl.cpp',
         'periodic_balancer_config_refresher.cpp',
         'periodic_sharded_index_consistency_checker.cpp',
+        'range_deletion_task.idl',
         'range_deletion_util.cpp',
         'read_only_catalog_cache_loader.cpp',
+        'resharding/resharding_collection_cloner.cpp',
+        'resharding/resharding_coordinator_observer.cpp',
+        'resharding/resharding_coordinator_service.cpp',
+        'resharding/resharding_donor_oplog_iterator.cpp',
+        'resharding/resharding_donor_recipient_common.cpp',
+        'resharding/resharding_donor_service.cpp',
+        'resharding/resharding_op_observer.cpp',
+        'resharding/resharding_oplog_applier.cpp',
+        'resharding/resharding_oplog_applier_progress.idl',
+        'resharding/resharding_oplog_application.cpp',
+        'resharding/resharding_oplog_fetcher.cpp',
+        'resharding/resharding_recipient_service.cpp',
+        'resharding/resharding_server_parameters.idl',
+        'resharding/resharding_txn_cloner.cpp',
+        'resharding/resharding_txn_cloner_progress.idl',
         'scoped_operation_completion_sharding_actions.cpp',
         'session_catalog_migration_destination.cpp',
         'session_catalog_migration_source.cpp',
         'shard_filtering_metadata_refresh.cpp',
         'shard_identity_rollback_notifier.cpp',
         'shard_key_util.cpp',
+        'shard_local.cpp',
         'shard_metadata_util.cpp',
         'shard_server_catalog_cache_loader.cpp',
         'shard_server_op_observer.cpp',
@@ -82,8 +101,9 @@ env.Library(
         'split_chunk.cpp',
         'split_vector.cpp',
         'start_chunk_clone_request.cpp',
-        env.Idlc('range_deletion_task.idl')[0],
-        env.Idlc('migration_coordinator_document.idl')[0],
+        'type_shard_collection.cpp',
+        'type_shard_collection.idl',
+        'type_shard_database.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/catalog/multi_index_block',
@@ -93,13 +113,16 @@ env.Library(
         '$BUILD_DIR/mongo/db/dbhelpers',
         '$BUILD_DIR/mongo/db/op_observer_impl',
         '$BUILD_DIR/mongo/db/ops/write_ops_exec',
+        '$BUILD_DIR/mongo/db/repl/abstract_async_component',
         '$BUILD_DIR/mongo/db/repl/oplog',
-        '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+        '$BUILD_DIR/mongo/db/repl/oplog_application',
+        '$BUILD_DIR/mongo/db/repl/primary_only_service',
+        '$BUILD_DIR/mongo/db/repl/wait_for_majority_service',
         '$BUILD_DIR/mongo/db/rw_concern_d',
         '$BUILD_DIR/mongo/db/server_options_core',
         '$BUILD_DIR/mongo/db/storage/remove_saver',
         '$BUILD_DIR/mongo/db/transaction',
-        '$BUILD_DIR/mongo/s/client/shard_local',
+        '$BUILD_DIR/mongo/db/vector_clock_mongod',
         '$BUILD_DIR/mongo/s/query/cluster_aggregate',
         '$BUILD_DIR/mongo/s/sharding_initialization',
         'chunk_splitter',
@@ -110,9 +133,41 @@ env.Library(
         'transaction_coordinator',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/client/clientdriver_minimal',
+        '$BUILD_DIR/mongo/db/catalog/catalog_helpers',
         '$BUILD_DIR/mongo/db/index_builds_coordinator_interface',
+        '$BUILD_DIR/mongo/db/rs_local_client',
         '$BUILD_DIR/mongo/db/session_catalog',
         '$BUILD_DIR/mongo/idl/server_parameter',
+        '$BUILD_DIR/mongo/util/future_util',
+        'resharding_util',
+    ],
+)
+
+# Be careful about adding dependencies to this library, as any dependencies will currently be
+# included in mongo_embedded.
+env.Library(
+    target='resharding_util',
+    source=[
+        'resharding_util.cpp',
+        'resharding/coordinator_document.idl',
+        'resharding/donor_document.idl',
+        'resharding/donor_oplog_id.idl',
+        'resharding/recipient_document.idl',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/common',
+        '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
+        '$BUILD_DIR/mongo/db/curop',
+        '$BUILD_DIR/mongo/db/namespace_string',
+        '$BUILD_DIR/mongo/db/pipeline/expression_context',
+        '$BUILD_DIR/mongo/db/pipeline/pipeline',
+        '$BUILD_DIR/mongo/db/storage/write_unit_of_work',
+        '$BUILD_DIR/mongo/s/async_requests_sender',
+        '$BUILD_DIR/mongo/s/common_s',
+        '$BUILD_DIR/mongo/s/grid',
+        'sharding_api_d',
     ],
 )
 
@@ -123,19 +178,6 @@ env.Library(
     ],
     LIBDEPS=[
         'sharding_api_d',
-    ],
-)
-
-env.Library(
-    target='op_observer_sharding_impl',
-    source=[
-        'op_observer_sharding_impl.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/db/op_observer_impl',
-    ],
-    LIBDEPS_PRIVATE=[
-        'sharding_runtime_d',
     ],
 )
 
@@ -154,19 +196,21 @@ env.Library(
         'transaction_coordinator_util.cpp',
         'transaction_coordinator_worker_curop_repository_mongod.cpp',
         'transaction_coordinator.cpp',
-        'wait_for_majority_service.cpp',
-        env.Idlc('transaction_coordinator_document.idl')[0],
-        env.Idlc('transaction_coordinators_stats.idl')[0],
+        'transaction_coordinator_document.idl',
+        'transaction_coordinators_stats.idl',
     ],
     LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/transaction',
         '$BUILD_DIR/mongo/db/commands/server_status',
         '$BUILD_DIR/mongo/db/commands/txn_cmd_request',
         '$BUILD_DIR/mongo/db/dbdirectclient',
+        '$BUILD_DIR/mongo/db/repl/wait_for_majority_service',
         '$BUILD_DIR/mongo/db/rw_concern_d',
+        '$BUILD_DIR/mongo/db/transaction',
+        '$BUILD_DIR/mongo/db/vector_clock_mongod',
         '$BUILD_DIR/mongo/executor/task_executor_pool',
         '$BUILD_DIR/mongo/s/grid',
         'sharding_api_d',
+        'sharding_runtime_d_params',
     ]
 )
 
@@ -184,43 +228,14 @@ env.Library(
 env.Library(
     target='type_shard_identity',
     source=[
-        env.Idlc('add_shard_cmd.idl')[0],
+        'add_shard_cmd.idl',
         'type_shard_identity.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/s/write_ops/batch_write_types',
         '$BUILD_DIR/mongo/bson/util/bson_extract',
         '$BUILD_DIR/mongo/s/common_s',
-    ],
-)
-
-env.Library(
-    target='balancer',
-    source=[
-        'balancer/balancer_chunk_selection_policy_impl.cpp',
-        'balancer/balancer_chunk_selection_policy.cpp',
-        'balancer/balancer_policy.cpp',
-        'balancer/balancer.cpp',
-        'balancer/cluster_statistics_impl.cpp',
-        'balancer/cluster_statistics.cpp',
-        'balancer/migration_manager.cpp',
-        'balancer/scoped_migration_request.cpp',
-        'balancer/type_migration.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/bson/util/bson_extract',
-        '$BUILD_DIR/mongo/db/common',
-        '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
-        '$BUILD_DIR/mongo/s/catalog/dist_lock_manager',
-        '$BUILD_DIR/mongo/s/client/sharding_client',
-        '$BUILD_DIR/mongo/s/coreshard',
-        'sharding_logging',
-    ],
-    LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/replica_set_aware_service',
-        'sharding_runtime_d_params',
+        '$BUILD_DIR/mongo/s/write_ops/batch_write_types',
     ],
 )
 
@@ -228,6 +243,15 @@ env.Library(
     target='sharding_catalog_manager',
     source=[
         'add_shard_util.cpp',
+        'balancer/balancer_chunk_selection_policy_impl.cpp',
+        'balancer/balancer_chunk_selection_policy.cpp',
+        'balancer/balancer.cpp',
+        'balancer/balancer_policy.cpp',
+        'balancer/cluster_statistics_impl.cpp',
+        'balancer/cluster_statistics.cpp',
+        'balancer/migration_manager.cpp',
+        'balancer/scoped_migration_request.cpp',
+        'balancer/type_migration.cpp',
         'config/initial_split_policy.cpp',
         'config/namespace_serializer.cpp',
         'config/sharding_catalog_manager_chunk_operations.cpp',
@@ -238,21 +262,35 @@ env.Library(
         'config/sharding_catalog_manager.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/db/audit',
-        '$BUILD_DIR/mongo/db/catalog/collection_options',
         '$BUILD_DIR/mongo/db/catalog_raii',
         '$BUILD_DIR/mongo/db/repl/read_concern_args',
         '$BUILD_DIR/mongo/db/rw_concern_d',
+        '$BUILD_DIR/mongo/db/transaction',
         '$BUILD_DIR/mongo/executor/network_interface',
         '$BUILD_DIR/mongo/s/catalog/sharding_catalog_client',
         '$BUILD_DIR/mongo/s/client/sharding_client',
         '$BUILD_DIR/mongo/s/coreshard',
-        'balancer',
         'type_shard_identity',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/bson/util/bson_extract',
+        '$BUILD_DIR/mongo/db/audit',
+        '$BUILD_DIR/mongo/db/catalog/collection_options',
         '$BUILD_DIR/mongo/db/commands/mongod_fcv',
+        '$BUILD_DIR/mongo/db/commands/set_feature_compatibility_version_idl',
+        '$BUILD_DIR/mongo/db/common',
+        '$BUILD_DIR/mongo/db/dbdirectclient',
+        '$BUILD_DIR/mongo/db/pipeline/sharded_agg_helpers',
+        '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+        '$BUILD_DIR/mongo/db/repl/replica_set_aware_service',
+        '$BUILD_DIR/mongo/db/snapshot_window_options',
+        '$BUILD_DIR/mongo/db/vector_clock_mongod',
+        '$BUILD_DIR/mongo/s/catalog/dist_lock_manager',
         '$BUILD_DIR/mongo/s/catalog/sharding_catalog_client_impl',
+        '$BUILD_DIR/mongo/util/options_parser/options_parser',
+        'sharding_logging',
+        'sharding_runtime_d_params',
     ],
 )
 
@@ -282,6 +320,7 @@ env.Library(
         'config/configsvr_refine_collection_shard_key_command.cpp',
         'config/configsvr_remove_shard_command.cpp',
         'config/configsvr_remove_shard_from_zone_command.cpp',
+        'config/configsvr_reshard_collection_cmd.cpp',
         'config/configsvr_shard_collection_command.cpp',
         'config/configsvr_split_chunk_command.cpp',
         'config/configsvr_update_zone_key_range_command.cpp',
@@ -297,6 +336,9 @@ env.Library(
         'set_shard_version_command.cpp',
         'sharding_server_status.cpp',
         'sharding_state_command.cpp',
+        'shardsvr_drop_collection_command.cpp',
+        'shardsvr_drop_database_command.cpp',
+        'shardsvr_rename_collection.cpp',
         'shardsvr_shard_collection.cpp',
         'split_chunk_command.cpp',
         'split_vector_command.cpp',
@@ -312,14 +354,31 @@ env.Library(
         '$BUILD_DIR/mongo/db/commands/server_status',
         '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
         '$BUILD_DIR/mongo/db/commands/txn_cmd_request',
+        '$BUILD_DIR/mongo/db/repl/primary_only_service',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         '$BUILD_DIR/mongo/db/repl/replica_set_messages',
         '$BUILD_DIR/mongo/s/commands/shared_cluster_commands',
-        '$BUILD_DIR/mongo/s/sharding_router_api',
         '$BUILD_DIR/mongo/s/sharding_initialization',
-        'balancer',
+        '$BUILD_DIR/mongo/s/sharding_router_api',
+        'resharding_util',
+        'sharding_catalog_manager',
         'sharding_runtime_d',
     ],
+)
+
+env.Library(
+    target='sessions_collection_config_server',
+    source=[
+        'sessions_collection_config_server.cpp',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/dbdirectclient',
+        '$BUILD_DIR/mongo/db/pipeline/sharded_agg_helpers',
+        '$BUILD_DIR/mongo/db/sessions_collection',
+        '$BUILD_DIR/mongo/s/client/sharding_client',
+        '$BUILD_DIR/mongo/s/coreshard',
+        '$BUILD_DIR/mongo/s/sessions_collection_sharded',
+    ]
 )
 
 env.Library(
@@ -328,36 +387,127 @@ env.Library(
         'sharding_logging.cpp',
     ],
     LIBDEPS=[
-        'sharding_api_d',
         '$BUILD_DIR/mongo/s/catalog/sharding_catalog_client_impl',
+        'sharding_api_d',
     ],
 )
 
-env.CppUnitTest(
-    target='db_s_test',
+env.Library(
+    target='sharding_mongod_test_fixture',
     source=[
-        'chunk_split_state_driver_test.cpp',
-        'config_server_op_observer_test.cpp',
-        'migration_session_id_test.cpp',
-        'sharding_logging_test.cpp',
-        'start_chunk_clone_request_test.cpp',
-        'type_shard_identity_test.cpp',
-        'wait_for_majority_service_test.cpp',
+        'sharding_mongod_test_fixture.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/db/auth/authmocks',
-        '$BUILD_DIR/mongo/db/auth/authmocks',
-        '$BUILD_DIR/mongo/s/config_server_test_fixture',
-        '$BUILD_DIR/mongo/s/sharding_router_test_fixture',
-        'chunk_splitter',
-        'sharding_logging',
+        '$BUILD_DIR/mongo/db/repl/drop_pending_collection_reaper',
+        '$BUILD_DIR/mongo/db/repl/replmocks',
+        '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
+        '$BUILD_DIR/mongo/s/sharding_test_fixture_common',
         'sharding_runtime_d',
-        'type_shard_identity',
+    ],
+)
+
+env.Library(
+    target='shard_server_test_fixture',
+    source=[
+        'shard_server_test_fixture.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/s/catalog/dist_lock_catalog_mock',
+        '$BUILD_DIR/mongo/s/catalog/dist_lock_manager_mock',
+        'sharding_mongod_test_fixture',
+    ],
+)
+
+env.Library(
+    target='config_server_test_fixture',
+    source=[
+        'config/config_server_test_fixture.cpp',
+    ],
+    LIBDEPS=[
+        'sharding_catalog_manager',
+        'sharding_mongod_test_fixture',
     ],
 )
 
 env.CppUnitTest(
-    target='db_s_balancer_test',
+    target='db_s_shard_server_test',
+    source=[
+        'active_migrations_registry_test.cpp',
+        'active_move_primaries_registry_test.cpp',
+        'active_shard_collection_registry_test.cpp',
+        'chunk_split_state_driver_test.cpp',
+        'collection_metadata_filtering_test.cpp',
+        'collection_metadata_test.cpp',
+        'collection_sharding_runtime_test.cpp',
+        'metadata_manager_test.cpp',
+        'migration_chunk_cloner_source_legacy_test.cpp',
+        'migration_destination_manager_test.cpp',
+        'migration_session_id_test.cpp',
+        'migration_util_test.cpp',
+        'namespace_metadata_change_notifications_test.cpp',
+        'op_observer_sharding_test.cpp',
+        'persistent_task_queue_test.cpp',
+        'range_deletion_util_test.cpp',
+        'resharding_collection_test.cpp',
+        'resharding_destined_recipient_test.cpp',
+        'resharding/resharding_collection_cloner_test.cpp',
+        'resharding/resharding_donor_oplog_iterator_test.cpp',
+        'resharding/resharding_donor_recipient_common_test.cpp',
+        'resharding/resharding_oplog_applier_test.cpp',
+        'resharding/resharding_oplog_fetcher_test.cpp',
+        'resharding/resharding_recipient_service_test.cpp',
+        'resharding/resharding_txn_cloner_test.cpp',
+        'session_catalog_migration_destination_test.cpp',
+        'session_catalog_migration_source_test.cpp',
+        'shard_local_test.cpp',
+        'shard_metadata_util_test.cpp',
+        'shard_server_catalog_cache_loader_test.cpp',
+        'sharding_initialization_mongod_test.cpp',
+        'sharding_initialization_op_observer_test.cpp',
+        'sharding_logging_test.cpp',
+        'split_vector_test.cpp',
+        'start_chunk_clone_request_test.cpp',
+        'transaction_coordinator_catalog_test.cpp',
+        'transaction_coordinator_futures_util_test.cpp',
+        'transaction_coordinator_service_test.cpp',
+        'transaction_coordinator_structures_test.cpp',
+        'transaction_coordinator_test_fixture.cpp',
+        'transaction_coordinator_test.cpp',
+        'type_shard_collection_test.cpp',
+        'type_shard_identity_test.cpp',
+        'vector_clock_shard_server_test.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/client/remote_command_targeter_mock',
+        '$BUILD_DIR/mongo/db/auth/authmocks',
+        '$BUILD_DIR/mongo/db/commands/server_status',
+        '$BUILD_DIR/mongo/db/keys_collection_client_direct',
+        '$BUILD_DIR/mongo/db/logical_session_cache_impl',
+        '$BUILD_DIR/mongo/db/ops/write_ops_exec',
+        '$BUILD_DIR/mongo/db/pipeline/document_source_mock',
+        '$BUILD_DIR/mongo/db/pipeline/expression_context',
+        '$BUILD_DIR/mongo/db/pipeline/process_interface/shardsvr_process_interface',
+        '$BUILD_DIR/mongo/db/query/query_request',
+        '$BUILD_DIR/mongo/db/query/query_test_service_context',
+        '$BUILD_DIR/mongo/db/repl/mock_repl_coord_server_fixture',
+        '$BUILD_DIR/mongo/db/repl/oplog_interface_local',
+        '$BUILD_DIR/mongo/db/repl/replmocks',
+        '$BUILD_DIR/mongo/db/repl/storage_interface_impl',
+        '$BUILD_DIR/mongo/db/repl/wait_for_majority_service',
+        '$BUILD_DIR/mongo/executor/thread_pool_task_executor_test_fixture',
+        '$BUILD_DIR/mongo/s/catalog/dist_lock_manager_mock',
+        '$BUILD_DIR/mongo/s/catalog/sharding_catalog_client_mock',
+        '$BUILD_DIR/mongo/s/sharding_router_test_fixture',
+        'resharding_util',
+        'shard_server_test_fixture',
+        'sharding_logging',
+        'sharding_runtime_d',
+        'transaction_coordinator',
+    ],
+)
+
+env.CppUnitTest(
+    target='db_s_config_server_test',
     source=[
         'balancer/balancer_chunk_selection_policy_test.cpp',
         'balancer/balancer_policy_test.cpp',
@@ -367,99 +517,12 @@ env.CppUnitTest(
         'balancer/migration_test_fixture.cpp',
         'balancer/scoped_migration_request_test.cpp',
         'balancer/type_migration_test.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/db/auth/authmocks',
-        '$BUILD_DIR/mongo/db/read_write_concern_defaults_mock',
-        '$BUILD_DIR/mongo/db/repl/replication_info',
-        '$BUILD_DIR/mongo/s/config_server_test_fixture',
-        '$BUILD_DIR/mongo/util/version_impl',
-        'balancer',
-    ]
-)
-
-env.CppUnitTest(
-    target='db_s_shard_server_test',
-    source=[
-        'active_migrations_registry_test.cpp',
-        'active_move_primaries_registry_test.cpp',
-        'active_shard_collection_registry_test.cpp',
-        'catalog_cache_loader_mock.cpp',
-        'migration_chunk_cloner_source_legacy_test.cpp',
-        'migration_destination_manager_test.cpp',
-        'migration_util_test.cpp',
-        'namespace_metadata_change_notifications_test.cpp',
-        'session_catalog_migration_destination_test.cpp',
-        'session_catalog_migration_source_test.cpp',
-        'shard_metadata_util_test.cpp',
-        'shard_server_catalog_cache_loader_test.cpp',
-        'sharding_initialization_mongod_test.cpp',
-        'sharding_initialization_op_observer_test.cpp',
-        'split_vector_test.cpp',
-    ],
-    LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/auth/authmocks',
-        '$BUILD_DIR/mongo/db/logical_session_cache_impl',
-        '$BUILD_DIR/mongo/db/ops/write_ops_exec',
-        '$BUILD_DIR/mongo/db/query/query_request',
-        '$BUILD_DIR/mongo/db/repl/mock_repl_coord_server_fixture',
-        '$BUILD_DIR/mongo/db/repl/storage_interface_impl',
-        '$BUILD_DIR/mongo/s/catalog/dist_lock_manager_mock',
-        '$BUILD_DIR/mongo/s/catalog/sharding_catalog_client_impl',
-        '$BUILD_DIR/mongo/s/catalog/sharding_catalog_client_mock',
-        '$BUILD_DIR/mongo/s/shard_server_test_fixture',
-        'sharding_runtime_d',
-    ],
-)
-
-env.CppUnitTest(
-    target='db_s_collection_sharding_runtime_test',
-    source=[
-        'collection_metadata_filtering_test.cpp',
-        'collection_metadata_test.cpp',
-        'op_observer_sharding_test.cpp',
-        'collection_sharding_runtime_test.cpp',
-        'metadata_manager_test.cpp',
-        'persistent_task_store_test.cpp',
-        'persistent_task_queue_test.cpp',
-        'range_deletion_util_test.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/client/remote_command_targeter_mock',
-        '$BUILD_DIR/mongo/db/auth/authmocks',
-        '$BUILD_DIR/mongo/db/repl/replmocks',
-        '$BUILD_DIR/mongo/executor/network_test_env',
-        '$BUILD_DIR/mongo/executor/thread_pool_task_executor_test_fixture',
-        '$BUILD_DIR/mongo/s/shard_server_test_fixture',
-    ],
-)
-
-env.CppUnitTest(
-    target='db_s_transaction_coordinator_test',
-    source=[
-        'transaction_coordinator_catalog_test.cpp',
-        'transaction_coordinator_futures_util_test.cpp',
-        'transaction_coordinator_service_test.cpp',
-        'transaction_coordinator_structures_test.cpp',
-        'transaction_coordinator_test_fixture.cpp',
-        'transaction_coordinator_test.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/db/auth/authmocks',
-        '$BUILD_DIR/mongo/db/commands/server_status',
-        '$BUILD_DIR/mongo/s/catalog/sharding_catalog_client_mock',
-        '$BUILD_DIR/mongo/s/shard_server_test_fixture',
-        'transaction_coordinator',
-    ],
-)
-
-env.CppUnitTest(
-    target='db_s_sharding_catalog_manager_test',
-    source=[
+        'config_server_op_observer_test.cpp',
         'config/initial_split_policy_test.cpp',
         'config/sharding_catalog_manager_add_shard_test.cpp',
         'config/sharding_catalog_manager_add_shard_to_zone_test.cpp',
         'config/sharding_catalog_manager_assign_key_range_to_zone_test.cpp',
+        'config/sharding_catalog_manager_bump_shard_versions_and_change_metadata_test.cpp',
         'config/sharding_catalog_manager_clear_jumbo_flag_test.cpp',
         'config/sharding_catalog_manager_commit_chunk_migration_test.cpp',
         'config/sharding_catalog_manager_config_initialization_test.cpp',
@@ -472,10 +535,22 @@ env.CppUnitTest(
         'config/sharding_catalog_manager_remove_shard_test.cpp',
         'config/sharding_catalog_manager_shard_collection_test.cpp',
         'config/sharding_catalog_manager_split_chunk_test.cpp',
+        'resharding/resharding_coordinator_observer_test.cpp',
+        'resharding/resharding_coordinator_test.cpp',
+        'resharding/resharding_util_refresh_test.cpp',
+        'resharding/resharding_util_test.cpp',
+        'vector_clock_config_server_test.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/auth/authmocks',
-        '$BUILD_DIR/mongo/s/config_server_test_fixture',
+        '$BUILD_DIR/mongo/db/commands/set_feature_compatibility_version_idl',
+        '$BUILD_DIR/mongo/db/pipeline/document_source_mock',
+        '$BUILD_DIR/mongo/db/read_write_concern_defaults_mock',
+        '$BUILD_DIR/mongo/db/repl/replication_info',
+        '$BUILD_DIR/mongo/s/catalog/dist_lock_manager_mock',
         '$BUILD_DIR/mongo/util/version_impl',
-    ]
+        'config_server_test_fixture',
+        'resharding_util',
+        'sharding_catalog_manager',
+    ],
 )

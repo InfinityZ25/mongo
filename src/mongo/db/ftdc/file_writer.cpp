@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kFTDC
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/ftdc/file_writer.h"

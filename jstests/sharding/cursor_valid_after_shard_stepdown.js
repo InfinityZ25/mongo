@@ -9,6 +9,12 @@ TestData.skipCheckOrphans = true;
 
 var st = new ShardingTest({shards: 1, rs: {nodes: 2}});
 
+// This test expects the shard version after step down to be UNKNOWN. Disable checking for index
+// consistency to ensure that the config server doesn't trigger a StaleShardVersion exception on
+// shard0 and cause it to refresh its sharding metadata.
+st._configServers.forEach(
+    config => config.adminCommand({setParameter: 1, enableShardedIndexConsistencyCheck: false}));
+
 assert.commandWorked(st.s0.adminCommand({enablesharding: 'TestDB'}));
 st.ensurePrimaryShard('TestDB', st.shard0.shardName);
 assert.commandWorked(st.s0.adminCommand({shardcollection: 'TestDB.TestColl', key: {x: 1}}));
@@ -20,7 +26,7 @@ var coll = db.TestColl;
 assert.commandWorked(coll.insert({x: 1, value: 'Test value 1'}));
 assert.commandWorked(coll.insert({x: 2, value: 'Test value 2'}));
 
-// Establish a cursor on the primary (by not using slaveOk read)
+// Establish a cursor on the primary (by not using secondaryOk read)
 var findCursor = assert.commandWorked(db.runCommand({find: 'TestColl', batchSize: 1})).cursor;
 
 var shardVersionBeforeStepdown =

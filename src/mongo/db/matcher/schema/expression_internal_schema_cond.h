@@ -43,8 +43,10 @@ public:
     static constexpr StringData kName = "$_internalSchemaCond"_sd;
 
     explicit InternalSchemaCondMatchExpression(
-        std::array<std::unique_ptr<MatchExpression>, 3> expressions)
-        : FixedArityMatchExpression(MatchType::INTERNAL_SCHEMA_COND, std::move(expressions)) {}
+        std::array<std::unique_ptr<MatchExpression>, 3> expressions,
+        clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : FixedArityMatchExpression(
+              MatchType::INTERNAL_SCHEMA_COND, std::move(expressions), std::move(annotation)) {}
 
     const MatchExpression* condition() const {
         return expressions()[0].get();
@@ -72,6 +74,14 @@ public:
      */
     bool matches(const MatchableDocument* doc, MatchDetails* details = nullptr) const final;
     bool matchesSingleElement(const BSONElement& elem, MatchDetails* details = nullptr) const final;
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
 };
 
 }  // namespace mongo

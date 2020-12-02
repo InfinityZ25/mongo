@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -36,7 +36,7 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/getmore_request.h"
-#include "mongo/db/query/killcursors_request.h"
+#include "mongo/db/query/kill_cursors_gen.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/time_support.h"
 
@@ -69,7 +69,7 @@ TaskExecutorCursor::~TaskExecutorCursor() {
             // timeout if an lsid is used.
             _executor
                 ->scheduleRemoteCommand(
-                    _createRequest(nullptr, KillCursorsRequest(_ns, {_cursorId}).toBSON()),
+                    _createRequest(nullptr, KillCursorsRequest(_ns, {_cursorId}).toBSON(BSONObj{})),
                     [](const auto&) {})
                 .isOK();
         }

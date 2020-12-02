@@ -173,6 +173,17 @@ private:
     void setUp() override {
         ServiceContextMongoDTest::setUp();
 
+        // Replaying prepared transactions requires 'enableMajorityReadConcern' to be set to true.
+        // This test uses ephemeralForTest under the hood and is ran in standalone mode. Given that,
+        // to satisfy the tests requirements, we forcefully set 'enableMajorityReadConcern' to true
+        // for these tests.
+        //
+        // Switching the storage engine to use WiredTiger comes with its own complications.
+        // 1. Transaction prepare is not supported with logged tables in debug builds.
+        // 2. Transactions cannot be assigned a log record if WT_CONN_LOG_DEBUG mode is not enabled.
+        _stashedEnableMajorityReadConcern =
+            std::exchange(serverGlobalParams.enableMajorityReadConcern, true);
+
         auto service = getServiceContext();
         StorageInterface::set(service, std::make_unique<StorageInterfaceRecovery>());
         _storageInterface = static_cast<StorageInterfaceRecovery*>(StorageInterface::get(service));
@@ -187,6 +198,8 @@ private:
         ASSERT_OK(
             ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY));
 
+        repl::createOplog(_opCtx.get());
+
         ASSERT_OK(_storageInterface->createCollection(
             getOperationContext(), testNs, generateOptionsWithUuid()));
 
@@ -197,13 +210,13 @@ private:
 
         repl::DropPendingCollectionReaper::set(
             service, std::make_unique<repl::DropPendingCollectionReaper>(_storageInterface));
-
-        setOplogCollectionName(service);
     }
 
     void tearDown() override {
         _opCtx.reset(nullptr);
         _consistencyMarkers.reset();
+
+        serverGlobalParams.enableMajorityReadConcern = _stashedEnableMajorityReadConcern;
 
         ServiceContextMongoDTest::tearDown();
         storageGlobalParams.readOnly = false;
@@ -217,6 +230,7 @@ private:
     ServiceContext::UniqueOperationContext _opCtx;
     StorageInterfaceRecovery* _storageInterface;
     std::unique_ptr<ReplicationConsistencyMarkersMock> _consistencyMarkers;
+    bool _stashedEnableMajorityReadConcern;
 };
 
 /**
@@ -250,7 +264,9 @@ repl::OplogEntry _makeOplogEntry(repl::OpTime opTime,
                             boost::none,                      // statement id
                             boost::none,   // optime of previous write within same transaction
                             boost::none,   // pre-image optime
-                            boost::none);  // post-image optime
+                            boost::none,   // post-image optime
+                            boost::none,   // ShardId of resharding recipient
+                            boost::none);  // _id
 }
 
 /**
@@ -327,11 +343,6 @@ CollectionOptions _createOplogCollectionOptions() {
  * Creates an oplog with insert entries at the given timestamps.
  */
 void _setUpOplog(OperationContext* opCtx, StorageInterface* storage, std::vector<int> timestamps) {
-    ASSERT_OK(storage->createCollection(opCtx, oplogNs, _createOplogCollectionOptions()));
-
-    // Initialize the cached pointer to the oplog collection.
-    acquireOplogCollectionForLogging(opCtx);
-
     for (int ts : timestamps) {
         ASSERT_OK(storage->insertDocument(
             opCtx, oplogNs, _makeInsertOplogEntry(ts), OpTime::kUninitializedTerm));
@@ -341,13 +352,31 @@ void _setUpOplog(OperationContext* opCtx, StorageInterface* storage, std::vector
 /**
  * Check collection contents. OplogInterface returns documents in reverse natural order.
  */
-void _assertDocumentsInCollectionEquals(OperationContext* opCtx,
-                                        const NamespaceString& nss,
-                                        const std::vector<BSONObj>& docs) {
+void _assertDocumentsInCollectionEqualsOrdered(OperationContext* opCtx,
+                                               const NamespaceString& nss,
+                                               const std::vector<BSONObj>& docs) {
     CollectionReader reader(opCtx, nss);
     for (const auto& doc : docs) {
         ASSERT_BSONOBJ_EQ(doc, unittest::assertGet(reader.next()));
     }
+    ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, reader.next().getStatus());
+}
+
+void _assertDocumentsInCollectionEqualsUnordered(OperationContext* opCtx,
+                                                 const NamespaceString& nss,
+                                                 const SimpleBSONObjSet& docs) {
+    SimpleBSONObjSet actualDocs;
+    CollectionReader reader(opCtx, nss);
+    for (std::size_t i = 0; i < docs.size(); ++i) {
+        actualDocs.insert(unittest::assertGet(reader.next()));
+    }
+    auto docIt = docs.begin();
+    auto docEnd = docs.end();
+    auto actualIt = actualDocs.begin();
+    for (; docIt != docEnd; ++docIt, ++actualIt) {
+        ASSERT_BSONOBJ_EQ(*docIt, *actualIt);
+    }
+
     ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, reader.next().getStatus());
 }
 
@@ -359,18 +388,19 @@ void _assertDocsInOplog(OperationContext* opCtx, std::vector<int> timestamps) {
     std::transform(timestamps.begin(), timestamps.end(), expectedOplog.begin(), [](int ts) {
         return _makeInsertOplogEntry(ts).obj;
     });
-    _assertDocumentsInCollectionEquals(opCtx, oplogNs, expectedOplog);
+    _assertDocumentsInCollectionEqualsOrdered(opCtx, oplogNs, expectedOplog);
 }
 
 /**
  * Asserts that the documents in the test collection have the given ids.
  */
 void _assertDocsInTestCollection(OperationContext* opCtx, std::vector<int> ids) {
-    std::vector<BSONObj> expectedColl(ids.size());
-    std::transform(ids.begin(), ids.end(), expectedColl.begin(), [](int id) {
-        return _makeInsertDocument(id);
-    });
-    _assertDocumentsInCollectionEquals(opCtx, testNs, expectedColl);
+    SimpleBSONObjSet expectedColl;
+    std::transform(ids.begin(),
+                   ids.end(),
+                   std::inserter(expectedColl, expectedColl.begin()),
+                   [](int id) { return _makeInsertDocument(id); });
+    _assertDocumentsInCollectionEqualsUnordered(opCtx, testNs, expectedColl);
 }
 
 TEST_F(ReplicationRecoveryTest, RecoveryWithNoOplogSucceeds) {
@@ -427,21 +457,6 @@ TEST_F(ReplicationRecoveryTest, RecoveryWithEmptyOplogSucceedsWithStableTimestam
     _assertDocsInTestCollection(opCtx, {});
 }
 
-DEATH_TEST_REGEX_F(ReplicationRecoveryTest,
-                   TruncateFassertsWithoutOplogCollection,
-                   "Fatal assertion.*34418.*NamespaceNotFound: Can't find local.oplog.rs") {
-    ReplicationRecoveryImpl recovery(getStorageInterface(), getConsistencyMarkers());
-    auto opCtx = getOperationContext();
-
-    getConsistencyMarkers()->setOplogTruncateAfterPoint(opCtx, Timestamp(4, 4));
-    getConsistencyMarkers()->setAppliedThrough(opCtx, OpTime(Timestamp(3, 3), 1));
-
-    // Create the database.
-    ASSERT_OK(getStorageInterface()->createCollection(
-        opCtx, NamespaceString("local.other"), generateOptionsWithUuid()));
-
-    recovery.recoverFromOplog(opCtx, boost::none);
-}
 
 DEATH_TEST_F(ReplicationRecoveryTest,
              RecoveryInvariantsIfStableTimestampAndDoesNotSupportRecoveryTimestamp,
@@ -692,20 +707,6 @@ TEST_F(ReplicationRecoveryTest,
     testRecoveryToStableAppliesDocumentsWithNoAppliedThrough(false);
 }
 
-DEATH_TEST_F(ReplicationRecoveryTest,
-             RecoveryFailsWithUnmatchedAppliedThrough,
-             "Invariant failure") {
-    ReplicationRecoveryImpl recovery(getStorageInterface(), getConsistencyMarkers());
-    auto opCtx = getOperationContext();
-
-    _setUpOplog(opCtx, getStorageInterface(), {1, 2, 3, 4, 5});
-
-    auto appliedThroughTS = Timestamp(4, 4);
-    getConsistencyMarkers()->setAppliedThrough(opCtx, OpTime(appliedThroughTS, 1));
-    getStorageInterfaceRecovery()->setRecoveryTimestamp(Timestamp(2, 2));
-    recovery.recoverFromOplog(opCtx, boost::none);
-}
-
 TEST_F(ReplicationRecoveryTest, RecoveryIgnoresDroppedCollections) {
     ReplicationRecoveryImpl recovery(getStorageInterface(), getConsistencyMarkers());
     auto opCtx = getOperationContext();
@@ -831,19 +832,6 @@ TEST_F(ReplicationRecoveryTest, RecoveryDoesNotApplyOperationsIfAppliedThroughIs
     ASSERT_EQ(OpTime(Timestamp(5, 5), 1), getConsistencyMarkers()->getAppliedThrough(opCtx));
 }
 
-DEATH_TEST_F(ReplicationRecoveryTest,
-             RecoveryInvariantsWithUnequalStableTimestampAndAppliedThrough,
-             "Invariant failure") {
-    ReplicationRecoveryImpl recovery(getStorageInterface(), getConsistencyMarkers());
-    auto opCtx = getOperationContext();
-
-    _setUpOplog(opCtx, getStorageInterface(), {5});
-
-    getConsistencyMarkers()->setAppliedThrough(opCtx, OpTime(Timestamp(3, 3), 1));
-
-    recovery.recoverFromOplog(opCtx, Timestamp(4, 4));
-}
-
 TEST_F(ReplicationRecoveryTest, RecoveryAppliesUpdatesIdempotently) {
     ReplicationRecoveryImpl recovery(getStorageInterface(), getConsistencyMarkers());
     auto opCtx = getOperationContext();
@@ -895,8 +883,8 @@ TEST_F(ReplicationRecoveryTest, RecoveryAppliesUpdatesIdempotently) {
 
     recovery.recoverFromOplog(opCtx, boost::none);
 
-    std::vector<BSONObj> expectedColl{BSON("_id" << 3 << "a" << 7)};
-    _assertDocumentsInCollectionEquals(opCtx, testNs, expectedColl);
+    SimpleBSONObjSet expectedColl{BSON("_id" << 3 << "a" << 7)};
+    _assertDocumentsInCollectionEqualsUnordered(opCtx, testNs, expectedColl);
 
     ASSERT_EQ(getConsistencyMarkers()->getOplogTruncateAfterPoint(opCtx), Timestamp());
     ASSERT_EQ(getConsistencyMarkers()->getAppliedThrough(opCtx), OpTime(Timestamp(ts, ts), 1));
@@ -954,8 +942,8 @@ TEST_F(ReplicationRecoveryTest, CorrectlyUpdatesConfigTransactions) {
 
     recovery.recoverFromOplog(opCtx, boost::none);
 
-    std::vector<BSONObj> expectedColl{BSON("_id" << 1), BSON("_id" << 2)};
-    _assertDocumentsInCollectionEquals(opCtx, testNs, expectedColl);
+    SimpleBSONObjSet expectedColl{BSON("_id" << 1), BSON("_id" << 2)};
+    _assertDocumentsInCollectionEqualsUnordered(opCtx, testNs, expectedColl);
 
     SessionTxnRecord expectedTxnRecord;
     expectedTxnRecord.setSessionId(*sessionInfo.getSessionId());
@@ -964,7 +952,7 @@ TEST_F(ReplicationRecoveryTest, CorrectlyUpdatesConfigTransactions) {
     expectedTxnRecord.setLastWriteDate(lastDate);
 
     std::vector<BSONObj> expectedTxnColl{expectedTxnRecord.toBSON()};
-    _assertDocumentsInCollectionEquals(
+    _assertDocumentsInCollectionEqualsOrdered(
         opCtx, NamespaceString::kSessionTransactionsTableNamespace, expectedTxnColl);
 
     ASSERT_EQ(getConsistencyMarkers()->getOplogTruncateAfterPoint(opCtx), Timestamp());
@@ -1013,7 +1001,7 @@ TEST_F(ReplicationRecoveryTest, PrepareTransactionOplogEntryCorrectlyUpdatesConf
     std::vector<BSONObj> expectedTxnColl{expectedTxnRecord.toBSON()};
 
     // Make sure that the transaction table shows that the transaction is prepared.
-    _assertDocumentsInCollectionEquals(
+    _assertDocumentsInCollectionEqualsOrdered(
         opCtx, NamespaceString::kSessionTransactionsTableNamespace, expectedTxnColl);
 
     ASSERT_EQ(getConsistencyMarkers()->getOplogTruncateAfterPoint(opCtx), Timestamp());
@@ -1074,7 +1062,7 @@ TEST_F(ReplicationRecoveryTest, AbortTransactionOplogEntryCorrectlyUpdatesConfig
     std::vector<BSONObj> expectedTxnColl{expectedTxnRecord.toBSON()};
 
     // Make sure that the transaction table shows that the transaction is aborted.
-    _assertDocumentsInCollectionEquals(
+    _assertDocumentsInCollectionEqualsOrdered(
         opCtx, NamespaceString::kSessionTransactionsTableNamespace, expectedTxnColl);
 
     ASSERT_EQ(getConsistencyMarkers()->getOplogTruncateAfterPoint(opCtx), Timestamp());
@@ -1175,12 +1163,12 @@ TEST_F(ReplicationRecoveryTest, CommitTransactionOplogEntryCorrectlyUpdatesConfi
     std::vector<BSONObj> expectedTxnColl{expectedTxnRecord.toBSON()};
 
     // Make sure that the transaction table shows that the transaction is commited.
-    _assertDocumentsInCollectionEquals(
+    _assertDocumentsInCollectionEqualsOrdered(
         opCtx, NamespaceString::kSessionTransactionsTableNamespace, expectedTxnColl);
 
     // Make sure the data from the transaction is applied.
     std::vector<BSONObj> expectedColl{BSON("_id" << 1)};
-    _assertDocumentsInCollectionEquals(opCtx, testNs, expectedColl);
+    _assertDocumentsInCollectionEqualsOrdered(opCtx, testNs, expectedColl);
 
     ASSERT_EQ(getConsistencyMarkers()->getOplogTruncateAfterPoint(opCtx), Timestamp());
     ASSERT_EQ(getConsistencyMarkers()->getAppliedThrough(opCtx), OpTime(Timestamp(3, 0), 1));
@@ -1260,7 +1248,7 @@ TEST_F(ReplicationRecoveryTest,
     std::vector<BSONObj> expectedTxnColl{expectedTxnRecord.toBSON()};
 
     // Make sure that the transaction table shows that the transaction is commited.
-    _assertDocumentsInCollectionEquals(
+    _assertDocumentsInCollectionEqualsOrdered(
         opCtx, NamespaceString::kSessionTransactionsTableNamespace, expectedTxnColl);
 
     ASSERT_EQ(getConsistencyMarkers()->getOplogTruncateAfterPoint(opCtx), Timestamp());

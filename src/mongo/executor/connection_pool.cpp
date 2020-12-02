@@ -27,22 +27,20 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kConnectionPool
-
-#include <fmt/format.h>
-#include <fmt/ostream.h>
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kConnectionPool
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/executor/connection_pool.h"
 
 #include <fmt/format.h>
+#include <fmt/ostream.h>
 
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/executor/connection_pool_stats.h"
 #include "mongo/executor/remote_command_request.h"
-#include "mongo/logger/log_severity_limiter.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_severity_suppressor.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/destructor_guard.h"
@@ -62,6 +60,11 @@ using namespace fmt::literals;
 namespace mongo {
 
 namespace {
+
+auto makeSeveritySuppressor() {
+    return std::make_unique<logv2::KeyedSeveritySuppressor<HostAndPort>>(
+        Seconds{1}, logv2::LogSeverity::Log(), logv2::LogSeverity::Debug(2));
+}
 
 template <typename Map, typename Key>
 auto& getOrInvariant(Map&& map, const Key& key) noexcept {
@@ -693,7 +696,7 @@ ConnectionPool::ConnectionHandle ConnectionPool::SpecificPool::tryGetConnection(
         _readyPool.erase(iter);
         conn->cancelTimeout();
 
-        if (!conn->isHealthy()) {
+        if (!conn->maybeHealthy()) {
             LOGV2(22561,
                   "Dropping unhealthy pooled connection to {hostAndPort}",
                   "Dropping unhealthy pooled connection",
@@ -913,9 +916,9 @@ void ConnectionPool::SpecificPool::processFailure(const Status& status) {
     _generation++;
 
     if (!_readyPool.empty() || !_processingPool.empty()) {
-        auto severity = MONGO_GET_LIMITED_SEVERITY(_hostAndPort, Seconds{1}, 0, 2);
+        static auto& bumpedSeverity = *makeSeveritySuppressor().release();
         LOGV2_DEBUG(22572,
-                    logSeverityV1toV2(severity).toInt(),
+                    bumpedSeverity(_hostAndPort).toInt(),
                     "Dropping all pooled connections to {hostAndPort} due to {error}",
                     "Dropping all pooled connections",
                     "hostAndPort"_attr = _hostAndPort,
@@ -1016,9 +1019,9 @@ void ConnectionPool::SpecificPool::spawnConnections() {
         return;
     }
 
-    auto severity = MONGO_GET_LIMITED_SEVERITY(_hostAndPort, Seconds{1}, 0, 2);
+    static auto& bumpedSeverity = *makeSeveritySuppressor().release();
     LOGV2_DEBUG(22576,
-                logSeverityV1toV2(severity).toInt(),
+                bumpedSeverity(_hostAndPort).toInt(),
                 "Connecting to {hostAndPort}",
                 "Connecting",
                 "hostAndPort"_attr = _hostAndPort);
@@ -1031,6 +1034,7 @@ void ConnectionPool::SpecificPool::spawnConnections() {
                 "Spawning connections",
                 "connAllowance"_attr = allowance,
                 "hostAndPort"_attr = _hostAndPort);
+
     for (decltype(allowance) i = 0; i < allowance; ++i) {
         OwnedConnection handle;
         try {
@@ -1130,9 +1134,8 @@ void ConnectionPool::SpecificPool::updateEventTimer() {
             std::pop_heap(begin(_requests), end(_requests), RequestComparator{});
 
             auto& request = _requests.back();
-            request.second.setError(Status(
-                ErrorCodes::NetworkInterfaceExceededTimeLimit,
-                fmt::format("Couldn't get a connection within the time limit of {}", timeout)));
+            request.second.setError(Status(ErrorCodes::NetworkInterfaceExceededTimeLimit,
+                                           "Couldn't get a connection within the time limit"));
             _requests.pop_back();
 
             // Since we've failed a request, we've interacted with external users
@@ -1196,7 +1199,7 @@ void ConnectionPool::SpecificPool::updateController() {
                 invariant(pool->_requests.empty());
             }
 
-            pool->triggerShutdown(Status(ErrorCodes::ShutdownInProgress,
+            pool->triggerShutdown(Status(ErrorCodes::ConnectionPoolExpired,
                                          str::stream() << "Pool for " << host << " has expired."));
         }
         return;

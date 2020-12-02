@@ -31,6 +31,7 @@
 
 #include "mongo/db/pipeline/document_source_match.h"
 
+#include <algorithm>
 #include <memory>
 
 #include "mongo/db/exec/document_value/document.h"
@@ -43,6 +44,7 @@
 #include "mongo/db/pipeline/document_path_support.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
+#include "mongo/util/ctype.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -144,14 +146,8 @@ namespace {
 // input is well formed.
 
 bool isAllDigits(StringData str) {
-    if (str.empty())
-        return false;
-
-    for (size_t i = 0; i < str.size(); i++) {
-        if (!isdigit(str[i]))
-            return false;
-    }
-    return true;
+    return !str.empty() &&
+        std::all_of(str.begin(), str.end(), [](char c) { return ctype::isDigit(c); });
 }
 
 bool isFieldnameRedactSafe(StringData fieldName) {
@@ -446,8 +442,7 @@ boost::intrusive_ptr<DocumentSourceMatch> DocumentSourceMatch::descendMatchOnPat
         invariant(expression::isPathPrefixOf(descendOn, leafPath));
 
         auto newPath = leafPath.substr(descendOn.size() + 1);
-        if (node->getCategory() == MatchExpression::MatchCategory::kLeaf &&
-            node->matchType() != MatchExpression::TYPE_OPERATOR) {
+        if (node->getCategory() == MatchExpression::MatchCategory::kLeaf) {
             auto leafNode = static_cast<LeafMatchExpression*>(node);
             leafNode->setPath(newPath);
         } else if (node->getCategory() == MatchExpression::MatchCategory::kArrayMatching) {
@@ -472,6 +467,10 @@ intrusive_ptr<DocumentSource> DocumentSourceMatch::createFromBson(
     uassert(15959, "the match filter must be an expression in an object", elem.type() == Object);
 
     return DocumentSourceMatch::create(elem.Obj(), pExpCtx);
+}
+
+bool DocumentSourceMatch::hasQuery() const {
+    return true;
 }
 
 BSONObj DocumentSourceMatch::getQuery() const {

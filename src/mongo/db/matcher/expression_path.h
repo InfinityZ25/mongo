@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/db/field_ref.h"
 #include "mongo/db/matcher/expression.h"
 
 namespace mongo {
@@ -45,12 +46,10 @@ public:
     PathMatchExpression(MatchType matchType,
                         StringData path,
                         ElementPath::LeafArrayBehavior leafArrBehavior,
-                        ElementPath::NonLeafArrayBehavior nonLeafArrayBehavior)
-        : MatchExpression(matchType), _path(path) {
-        _elementPath.init(_path);
-        _elementPath.setLeafArrayBehavior(leafArrBehavior);
-        _elementPath.setNonLeafArrayBehavior(nonLeafArrayBehavior);
-    }
+                        ElementPath::NonLeafArrayBehavior nonLeafArrayBehavior,
+                        clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : MatchExpression(matchType, std::move(annotation)),
+          _elementPath(path, leafArrBehavior, nonLeafArrayBehavior) {}
 
     virtual ~PathMatchExpression() {}
 
@@ -70,12 +69,15 @@ public:
     }
 
     const StringData path() const final {
-        return _path;
+        return _elementPath.fieldRef().dottedField();
     }
 
+    /**
+     * Resets the path for this expression. Note that this method will make a copy of 'path' such
+     * that there's no lifetime requirements for the string which 'path' points into.
+     */
     void setPath(StringData path) {
-        _path = path;
-        _elementPath.init(_path);
+        _elementPath.reset(path);
     }
 
     /**
@@ -85,17 +87,17 @@ public:
      * element).
      */
     void applyRename(const StringMap<std::string>& renameList) {
-        FieldRef pathFieldRef(_path);
-
         size_t renamesFound = 0u;
+        std::string rewrittenPath;
         for (auto rename : renameList) {
-            if (rename.first == _path) {
-                _rewrittenPath = rename.second;
+            if (rename.first == path()) {
+                rewrittenPath = rename.second;
 
                 ++renamesFound;
             }
 
             FieldRef prefixToRename(rename.first);
+            const auto& pathFieldRef = _elementPath.fieldRef();
             if (prefixToRename.isPrefixOf(pathFieldRef)) {
                 // Get the 'pathTail' by chopping off the 'prefixToRename' path components from the
                 // beginning of the 'pathFieldRef' path.
@@ -103,7 +105,7 @@ public:
                                                              pathFieldRef.numParts());
                 // Replace the chopped off components with the component names resulting from the
                 // rename.
-                _rewrittenPath = str::stream() << rename.second << "." << pathTail.toString();
+                rewrittenPath = str::stream() << rename.second << "." << pathTail.toString();
 
                 ++renamesFound;
             }
@@ -114,7 +116,7 @@ public:
         if (renamesFound == 1u) {
             // There is an applicable rename. Modify the path of this expression to use the new
             // name.
-            setPath(_rewrittenPath);
+            setPath(rewrittenPath);
         }
     }
 
@@ -136,17 +138,27 @@ public:
 
 protected:
     void _doAddDependencies(DepsTracker* deps) const final {
-        if (!_path.empty()) {
-            deps->fields.insert(_path.toString());
+        if (!path().empty()) {
+            // If a path contains a numeric component then it should not be naively added to the
+            // projection, since we do not support projecting specific array indices. Instead we add
+            // the prefix of the path up to the numeric path component. Note that we start at path
+            // component 1 rather than 0, because a numeric path component at the root of the
+            // document can only ever be a field name, never an array index.
+            FieldRef fieldRef(path());
+            for (size_t i = 1; i < fieldRef.numParts(); ++i) {
+                if (fieldRef.isNumericPathComponentStrict(i)) {
+                    auto prefix = fieldRef.dottedSubstring(0, i);
+                    deps->fields.insert(prefix.toString());
+                    return;
+                }
+            }
+
+            deps->fields.insert(path().toString());
         }
     }
 
 private:
-    StringData _path;
+    // ElementPath holds a FieldRef, which owns the underlying path string.
     ElementPath _elementPath;
-
-    // We use this when we rewrite the value in '_path' and we need a backing store for the
-    // rewritten string.
-    std::string _rewrittenPath;
 };
 }  // namespace mongo

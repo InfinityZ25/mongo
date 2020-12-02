@@ -1,14 +1,24 @@
 /**
  * Ensure serverStatus reports the total time spent sampling the oplog for all storage engines that
  * support OplogStones.
- * @tags: [ requires_wiredtiger, requires_persistence, requires_fcv_44 ]
+ * @tags: [
+ *   requires_persistence,
+ *   requires_wiredtiger,
+ * ]
  */
 (function() {
 "use strict";
 
-const kOplogDocs = 45000;
+const kOplogDocs = 47500;
 // kNumOplogSamples is derived from the number of oplog entries above.
-const kNumOplogSamples = 15;
+// Formula is kRandomSamplesPerStone * numRecords / estRecordsPerStone, where
+// kRandomSamplesPerStone = 10
+// numRecords = kOplogDocs + some small number of bookkeeping records
+// estRecordsPerStone = (16MB / average oplog record size), empirically about 28700 records.
+// The number of samples is picked to NOT be divisible by kLoggingIntervalSeconds so we can
+// safely miss a logging interval without failing; this can sometimes happen due to clock
+// adjustment.
+const kNumOplogSamples = 16;
 const kOplogSampleReadDelay = 1;
 const kLoggingIntervalSeconds = 3;
 
@@ -32,8 +42,17 @@ replSet.initiate();
 let coll = replSet.getPrimary().getDB(testDB).getCollection("testcoll");
 
 // Insert enough documents to force kNumOplogSamples to be taken on the following start up.
-for (let i = 0; i < kOplogDocs; i++) {
-    assert.commandWorked(coll.insert({m: 1 + i}));
+let docsRemaining = kOplogDocs;
+let docsDone = 0;
+while (docsRemaining) {
+    let batchDocs = docsRemaining > 1000 ? 1000 : docsRemaining;
+    let bulk = coll.initializeUnorderedBulkOp();
+    for (let i = 0; i < batchDocs; i++) {
+        bulk.insert({m: 1 + i + docsDone});
+    }
+    assert.commandWorked(bulk.execute());
+    docsRemaining -= batchDocs;
+    docsDone += batchDocs;
 }
 
 // Restart replica set to load entries from the oplog for sampling.
@@ -49,8 +68,7 @@ assert.commandWorked(replSet.getPrimary().getDB(testDB).serverStatus());
 const maxSamplesPerLog = Math.ceil(kLoggingIntervalSeconds / kOplogSampleReadDelay);
 const minExpectedLogs = Math.floor(kNumOplogSamples / maxSamplesPerLog);
 
-checkLog.containsWithAtLeastCount(
-    replSet.getPrimary(), "Oplog sampling progress:", minExpectedLogs);
+checkLog.containsWithAtLeastCount(replSet.getPrimary(), "Oplog sampling progress", minExpectedLogs);
 assert(checkLog.checkContainsOnce(replSet.getPrimary(), "Oplog sampling complete"));
 
 replSet.stopSet();

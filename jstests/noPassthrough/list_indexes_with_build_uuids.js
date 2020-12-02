@@ -52,7 +52,7 @@ replSet.awaitReplication();
 // Build and finish the first index.
 assert.commandWorked(primaryDB.runCommand(
     {createIndexes: collName, indexes: [{key: {i: 1}, name: firstIndexName, background: true}]}));
-replSet.waitForAllIndexBuildsToFinish(dbName, collName);
+replSet.awaitReplication();
 
 // Start hanging index builds on the secondary.
 IndexBuildTest.pauseIndexBuilds(secondary);
@@ -62,9 +62,7 @@ IndexBuildTest.pauseIndexBuilds(secondary);
 // PBWM while waiting for the index build to complete in the backgroud. Therefore, we get the
 // primary to hold off on writing the commitIndexBuild oplog entry until we are ready to resume
 // index builds on the secondary.
-if (IndexBuildTest.supportsTwoPhaseIndexBuild(primary)) {
-    IndexBuildTest.pauseIndexBuilds(primary);
-}
+IndexBuildTest.pauseIndexBuilds(primary);
 
 // Build and hang on the second index. This should be run in the background if we pause index
 // builds on the primary because the createIndexes command will block.
@@ -76,24 +74,23 @@ const createIdx =
 const opId = IndexBuildTest.waitForIndexBuildToStart(secondaryDB);
 jsTestLog('Index builds started on secondary. Op ID of one of the builds: ' + opId);
 
+// Wait for replication to allow listIndexes to read the latest state on the secondary.
+replSet.awaitReplication();
+
 // Check the listIndexes() output.
 let res = secondaryDB.runCommand({listIndexes: collName, includeBuildUUIDs: true});
 
 assert.commandWorked(res);
 let indexes = res.cursor.firstBatch;
-assert.eq(3, indexes.length);
+assert.eq(3, indexes.length, tojson(res));
 
 jsTest.log(indexes);
 
 assert.eq(indexes[0].name, "_id_");
 assert.eq(indexes[1].name, "first");
 
-if (IndexBuildTest.supportsTwoPhaseIndexBuild(secondary)) {
-    assert.eq(indexes[2].spec.name, "second");
-    assert(indexes[2].hasOwnProperty("buildUUID"));
-} else {
-    assert.eq(indexes[2].name, "second");
-}
+assert.eq(indexes[2].spec.name, "second");
+assert(indexes[2].hasOwnProperty("buildUUID"));
 
 // Allow the replica set to finish the index build.
 IndexBuildTest.resumeIndexBuilds(secondary);

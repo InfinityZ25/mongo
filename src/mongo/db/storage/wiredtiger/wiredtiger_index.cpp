@@ -38,14 +38,17 @@
 
 #include "mongo/base/checked_cast.h"
 #include "mongo/db/catalog/index_catalog_entry.h"
+#include "mongo/db/catalog/validate_results.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/global_settings.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/json.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/stats/resource_consumption_metrics.h"
 #include "mongo/db/storage/index_entry_comparison.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_cursor_helpers.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_customization_hooks.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
@@ -56,6 +59,7 @@
 #include "mongo/util/fail_point.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/str.h"
+#include "mongo/util/testing_proctor.h"
 
 #define TRACING_ENABLED 0
 
@@ -103,7 +107,7 @@ void WiredTigerIndex::setKey(WT_CURSOR* cursor, const WT_ITEM* item) {
     }
 }
 
-void WiredTigerIndex::getKey(WT_CURSOR* cursor, WT_ITEM* key) {
+void WiredTigerIndex::getKey(OperationContext* opCtx, WT_CURSOR* cursor, WT_ITEM* key) {
     if (_prefix == KVPrefix::kNotPrefixed) {
         invariantWTOK(cursor->get_key(cursor, key));
     } else {
@@ -111,6 +115,9 @@ void WiredTigerIndex::getKey(WT_CURSOR* cursor, WT_ITEM* key) {
         invariantWTOK(cursor->get_key(cursor, &prefix, key));
         invariant(_prefix.repr() == prefix);
     }
+
+    auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
+    metricsCollector.incrementOneIdxEntryRead(key->size);
 }
 
 // static
@@ -157,11 +164,13 @@ std::string WiredTigerIndex::generateAppMetadataString(const IndexDescriptor& de
 }
 
 // static
-StatusWith<std::string> WiredTigerIndex::generateCreateString(const std::string& engineName,
-                                                              const std::string& sysIndexConfig,
-                                                              const std::string& collIndexConfig,
-                                                              const IndexDescriptor& desc,
-                                                              bool isPrefixed) {
+StatusWith<std::string> WiredTigerIndex::generateCreateString(
+    const std::string& engineName,
+    const std::string& sysIndexConfig,
+    const std::string& collIndexConfig,
+    const NamespaceString& collectionNamespace,
+    const IndexDescriptor& desc,
+    bool isPrefixed) {
     str::stream ss;
 
     // Separate out a prefix and suffix in the default string. User configuration will override
@@ -175,7 +184,7 @@ StatusWith<std::string> WiredTigerIndex::generateCreateString(const std::string&
 
     ss << "block_compressor=" << wiredTigerGlobalOptions.indexBlockCompressor << ",";
     ss << WiredTigerCustomizationHooks::get(getGlobalServiceContext())
-              ->getTableCreateConfig(desc.parentNS().ns());
+              ->getTableCreateConfig(collectionNamespace.ns());
     ss << sysIndexConfig << ",";
     ss << collIndexConfig << ",";
 
@@ -212,7 +221,7 @@ StatusWith<std::string> WiredTigerIndex::generateCreateString(const std::string&
 
     bool replicatedWrites = getGlobalReplSettings().usingReplSets() ||
         repl::ReplSettings::shouldRecoverFromOplogAsStandalone();
-    if (WiredTigerUtil::useTableLogging(NamespaceString(desc.parentNS()), replicatedWrites)) {
+    if (WiredTigerUtil::useTableLogging(collectionNamespace, replicatedWrites)) {
         ss << "log=(enabled=true)";
     } else {
         ss << "log=(enabled=false)";
@@ -233,21 +242,34 @@ int WiredTigerIndex::Create(OperationContext* opCtx,
     return s->create(s, uri.c_str(), config.c_str());
 }
 
+int WiredTigerIndex::Drop(OperationContext* opCtx, const std::string& uri) {
+    WiredTigerSession session(WiredTigerRecoveryUnit::get(opCtx)->getSessionCache()->conn());
+    WT_SESSION* s = session.getSession();
+
+    return s->drop(s, uri.c_str(), nullptr);
+}
+
 WiredTigerIndex::WiredTigerIndex(OperationContext* ctx,
                                  const std::string& uri,
+                                 StringData ident,
                                  const IndexDescriptor* desc,
                                  KVPrefix prefix,
                                  bool isReadOnly)
-    : SortedDataInterface(_handleVersionInfo(ctx, uri, desc, isReadOnly),
+    : SortedDataInterface(ident,
+                          _handleVersionInfo(ctx, uri, desc, isReadOnly),
                           Ordering::make(desc->keyPattern())),
       _uri(uri),
       _tableId(WiredTigerSession::genTableId()),
-      _collectionNamespace(desc->parentNS()),
+      _desc(desc),
       _indexName(desc->indexName()),
       _keyPattern(desc->keyPattern()),
       _collation(desc->collation()),
       _prefix(prefix),
       _isIdIndex(desc->isIdIndex()) {}
+
+NamespaceString WiredTigerIndex::getCollectionNamespace(OperationContext* opCtx) const {
+    return _desc->getEntry()->getNSSFromCatalog(opCtx);
+}
 
 Status WiredTigerIndex::insert(OperationContext* opCtx,
                                const KeyString::Value& keyString,
@@ -280,7 +302,7 @@ void WiredTigerIndex::unindex(OperationContext* opCtx,
 
 void WiredTigerIndex::fullValidate(OperationContext* opCtx,
                                    long long* numKeysOut,
-                                   ValidateResults* fullResults) const {
+                                   IndexValidateResults* fullResults) const {
     dassert(opCtx->lockState()->isReadLocked());
     if (fullResults && !WiredTigerRecoveryUnit::get(opCtx)->getSessionCache()->isEphemeral()) {
         int err = WiredTigerUtil::verifyTable(opCtx, _uri, &(fullResults->errors));
@@ -379,9 +401,11 @@ Status WiredTigerIndex::dupKeyCheck(OperationContext* opCtx, const KeyString::Va
     WiredTigerCursor curwrap(_uri, _tableId, false, opCtx);
     WT_CURSOR* c = curwrap.get();
 
-    if (isDup(opCtx, c, key))
-        return buildDupKeyErrorStatus(
-            key, _collectionNamespace, _indexName, _keyPattern, _collation, _ordering);
+    if (isDup(opCtx, c, key)) {
+        auto entry = _desc->getEntry();
+        auto nss = entry ? entry->getNSSFromCatalog(opCtx) : NamespaceString();
+        return buildDupKeyErrorStatus(key, nss, _indexName, _keyPattern, _collation, _ordering);
+    }
     return Status::OK();
 }
 
@@ -451,6 +475,14 @@ long long WiredTigerIndex::getSpaceUsedBytes(OperationContext* opCtx) const {
     return static_cast<long long>(WiredTigerUtil::getIdentSize(session->getSession(), _uri));
 }
 
+long long WiredTigerIndex::getFreeStorageBytes(OperationContext* opCtx) const {
+    dassert(opCtx->lockState()->isReadLocked());
+    auto ru = WiredTigerRecoveryUnit::get(opCtx);
+    WiredTigerSession* session = ru->getSession();
+
+    return static_cast<long long>(WiredTigerUtil::getIdentReuseSize(session->getSession(), _uri));
+}
+
 bool WiredTigerIndex::isDup(OperationContext* opCtx, WT_CURSOR* c, const KeyString::Value& key) {
     dassert(opCtx->lockState()->isReadLocked());
     invariant(unique());
@@ -464,6 +496,9 @@ bool WiredTigerIndex::isDup(OperationContext* opCtx, WT_CURSOR* c, const KeyStri
         return false;
     }
     invariantWTOK(ret);
+
+    auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
+    metricsCollector.incrementOneCursorSeek();
 
     // If the key exists, check if we already have this id at this key. If so, we don't
     // consider that to be a dup.
@@ -491,10 +526,6 @@ Status WiredTigerIndex::compact(OperationContext* opCtx) {
     if (!cache->isEphemeral()) {
         WT_SESSION* s = WiredTigerRecoveryUnit::get(opCtx)->getSession()->getSession();
         opCtx->recoveryUnit()->abandonSnapshot();
-        // WT compact prompts WT to take checkpoints, so we need to take the checkpoint lock around
-        // WT compact calls.
-        auto checkpointLock =
-            opCtx->getServiceContext()->getStorageEngine()->getCheckpointLock(opCtx);
         int ret = s->compact(s, uri().c_str(), "timeout=0");
         invariantWTOK(ret);
     }
@@ -508,34 +539,36 @@ KeyString::Version WiredTigerIndex::_handleVersionInfo(OperationContext* ctx,
     auto version = WiredTigerUtil::checkApplicationMetadataFormatVersion(
         ctx, uri, kMinimumIndexVersion, kMaximumIndexVersion);
     if (!version.isOK()) {
+        auto collectionNamespace = desc->getEntry()->getNSSFromCatalog(ctx);
         Status versionStatus = version.getStatus();
         Status indexVersionStatus(ErrorCodes::UnsupportedFormat,
                                   str::stream()
                                       << versionStatus.reason() << " Index: {name: "
-                                      << desc->indexName() << ", ns: " << desc->parentNS()
+                                      << desc->indexName() << ", ns: " << collectionNamespace
                                       << "} - version either too old or too new for this mongod.");
         fassertFailedWithStatusNoTrace(28579, indexVersionStatus);
     }
     _dataFormatVersion = version.getValue();
 
-    if (!desc->isIdIndex() && desc->unique()) {
-        Status versionStatus = _dataFormatVersion == kDataFormatV3KeyStringV0UniqueIndexVersionV1 ||
-                _dataFormatVersion == kDataFormatV4KeyStringV1UniqueIndexVersionV2
-            ? Status::OK()
-            : Status(ErrorCodes::UnsupportedFormat,
-                     str::stream()
-                         << "Index: {name: " << desc->indexName() << ", ns: " << desc->parentNS()
-                         << "} has incompatible format version: " << _dataFormatVersion);
-        fassertNoTrace(31179, versionStatus);
+    if (!desc->isIdIndex() && desc->unique() &&
+        _dataFormatVersion != kDataFormatV3KeyStringV0UniqueIndexVersionV1 &&
+        _dataFormatVersion != kDataFormatV4KeyStringV1UniqueIndexVersionV2) {
+        auto collectionNamespace = desc->getEntry()->getNSSFromCatalog(ctx);
+        Status versionStatus(ErrorCodes::UnsupportedFormat,
+                             str::stream()
+                                 << "Index: {name: " << desc->indexName()
+                                 << ", ns: " << collectionNamespace
+                                 << "} has incompatible format version: " << _dataFormatVersion);
+        fassertFailedWithStatusNoTrace(31179, versionStatus);
     }
 
     if (!isReadOnly) {
         bool replicatedWrites = getGlobalReplSettings().usingReplSets() ||
             repl::ReplSettings::shouldRecoverFromOplogAsStandalone();
-        uassertStatusOK(WiredTigerUtil::setTableLogging(
-            ctx,
-            uri,
-            WiredTigerUtil::useTableLogging(NamespaceString(desc->parentNS()), replicatedWrites)));
+        bool useTableLogging = !replicatedWrites ||
+            WiredTigerUtil::useTableLogging(desc->getEntry()->getNSSFromCatalog(ctx),
+                                            replicatedWrites);
+        uassertStatusOK(WiredTigerUtil::setTableLogging(ctx, uri, useTableLogging));
     }
 
     /*
@@ -588,6 +621,7 @@ protected:
         LOGV2_WARNING(51783,
                       "failed to create WiredTiger bulk cursor: {error} falling back to non-bulk "
                       "cursor for index {index}",
+                      "Failed to create WiredTiger bulk cursor, falling back to non-bulk",
                       "error"_attr = wiredtiger_strerror(err),
                       "index"_attr = idx->uri());
 
@@ -633,7 +667,10 @@ public:
 
         _cursor->set_value(_cursor, valueItem.Get());
 
-        invariantWTOK(_cursor->insert(_cursor));
+        invariantWTOK(wiredTigerCursorInsert(_opCtx, _cursor));
+
+        auto& metricsCollector = ResourceConsumption::MetricsCollector::get(_opCtx);
+        metricsCollector.incrementOneIdxEntryWritten(item.size);
 
         return Status::OK();
     }
@@ -694,8 +731,10 @@ private:
             if (cmp == 0) {
                 // Duplicate found!
                 auto newKey = KeyString::toBson(newKeyString, _idx->_ordering);
+                auto entry = _idx->_desc->getEntry();
                 return buildDupKeyErrorStatus(newKey,
-                                              _idx->collectionNamespace(),
+                                              entry ? entry->getNSSFromCatalog(_opCtx)
+                                                    : NamespaceString(),
                                               _idx->indexName(),
                                               _idx->keyPattern(),
                                               _idx->_collation);
@@ -719,7 +758,10 @@ private:
 
         _cursor->set_value(_cursor, valueItem.Get());
 
-        invariantWTOK(_cursor->insert(_cursor));
+        invariantWTOK(wiredTigerCursorInsert(_opCtx, _cursor));
+
+        auto& metricsCollector = ResourceConsumption::MetricsCollector::get(_opCtx);
+        metricsCollector.incrementOneIdxEntryWritten(keyItem.size);
 
         // Don't copy the key again if dups are allowed.
         if (!_dupsAllowed)
@@ -743,7 +785,7 @@ private:
             if (!_dupsAllowed) {
                 auto newKey = KeyString::toBson(newKeyString, _idx->_ordering);
                 return buildDupKeyErrorStatus(newKey,
-                                              _idx->collectionNamespace(),
+                                              _idx->_desc->getEntry()->getNSSFromCatalog(_opCtx),
                                               _idx->indexName(),
                                               _idx->keyPattern(),
                                               _idx->_collation);
@@ -783,7 +825,9 @@ private:
         setKey(_cursor, keyItem.Get());
         _cursor->set_value(_cursor, valueItem.Get());
 
-        invariantWTOK(_cursor->insert(_cursor));
+        invariantWTOK(wiredTigerCursorInsert(_opCtx, _cursor));
+        auto& metricsCollector = ResourceConsumption::MetricsCollector::get(_opCtx);
+        metricsCollector.incrementOneIdxEntryWritten(keyItem.size);
 
         _records.clear();
     }
@@ -1006,6 +1050,9 @@ protected:
             invariantWTOK(cursor->get_key(cursor, &prefix, key));
             invariant(_prefix.repr() == prefix);
         }
+
+        auto& metricsCollector = ResourceConsumption::MetricsCollector::get(_opCtx);
+        metricsCollector.incrementOneIdxEntryRead(key->size);
     }
 
     bool hasWrongPrefix(WT_CURSOR* cursor) {
@@ -1094,6 +1141,10 @@ protected:
             return false;
         }
         invariantWTOK(ret);
+
+        auto& metricsCollector = ResourceConsumption::MetricsCollector::get(_opCtx);
+        metricsCollector.incrementOneCursorSeek();
+
         _cursorAtEof = false;
 
         LOGV2_TRACE_CURSOR(20089, "cmp: {cmp}", "cmp"_attr = cmp);
@@ -1148,11 +1199,12 @@ protected:
                 LOGV2(51790,
                       "WTIndex::updatePosition -- the new key ({newKey}) is less than the previous "
                       "key ({prevKey}), which is a bug.",
-                      "newKey"_attr = redact(toHex(item.data, item.size)),
+                      "WTIndex::updatePosition -- new key is less than previous key",
+                      "newKey"_attr = redact(hexblob::encode(item.data, item.size)),
                       "prevKey"_attr = redact(_key.toString()));
 
-                // Crash when test commands are enabled.
-                invariant(!getTestCommandsEnabled());
+                // Crash when testing diagnostics are enabled.
+                invariant(!TestingProctor::instance().isEnabled());
 
                 // Force a retry of the operation from our last known position by acting as-if
                 // we received a WT_ROLLBACK error.
@@ -1342,10 +1394,11 @@ private:
             LOGV2_FATAL(28608,
                         "Unique index cursor seeing multiple records for key {key} in index "
                         "{index} ({uri}) belonging to collection {collection}",
+                        "Unique index cursor seeing multiple records for key in index",
                         "key"_attr = redact(curr(kWantKey)->key),
                         "index"_attr = _idx.indexName(),
                         "uri"_attr = _idx.uri(),
-                        "collection"_attr = _idx.collectionNamespace());
+                        "collection"_attr = _idx.getCollectionNamespace(_opCtx));
         }
     }
 };
@@ -1354,10 +1407,11 @@ private:
 
 WiredTigerIndexUnique::WiredTigerIndexUnique(OperationContext* ctx,
                                              const std::string& uri,
+                                             StringData ident,
                                              const IndexDescriptor* desc,
                                              KVPrefix prefix,
                                              bool isReadOnly)
-    : WiredTigerIndex(ctx, uri, desc, prefix, isReadOnly), _partial(desc->isPartial()) {}
+    : WiredTigerIndex(ctx, uri, ident, desc, prefix, isReadOnly), _partial(desc->isPartial()) {}
 
 std::unique_ptr<SortedDataInterface::Cursor> WiredTigerIndexUnique::newCursor(
     OperationContext* opCtx, bool forward) const {
@@ -1393,12 +1447,15 @@ bool WiredTigerIndexUnique::_keyExists(OperationContext* opCtx,
         return false;
     invariantWTOK(ret);
 
+    auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
+    metricsCollector.incrementOneCursorSeek();
+
     if (cmp == 0)
         return true;
 
     WT_ITEM item;
     // Obtain the key from the record returned by search near.
-    getKey(c, &item);
+    getKey(opCtx, c, &item);
     if (std::memcmp(buffer, item.data, std::min(size, item.size)) == 0) {
         return true;
     }
@@ -1417,7 +1474,7 @@ bool WiredTigerIndexUnique::_keyExists(OperationContext* opCtx,
     }
     invariantWTOK(ret);
 
-    getKey(c, &item);
+    getKey(opCtx, c, &item);
     return std::memcmp(buffer, item.data, std::min(size, item.size)) == 0;
 }
 
@@ -1441,7 +1498,7 @@ bool WiredTigerIndexUnique::isDup(OperationContext* opCtx,
 
     WT_ITEM item;
     if (ret == 0) {
-        getKey(c, &item);
+        getKey(opCtx, c, &item);
         return std::memcmp(
                    prefixKey.getBuffer(), item.data, std::min(prefixKey.getSize(), item.size)) == 0;
     }
@@ -1485,7 +1542,12 @@ Status WiredTigerIndexUnique::_insertTimestampUnsafe(OperationContext* opCtx,
     WiredTigerItem valueItem(value.getBuffer(), value.getSize());
     setKey(c, keyItem.Get());
     c->set_value(c, valueItem.Get());
-    int ret = WT_OP_CHECK(c->insert(c));
+    int ret = WT_OP_CHECK(wiredTigerCursorInsert(opCtx, c));
+
+    // Account for the first insert attempt, but do not attempt to account for the complexity of
+    // any subsequent writes.
+    auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
+    metricsCollector.incrementOneIdxEntryWritten(keyItem.size);
 
     if (ret != WT_DUPLICATE_KEY) {
         if (ret == 0) {
@@ -1501,6 +1563,8 @@ Status WiredTigerIndexUnique::_insertTimestampUnsafe(OperationContext* opCtx,
     // down to a single value, it will be cleaned up.
     ret = wiredTigerPrepareConflictRetry(opCtx, [&] { return c->search(c); });
     invariantWTOK(ret);
+
+    metricsCollector.incrementOneCursorSeek();
 
     WT_ITEM old;
     invariantWTOK(c->get_value(c, &old));
@@ -1528,7 +1592,7 @@ Status WiredTigerIndexUnique::_insertTimestampUnsafe(OperationContext* opCtx,
     if (!dupsAllowed) {
         auto key = KeyString::toBson(keyString, _ordering);
         return buildDupKeyErrorStatus(
-            key, _collectionNamespace, _indexName, _keyPattern, _collation);
+            key, _desc->getEntry()->getNSSFromCatalog(opCtx), _indexName, _keyPattern, _collation);
     }
 
     if (!insertedId) {
@@ -1539,7 +1603,7 @@ Status WiredTigerIndexUnique::_insertTimestampUnsafe(OperationContext* opCtx,
 
     valueItem = WiredTigerItem(value.getBuffer(), value.getSize());
     c->set_value(c, valueItem.Get());
-    Status status = wtRCToStatus(c->update(c));
+    Status status = wtRCToStatus(wiredTigerCursorUpdate(opCtx, c));
 
     if (!status.isOK())
         return status;
@@ -1567,15 +1631,18 @@ Status WiredTigerIndexUnique::_insertTimestampSafe(OperationContext* opCtx,
         // First phase inserts the prefix key to prohibit concurrent insertions of same key
         setKey(c, prefixKeyItem.Get());
         c->set_value(c, emptyItem.Get());
-        ret = WT_OP_CHECK(c->insert(c));
+        ret = WT_OP_CHECK(wiredTigerCursorInsert(opCtx, c));
 
         // An entry with prefix key already exists. This can happen only during rolling upgrade when
         // both timestamp unsafe and timestamp safe index format keys could be present.
         if (ret == WT_DUPLICATE_KEY) {
             auto key = KeyString::toBson(
                 keyString.getBuffer(), sizeWithoutRecordId, _ordering, keyString.getTypeBits());
-            return buildDupKeyErrorStatus(
-                key, _collectionNamespace, _indexName, _keyPattern, _collation);
+            return buildDupKeyErrorStatus(key,
+                                          _desc->getEntry()->getNSSFromCatalog(opCtx),
+                                          _indexName,
+                                          _keyPattern,
+                                          _collation);
         }
         invariantWTOK(ret);
 
@@ -1583,15 +1650,20 @@ Status WiredTigerIndexUnique::_insertTimestampSafe(OperationContext* opCtx,
         // transactions, but will not conflict with any transaction that begins after this
         // operation commits.
         setKey(c, prefixKeyItem.Get());
-        ret = WT_OP_CHECK(c->remove(c));
+        ret = WT_OP_CHECK(wiredTigerCursorRemove(opCtx, c));
         invariantWTOK(ret);
 
         // Second phase looks up for existence of key to avoid insertion of duplicate key
         if (_keyExists(opCtx, c, keyString.getBuffer(), sizeWithoutRecordId)) {
             auto key = KeyString::toBson(
                 keyString.getBuffer(), sizeWithoutRecordId, _ordering, keyString.getTypeBits());
-            return buildDupKeyErrorStatus(
-                key, _collectionNamespace, _indexName, _keyPattern, _collation);
+            auto entry = _desc->getEntry();
+            return buildDupKeyErrorStatus(key,
+                                          entry ? entry->getNSSFromCatalog(opCtx)
+                                                : NamespaceString(),
+                                          _indexName,
+                                          _keyPattern,
+                                          _collation);
         }
     }
 
@@ -1604,7 +1676,12 @@ Status WiredTigerIndexUnique::_insertTimestampSafe(OperationContext* opCtx,
         : WiredTigerItem(typeBits.getBuffer(), typeBits.getSize());
     setKey(c, keyItem.Get());
     c->set_value(c, valueItem.Get());
-    ret = WT_OP_CHECK(c->insert(c));
+    ret = WT_OP_CHECK(wiredTigerCursorInsert(opCtx, c));
+
+    // Account for the actual key insertion, but do not attempt account for the complexity of any
+    // previous duplicate key detection, which may perform writes.
+    auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
+    metricsCollector.incrementOneIdxEntryWritten(keyItem.size);
 
     // It is possible that this key is already present during a concurrent background index build.
     if (ret != WT_DUPLICATE_KEY)
@@ -1635,15 +1712,15 @@ void WiredTigerIndexUnique::_unindexTimestampUnsafe(OperationContext* opCtx,
     WiredTigerItem keyItem(keyString.getBuffer(), sizeWithoutRecordId);
     setKey(c, keyItem.Get());
 
-    auto triggerWriteConflictAtPoint = [this, &keyItem](WT_CURSOR* point) {
+    auto triggerWriteConflictAtPoint = [this, opCtx, &keyItem](WT_CURSOR* point) {
         // WT_NOTFOUND may occur during a background index build. Insert a dummy value and
         // delete it again to trigger a write conflict in case this is being concurrently
         // indexed by the background indexer.
         setKey(point, keyItem.Get());
         point->set_value(point, emptyItem.Get());
-        invariantWTOK(WT_OP_CHECK(point->insert(point)));
+        invariantWTOK(WT_OP_CHECK(wiredTigerCursorInsert(opCtx, point)));
         setKey(point, keyItem.Get());
-        invariantWTOK(WT_OP_CHECK(point->remove(point)));
+        invariantWTOK(WT_OP_CHECK(wiredTigerCursorRemove(opCtx, point)));
     };
 
     if (!dupsAllowed) {
@@ -1656,6 +1733,10 @@ void WiredTigerIndexUnique::_unindexTimestampUnsafe(OperationContext* opCtx,
                 return;
             }
             invariantWTOK(ret);
+
+            auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
+            metricsCollector.incrementOneCursorSeek();
+
             WT_ITEM value;
             invariantWTOK(c->get_value(c, &value));
             BufReader br(value.data, value.size);
@@ -1667,7 +1748,13 @@ void WiredTigerIndexUnique::_unindexTimestampUnsafe(OperationContext* opCtx,
             KeyString::TypeBits::fromBuffer(getKeyStringVersion(), &br);
             fassert(40417, !br.remaining());
         }
-        int ret = WT_OP_CHECK(c->remove(c));
+        int ret = WT_OP_CHECK(wiredTigerCursorRemove(opCtx, c));
+
+        // Only account for the actual key removal, but do not attempt account for the complexity
+        // of any previous or subsequent writes.
+        auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
+        metricsCollector.incrementOneIdxEntryWritten(keyItem.size);
+
         if (ret == WT_NOTFOUND) {
             triggerWriteConflictAtPoint(c);
             return;
@@ -1685,6 +1772,9 @@ void WiredTigerIndexUnique::_unindexTimestampUnsafe(OperationContext* opCtx,
     }
     invariantWTOK(ret);
 
+    auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
+    metricsCollector.incrementOneCursorSeek();
+
     WT_ITEM old;
     invariantWTOK(c->get_value(c, &old));
 
@@ -1700,7 +1790,7 @@ void WiredTigerIndexUnique::_unindexTimestampUnsafe(OperationContext* opCtx,
             if (records.empty() && !br.remaining()) {
                 // This is the common case: we are removing the only id for this key.
                 // Remove the whole entry.
-                invariantWTOK(WT_OP_CHECK(c->remove(c)));
+                invariantWTOK(WT_OP_CHECK(wiredTigerCursorRemove(opCtx, c)));
                 return;
             }
 
@@ -1713,10 +1803,15 @@ void WiredTigerIndexUnique::_unindexTimestampUnsafe(OperationContext* opCtx,
 
     if (!foundId) {
         auto key = KeyString::toBson(keyString, _ordering);
-        LOGV2_WARNING(51797,
-                      "{id} not found in index for key {key}",
-                      "id"_attr = id,
-                      "key"_attr = redact(key));
+        LOGV2_WARNING(
+            51797,
+            "{recordId} not found in collection {collection} on index {index} with key {key} while "
+            "attempting to remove the index entry",
+            "Associated record not found in collection while removing index entry",
+            "collection"_attr = getCollectionNamespace(opCtx),
+            "index"_attr = _indexName,
+            "key"_attr = redact(key),
+            "recordId"_attr = id);
         return;  // nothing to do
     }
 
@@ -1734,7 +1829,7 @@ void WiredTigerIndexUnique::_unindexTimestampUnsafe(OperationContext* opCtx,
 
     WiredTigerItem valueItem = WiredTigerItem(newValue.getBuffer(), newValue.getSize());
     c->set_value(c, valueItem.Get());
-    invariantWTOK(c->update(c));
+    invariantWTOK(wiredTigerCursorUpdate(opCtx, c));
 }
 
 void WiredTigerIndexUnique::_unindexTimestampSafe(OperationContext* opCtx,
@@ -1743,7 +1838,13 @@ void WiredTigerIndexUnique::_unindexTimestampSafe(OperationContext* opCtx,
                                                   bool dupsAllowed) {
     WiredTigerItem item(keyString.getBuffer(), keyString.getSize());
     setKey(c, item.Get());
-    int ret = WT_OP_CHECK(c->remove(c));
+    int ret = WT_OP_CHECK(wiredTigerCursorRemove(opCtx, c));
+
+    // Account for the first removal attempt, but do not attempt to account for the complexity of
+    // any subsequent removals and insertions when the index's keys are not fully-upgraded.
+    auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
+    metricsCollector.incrementOneIdxEntryWritten(item.size);
+
     if (ret != WT_NOTFOUND) {
         invariantWTOK(ret);
         return;
@@ -1758,7 +1859,7 @@ void WiredTigerIndexUnique::_unindexTimestampSafe(OperationContext* opCtx,
     WiredTigerItem keyItem(keyString.getBuffer(), sizeWithoutRecordId);
     setKey(c, keyItem.Get());
 
-    ret = WT_OP_CHECK(c->remove(c));
+    ret = WT_OP_CHECK(wiredTigerCursorRemove(opCtx, c));
     if (ret != WT_NOTFOUND) {
         invariantWTOK(ret);
         return;
@@ -1768,18 +1869,19 @@ void WiredTigerIndexUnique::_unindexTimestampSafe(OperationContext* opCtx,
     // by the background indexer.
     setKey(c, item.Get());
     c->set_value(c, emptyItem.Get());
-    invariantWTOK(WT_OP_CHECK(c->insert(c)));
+    invariantWTOK(WT_OP_CHECK(wiredTigerCursorInsert(opCtx, c)));
     setKey(c, item.Get());
-    invariantWTOK(WT_OP_CHECK(c->remove(c)));
+    invariantWTOK(WT_OP_CHECK(wiredTigerCursorRemove(opCtx, c)));
 }
 // ------------------------------
 
 WiredTigerIndexStandard::WiredTigerIndexStandard(OperationContext* ctx,
                                                  const std::string& uri,
+                                                 StringData ident,
                                                  const IndexDescriptor* desc,
                                                  KVPrefix prefix,
                                                  bool isReadOnly)
-    : WiredTigerIndex(ctx, uri, desc, prefix, isReadOnly) {}
+    : WiredTigerIndex(ctx, uri, ident, desc, prefix, isReadOnly) {}
 
 std::unique_ptr<SortedDataInterface::Cursor> WiredTigerIndexStandard::newCursor(
     OperationContext* opCtx, bool forward) const {
@@ -1808,7 +1910,10 @@ Status WiredTigerIndexStandard::_insert(OperationContext* opCtx,
 
     setKey(c, keyItem.Get());
     c->set_value(c, valueItem.Get());
-    int ret = WT_OP_CHECK(c->insert(c));
+    int ret = WT_OP_CHECK(wiredTigerCursorInsert(opCtx, c));
+
+    auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
+    metricsCollector.incrementOneIdxEntryWritten(keyItem.size);
 
     // If the record was already in the index, we just return OK.
     // This can happen, for example, when building a background index while documents are being
@@ -1826,7 +1931,11 @@ void WiredTigerIndexStandard::_unindex(OperationContext* opCtx,
     invariant(dupsAllowed);
     WiredTigerItem item(keyString.getBuffer(), keyString.getSize());
     setKey(c, item.Get());
-    int ret = WT_OP_CHECK(c->remove(c));
+    int ret = WT_OP_CHECK(wiredTigerCursorRemove(opCtx, c));
+
+    auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
+    metricsCollector.incrementOneIdxEntryWritten(item.size);
+
     if (ret != WT_NOTFOUND) {
         invariantWTOK(ret);
     } else {
@@ -1835,9 +1944,9 @@ void WiredTigerIndexStandard::_unindex(OperationContext* opCtx,
         // the background indexer.
         setKey(c, item.Get());
         c->set_value(c, emptyItem.Get());
-        invariantWTOK(WT_OP_CHECK(c->insert(c)));
+        invariantWTOK(WT_OP_CHECK(wiredTigerCursorInsert(opCtx, c)));
         setKey(c, item.Get());
-        invariantWTOK(WT_OP_CHECK(c->remove(c)));
+        invariantWTOK(WT_OP_CHECK(wiredTigerCursorRemove(opCtx, c)));
     }
 }
 

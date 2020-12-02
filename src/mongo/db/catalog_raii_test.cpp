@@ -138,7 +138,7 @@ TEST_F(CatalogRAIITestFixture, AutoGetCollectionCollLockDeadline) {
             AutoGetCollection coll(client2.second.get(),
                                    nss,
                                    MODE_X,
-                                   AutoGetCollection::ViewMode::kViewsForbidden,
+                                   AutoGetCollectionViewMode::kViewsForbidden,
                                    Date_t::now() + timeoutMs);
         },
         timeoutMs);
@@ -152,7 +152,7 @@ TEST_F(CatalogRAIITestFixture, AutoGetCollectionDBLockDeadline) {
             AutoGetCollection coll(client2.second.get(),
                                    nss,
                                    MODE_X,
-                                   AutoGetCollection::ViewMode::kViewsForbidden,
+                                   AutoGetCollectionViewMode::kViewsForbidden,
                                    Date_t::now() + timeoutMs);
         },
         timeoutMs);
@@ -166,7 +166,7 @@ TEST_F(CatalogRAIITestFixture, AutoGetCollectionGlobalLockDeadline) {
             AutoGetCollection coll(client2.second.get(),
                                    nss,
                                    MODE_X,
-                                   AutoGetCollection::ViewMode::kViewsForbidden,
+                                   AutoGetCollectionViewMode::kViewsForbidden,
                                    Date_t::now() + timeoutMs);
         },
         timeoutMs);
@@ -183,7 +183,7 @@ TEST_F(CatalogRAIITestFixture, AutoGetCollectionDeadlineNow) {
             AutoGetCollection coll(client2.second.get(),
                                    nss,
                                    MODE_X,
-                                   AutoGetCollection::ViewMode::kViewsForbidden,
+                                   AutoGetCollectionViewMode::kViewsForbidden,
                                    Date_t::now());
         },
         Milliseconds(0));
@@ -200,7 +200,7 @@ TEST_F(CatalogRAIITestFixture, AutoGetCollectionDeadlineMin) {
             AutoGetCollection coll(client2.second.get(),
                                    nss,
                                    MODE_X,
-                                   AutoGetCollection::ViewMode::kViewsForbidden,
+                                   AutoGetCollectionViewMode::kViewsForbidden,
                                    Date_t());
         },
         Milliseconds(0));
@@ -225,12 +225,12 @@ public:
     ReadSource getTimestampReadSource() const override {
         return _source;
     };
-    boost::optional<Timestamp> getPointInTimeReadTimestamp() override {
+    boost::optional<Timestamp> getPointInTimeReadTimestamp(OperationContext* opCtx) override {
         return _timestamp;
     }
 
 private:
-    ReadSource _source = ReadSource::kUnset;
+    ReadSource _source = ReadSource::kNoTimestamp;
     boost::optional<Timestamp> _timestamp;
 };
 
@@ -255,17 +255,17 @@ void ReadSourceScopeTest::setUp() {
 TEST_F(ReadSourceScopeTest, RestoreReadSource) {
     opCtx()->recoveryUnit()->setTimestampReadSource(ReadSource::kProvided, Timestamp(1, 2));
     ASSERT_EQ(opCtx()->recoveryUnit()->getTimestampReadSource(), ReadSource::kProvided);
-    ASSERT_EQ(opCtx()->recoveryUnit()->getPointInTimeReadTimestamp(), Timestamp(1, 2));
+    ASSERT_EQ(opCtx()->recoveryUnit()->getPointInTimeReadTimestamp(opCtx()), Timestamp(1, 2));
     {
-        ReadSourceScope scope(opCtx());
-        ASSERT_EQ(opCtx()->recoveryUnit()->getTimestampReadSource(), ReadSource::kUnset);
+        ReadSourceScope scope(opCtx(), ReadSource::kNoTimestamp);
+        ASSERT_EQ(opCtx()->recoveryUnit()->getTimestampReadSource(), ReadSource::kNoTimestamp);
 
-        opCtx()->recoveryUnit()->setTimestampReadSource(ReadSource::kLastApplied);
-        ASSERT_EQ(opCtx()->recoveryUnit()->getTimestampReadSource(), ReadSource::kLastApplied);
-        ASSERT_EQ(opCtx()->recoveryUnit()->getPointInTimeReadTimestamp(), boost::none);
+        opCtx()->recoveryUnit()->setTimestampReadSource(ReadSource::kNoOverlap);
+        ASSERT_EQ(opCtx()->recoveryUnit()->getTimestampReadSource(), ReadSource::kNoOverlap);
+        ASSERT_EQ(opCtx()->recoveryUnit()->getPointInTimeReadTimestamp(opCtx()), boost::none);
     }
     ASSERT_EQ(opCtx()->recoveryUnit()->getTimestampReadSource(), ReadSource::kProvided);
-    ASSERT_EQ(opCtx()->recoveryUnit()->getPointInTimeReadTimestamp(), Timestamp(1, 2));
+    ASSERT_EQ(opCtx()->recoveryUnit()->getPointInTimeReadTimestamp(opCtx()), Timestamp(1, 2));
 }
 
 }  // namespace

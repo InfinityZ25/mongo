@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -58,7 +58,7 @@ namespace {
 const ReadPreferenceSetting kPrimaryOnlyReadPreference{ReadPreference::PrimaryOnly};
 
 bool checkIfSingleDoc(OperationContext* opCtx,
-                      Collection* collection,
+                      const CollectionPtr& collection,
                       const IndexDescriptor* idx,
                       const ChunkType* chunk) {
     KeyPattern kp(idx->keyPattern());
@@ -66,12 +66,12 @@ bool checkIfSingleDoc(OperationContext* opCtx,
     BSONObj newmax = Helpers::toKeyFormat(kp.extendRangeBound(chunk->getMax(), true));
 
     auto exec = InternalPlanner::indexScan(opCtx,
-                                           collection,
+                                           &collection,
                                            idx,
                                            newmin,
                                            newmax,
                                            BoundInclusion::kIncludeStartKeyOnly,
-                                           PlanExecutor::NO_YIELD);
+                                           PlanYieldPolicy::YieldPolicy::NO_YIELD);
     // check if exactly one document found
     PlanExecutor::ExecState state;
     BSONObj obj;
@@ -132,8 +132,9 @@ StatusWith<boost::optional<ChunkRange>> splitChunk(OperationContext* opCtx,
                                                    const std::vector<BSONObj>& splitKeys,
                                                    const std::string& shardName,
                                                    const OID& expectedCollectionEpoch) {
-    const std::string whyMessage(str::stream() << "splitting chunk " << chunkRange.toString()
-                                               << " in " << nss.toString());
+    const std::string whyMessage(str::stream()
+                                 << "splitting chunk " << redact(chunkRange.toString()) << " in "
+                                 << nss.toString());
     auto scopedDistLock = Grid::get(opCtx)->catalogClient()->getDistLockManager()->lock(
         opCtx, nss.ns(), whyMessage, DistLockManager::kDefaultLockTimeout);
     if (!scopedDistLock.isOK()) {
@@ -195,7 +196,7 @@ StatusWith<boost::optional<ChunkRange>> splitChunk(OperationContext* opCtx,
     // succeeds, thus the automatic retry fails with a precondition violation, for example.
     //
     if (!commandStatus.isOK() || !writeConcernStatus.isOK()) {
-        forceShardFilteringMetadataRefresh(opCtx, nss);
+        onShardVersionMismatch(opCtx, nss, boost::none);
 
         if (checkMetadataForSuccessfulSplitChunk(
                 opCtx, nss, expectedCollectionEpoch, chunkRange, splitKeys)) {
@@ -207,9 +208,7 @@ StatusWith<boost::optional<ChunkRange>> splitChunk(OperationContext* opCtx,
         }
     }
 
-    AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-
-    Collection* const collection = autoColl.getCollection();
+    AutoGetCollection collection(opCtx, nss, MODE_IS);
     if (!collection) {
         LOGV2_WARNING(
             23778,
@@ -236,10 +235,10 @@ StatusWith<boost::optional<ChunkRange>> splitChunk(OperationContext* opCtx,
 
     KeyPattern shardKeyPattern(keyPatternObj);
     if (shardKeyPattern.globalMax().woCompare(backChunk.getMax()) == 0 &&
-        checkIfSingleDoc(opCtx, collection, idx, &backChunk)) {
+        checkIfSingleDoc(opCtx, collection.getCollection(), idx, &backChunk)) {
         return boost::optional<ChunkRange>(ChunkRange(backChunk.getMin(), backChunk.getMax()));
     } else if (shardKeyPattern.globalMin().woCompare(frontChunk.getMin()) == 0 &&
-               checkIfSingleDoc(opCtx, collection, idx, &frontChunk)) {
+               checkIfSingleDoc(opCtx, collection.getCollection(), idx, &frontChunk)) {
         return boost::optional<ChunkRange>(ChunkRange(frontChunk.getMin(), frontChunk.getMax()));
     }
 

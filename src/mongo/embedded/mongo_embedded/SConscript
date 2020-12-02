@@ -1,23 +1,24 @@
 # -*- mode: python; -*-
 
-import libdeps
-
 Import("env")
 Import("get_option")
 
+if get_option('build-tools') == 'next':
+    import libdeps_next as libdeps
+else:
+    import libdeps
+
 env = env.Clone()
 
-
-if get_option('install-mode') == 'hygienic':
-    env.AutoInstall(
-        '$PREFIX_DOCDIR/mongo_embedded',
-        source=[
-            '#/LICENSE-Community.txt',
-            '../LICENSE-Embedded.txt',
-        ],
-        AIB_COMPONENT='embedded',
-        AIB_ROLE='base',
-    )
+env.AutoInstall(
+    '$PREFIX_DOCDIR/mongo_embedded',
+    source=[
+        '#/LICENSE-Community.txt',
+        '../LICENSE-Embedded.txt',
+    ],
+    AIB_COMPONENT='embedded',
+    AIB_ROLE='base',
+)
 
 mongoEmbeddedEnv = env.Clone()
 mongoEmbeddedEnv.AppendUnique(
@@ -67,20 +68,19 @@ mongoEmbeddedTargets = mongoEmbeddedEnv.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/service_context',
+        '$BUILD_DIR/mongo/embedded/embedded',
         '$BUILD_DIR/mongo/rpc/protocol',
         '$BUILD_DIR/mongo/transport/transport_layer_mock',
-        '$BUILD_DIR/mongo/embedded/embedded',
     ],
     AIB_COMPONENT='embedded',
 )
 
-if get_option('install-mode') == 'hygienic':
-    env.AutoInstall(
-        '$PREFIX_INCLUDEDIR/mongo_embedded/v1/mongo_embedded',
-        source=['mongo_embedded.h'],
-        AIB_COMPONENT='embedded',
-        AIB_ROLE='dev',
-    )
+env.AutoInstall(
+    '$PREFIX_INCLUDEDIR/mongo_embedded/v1/mongo_embedded',
+    source=['mongo_embedded.h'],
+    AIB_COMPONENT='embedded',
+    AIB_ROLE='dev',
+)
 
 yamlEnv = env.Clone()
 yamlEnv.InjectThirdParty(libraries=['yaml'])
@@ -90,9 +90,9 @@ if get_option('link-model') != 'dynamic-sdk':
         target='mongo_embedded_test',
         source=[
             'mongo_embedded_test.cpp',
-            env.Idlc('mongo_embedded_test.idl')[0],
+            'mongo_embedded_test.idl',
         ],
-        LIBDEPS_PRIVATE=[
+        LIBDEPS=[
             '$BUILD_DIR/mongo/base',
             '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
             '$BUILD_DIR/mongo/db/server_options_core',

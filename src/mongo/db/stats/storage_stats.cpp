@@ -27,6 +27,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kFTDC
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/catalog/collection.h"
@@ -34,6 +36,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/logv2/log.h"
 
 #include "mongo/db/stats/storage_stats.h"
 
@@ -54,10 +57,21 @@ Status appendCollectionStorageStats(OperationContext* opCtx,
     }
 
     bool verbose = param["verbose"].trueValue();
+    bool waitForLock = !param.hasField("waitForLock") || param["waitForLock"].trueValue();
 
-    AutoGetCollectionForReadCommand ctx(opCtx, nss);
-    Collection* collection = ctx.getCollection();  // Will be set if present
-    if (!ctx.getDb() || !collection) {
+    boost::optional<AutoGetCollectionForReadCommand> autoColl;
+    try {
+        autoColl.emplace(opCtx,
+                         nss,
+                         AutoGetCollectionViewMode::kViewsForbidden,
+                         waitForLock ? Date_t::max() : Date_t::now());
+    } catch (const ExceptionForCat<ErrorCategory::Interruption>&) {
+        LOGV2_DEBUG(3088801, 2, "Failed to retrieve storage statistics", logAttrs(nss));
+        return Status::OK();
+    }
+
+    const auto& collection = autoColl->getCollection();  // Will be set if present
+    if (!autoColl->getDb() || !collection) {
         result->appendNumber("size", 0);
         result->appendNumber("count", 0);
         result->appendNumber("storageSize", 0);
@@ -67,8 +81,9 @@ Status appendCollectionStorageStats(OperationContext* opCtx,
         result->append("indexDetails", BSONObj());
         result->append("indexSizes", BSONObj());
         result->append("scaleFactor", scale);
-        std::string errmsg = !(ctx.getDb()) ? "Database [" + nss.db().toString() + "] not found."
-                                            : "Collection [" + nss.toString() + "] not found.";
+        std::string errmsg = !autoColl->getDb()
+            ? "Database [" + nss.db().toString() + "] not found."
+            : "Collection [" + nss.toString() + "] not found.";
         return {ErrorCodes::NamespaceNotFound, errmsg};
     }
 
@@ -80,19 +95,16 @@ Status appendCollectionStorageStats(OperationContext* opCtx,
     if (numRecords)
         result->append("avgObjSize", collection->averageObjectSize(opCtx));
 
-    RecordStore* recordStore = collection->getRecordStore();
+    const RecordStore* recordStore = collection->getRecordStore();
     auto storageSize =
         static_cast<long long>(recordStore->storageSize(opCtx, result, verbose ? 1 : 0));
     result->appendNumber("storageSize", storageSize / scale);
-
-    auto freeStorageSize = static_cast<long long>(recordStore->freeStorageSize(opCtx));
-    if (freeStorageSize != 0) {
-        result->appendNumber("freeStorageSize", freeStorageSize / scale);
-    }
+    result->appendNumber("freeStorageSize",
+                         static_cast<long long>(recordStore->freeStorageSize(opCtx)) / scale);
 
     recordStore->appendCustomStats(opCtx, result, scale);
 
-    IndexCatalog* indexCatalog = collection->getIndexCatalog();
+    const IndexCatalog* indexCatalog = collection->getIndexCatalog();
     result->append("nindexes", indexCatalog->numIndexesTotal(opCtx));
 
     BSONObjBuilder indexDetails;
@@ -111,7 +123,14 @@ Status appendCollectionStorageStats(OperationContext* opCtx,
             indexDetails.append(descriptor->indexName(), bob.obj());
         }
 
-        if (!entry->isReady(opCtx)) {
+        // Not all indexes in the collection stats may be visible or consistent with our
+        // snapshot. For this reason, it is unsafe to check `isReady` on the entry, which
+        // asserts that the index's in-memory state is consistent with our snapshot.
+        if (!entry->isPresentInMySnapshot(opCtx)) {
+            continue;
+        }
+
+        if (!entry->isReadyInMySnapshot(opCtx)) {
             indexBuilds.push_back(descriptor->indexName());
         }
     }
@@ -133,13 +152,12 @@ Status appendCollectionStorageStats(OperationContext* opCtx,
 Status appendCollectionRecordCount(OperationContext* opCtx,
                                    const NamespaceString& nss,
                                    BSONObjBuilder* result) {
-    AutoGetCollectionForReadCommand ctx(opCtx, nss);
-    if (!ctx.getDb()) {
+    AutoGetCollectionForReadCommand collection(opCtx, nss);
+    if (!collection.getDb()) {
         return {ErrorCodes::BadValue,
                 str::stream() << "Database [" << nss.db().toString() << "] not found."};
     }
 
-    Collection* collection = ctx.getCollection();
     if (!collection) {
         return {ErrorCodes::BadValue,
                 str::stream() << "Collection [" << nss.toString() << "] not found."};

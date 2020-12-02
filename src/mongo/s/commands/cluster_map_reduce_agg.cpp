@@ -58,12 +58,12 @@ namespace {
 
 auto makeExpressionContext(OperationContext* opCtx,
                            const MapReduce& parsedMr,
-                           boost::optional<CachedCollectionRoutingInfo> routingInfo,
+                           const ChunkManager& cm,
                            boost::optional<ExplainOptions::Verbosity> verbosity) {
     // Populate the collection UUID and the appropriate collation to use.
     auto nss = parsedMr.getNamespace();
     auto [collationObj, uuid] = cluster_aggregation_planner::getCollationAndUUID(
-        routingInfo, nss, parsedMr.getCollation().get_value_or(BSONObj()));
+        opCtx, cm, nss, parsedMr.getCollation().get_value_or(BSONObj()));
 
     std::unique_ptr<CollatorInterface> resolvedCollator;
     if (!collationObj.isEmpty()) {
@@ -102,7 +102,8 @@ auto makeExpressionContext(OperationContext* opCtx,
             Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor()),
         std::move(resolvedNamespaces),
         boost::none,  // uuid
-        false         // mayDbProfile: false because mongos has no profile collection.
+        boost::none,
+        false  // mayDbProfile: false because mongos has no profile collection.
     );
     expCtx->inMongos = true;
     return expCtx;
@@ -117,9 +118,9 @@ Document serializeToCommand(BSONObj originalCmd, const MapReduce& parsedMr, Pipe
         Value(Document{{"batchSize", std::numeric_limits<long long>::max()}});
     translatedCmd[AggregationRequest::kAllowDiskUseName] = Value(true);
     translatedCmd[AggregationRequest::kFromMongosName] = Value(true);
-    translatedCmd[AggregationRequest::kRuntimeConstants] =
-        Value(pipeline->getContext()->getRuntimeConstants().toBSON());
-    translatedCmd[AggregationRequest::kIsMapReduceCommand] = Value(true);
+    translatedCmd[AggregationRequest::kLetName] = Value(
+        pipeline->getContext()->variablesParseState.serialize(pipeline->getContext()->variables));
+    translatedCmd[AggregationRequest::kIsMapReduceCommandName] = Value(true);
 
     if (shouldBypassDocumentValidationForCommand(originalCmd)) {
         translatedCmd[bypassDocumentValidationCommandOption()] = Value(true);
@@ -131,7 +132,7 @@ Document serializeToCommand(BSONObj originalCmd, const MapReduce& parsedMr, Pipe
     }
 
     // Append generic command options.
-    for (const auto& elem : CommandHelpers::appendPassthroughFields(originalCmd, BSONObj())) {
+    for (const auto& elem : CommandHelpers::appendGenericCommandArgs(originalCmd, BSONObj())) {
         translatedCmd[elem.fieldNameStringData()] = Value(elem);
     }
     return translatedCmd.freeze();
@@ -153,9 +154,9 @@ bool runAggregationMapReduce(OperationContext* opCtx,
         involvedNamespaces.insert(resolvedOutNss);
     }
 
-    auto routingInfo = uassertStatusOK(
+    auto cm = uassertStatusOK(
         sharded_agg_helpers::getExecutionNsRoutingInfo(opCtx, parsedMr.getNamespace()));
-    auto expCtx = makeExpressionContext(opCtx, parsedMr, routingInfo, verbosity);
+    auto expCtx = makeExpressionContext(opCtx, parsedMr, cm, verbosity);
 
     const auto pipelineBuilder = [&]() {
         return map_reduce_common::translateFromMR(parsedMr, expCtx);
@@ -175,7 +176,7 @@ bool runAggregationMapReduce(OperationContext* opCtx,
         cluster_aggregation_planner::AggregationTargeter::make(opCtx,
                                                                parsedMr.getNamespace(),
                                                                pipelineBuilder,
-                                                               routingInfo,
+                                                               cm,
                                                                involvedNamespaces,
                                                                false,  // hasChangeStream
                                                                true);  // allowedToPassthrough
@@ -186,14 +187,14 @@ bool runAggregationMapReduce(OperationContext* opCtx,
                 // needed in the normal aggregation path. For this translation, though, we need to
                 // build the pipeline to serialize and send to the primary shard.
                 auto serialized = serializeToCommand(cmd, parsedMr, pipelineBuilder().get());
-                uassertStatusOK(cluster_aggregation_planner::runPipelineOnPrimaryShard(
-                    expCtx,
-                    namespaces,
-                    targeter.routingInfo->db(),
-                    verbosity,
-                    std::move(serialized),
-                    privileges,
-                    &tempResults));
+                uassertStatusOK(
+                    cluster_aggregation_planner::runPipelineOnPrimaryShard(expCtx,
+                                                                           namespaces,
+                                                                           *targeter.cm,
+                                                                           verbosity,
+                                                                           std::move(serialized),
+                                                                           privileges,
+                                                                           &tempResults));
                 break;
             }
 
@@ -214,7 +215,6 @@ bool runAggregationMapReduce(OperationContext* opCtx,
                 // a pointer to the constructed ExpressionContext.
                 uassertStatusOK(cluster_aggregation_planner::dispatchPipelineAndMerge(
                     opCtx,
-                    expCtx->mongoProcessInterface->taskExecutor,
                     std::move(targeter),
                     std::move(serialized),
                     std::numeric_limits<long long>::max(),

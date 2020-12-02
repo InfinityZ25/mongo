@@ -59,7 +59,7 @@ public:
 
     Date_t getTime();
     int64_t getDifferenceInMillis(Date_t start, Date_t end);
-    SortedDataInterfaceThrottleCursor getIdIndex(Collection* coll);
+    SortedDataInterfaceThrottleCursor getIdIndex(const CollectionPtr& coll);
 
     std::unique_ptr<DataThrottle> _dataThrottle;
 };
@@ -72,8 +72,7 @@ void ThrottleCursorTest::setUp() {
 
     // Insert random data into the collection. We don't need to create an index as the _id index is
     // created by default.
-    AutoGetCollection autoColl(operationContext(), kNss, MODE_X);
-    Collection* collection = autoColl.getCollection();
+    AutoGetCollection collection(operationContext(), kNss, MODE_X);
     invariant(collection);
 
     OpDebug* const nullOpDebug = nullptr;
@@ -108,7 +107,7 @@ int64_t ThrottleCursorTest::getDifferenceInMillis(Date_t start, Date_t end) {
     return end.toMillisSinceEpoch() - start.toMillisSinceEpoch();
 }
 
-SortedDataInterfaceThrottleCursor ThrottleCursorTest::getIdIndex(Collection* coll) {
+SortedDataInterfaceThrottleCursor ThrottleCursorTest::getIdIndex(const CollectionPtr& coll) {
     const IndexDescriptor* idDesc = coll->getIndexCatalog()->findIdIndex(operationContext());
     const IndexCatalogEntry* idEntry = coll->getIndexCatalog()->getEntry(idDesc);
     const IndexAccessMethod* iam = idEntry->accessMethod();
@@ -119,7 +118,7 @@ SortedDataInterfaceThrottleCursor ThrottleCursorTest::getIdIndex(Collection* col
 TEST_F(ThrottleCursorTest, TestSeekableRecordThrottleCursorOff) {
     auto opCtx = operationContext();
     AutoGetCollection autoColl(opCtx, kNss, MODE_X);
-    Collection* coll = autoColl.getCollection();
+    const CollectionPtr& coll = autoColl.getCollection();
 
     // Use a fixed record data size to simplify the timing calculations.
     FailPointEnableBlock failPoint("fixedCursorDataSizeOf512KBForDataThrottle");
@@ -152,7 +151,7 @@ TEST_F(ThrottleCursorTest, TestSeekableRecordThrottleCursorOff) {
 TEST_F(ThrottleCursorTest, TestSeekableRecordThrottleCursorOn) {
     auto opCtx = operationContext();
     AutoGetCollection autoColl(opCtx, kNss, MODE_X);
-    Collection* coll = autoColl.getCollection();
+    const CollectionPtr& coll = autoColl.getCollection();
 
     // Use a fixed record data size to simplify the timing calculations.
     FailPointEnableBlock failPoint("fixedCursorDataSizeOf512KBForDataThrottle");
@@ -201,10 +200,71 @@ TEST_F(ThrottleCursorTest, TestSeekableRecordThrottleCursorOn) {
     }
 }
 
+TEST_F(ThrottleCursorTest, TestSeekableRecordThrottleCursorOnLargeDocs) {
+    auto opCtx = operationContext();
+    AutoGetCollection autoColl(opCtx, kNss, MODE_X);
+    const CollectionPtr& coll = autoColl.getCollection();
+
+    // Use a fixed record data size to simplify the timing calculations.
+    FailPointEnableBlock failPoint("fixedCursorDataSizeOf2MBForDataThrottle");
+
+    // Move the clock faster to speed up the test.
+    operationContext()->getServiceContext()->setFastClockSource(
+        std::make_unique<AutoAdvancingClockSourceMock>(Milliseconds(1000)));
+
+    SeekableRecordThrottleCursor cursor =
+        SeekableRecordThrottleCursor(opCtx, coll->getRecordStore(), _dataThrottle.get());
+
+    // Using a throttle with a limit of 1MB per second, all operations should take at least 10
+    // seconds to finish. We scan 5 records, each of which is 2MB courtesy of the fail point, so
+    // 1 record every 2 seconds.
+    {
+        setMaxMbPerSec(1);
+        Date_t start = getTime();
+
+        // Seek to the first record, then iterate through 4 more.
+        ASSERT_TRUE(cursor.seekExact(opCtx, RecordId(1)));
+        int scanRecords = 4;
+
+        while (scanRecords > 0 && cursor.next(opCtx)) {
+            scanRecords--;
+        }
+
+        Date_t end = getTime();
+
+        ASSERT_EQ(scanRecords, 0);
+        ASSERT_GTE(getDifferenceInMillis(start, end), 10 * 1000);
+    }
+
+    operationContext()->getServiceContext()->setFastClockSource(
+        std::make_unique<AutoAdvancingClockSourceMock>(Milliseconds(kTickDelay)));
+
+    // Using a throttle with a limit of 5MB per second, all operations should take at least 2
+    // second to finish. We scan 5 records, each of which is 2MB courtesy of the fail point, so
+    // 2.5 records per second.
+    {
+        setMaxMbPerSec(5);
+        Date_t start = getTime();
+
+        // Seek to the first record, then iterate through 4 more.
+        ASSERT_TRUE(cursor.seekExact(opCtx, RecordId(1)));
+        int scanRecords = 4;
+
+        while (scanRecords > 0 && cursor.next(opCtx)) {
+            scanRecords--;
+        }
+
+        Date_t end = getTime();
+
+        ASSERT_EQ(scanRecords, 0);
+        ASSERT_GTE(getDifferenceInMillis(start, end), 2000);
+    }
+}
+
 TEST_F(ThrottleCursorTest, TestSortedDataInterfaceThrottleCursorOff) {
     auto opCtx = operationContext();
     AutoGetCollection autoColl(opCtx, kNss, MODE_X);
-    Collection* coll = autoColl.getCollection();
+    const CollectionPtr& coll = autoColl.getCollection();
 
     // Use a fixed record data size to simplify the timing calculations.
     FailPointEnableBlock failPoint("fixedCursorDataSizeOf512KBForDataThrottle");
@@ -231,7 +291,7 @@ TEST_F(ThrottleCursorTest, TestSortedDataInterfaceThrottleCursorOff) {
 TEST_F(ThrottleCursorTest, TestSortedDataInterfaceThrottleCursorOn) {
     auto opCtx = operationContext();
     AutoGetCollection autoColl(opCtx, kNss, MODE_X);
-    Collection* coll = autoColl.getCollection();
+    const CollectionPtr& coll = autoColl.getCollection();
 
     // Use a fixed record data size to simplify the timing calculations.
     FailPointEnableBlock failPoint("fixedCursorDataSizeOf512KBForDataThrottle");
@@ -282,7 +342,7 @@ TEST_F(ThrottleCursorTest, TestSortedDataInterfaceThrottleCursorOn) {
 TEST_F(ThrottleCursorTest, TestMixedCursorsWithSharedThrottleOff) {
     auto opCtx = operationContext();
     AutoGetCollection autoColl(opCtx, kNss, MODE_X);
-    Collection* coll = autoColl.getCollection();
+    const CollectionPtr& coll = autoColl.getCollection();
 
     // Use a fixed record data size to simplify the timing calculations.
     FailPointEnableBlock failPoint("fixedCursorDataSizeOf512KBForDataThrottle");
@@ -324,7 +384,7 @@ TEST_F(ThrottleCursorTest, TestMixedCursorsWithSharedThrottleOff) {
 TEST_F(ThrottleCursorTest, TestMixedCursorsWithSharedThrottleOn) {
     auto opCtx = operationContext();
     AutoGetCollection autoColl(opCtx, kNss, MODE_X);
-    Collection* coll = autoColl.getCollection();
+    const CollectionPtr& coll = autoColl.getCollection();
 
     // Use a fixed record data size to simplify the timing calculations.
     FailPointEnableBlock failPoint("fixedCursorDataSizeOf512KBForDataThrottle");

@@ -27,13 +27,12 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/catalog/drop_collection.h"
 
-#include "mongo/db/background.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/uncommitted_collections.h"
 #include "mongo/db/client.h"
@@ -42,8 +41,10 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/timeseries/bucket_catalog.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/fail_point.h"
@@ -53,14 +54,14 @@ namespace mongo {
 MONGO_FAIL_POINT_DEFINE(hangDropCollectionBeforeLockAcquisition);
 MONGO_FAIL_POINT_DEFINE(hangDuringDropCollection);
 
-Status _checkNssAndReplState(OperationContext* opCtx, Collection* coll) {
+Status _checkNssAndReplState(OperationContext* opCtx, const CollectionPtr& coll) {
     if (!coll) {
         return Status(ErrorCodes::NamespaceNotFound, "ns not found");
     }
 
     if (opCtx->writesAreReplicated() &&
         !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, coll->ns())) {
-        return Status(ErrorCodes::NotMaster,
+        return Status(ErrorCodes::NotWritablePrimary,
                       str::stream() << "Not primary while dropping collection " << coll->ns());
     }
 
@@ -70,7 +71,8 @@ Status _checkNssAndReplState(OperationContext* opCtx, Collection* coll) {
 Status _dropView(OperationContext* opCtx,
                  Database* db,
                  const NamespaceString& collectionName,
-                 BSONObjBuilder& result) {
+                 BSONObjBuilder* result,
+                 bool clearBucketCatalog = false) {
     if (!db) {
         return Status(ErrorCodes::NamespaceNotFound, "ns not found");
     }
@@ -94,15 +96,16 @@ Status _dropView(OperationContext* opCtx,
         hangDuringDropCollection.pauseWhileSet();
     }
 
-    AutoStatsTracker statsTracker(opCtx,
-                                  collectionName,
-                                  Top::LockType::NotLocked,
-                                  AutoStatsTracker::LogMode::kUpdateCurOp,
-                                  db->getProfilingLevel());
+    AutoStatsTracker statsTracker(
+        opCtx,
+        collectionName,
+        Top::LockType::NotLocked,
+        AutoStatsTracker::LogMode::kUpdateCurOp,
+        CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(collectionName.db()));
 
     if (opCtx->writesAreReplicated() &&
         !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, collectionName)) {
-        return Status(ErrorCodes::NotMaster,
+        return Status(ErrorCodes::NotWritablePrimary,
                       str::stream() << "Not primary while dropping collection " << collectionName);
     }
 
@@ -113,19 +116,23 @@ Status _dropView(OperationContext* opCtx,
     }
     wunit.commit();
 
-    result.append("ns", collectionName.ns());
+    if (clearBucketCatalog) {
+        BucketCatalog::get(opCtx).clear(collectionName);
+    }
+
+    result->append("ns", collectionName.ns());
     return Status::OK();
 }
 
-Status _abortIndexBuildsAndDropCollection(OperationContext* opCtx,
-                                          const NamespaceString& startingNss,
-                                          DropCollectionSystemCollectionMode systemCollectionMode,
-                                          BSONObjBuilder& result) {
+Status _abortIndexBuildsAndDrop(OperationContext* opCtx,
+                                AutoGetDb&& autoDb,
+                                const NamespaceString& startingNss,
+                                std::function<Status(Database*, const NamespaceString&)>&& dropFn,
+                                BSONObjBuilder* result,
+                                bool appendNs = true) {
     // We only need to hold an intent lock to send abort signals to the active index builder on this
     // collection.
-    boost::optional<AutoGetDb> autoDb;
-    autoDb.emplace(opCtx, startingNss.db(), MODE_IX);
-
+    boost::optional<AutoGetDb> optionalAutoDb(std::move(autoDb));
     boost::optional<Lock::CollectionLock> collLock;
     collLock.emplace(opCtx, startingNss, MODE_IX);
 
@@ -133,8 +140,8 @@ Status _abortIndexBuildsAndDropCollection(OperationContext* opCtx,
     // which may have changed when we released the collection lock temporarily.
     opCtx->recoveryUnit()->abandonSnapshot();
 
-    Collection* coll =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, startingNss);
+    CollectionPtr coll =
+        CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, startingNss);
     Status status = _checkNssAndReplState(opCtx, coll);
     if (!status.isOK()) {
         return status;
@@ -147,11 +154,12 @@ Status _abortIndexBuildsAndDropCollection(OperationContext* opCtx,
         hangDuringDropCollection.pauseWhileSet();
     }
 
-    AutoStatsTracker statsTracker(opCtx,
-                                  startingNss,
-                                  Top::LockType::NotLocked,
-                                  AutoStatsTracker::LogMode::kUpdateCurOp,
-                                  autoDb->getDb()->getProfilingLevel());
+    AutoStatsTracker statsTracker(
+        opCtx,
+        startingNss,
+        Top::LockType::NotLocked,
+        AutoStatsTracker::LogMode::kUpdateCurOp,
+        CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(startingNss.db()));
 
     IndexBuildsCoordinator* indexBuildsCoord = IndexBuildsCoordinator::get(opCtx);
     const UUID collectionUUID = coll->uuid();
@@ -164,7 +172,7 @@ Status _abortIndexBuildsAndDropCollection(OperationContext* opCtx,
 
         // Release locks before aborting index builds. The helper will acquire locks on our behalf.
         collLock = boost::none;
-        autoDb = boost::none;
+        optionalAutoDb = boost::none;
 
         // Send the abort signal to any active index builds on the collection. This waits until all
         // aborted index builds complete.
@@ -176,14 +184,14 @@ Status _abortIndexBuildsAndDropCollection(OperationContext* opCtx,
                                                          << collectionUUID << ") is being dropped");
 
         // Take an exclusive lock to finish the collection drop.
-        autoDb.emplace(opCtx, startingNss.db(), MODE_IX);
+        optionalAutoDb.emplace(opCtx, startingNss.db(), MODE_IX);
         collLock.emplace(opCtx, dbAndUUID, MODE_X);
 
         // Abandon the snapshot as the index catalog will compare the in-memory state to the
         // disk state, which may have changed when we released the collection lock temporarily.
         opCtx->recoveryUnit()->abandonSnapshot();
 
-        coll = CollectionCatalog::get(opCtx).lookupCollectionByUUID(opCtx, collectionUUID);
+        coll = CollectionCatalog::get(opCtx)->lookupCollectionByUUID(opCtx, collectionUUID);
         status = _checkNssAndReplState(opCtx, coll);
         if (!status.isOK()) {
             return status;
@@ -204,21 +212,21 @@ Status _abortIndexBuildsAndDropCollection(OperationContext* opCtx,
         return Status::OK();
     }
 
-    WriteUnitOfWork wunit(opCtx);
+    // Serialize the drop with refreshes to prevent dropping a collection and creating the same
+    // nss as a view while refreshing.
+    CollectionShardingState::get(opCtx, resolvedNss)->checkShardVersionOrThrow(opCtx);
 
     invariant(coll->getIndexCatalog()->numIndexesInProgress(opCtx) == 0);
-    status =
-        systemCollectionMode == DropCollectionSystemCollectionMode::kDisallowSystemCollectionDrops
-        ? autoDb->getDb()->dropCollection(opCtx, resolvedNss, {})
-        : autoDb->getDb()->dropCollectionEvenIfSystem(opCtx, resolvedNss, {});
 
+    status = dropFn(optionalAutoDb->getDb(), resolvedNss);
     if (!status.isOK()) {
         return status;
     }
-    wunit.commit();
 
-    result.append("nIndexesWas", numIndexes);
-    result.append("ns", resolvedNss.ns());
+    result->append("nIndexesWas", numIndexes);
+    if (appendNs) {
+        result->append("ns", resolvedNss.ns());
+    }
 
     return Status::OK();
 }
@@ -228,10 +236,10 @@ Status _dropCollection(OperationContext* opCtx,
                        const NamespaceString& collectionName,
                        const repl::OpTime& dropOpTime,
                        DropCollectionSystemCollectionMode systemCollectionMode,
-                       BSONObjBuilder& result) {
+                       BSONObjBuilder* result) {
     Lock::CollectionLock collLock(opCtx, collectionName, MODE_X);
-    Collection* coll =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, collectionName);
+    const CollectionPtr& coll =
+        CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, collectionName);
     Status status = _checkNssAndReplState(opCtx, coll);
     if (!status.isOK()) {
         return status;
@@ -244,16 +252,16 @@ Status _dropCollection(OperationContext* opCtx,
         hangDuringDropCollection.pauseWhileSet();
     }
 
-    AutoStatsTracker statsTracker(opCtx,
-                                  collectionName,
-                                  Top::LockType::NotLocked,
-                                  AutoStatsTracker::LogMode::kUpdateCurOp,
-                                  db->getProfilingLevel());
+    AutoStatsTracker statsTracker(
+        opCtx,
+        collectionName,
+        Top::LockType::NotLocked,
+        AutoStatsTracker::LogMode::kUpdateCurOp,
+        CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(collectionName.db()));
 
     WriteUnitOfWork wunit(opCtx);
 
     int numIndexes = coll->getIndexCatalog()->numIndexesTotal(opCtx);
-    BackgroundOperation::assertNoBgOpInProgForNs(collectionName.ns());
     IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(coll->uuid());
     status =
         systemCollectionMode == DropCollectionSystemCollectionMode::kDisallowSystemCollectionDrops
@@ -265,8 +273,8 @@ Status _dropCollection(OperationContext* opCtx,
     }
     wunit.commit();
 
-    result.append("nIndexesWas", numIndexes);
-    result.append("ns", collectionName.ns());
+    result->append("nIndexesWas", numIndexes);
+    result->append("ns", collectionName.ns());
 
     return Status::OK();
 }
@@ -276,8 +284,7 @@ Status dropCollection(OperationContext* opCtx,
                       BSONObjBuilder& result,
                       DropCollectionSystemCollectionMode systemCollectionMode) {
     if (!serverGlobalParams.quiet.load()) {
-        LOGV2(
-            518070, "CMD: drop {collectionName}", "CMD: drop", "collection"_attr = collectionName);
+        LOGV2(518070, "CMD: drop", logAttrs(collectionName));
     }
 
     if (MONGO_unlikely(hangDropCollectionBeforeLockAcquisition.shouldFail())) {
@@ -287,31 +294,67 @@ Status dropCollection(OperationContext* opCtx,
 
     try {
         return writeConflictRetry(opCtx, "drop", collectionName.ns(), [&] {
-            {
-                AutoGetDb autoDb(opCtx, collectionName.db(), MODE_IX);
-                Database* db = autoDb.getDb();
-                if (!db) {
-                    return Status(ErrorCodes::NamespaceNotFound, "ns not found");
-                }
-
-                Collection* coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
-                    opCtx, collectionName);
-
-                if (!coll) {
-                    return _dropView(opCtx, db, collectionName, result);
-                }
-
-                // Only abort in-progress index builds if two phase index builds are supported.
-                bool supportsTwoPhaseIndexBuild =
-                    IndexBuildsCoordinator::get(opCtx)->supportsTwoPhaseIndexBuild();
-                if (!supportsTwoPhaseIndexBuild) {
-                    return _dropCollection(
-                        opCtx, db, collectionName, {}, systemCollectionMode, result);
-                }
+            AutoGetDb autoDb(opCtx, collectionName.db(), MODE_IX);
+            auto db = autoDb.getDb();
+            if (!db) {
+                return Status(ErrorCodes::NamespaceNotFound, "ns not found");
             }
 
-            return _abortIndexBuildsAndDropCollection(
-                opCtx, collectionName, systemCollectionMode, result);
+            if (CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, collectionName)) {
+                return _abortIndexBuildsAndDrop(
+                    opCtx,
+                    std::move(autoDb),
+                    collectionName,
+                    [opCtx, systemCollectionMode](Database* db, const NamespaceString& resolvedNs) {
+                        WriteUnitOfWork wuow(opCtx);
+
+                        auto status = systemCollectionMode ==
+                                DropCollectionSystemCollectionMode::kDisallowSystemCollectionDrops
+                            ? db->dropCollection(opCtx, resolvedNs)
+                            : db->dropCollectionEvenIfSystem(opCtx, resolvedNs);
+                        if (!status.isOK()) {
+                            return status;
+                        }
+
+                        wuow.commit();
+                        return Status::OK();
+                    },
+                    &result);
+            }
+
+            auto view = ViewCatalog::get(db)->lookupWithoutValidatingDurableViews(
+                opCtx, collectionName.ns());
+            if (!view) {
+                return Status(ErrorCodes::NamespaceNotFound, "ns not found");
+            }
+
+            if (!view->timeseries()) {
+                return _dropView(opCtx, db, collectionName, &result);
+            }
+
+            return _abortIndexBuildsAndDrop(
+                opCtx,
+                std::move(autoDb),
+                view->viewOn(),
+                [opCtx, &collectionName, &result](Database* db, const NamespaceString& bucketsNs) {
+                    auto status = _dropView(
+                        opCtx, db, collectionName, &result, true /* clearBucketCatalog */);
+                    if (!status.isOK()) {
+                        return status;
+                    }
+
+                    // Drop the buckets collection in its own writeConflictRetry so that if it
+                    // throws a WCE, only the buckets collection drop is retried.
+                    writeConflictRetry(opCtx, "drop", bucketsNs.ns(), [opCtx, db, &bucketsNs] {
+                        WriteUnitOfWork wuow(opCtx);
+                        db->dropCollectionEvenIfSystem(opCtx, bucketsNs).ignore();
+                        wuow.commit();
+                    });
+
+                    return Status::OK();
+                },
+                &result,
+                false /* appendNs */);
         });
     } catch (ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
         // The shell requires that NamespaceNotFound error codes return the "ns not found"
@@ -325,7 +368,7 @@ Status dropCollectionForApplyOps(OperationContext* opCtx,
                                  const repl::OpTime& dropOpTime,
                                  DropCollectionSystemCollectionMode systemCollectionMode) {
     if (!serverGlobalParams.quiet.load()) {
-        LOGV2(20332, "CMD: drop {collectionName}", "CMD: drop", "collection"_attr = collectionName);
+        LOGV2(20332, "CMD: drop", logAttrs(collectionName));
     }
 
     if (MONGO_unlikely(hangDropCollectionBeforeLockAcquisition.shouldFail())) {
@@ -339,15 +382,15 @@ Status dropCollectionForApplyOps(OperationContext* opCtx,
             return Status(ErrorCodes::NamespaceNotFound, "ns not found");
         }
 
-        Collection* coll =
-            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, collectionName);
+        const CollectionPtr& coll =
+            CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, collectionName);
 
         BSONObjBuilder unusedBuilder;
         if (!coll) {
-            return _dropView(opCtx, db, collectionName, unusedBuilder);
+            return _dropView(opCtx, db, collectionName, &unusedBuilder);
         } else {
             return _dropCollection(
-                opCtx, db, collectionName, dropOpTime, systemCollectionMode, unusedBuilder);
+                opCtx, db, collectionName, dropOpTime, systemCollectionMode, &unusedBuilder);
         }
     });
 }

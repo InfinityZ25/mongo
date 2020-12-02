@@ -69,6 +69,12 @@ const NamespaceString NamespaceString::kTransactionCoordinatorsNamespace(
 const NamespaceString NamespaceString::kMigrationCoordinatorsNamespace(NamespaceString::kConfigDb,
                                                                        "migrationCoordinators");
 
+const NamespaceString NamespaceString::kTenantMigrationDonorsNamespace(NamespaceString::kConfigDb,
+                                                                       "tenantMigrationDonors");
+
+const NamespaceString NamespaceString::kTenantMigrationRecipientsNamespace(
+    NamespaceString::kConfigDb, "tenantMigrationRecipients");
+
 const NamespaceString NamespaceString::kShardConfigCollectionsNamespace(NamespaceString::kConfigDb,
                                                                         "cache.collections");
 const NamespaceString NamespaceString::kShardConfigDatabasesNamespace(NamespaceString::kConfigDb,
@@ -82,8 +88,25 @@ const NamespaceString NamespaceString::kIndexBuildEntryNamespace(NamespaceString
                                                                  "system.indexBuilds");
 const NamespaceString NamespaceString::kRangeDeletionNamespace(NamespaceString::kConfigDb,
                                                                "rangeDeletions");
+const NamespaceString NamespaceString::kConfigReshardingOperationsNamespace(
+    NamespaceString::kConfigDb, "reshardingOperations");
+
+const NamespaceString NamespaceString::kDonorReshardingOperationsNamespace(
+    NamespaceString::kConfigDb, "localReshardingOperations.donor");
+
+const NamespaceString NamespaceString::kRecipientReshardingOperationsNamespace(
+    NamespaceString::kConfigDb, "localReshardingOperations.recipient");
+
 const NamespaceString NamespaceString::kConfigSettingsNamespace(NamespaceString::kConfigDb,
                                                                 "settings");
+const NamespaceString NamespaceString::kVectorClockNamespace(NamespaceString::kConfigDb,
+                                                             "vectorClock");
+
+const NamespaceString NamespaceString::kReshardingApplierProgressNamespace(
+    NamespaceString::kConfigDb, "localReshardingOperations.recipient.progress_applier");
+
+const NamespaceString NamespaceString::kReshardingTxnClonerProgressNamespace(
+    NamespaceString::kConfigDb, "localReshardingOperations.recipient.progress_txn_cloner");
 
 bool NamespaceString::isListCollectionsCursorNS() const {
     return coll() == listCollectionsCursorCol;
@@ -94,36 +117,55 @@ bool NamespaceString::isCollectionlessAggregateNS() const {
 }
 
 bool NamespaceString::isLegalClientSystemNS() const {
-    if (db() == "admin") {
-        if (ns() == "admin.system.roles")
+    if (db() == kAdminDb) {
+        if (coll() == "system.roles")
             return true;
-        if (ns() == kServerConfigurationNamespace.ns())
+        if (coll() == kServerConfigurationNamespace.coll())
             return true;
-        if (ns() == kSystemKeysNamespace.ns())
+        if (coll() == kSystemKeysNamespace.coll())
             return true;
-        if (ns() == "admin.system.new_users")
+        if (coll() == "system.backup_users")
             return true;
-        if (ns() == "admin.system.backup_users")
+    } else if (db() == kConfigDb) {
+        if (coll() == "system.sessions")
             return true;
-    } else if (db() == "config") {
-        if (ns() == "config.system.sessions")
+        if (coll() == kIndexBuildEntryNamespace.coll())
             return true;
-        if (ns() == kIndexBuildEntryNamespace.ns())
+        if (coll().find(".system.resharding.") != std::string::npos)
+            return true;
+    } else if (db() == kLocalDb) {
+        if (coll() == kSystemReplSetNamespace.coll())
+            return true;
+        if (coll() == "system.healthlog")
             return true;
     }
-
-    if (ns() == "local.system.replset")
-        return true;
 
     if (coll() == "system.users")
         return true;
     if (coll() == "system.js")
         return true;
-
     if (coll() == kSystemDotViewsCollectionName)
         return true;
+    if (isTemporaryReshardingCollection()) {
+        return true;
+    }
+    if (isTimeseriesBucketsCollection()) {
+        return true;
+    }
 
     return false;
+}
+
+/**
+ * Oplog entries on 'system.views' should also be processed one at a time. View catalog immediately
+ * reflects changes for each oplog entry so we can see inconsistent view catalog if multiple oplog
+ * entries on 'system.views' are being applied out of the original order.
+ *
+ * Process updates to 'admin.system.version' individually as well so the secondary's FCV when
+ * processing each operation matches the primary's when committing that operation.
+ */
+bool NamespaceString::mustBeAppliedInOwnOplogBatch() const {
+    return isSystemDotViews() || isServerConfigurationCollection() || isPrivilegeCollection();
 }
 
 NamespaceString NamespaceString::makeListCollectionsNSS(StringData dbName) {
@@ -215,18 +257,38 @@ bool NamespaceString::isNamespaceAlwaysUnsharded() const {
 
     // Certain config collections can never be sharded
     if (ns() == kSessionTransactionsTableNamespace.ns() || ns() == kRangeDeletionNamespace.ns() ||
-        ns() == kTransactionCoordinatorsNamespace.ns() ||
-        ns() == kMigrationCoordinatorsNamespace.ns())
+        ns() == kTransactionCoordinatorsNamespace.ns() || ns() == kVectorClockNamespace.ns() ||
+        ns() == kMigrationCoordinatorsNamespace.ns() || ns() == kIndexBuildEntryNamespace.ns())
         return true;
 
     if (isSystemDotProfile())
         return true;
 
+    if (isSystemDotViews())
+        return true;
+
     if (ns() == "config.cache.databases" || ns() == "config.cache.collections" ||
-        (db() == "config" && coll().startsWith("cache.chunks")))
+        isConfigDotCacheDotChunks())
         return true;
 
     return false;
+}
+
+bool NamespaceString::isConfigDotCacheDotChunks() const {
+    return db() == "config" && coll().startsWith("cache.chunks.");
+}
+
+bool NamespaceString::isTemporaryReshardingCollection() const {
+    return coll().startsWith(kTemporaryReshardingCollectionPrefix);
+}
+
+bool NamespaceString::isTimeseriesBucketsCollection() const {
+    return coll().startsWith(kTimeseriesBucketsCollectionPrefix);
+}
+
+NamespaceString NamespaceString::makeTimeseriesBucketsNamespace() const {
+    auto bucketsColl = kTimeseriesBucketsCollectionPrefix.toString() + coll();
+    return {db(), bucketsColl};
 }
 
 bool NamespaceString::isReplicated() const {

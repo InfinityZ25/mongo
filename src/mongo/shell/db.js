@@ -13,6 +13,14 @@ if (DB === undefined) {
     };
 }
 
+/**
+ * Rotate certificates, CRLs, and CA files.
+ * @param {String} message optional message for server to log at rotation time
+ */
+DB.prototype.rotateCertificates = function(message) {
+    return this._adminCommand({rotateCertificates: 1, message: message});
+};
+
 DB.prototype.getMongo = function() {
     assert(this._mongo, "why no mongo!");
     return this._mongo;
@@ -189,6 +197,16 @@ DB.prototype.adminCommand = function(obj, extra) {
 
 DB.prototype._adminCommand = DB.prototype.adminCommand;  // alias old name
 
+DB.prototype._runCommandWithoutApiStrict = function(command) {
+    let commandWithoutApiStrict = Object.assign({}, command);
+    if (this.getMongo().getApiParameters().strict) {
+        // Permit this command invocation, even if it's not in the requested API version.
+        commandWithoutApiStrict["apiStrict"] = false;
+    }
+
+    return this.runCommand(commandWithoutApiStrict);
+};
+
 DB.prototype._runAggregate = function(cmdObj, aggregateOptions) {
     assert(cmdObj.pipeline instanceof Array, "cmdObj must contain a 'pipeline' array");
     assert(cmdObj.aggregate !== undefined, "cmdObj must contain 'aggregate' field");
@@ -229,23 +247,7 @@ DB.prototype._runAggregate = function(cmdObj, aggregateOptions) {
         cmdObj.cursor = {};
     }
 
-    const pipeline = cmdObj.pipeline;
-
-    // Check whether the pipeline has a stage which performs writes like $out. If not, we may
-    // run on a Secondary and should attach a readPreference.
-    const hasWritingStage = (function() {
-        if (pipeline.length == 0) {
-            return false;
-        }
-        const lastStage = pipeline[pipeline.length - 1];
-        return lastStage.hasOwnProperty("$out") || lastStage.hasOwnProperty("$merge");
-    }());
-
-    const doAgg = function(cmdObj) {
-        return hasWritingStage ? this.runCommand(cmdObj) : this.runReadCommand(cmdObj);
-    }.bind(this);
-
-    const res = doAgg(cmdObj);
+    const res = this.runReadCommand(cmdObj);
 
     if (!res.ok && (res.code == 17020 || res.errmsg == "unrecognized field \"cursor") &&
         !("cursor" in aggregateOptions)) {
@@ -405,7 +407,7 @@ DB.prototype.dropDatabase = function(writeConcern) {
  * Shuts down the database.  Must be run while using the admin database.
  * @param opts Options for shutdown. Possible options are:
  *   - force: (boolean) if the server should shut down, even if there is no
- *     up-to-date slave
+ *     up-to-date secondary
  *   - timeoutSecs: (number) the server will continue checking over timeoutSecs
  *     if any other servers have caught up enough for it to shut down.
  */
@@ -437,99 +439,6 @@ DB.prototype.shutdownServer = function(opts) {
     }
 };
 
-/**
-  Clone database on another server to here. This functionality was removed as of MongoDB 4.2.
-  The shell helper is kept to maintain compatibility with previous versions of MongoDB.
-  <p>
-  Generally, you should dropDatabase() first as otherwise the cloned information will MERGE
-  into whatever data is already present in this database.  (That is however a valid way to use
-  clone if you are trying to do something intentionally, such as union three non-overlapping
-  databases into one.)
-  <p>
-  This is a low level administrative function will is not typically used.
-
- * @param {String} from Where to clone from (dbhostname[:port]).  May not be this database
-                   (self) as you cannot clone to yourself.
- * @return Object returned has member ok set to true if operation succeeds, false otherwise.
- * See also: db.copyDatabase()
- */
-DB.prototype.cloneDatabase = function(from) {
-    print(
-        "WARNING: db.cloneDatabase will only function with MongoDB 4.0 and below. See http://dochub.mongodb.org/core/4.2-copydb-clone");
-    assert(isString(from) && from.length);
-    return this._dbCommand({clone: from});
-};
-
-/**
-  Copy database from one server or name to another server or name. This functionality was
-  removed as of MongoDB 4.2. The shell helper is kept to maintain compatibility with previous
-  versions of MongoDB.
-
-  Generally, you should dropDatabase() first as otherwise the copied information will MERGE
-  into whatever data is already present in this database (and you will get duplicate objects
-  in collections potentially.)
-
-  For security reasons this function only works when executed on the "admin" db.  However,
-  if you have access to said db, you can copy any database from one place to another.
-
-  This method provides a way to "rename" a database by copying it to a new db name and
-  location.  Additionally, it effectively provides a repair facility.
-
-  * @param {String} fromdb database name from which to copy.
-  * @param {String} todb database name to copy to.
-  * @param {String} fromhost hostname of the database (and optionally, ":port") from which to
-                    copy the data.  default if unspecified is to copy from self.
-  * @return Object returned has member ok set to true if operation succeeds, false otherwise.
-  * See also: db.clone()
-*/
-DB.prototype.copyDatabase = function(
-    fromdb, todb, fromhost, username, password, mechanism, slaveOk) {
-    print(
-        "WARNING: db.copyDatabase will only function with MongoDB 4.0 and below. See http://dochub.mongodb.org/core/4.2-copydb-clone");
-    assert(isString(fromdb) && fromdb.length);
-    assert(isString(todb) && todb.length);
-    fromhost = fromhost || "";
-    if ((typeof username === "boolean") && (typeof password === "undefined") &&
-        (typeof mechanism === "undefined") && (typeof slaveOk === "undefined")) {
-        slaveOk = username;
-        username = undefined;
-    }
-    if (typeof slaveOk !== "boolean") {
-        slaveOk = false;
-    }
-
-    if (!mechanism) {
-        mechanism = this._getDefaultAuthenticationMechanism(username, fromdb);
-    }
-    assert(mechanism == "SCRAM-SHA-1" || mechanism == "SCRAM-SHA-256" || mechanism == "MONGODB-CR");
-
-    // Check for no auth or copying from localhost
-    if (!username || !password || fromhost == "") {
-        return this._adminCommand(
-            {copydb: 1, fromhost: fromhost, fromdb: fromdb, todb: todb, slaveOk: slaveOk});
-    }
-
-    // Use the copyDatabase native helper for SCRAM-SHA-1/256
-    if (mechanism != "MONGODB-CR") {
-        // TODO SERVER-30886: Add session support for Mongo.prototype.copyDatabaseWithSCRAM().
-        return this.getMongo().copyDatabaseWithSCRAM(
-            fromdb, todb, fromhost, username, password, slaveOk);
-    }
-
-    // Fall back to MONGODB-CR
-    var n = assert.commandWorked(this._adminCommand({copydbgetnonce: 1, fromhost: fromhost}));
-    return this._adminCommand({
-        copydb: 1,
-        fromhost: fromhost,
-        fromdb: fromdb,
-        todb: todb,
-        username: username,
-        nonce: n.nonce,
-        key: this.__pwHash(n.nonce, username, password),
-        slaveOk: slaveOk,
-    });
-};
-
 DB.prototype.help = function() {
     print("DB methods:");
     print(
@@ -537,11 +446,7 @@ DB.prototype.help = function() {
     print(
         "\tdb.aggregate([pipeline], {options}) - performs a collectionless aggregation on this database; returns a cursor");
     print("\tdb.auth(username, password)");
-    print("\tdb.cloneDatabase(fromhost) - will only function with MongoDB 4.0 and below");
     print("\tdb.commandHelp(name) returns the help for the command");
-    print(
-        "\tdb.copyDatabase(fromdb, todb, fromhost) - will only function with MongoDB 4.0 and below");
-    print("\tdb.createCollection(name, {size: ..., capped: ..., max: ...})");
     print("\tdb.createUser(userDocument)");
     print("\tdb.createView(name, viewOn, [{$operator: {...}}, ...], {viewOptions})");
     print("\tdb.currentOp() displays currently executing operations in the db");
@@ -558,7 +463,7 @@ DB.prototype.help = function() {
     print("\tdb.getLastErrorObj() - return full status object");
     print("\tdb.getLogComponents()");
     print("\tdb.getMongo() get the server connection object");
-    print("\tdb.getMongo().setSlaveOk() allow queries on a replication slave server");
+    print("\tdb.getMongo().setSecondaryOk() allow queries on a replication secondary server");
     print("\tdb.getName()");
     print("\tdb.getProfilingLevel() - deprecated");
     print("\tdb.getProfilingStatus() - returns if profiling is on and slow threshold");
@@ -568,6 +473,7 @@ DB.prototype.help = function() {
         "\tdb.getWriteConcern() - returns the write concern used for any operations on this db, inherited from server object if set");
     print("\tdb.hostInfo() get details about the server's host");
     print("\tdb.isMaster() check replica primary status");
+    print("\tdb.hello() check replica primary status");
     print("\tdb.killOp(opid) kills the current operation in the db");
     print("\tdb.listCommands() lists all the db commands");
     print("\tdb.loadServerScripts() loads all the scripts in db.system.js");
@@ -575,8 +481,10 @@ DB.prototype.help = function() {
     print("\tdb.printCollectionStats()");
     print("\tdb.printReplicationInfo()");
     print("\tdb.printShardingStatus()");
-    print("\tdb.printSlaveReplicationInfo()");
+    print("\tdb.printSecondaryReplicationInfo()");
     print("\tdb.resetError()");
+    print(
+        "\tdb.rotateCertificates(message) - rotates certificates, CRLs, and CA files and logs an optional message");
     print(
         "\tdb.runCommand(cmdObj) run a database command.  if cmdObj is a string, turns it into {cmdObj: 1}");
     print("\tdb.serverStatus()");
@@ -900,6 +808,10 @@ DB.prototype.isMaster = function() {
     return this.runCommand("isMaster");
 };
 
+DB.prototype.hello = function() {
+    return this.runCommand("hello");
+};
+
 var commandUnsupported = function(res) {
     return (!res.ok &&
             (res.errmsg.startsWith("no such cmd") || res.errmsg.startsWith("no such command") ||
@@ -967,7 +879,7 @@ DB.tsToSeconds = function(x) {
        use local
        db.getReplicationInfo();
   </pre>
-  * @return Object timeSpan: time span of the oplog from start to end  if slave is more out
+  * @return Object timeSpan: time span of the oplog from start to end  if secondary is more out
   *                          of date than that, it can't recover without a complete resync
 */
 DB.prototype.getReplicationInfo = function() {
@@ -1033,8 +945,8 @@ DB.prototype.printReplicationInfo = function() {
             print("cannot provide replication status from an arbiter.");
             return;
         } else if (!isMaster.ismaster) {
-            print("this is a slave, printing slave replication info.");
-            this.printSlaveReplicationInfo();
+            print("this is a secondary, printing secondary replication info.");
+            this.printSecondaryReplicationInfo();
             return;
         }
         print(tojson(result));
@@ -1048,6 +960,12 @@ DB.prototype.printReplicationInfo = function() {
 };
 
 DB.prototype.printSlaveReplicationInfo = function() {
+    print(
+        "WARNING: printSlaveReplicationInfo is deprecated and may be removed in the next major release. Please use printSecondaryReplicationInfo instead.");
+    this.printSecondaryReplicationInfo();
+};
+
+DB.prototype.printSecondaryReplicationInfo = function() {
     var startOptimeDate = null;
     var primary = null;
 
@@ -1065,7 +983,7 @@ DB.prototype.printSlaveReplicationInfo = function() {
         print("\t" + Math.round(ago) + " secs (" + hrs + " hrs) behind the " + suffix);
     }
 
-    function getMaster(members) {
+    function getPrimary(members) {
         for (i in members) {
             var row = members[i];
             if (row.state === 1) {
@@ -1076,36 +994,34 @@ DB.prototype.printSlaveReplicationInfo = function() {
         return null;
     }
 
-    function g(x) {
-        assert(x, "how could this be null (printSlaveReplicationInfo gx)");
-        print("source: " + x.host);
-        if (x.syncedTo) {
-            var st = new Date(DB.tsToSeconds(x.syncedTo) * 1000);
-            getReplLag(st);
-        } else {
-            print("\tdoing initial sync");
-        }
-    }
-
-    function r(x) {
-        assert(x, "how could this be null (printSlaveReplicationInfo rx)");
-        if (x.state == 1 || x.state == 7) {  // ignore primaries (1) and arbiters (7)
+    function printNodeReplicationInfo(node) {
+        assert(node);
+        if (node.state === 1 || node.state === 7) {  // ignore primaries (1) and arbiters (7)
             return;
         }
 
-        print("source: " + x.name);
-        if (x.optime) {
-            getReplLag(x.optimeDate);
+        print("source: " + node.name);
+        if (node.optime && node.health != 0) {
+            getReplLag(node.optimeDate);
         } else {
-            print("\tno replication info, yet.  State: " + x.stateStr);
+            print("\tno replication info, yet.  State: " + node.stateStr);
         }
+    }
+
+    function printNodeInitialSyncInfo(syncSourceString, remainingMillis) {
+        print("\tInitialSyncSyncSource: " + syncSourceString);
+        let minutes = Math.floor((remainingMillis / (1000 * 60)) % 60);
+        let hours = Math.floor(remainingMillis / (1000 * 60 * 60));
+        print("\tInitialSyncRemainingEstimatedDuration: " + hours + " hour(s) " + minutes +
+              " minute(s)");
     }
 
     var L = this.getSiblingDB("local");
 
     if (L.system.replset.count() != 0) {
-        var status = this.adminCommand({'replSetGetStatus': 1});
-        primary = getMaster(status.members);
+        const status =
+            this.getSiblingDB('admin')._runCommandWithoutApiStrict({'replSetGetStatus': 1});
+        primary = getPrimary(status.members);
         if (primary) {
             startOptimeDate = primary.optimeDate;
         }
@@ -1120,13 +1036,25 @@ DB.prototype.printSlaveReplicationInfo = function() {
         }
 
         for (i in status.members) {
-            r(status.members[i]);
+            if (status.members[i].self && status.members[i].state === 5) {
+                print("source: " + status.members[i].name);
+                if (!status.initialSyncStatus) {
+                    print("InitialSyncStatus information not found");
+                    continue;
+                }
+                // Print initial sync info if node is in the STARTUP2 state.
+                printNodeInitialSyncInfo(
+                    status.members[i].syncSourceHost,
+                    status.initialSyncStatus.remainingInitialSyncEstimatedMillis);
+            } else {
+                printNodeReplicationInfo(status.members[i]);
+            }
         }
     }
 };
 
 DB.prototype.serverBuildInfo = function() {
-    return this._adminCommand("buildinfo");
+    return this.getSiblingDB("admin")._runCommandWithoutApiStrict({buildinfo: 1});
 };
 
 // Used to trim entries from the metrics.commands that have never been executed
@@ -1194,8 +1122,8 @@ DB.prototype.listCommands = function() {
 
         if (c.adminOnly)
             s += " adminOnly ";
-        if (c.slaveOk)
-            s += " slaveOk ";
+        if (c.secondaryOk)
+            s += " secondaryOk ";
 
         s += "\n  ";
         s += c.help.replace(/\n/g, '\n  ');
@@ -1229,8 +1157,10 @@ DB.prototype.fsyncUnlock = function() {
 };
 
 DB.autocomplete = function(obj) {
-    // Time out if a transaction or other op holds locks we need. Caller suppresses exceptions.
-    var colls = obj._getCollectionNamesInternal({maxTimeMS: 1000});
+    // In interactive mode, time out if a transaction or other op holds locks we need. Caller
+    // suppresses exceptions. In non-interactive mode, don't specify a timeout, because in an
+    // automated test we prefer consistent results over quick feedback.
+    var colls = obj._getCollectionNamesInternal(isInteractive() ? {maxTimeMS: 1000} : {});
     var ret = [];
     for (var i = 0; i < colls.length; i++) {
         if (colls[i].match(/^[a-zA-Z0-9_.\$]+$/))
@@ -1239,21 +1169,31 @@ DB.autocomplete = function(obj) {
     return ret;
 };
 
-DB.prototype.setSlaveOk = function(value) {
-    if (value == undefined)
-        value = true;
-    this._slaveOk = value;
+DB.prototype.setSlaveOk = function(value = true) {
+    print(
+        "WARNING: setSlaveOk() is deprecated and may be removed in the next major release. Please use setSecondaryOk() instead.");
+    this.setSecondaryOk(value);
 };
 
 DB.prototype.getSlaveOk = function() {
-    if (this._slaveOk != undefined)
-        return this._slaveOk;
-    return this._mongo.getSlaveOk();
+    print(
+        "WARNING: getSlaveOk() is deprecated and may be removed in the next major release. Please use getSecondaryOk() instead.");
+    return this.getSecondaryOk();
+};
+
+DB.prototype.setSecondaryOk = function(value = true) {
+    this._secondaryOk = value;
+};
+
+DB.prototype.getSecondaryOk = function() {
+    if (this._secondaryOk != undefined)
+        return this._secondaryOk;
+    return this._mongo.getSecondaryOk();
 };
 
 DB.prototype.getQueryOptions = function() {
     var options = 0;
-    if (this.getSlaveOk())
+    if (this.getSecondaryOk())
         options |= 4;
     return options;
 };
@@ -1844,3 +1784,12 @@ DB.prototype.getSession = function() {
 };
 })(Object.prototype.hasOwnProperty);
 }());
+
+DB.prototype._sbe = function(query) {
+    const res = this.runCommand({sbe: query});
+    if (!res.ok) {
+        throw _getErrorWithCode(res, "sbe failed: " + tojson(res));
+    }
+
+    return new DBCommandCursor(this, res);
+};

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -37,8 +37,8 @@
 #include "mongo/db/bson/bson_helper.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/commands/feature_compatibility_version_documentation.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/pipeline/change_stream_constants.h"
+#include "mongo/db/pipeline/change_stream_document_diff_parser.h"
 #include "mongo/db/pipeline/document_path_support.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_change_stream.h"
@@ -54,8 +54,8 @@
 #include "mongo/db/repl/oplog_entry_gen.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/transaction_history_iterator.h"
-#include "mongo/s/catalog_cache.h"
-#include "mongo/s/grid.h"
+#include "mongo/db/update/update_oplog_entry_serialization.h"
+#include "mongo/db/update/update_oplog_entry_version.h"
 
 namespace mongo {
 
@@ -238,7 +238,27 @@ Document DocumentSourceChangeStreamTransform::applyTransformation(const Document
             break;
         }
         case repl::OpTypeEnum::kUpdate: {
-            if (id.missing()) {
+            // The version of oplog entry format. 1 or missing value indicates the old format. 2
+            // indicates the delta oplog entry.
+            Value oplogVersion =
+                input[repl::OplogEntry::kObjectFieldName][kUpdateOplogEntryVersionFieldName];
+            if (!oplogVersion.missing() && oplogVersion.getInt() == 2) {
+                // Parsing the delta oplog entry.
+                operationType = DocumentSourceChangeStream::kUpdateOpType;
+                Value diffObj = input[repl::OplogEntry::kObjectFieldName]
+                                     [update_oplog_entry::kDiffObjectFieldName];
+                checkValueType(diffObj,
+                               repl::OplogEntry::kObjectFieldName + "." +
+                                   update_oplog_entry::kDiffObjectFieldName,
+                               BSONType::Object);
+
+                const auto& deltaDesc =
+                    change_stream_document_diff_parser::parseDiff(diffObj.getDocument().toBson());
+
+                updateDescription = Value(Document{{"updatedFields", deltaDesc.updatedFields},
+                                                   {"removedFields", deltaDesc.removedFields},
+                                                   {"truncatedArrays", deltaDesc.truncatedArrays}});
+            } else if (id.missing()) {
                 operationType = DocumentSourceChangeStream::kUpdateOpType;
                 checkValueType(input[repl::OplogEntry::kObjectFieldName],
                                repl::OplogEntry::kObjectFieldName,
@@ -618,5 +638,4 @@ void DocumentSourceChangeStreamTransform::TransactionOpIterator::_collectAllOpTi
         uasserted(ErrorCodes::ChangeStreamHistoryLost, ex.reason());
     }
 }
-
 }  // namespace mongo

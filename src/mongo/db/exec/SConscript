@@ -7,6 +7,7 @@ env = env.Clone()
 env.SConscript(
     dirs=[
         "document_value",
+        "sbe",
     ],
     exports=[
         "env",
@@ -37,6 +38,19 @@ env.Library(
     ],
 )
 
+env.Library(
+    target = "js_function",
+    source = [
+        "js_function.cpp",
+    ],
+    LIBDEPS = [
+        '$BUILD_DIR/mongo/db/auth/auth',
+        '$BUILD_DIR/mongo/db/query/query_knobs',
+        '$BUILD_DIR/mongo/db/service_context',
+        '$BUILD_DIR/mongo/scripting/scripting_server',
+    ],
+)
+
 sortExecutorEnv = env.Clone()
 sortExecutorEnv.InjectThirdParty(libraries=['snappy'])
 sortExecutorEnv.Library(
@@ -52,6 +66,9 @@ sortExecutorEnv.Library(
         '$BUILD_DIR/mongo/s/is_mongos',
         '$BUILD_DIR/third_party/shim_snappy',
         'working_set',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/sorter/sorter_idl',
     ],
 )
 
@@ -77,6 +94,20 @@ env.Library(
     LIBDEPS=[
         "$BUILD_DIR/mongo/db/index/index_access_methods",
         "$BUILD_DIR/mongo/db/query_exec",
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
+    ],
+)
+
+env.Library(
+    target='sbe_cmd',
+    source=[
+        'sbe_cmd.cpp'
+    ],
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/db/query_exec",
+        "sbe/query_sbe_parser",
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/commands/test_commands_enabled',

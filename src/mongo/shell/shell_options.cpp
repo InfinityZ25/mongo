@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -39,6 +39,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/client/client_api_version_parameters_gen.h"
 #include "mongo/client/mongo_uri.h"
 #include "mongo/config.h"
 #include "mongo/db/auth/sasl_command_constants.h"
@@ -65,6 +66,7 @@ const std::set<std::string> kSetShellParameterWhitelist = {
     "awsEC2InstanceMetadataUrl",
     "awsECSInstanceMetadataUrl",
     "ocspEnabled",
+    "ocspClientHttpTimeoutSecs",
     "disabledSecureAllocatorDomains",
     "newLineAfterPasswordPromptForTest",
     "skipShellCursorFinalize",
@@ -112,10 +114,12 @@ Status storeMongoShellOptions(const moe::Environment& params,
         shellGlobalParams.enableIPv6 = true;
     }
 
+    auto minimumLoggedSeveity = logv2::LogSeverity::Info();
     if (params.count("verbose")) {
-        logv2::LogManager::global().getGlobalSettings().setMinimumLoggedSeverity(
-            mongo::logv2::LogComponent::kDefault, logv2::LogSeverity::Debug(1));
+        minimumLoggedSeveity = logv2::LogSeverity::Debug(1);
     }
+    logv2::LogManager::global().getGlobalSettings().setMinimumLoggedSeverity(
+        mongo::logv2::LogComponent::kDefault, minimumLoggedSeveity);
 
     // `objcheck` option is part of `serverGlobalParams` to avoid making common parts depend upon
     // the client options.  The option is set to false in clients by default.
@@ -317,6 +321,13 @@ Status storeMongoShellOptions(const moe::Environment& params,
         }
     }
 
+    // Future API versions may require logic changes in the shell, so ban them for now.
+    if (!shellGlobalParams.apiVersion.empty() && shellGlobalParams.apiVersion != "1") {
+        uasserted(4938003,
+                  str::stream() << "Bad value --apiVersion '" << shellGlobalParams.apiVersion
+                                << "', only API Version 1 is supported");
+    }
+
     if (params.count("setShellParameter")) {
         auto ssp = params["setShellParameter"].as<std::map<std::string, std::string>>();
         auto map = ServerParameterSet::getGlobal()->getMap();
@@ -343,6 +354,23 @@ Status storeMongoShellOptions(const moe::Environment& params,
     }
 
     return Status::OK();
+}
+
+std::string getApiParametersJSON() {
+    BSONObjBuilder bob;
+    if (!shellGlobalParams.apiVersion.empty()) {
+        bob.append(ClientAPIVersionParameters::kVersionFieldName, shellGlobalParams.apiVersion);
+    }
+
+    if (shellGlobalParams.apiStrict) {
+        bob.append(ClientAPIVersionParameters::kStrictFieldName, true);
+    }
+
+    if (shellGlobalParams.apiDeprecationErrors) {
+        bob.append(ClientAPIVersionParameters::kDeprecationErrorsFieldName, true);
+    }
+
+    return bob.done().jsonString();
 }
 
 }  // namespace mongo

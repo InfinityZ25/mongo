@@ -1,6 +1,5 @@
 /**
  * tests sharding with replica sets
- * @tags: [need_fixing_for_46]
  */
 (function() {
 'use strict';
@@ -41,10 +40,10 @@ s._rs.forEach(function(rsNode) {
     var dbHashes = rsNode.test.getHashes("test");
     print(rsNode.url + ': ' + tojson(dbHashes));
 
-    for (var j = 0; j < dbHashes.slaves.length; j++) {
-        assert.eq(dbHashes.master.md5,
-                  dbHashes.slaves[j].md5,
-                  "hashes not same for: " + rsNode.url + " slave: " + j);
+    for (var j = 0; j < dbHashes.secondaries.length; j++) {
+        assert.eq(dbHashes.primary.md5,
+                  dbHashes.secondaries[j].md5,
+                  "hashes not same for: " + rsNode.url + " secondary: " + j);
     }
 });
 
@@ -53,7 +52,7 @@ assert.eq(num, db.foo.find().itcount(), "C2");
 assert.eq(num, db.foo.find().sort({_id: 1}).itcount(), "C3");
 assert.eq(num, db.foo.find().sort({_id: -1}).itcount(), "C4");
 
-db.foo.ensureIndex({x: 1});
+db.foo.createIndex({x: 1});
 assert.eq(num, db.foo.find().sort({x: 1}).itcount(), "C5");
 assert.eq(num, db.foo.find().sort({x: -1}).itcount(), "C6");
 

@@ -31,6 +31,7 @@
 
 #include "mongo/base/string_data.h"
 #include "mongo/db/exec/delete.h"
+#include "mongo/db/query/index_bounds.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/record_id.h"
 
@@ -38,6 +39,7 @@ namespace mongo {
 
 class BSONObj;
 class Collection;
+class CollectionPtr;
 class IndexDescriptor;
 class OperationContext;
 class PlanStage;
@@ -71,18 +73,19 @@ public:
     static std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> collectionScan(
         OperationContext* opCtx,
         StringData ns,
-        Collection* collection,
-        PlanExecutor::YieldPolicy yieldPolicy,
-        const Direction direction = FORWARD);
+        const CollectionPtr* collection,
+        PlanYieldPolicy::YieldPolicy yieldPolicy,
+        const Direction direction = FORWARD,
+        boost::optional<RecordId> resumeAfterRecordId = boost::none);
 
     /**
      * Returns a FETCH => DELETE plan.
      */
     static std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> deleteWithCollectionScan(
         OperationContext* opCtx,
-        Collection* collection,
+        const CollectionPtr* collection,
         std::unique_ptr<DeleteStageParams> params,
-        PlanExecutor::YieldPolicy yieldPolicy,
+        PlanYieldPolicy::YieldPolicy yieldPolicy,
         Direction direction = FORWARD);
 
     /**
@@ -90,12 +93,12 @@ public:
      */
     static std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> indexScan(
         OperationContext* opCtx,
-        const Collection* collection,
+        const CollectionPtr* collection,
         const IndexDescriptor* descriptor,
         const BSONObj& startKey,
         const BSONObj& endKey,
         BoundInclusion boundInclusion,
-        PlanExecutor::YieldPolicy yieldPolicy,
+        PlanYieldPolicy::YieldPolicy yieldPolicy,
         Direction direction = FORWARD,
         int options = IXSCAN_DEFAULT);
 
@@ -104,13 +107,13 @@ public:
      */
     static std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> deleteWithIndexScan(
         OperationContext* opCtx,
-        Collection* collection,
+        const CollectionPtr* collection,
         std::unique_ptr<DeleteStageParams> params,
         const IndexDescriptor* descriptor,
         const BSONObj& startKey,
         const BSONObj& endKey,
         BoundInclusion boundInclusion,
-        PlanExecutor::YieldPolicy yieldPolicy,
+        PlanYieldPolicy::YieldPolicy yieldPolicy,
         Direction direction = FORWARD);
 
     /**
@@ -118,11 +121,11 @@ public:
      */
     static std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> updateWithIdHack(
         OperationContext* opCtx,
-        Collection* collection,
+        const CollectionPtr* collection,
         const UpdateStageParams& params,
         const IndexDescriptor* descriptor,
         const BSONObj& key,
-        PlanExecutor::YieldPolicy yieldPolicy);
+        PlanYieldPolicy::YieldPolicy yieldPolicy);
 
 private:
     /**
@@ -133,8 +136,9 @@ private:
     static std::unique_ptr<PlanStage> _collectionScan(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         WorkingSet* ws,
-        const Collection* collection,
-        Direction direction);
+        const CollectionPtr* collection,
+        Direction direction,
+        boost::optional<RecordId> resumeAfterRecordId = boost::none);
 
     /**
      * Returns a plan stage that is either an index scan or an index scan with a fetch stage.
@@ -144,7 +148,7 @@ private:
     static std::unique_ptr<PlanStage> _indexScan(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         WorkingSet* ws,
-        const Collection* collection,
+        const CollectionPtr* collection,
         const IndexDescriptor* descriptor,
         const BSONObj& startKey,
         const BSONObj& endKey,

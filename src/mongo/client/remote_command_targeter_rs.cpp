@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -52,15 +52,12 @@ RemoteCommandTargeterRS::RemoteCommandTargeterRS(const std::string& rsName,
     std::set<HostAndPort> seedServers(seedHosts.begin(), seedHosts.end());
     _rsMonitor = ReplicaSetMonitor::createIfNeeded(rsName, seedServers);
 
-    LOGV2_DEBUG(
-        20157,
-        1,
-        "Started targeter for "
-        "{ConnectionString_forReplicaSet_rsName_std_vector_HostAndPort_seedServers_begin_"
-        "seedServers_end}",
-        "ConnectionString_forReplicaSet_rsName_std_vector_HostAndPort_seedServers_begin_seedServers_end"_attr =
-            ConnectionString::forReplicaSet(
-                rsName, std::vector<HostAndPort>(seedServers.begin(), seedServers.end())));
+    LOGV2_DEBUG(20157,
+                1,
+                "Started targeter for {connectionString}",
+                "Started targeter",
+                "connectionString"_attr = ConnectionString::forReplicaSet(
+                    rsName, std::vector<HostAndPort>(seedServers.begin(), seedServers.end())));
 }
 
 ConnectionString RemoteCommandTargeterRS::connectionString() {
@@ -69,12 +66,14 @@ ConnectionString RemoteCommandTargeterRS::connectionString() {
 
 SemiFuture<HostAndPort> RemoteCommandTargeterRS::findHostWithMaxWait(
     const ReadPreferenceSetting& readPref, Milliseconds maxWait) {
-    return _rsMonitor->getHostOrRefresh(readPref, maxWait);
+    // TODO (SERVER-51296): Add CancelationToken support to the RemoteCommandTargeter API.
+    return _rsMonitor->getHostOrRefresh(readPref, CancelationToken::uncancelable());
 }
 
 SemiFuture<std::vector<HostAndPort>> RemoteCommandTargeterRS::findHostsWithMaxWait(
     const ReadPreferenceSetting& readPref, Milliseconds maxWait) {
-    return _rsMonitor->getHostsOrRefresh(readPref, maxWait);
+    // TODO (SERVER-51296): Add CancelationToken support to the RemoteCommandTargeter API.
+    return _rsMonitor->getHostsOrRefresh(readPref, CancelationToken::uncancelable());
 }
 
 StatusWith<HostAndPort> RemoteCommandTargeterRS::findHost(OperationContext* opCtx,
@@ -87,19 +86,32 @@ StatusWith<HostAndPort> RemoteCommandTargeterRS::findHost(OperationContext* opCt
     // Enforce a 20-second ceiling on the time spent looking for a host. This conforms with the
     // behavior used throughout mongos prior to version 3.4, but is not fundamentally desirable.
     // See comment in remote_command_targeter.h for details.
-    return _rsMonitor
-        ->getHostOrRefresh(readPref,
-                           std::min<Milliseconds>(opCtx->getRemainingMaxTimeMillis(), Seconds(20)))
-        .getNoThrow(opCtx);
+    bool maxTimeMsLesser = (opCtx->getRemainingMaxTimeMillis() < Milliseconds(Seconds(20)));
+    // TODO (SERVER-51296): Add CancelationToken support to the RemoteCommandTargeter. In this case
+    // we would pass the CancelationToken attached to the OperationContext to getHostOrRefresh.
+    auto swHostAndPort =
+        _rsMonitor->getHostOrRefresh(readPref, CancelationToken::uncancelable()).getNoThrow(opCtx);
+
+    if (maxTimeMsLesser && swHostAndPort.getStatus() == ErrorCodes::FailedToSatisfyReadPreference) {
+        return Status(ErrorCodes::MaxTimeMSExpired, "operation timed out");
+    }
+
+    return swHostAndPort;
 }
 
-void RemoteCommandTargeterRS::markHostNotMaster(const HostAndPort& host, const Status& status) {
+void RemoteCommandTargeterRS::markHostNotPrimary(const HostAndPort& host, const Status& status) {
     invariant(_rsMonitor);
 
     _rsMonitor->failedHost(host, status);
 }
 
 void RemoteCommandTargeterRS::markHostUnreachable(const HostAndPort& host, const Status& status) {
+    invariant(_rsMonitor);
+
+    _rsMonitor->failedHost(host, status);
+}
+
+void RemoteCommandTargeterRS::markHostShuttingDown(const HostAndPort& host, const Status& status) {
     invariant(_rsMonitor);
 
     _rsMonitor->failedHost(host, status);

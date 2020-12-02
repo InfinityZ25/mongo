@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -67,16 +67,10 @@ PlanStage::StageState SortKeyGeneratorStage::doWork(WorkingSetID* out) {
     if (stageState == PlanStage::ADVANCED) {
         WorkingSetMember* member = _ws->get(*out);
 
-        try {
-            auto sortKey = _sortKeyGen.computeSortKey(*member);
+        auto sortKey = _sortKeyGen.computeSortKey(*member);
 
-            // Add the sort key to the WSM as metadata.
-            member->metadata().setSortKey(std::move(sortKey), _sortKeyGen.isSingleElementKey());
-        } catch (const DBException& computeSortKeyException) {
-            *out = WorkingSetCommon::allocateStatusMember(_ws, computeSortKeyException.toStatus());
-            return PlanStage::FAILURE;
-        }
-
+        // Add the sort key to the WSM as metadata.
+        member->metadata().setSortKey(std::move(sortKey), _sortKeyGen.isSingleElementKey());
         return PlanStage::ADVANCED;
     }
 

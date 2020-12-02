@@ -34,7 +34,7 @@
 #include <memory>
 #include <string>
 
-#include "mongo/db/repl/is_master_response.h"
+#include "mongo/db/repl/hello_response.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/mutex.h"
@@ -84,14 +84,24 @@ public:
     void shutdown() noexcept;
 
     /**
-     * Returns a reference (shared pointer) to the cached version of `IsMasterResponse`.
+     * Returns a reference (shared pointer) to the cached version of `HelloResponse`.
      * Note that the reference is initially set to `nullptr`.
      * Also, the reference is set back to `nullptr` if the thread that updates `_cache` terminates
      * due to an error (i.e., exception), or it receives an invalid response.
      */
-    std::shared_ptr<const IsMasterResponse> getCached() noexcept;
+    std::shared_ptr<const HelloResponse> getCached() noexcept;
 
     std::string toString() const;
+
+    /**
+     * Returns true if this TopologyVersionObserver background thread has stopped.
+     *
+     * Note that this funtion only returns true after _thread has started and ended, thus implies
+     * that getCached() will never return a valid HelloResponse again.
+     */
+    bool isShutdown() const noexcept {
+        return _state.loadRelaxed() == State::kShutdown;
+    }
 
 private:
     enum class State {
@@ -100,7 +110,7 @@ private:
         kShutdown,
     };
 
-    void _cacheIsMasterResponse(OperationContext*, boost::optional<TopologyVersion>) noexcept;
+    void _cacheHelloResponse(OperationContext*, boost::optional<TopologyVersion>);
 
     void _workerThreadBody() noexcept;
 
@@ -108,7 +118,7 @@ private:
      * Protects shared accesses to `_cache`, `_observerClient`, and serializes calls to `init()`
      * and `shutdown()` methods.
      *
-     * Accessing the cached `IsMasterResponse` follows a single-producer, multi-consumer model:
+     * Accessing the cached `HelloResponse` follows a single-producer, multi-consumer model:
      * consumers are readers of `_cache` and the producer is the observer thread. The assumption
      * is that the contention on this lock is insignificant.
      */
@@ -122,8 +132,8 @@ private:
      */
     AtomicWord<bool> _shouldShutdown;
 
-    // The reference to the latest cached version of `IsMasterResponse`
-    std::shared_ptr<const IsMasterResponse> _cache;
+    // The reference to the latest cached version of `HelloResponse`
+    std::shared_ptr<const HelloResponse> _cache;
 
     /**
      * Represents the current state of the observer.

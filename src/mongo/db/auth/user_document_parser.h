@@ -63,6 +63,8 @@ public:
     Status initializeUserPrivilegesFromUserDocument(const BSONObj& doc, User* user) const;
     Status initializeAuthenticationRestrictionsFromUserDocument(const BSONObj& doc,
                                                                 User* user) const;
+
+    Status initializeUserFromUserDocument(const BSONObj& privDoc, User* user) const;
 };
 
 }  // namespace mongo

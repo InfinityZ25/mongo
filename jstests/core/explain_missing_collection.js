@@ -1,6 +1,8 @@
 /**
  * Test explaining various operations against a non-existent collection.
- * @tags: [assumes_no_implicit_collection_creation_after_drop]
+ * @tags: [
+ *   assumes_no_implicit_collection_creation_after_drop,
+ * ]
  */
 (function() {
 var missingColl = db.explain_null_collection;

@@ -34,12 +34,6 @@
 
 namespace mongo {
 
-void ElementPath::init(StringData path) {
-    _nonLeafArrayBehavior = NonLeafArrayBehavior::kTraverse;
-    _leafArrayBehavior = LeafArrayBehavior::kTraverse;
-    _fieldRef.parse(path);
-}
-
 // -----
 
 ElementIterator::~ElementIterator() {}
@@ -191,10 +185,10 @@ bool BSONElementIterator::subCursorHasMore() {
                 return true;
             }
 
-            _subCursorPath.reset(new ElementPath());
-            _subCursorPath->init(_arrayIterationState.restOfPath.substr(
-                _arrayIterationState.nextPieceOfPath.size() + 1));
-            _subCursorPath->setLeafArrayBehavior(_path->leafArrayBehavior());
+            _subCursorPath.reset(
+                new ElementPath(_arrayIterationState.restOfPath.substr(
+                                    _arrayIterationState.nextPieceOfPath.size() + 1),
+                                _path->leafArrayBehavior()));
 
             // If we're here, we must be able to traverse nonleaf arrays.
             dassert(_path->nonLeafArrayBehavior() == ElementPath::NonLeafArrayBehavior::kTraverse);
@@ -281,9 +275,8 @@ bool BSONElementIterator::more() {
             if (eltInArray.type() == Object) {
                 // The current array element is a subdocument.  See if the subdocument generates
                 // any elements matching the remaining subpath.
-                _subCursorPath.reset(new ElementPath());
-                _subCursorPath->init(_arrayIterationState.restOfPath);
-                _subCursorPath->setLeafArrayBehavior(_path->leafArrayBehavior());
+                _subCursorPath.reset(
+                    new ElementPath(_arrayIterationState.restOfPath, _path->leafArrayBehavior()));
 
                 _subCursor.reset(new BSONElementIterator(_subCursorPath.get(), eltInArray.Obj()));
                 if (subCursorHasMore()) {
@@ -306,11 +299,11 @@ bool BSONElementIterator::more() {
                 invariant(eltInArray.type() != Object);  // Handled above.
                 if (eltInArray.type() == Array) {
                     // The current array element is itself an array.  See if the nested array
-                    // has any elements matching the remainihng.
-                    _subCursorPath.reset(new ElementPath());
-                    _subCursorPath->init(_arrayIterationState.restOfPath.substr(
-                        _arrayIterationState.nextPieceOfPath.size() + 1));
-                    _subCursorPath->setLeafArrayBehavior(_path->leafArrayBehavior());
+                    // has any elements matching the remaining.
+                    _subCursorPath.reset(
+                        new ElementPath(_arrayIterationState.restOfPath.substr(
+                                            _arrayIterationState.nextPieceOfPath.size() + 1),
+                                        _path->leafArrayBehavior()));
                     BSONElementIterator* real = new BSONElementIterator(
                         _subCursorPath.get(), _arrayIterationState._current.Obj());
                     _subCursor.reset(real);
@@ -334,6 +327,14 @@ bool BSONElementIterator::more() {
             return false;
         }
 
+        // All array elements have been iterated over. If the leaf array behavior is to omit the
+        // array from the results, then we indicate that there are no more items.
+        if (_path->leafArrayBehavior() == ElementPath::LeafArrayBehavior::kTraverseOmitArray) {
+            return false;
+        }
+
+        // Leaf array behavior is kTraverse, therefore return the array we iterated over as the last
+        // item.
         _next.reset(_arrayIterationState._theArray, BSONElement());
         _state = DONE;
         return true;

@@ -26,8 +26,6 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
-
 #include "mongo/client/sdam/topology_manager.h"
 
 #include <boost/optional/optional_io.hpp>
@@ -37,11 +35,8 @@
 #include "mongo/util/system_clock_source.h"
 
 namespace mongo {
-template std::ostream& operator<<(std::ostream& os,
-                                  const std::vector<mongo::sdam::ServerAddress>& s);
 
 namespace sdam {
-using mongo::operator<<;
 
 class TopologyManagerTestFixture : public SdamTestFixture {
 protected:
@@ -49,7 +44,9 @@ protected:
 
     static inline const auto kSetName = std::string("mySetName");
 
-    static inline const std::vector<ServerAddress> kOneServer{"foo:1234"};
+    static inline const std::vector<HostAndPort> kOneServer{HostAndPort("foo:1234")};
+    static inline const std::vector<HostAndPort> kThreeServers{
+        HostAndPort("foo:1234"), HostAndPort("bar:1234"), HostAndPort("baz:1234")};
 
     static BSONObjBuilder okBuilder() {
         return std::move(BSONObjBuilder().append("ok", 1));
@@ -62,6 +59,17 @@ protected:
         okBuilder().append("topologyVersion", TopologyVersion(OID::max(), 0).toBSON()).obj();
     static inline const auto kBsonTopologyVersionHigh =
         okBuilder().append("topologyVersion", TopologyVersion(OID::max(), 1).toBSON()).obj();
+    static inline const auto kBsonRsPrimary = okBuilder()
+                                                  .append("ismaster", true)
+                                                  .append("setName", kSetName)
+                                                  .append("minWireVersion", 2)
+                                                  .append("maxWireVersion", 10)
+                                                  .appendArray("hosts",
+                                                               BSON_ARRAY("foo:1234"
+                                                                          << "bar:1234"
+                                                                          << "baz:1234"))
+
+                                                  .obj();
 };
 
 TEST_F(TopologyManagerTestFixture, ShouldUpdateTopologyVersionOnSuccess) {
@@ -74,24 +82,53 @@ TEST_F(TopologyManagerTestFixture, ShouldUpdateTopologyVersionOnSuccess) {
     ASSERT(serverDescription->getTopologyVersion() == boost::none);
 
     // If previous topologyVersion is boost::none, should update to new topologyVersion
-    auto isMasterOutcome = IsMasterOutcome(serverDescription->getAddress(),
-                                           kBsonTopologyVersionLow,
-                                           duration_cast<IsMasterRTT>(mongo::Milliseconds(40)));
-    topologyManager.onServerDescription(isMasterOutcome);
+    auto helloOutcome = HelloOutcome(serverDescription->getAddress(),
+                                     kBsonTopologyVersionLow,
+                                     duration_cast<HelloRTT>(mongo::Milliseconds(40)));
+    topologyManager.onServerDescription(helloOutcome);
     topologyDescription = topologyManager.getTopologyDescription();
     auto newServerDescription = topologyDescription->getServers()[0];
+    ASSERT(newServerDescription->getTopologyVersion());
     ASSERT_BSONOBJ_EQ(newServerDescription->getTopologyVersion()->toBSON(),
                       kBsonTopologyVersionLow.getObjectField("topologyVersion"));
 
     // If previous topologyVersion is <= new topologyVersion, should update to new topologyVersion
-    isMasterOutcome = IsMasterOutcome(serverDescription->getAddress(),
-                                      kBsonTopologyVersionHigh,
-                                      duration_cast<IsMasterRTT>(mongo::Milliseconds(40)));
-    topologyManager.onServerDescription(isMasterOutcome);
+    helloOutcome = HelloOutcome(serverDescription->getAddress(),
+                                kBsonTopologyVersionHigh,
+                                duration_cast<HelloRTT>(mongo::Milliseconds(40)));
+    topologyManager.onServerDescription(helloOutcome);
     topologyDescription = topologyManager.getTopologyDescription();
     newServerDescription = topologyDescription->getServers()[0];
+    ASSERT(newServerDescription->getTopologyVersion());
     ASSERT_BSONOBJ_EQ(newServerDescription->getTopologyVersion()->toBSON(),
                       kBsonTopologyVersionHigh.getObjectField("topologyVersion"));
+}
+
+TEST_F(TopologyManagerTestFixture,
+       ShouldUpdateServerDescriptionsTopologyDescriptionPtrWhenTopologyDescriptionIsInstalled) {
+    auto checkServerTopologyDescriptionMatches = [](TopologyDescriptionPtr topologyDescription) {
+        auto rawTopologyDescPtr = topologyDescription.get();
+        for (auto server : topologyDescription->getServers()) {
+            auto rawServerTopologyDescPtr = (*server->getTopologyDescription()).get();
+            ASSERT(server->getTopologyDescription());
+            ASSERT(rawServerTopologyDescPtr == rawTopologyDescPtr);
+        }
+    };
+
+    auto config = SdamConfiguration(kThreeServers);
+    TopologyManager topologyManager(config, clockSource);
+    checkServerTopologyDescriptionMatches(topologyManager.getTopologyDescription());
+
+    auto topologyDescription = topologyManager.getTopologyDescription();
+    auto firstServer = *topologyDescription->getServers()[0];
+    auto host = firstServer.getAddress();
+    auto helloOutcome =
+        HelloOutcome(host, kBsonRsPrimary, duration_cast<HelloRTT>(mongo::Milliseconds{40}));
+    topologyManager.onServerDescription(helloOutcome);
+    checkServerTopologyDescriptionMatches(topologyManager.getTopologyDescription());
+
+    topologyManager.onServerRTTUpdated(host, Milliseconds{40});
+    checkServerTopologyDescriptionMatches(topologyManager.getTopologyDescription());
 }
 
 TEST_F(TopologyManagerTestFixture, ShouldUpdateTopologyVersionOnErrorIfSent) {
@@ -104,19 +141,19 @@ TEST_F(TopologyManagerTestFixture, ShouldUpdateTopologyVersionOnErrorIfSent) {
     ASSERT(serverDescription->getTopologyVersion() == boost::none);
 
     // If previous topologyVersion is boost::none, should update to new topologyVersion
-    auto isMasterOutcome = IsMasterOutcome(serverDescription->getAddress(),
-                                           kBsonTopologyVersionLow,
-                                           duration_cast<IsMasterRTT>(mongo::Milliseconds(40)));
-    topologyManager.onServerDescription(isMasterOutcome);
+    auto helloOutcome = HelloOutcome(serverDescription->getAddress(),
+                                     kBsonTopologyVersionLow,
+                                     duration_cast<HelloRTT>(mongo::Milliseconds(40)));
+    topologyManager.onServerDescription(helloOutcome);
     topologyDescription = topologyManager.getTopologyDescription();
     auto newServerDescription = topologyDescription->getServers()[0];
     ASSERT_BSONOBJ_EQ(newServerDescription->getTopologyVersion()->toBSON(),
                       kBsonTopologyVersionLow.getObjectField("topologyVersion"));
 
-    // If isMasterOutcome is not successful, should preserve old topologyVersion
-    isMasterOutcome = IsMasterOutcome(
-        serverDescription->getAddress(), kBsonTopologyVersionLow, "an error occurred");
-    topologyManager.onServerDescription(isMasterOutcome);
+    // If helloOutcome is not successful, should preserve old topologyVersion
+    helloOutcome =
+        HelloOutcome(serverDescription->getAddress(), kBsonTopologyVersionLow, "an error occurred");
+    topologyManager.onServerDescription(helloOutcome);
     topologyDescription = topologyManager.getTopologyDescription();
     newServerDescription = topologyDescription->getServers()[0];
     ASSERT_BSONOBJ_EQ(newServerDescription->getTopologyVersion()->toBSON(),
@@ -133,57 +170,22 @@ TEST_F(TopologyManagerTestFixture, ShouldNotUpdateServerDescriptionIfNewTopology
     ASSERT(serverDescription->getTopologyVersion() == boost::none);
 
     // If previous topologyVersion is boost::none, should update to new topologyVersion
-    auto isMasterOutcome = IsMasterOutcome(serverDescription->getAddress(),
-                                           kBsonTopologyVersionHigh,
-                                           duration_cast<IsMasterRTT>(mongo::Milliseconds(40)));
-    topologyManager.onServerDescription(isMasterOutcome);
+    auto helloOutcome = HelloOutcome(serverDescription->getAddress(),
+                                     kBsonTopologyVersionHigh,
+                                     duration_cast<HelloRTT>(mongo::Milliseconds(40)));
+    topologyManager.onServerDescription(helloOutcome);
     topologyDescription = topologyManager.getTopologyDescription();
     auto newServerDescription = topologyDescription->getServers()[0];
     ASSERT_BSONOBJ_EQ(newServerDescription->getTopologyVersion()->toBSON(),
                       kBsonTopologyVersionHigh.getObjectField("topologyVersion"));
 
-    // If isMasterOutcome is not successful, should preserve old topologyVersion
-    isMasterOutcome = IsMasterOutcome(serverDescription->getAddress(), kBsonTopologyVersionLow);
-    topologyManager.onServerDescription(isMasterOutcome);
+    // If helloOutcome is not successful, should preserve old topologyVersion
+    helloOutcome = HelloOutcome(serverDescription->getAddress(), kBsonTopologyVersionLow);
+    topologyManager.onServerDescription(helloOutcome);
     topologyDescription = topologyManager.getTopologyDescription();
     newServerDescription = topologyDescription->getServers()[0];
     ASSERT_BSONOBJ_EQ(newServerDescription->getTopologyVersion()->toBSON(),
                       kBsonTopologyVersionHigh.getObjectField("topologyVersion"));
-}
-
-TEST_F(TopologyManagerTestFixture, ShouldNowIncrementPoolResetCounterOnSuccess) {
-    auto config = SdamConfiguration(kOneServer);
-    TopologyManager topologyManager(config, clockSource);
-
-    auto topologyDescription = topologyManager.getTopologyDescription();
-    ASSERT_EQUALS(topologyDescription->getServers().size(), 1);
-    auto serverDescription = topologyDescription->getServers()[0];
-    ASSERT_EQUALS(serverDescription->getPoolResetCounter(), 0);
-
-    // If isMasterOutcome is successful, poolResetCounter should remain the same
-    IsMasterOutcome isMasterOutcome(serverDescription->getAddress(), kBsonOk);
-    topologyManager.onServerDescription(isMasterOutcome);
-    topologyDescription = topologyManager.getTopologyDescription();
-    auto newServerDescription = topologyDescription->getServers()[0];
-    ASSERT_EQUALS(newServerDescription->getPoolResetCounter(), 0);
-}
-
-TEST_F(TopologyManagerTestFixture, ShouldIncrementPoolResetCounterOnError) {
-    auto config = SdamConfiguration(kOneServer);
-    TopologyManager topologyManager(config, clockSource);
-
-    auto topologyDescription = topologyManager.getTopologyDescription();
-    ASSERT_EQUALS(topologyDescription->getServers().size(), 1);
-    auto serverDescription = topologyDescription->getServers()[0];
-    ASSERT_EQUALS(serverDescription->getPoolResetCounter(), 0);
-
-    // If isMasterOutcome is successful, poolResetCounter should remain the same
-    IsMasterOutcome isMasterOutcome(
-        serverDescription->getAddress(), kBsonTopologyVersionLow, "an error occurred");
-    topologyManager.onServerDescription(isMasterOutcome);
-    topologyDescription = topologyManager.getTopologyDescription();
-    auto newServerDescription = topologyDescription->getServers()[0];
-    ASSERT_EQUALS(newServerDescription->getPoolResetCounter(), 1);
 }
 };  // namespace sdam
 };  // namespace mongo

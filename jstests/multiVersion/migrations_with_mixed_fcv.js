@@ -1,6 +1,5 @@
 /*
  *  Tests that migrations work correctly across shards with mixed FCV state.
- *  @tags: [fix_for_fcv_46]
  */
 
 (function() {
@@ -34,14 +33,14 @@ function setup() {
     return st;
 }
 
-function testMigrationFailsWhileUpgradingSource() {
-    jsTestLog("Test fail while upgrading source");
+function testMigrationSucceedsWhileUpgradingSource() {
+    jsTestLog("Test that migration succeeds while upgrading source");
 
     let st = setup();
 
-    // Ensure last-stable FCV on shard0.
-    assert.commandWorked(st.shard0.adminCommand({setFeatureCompatibilityVersion: lastStableFCV}));
-    checkFCV(st.shard0.getDB("admin"), lastStableFCV);
+    // Ensure last-lts FCV on shard0.
+    assert.commandWorked(st.shard0.adminCommand({setFeatureCompatibilityVersion: lastLTSFCV}));
+    checkFCV(st.shard0.getDB("admin"), lastLTSFCV);
     checkFCV(st.shard1.getDB("admin"), latestFCV);
 
     // Fail while upgrading.
@@ -51,18 +50,17 @@ function testMigrationFailsWhileUpgradingSource() {
     // Upgrade source.
     assert.commandFailed(st.shard0.adminCommand({setFeatureCompatibilityVersion: latestFCV}));
 
-    // Move chunk [50, inf) to shard1 should fail.
-    assert.commandFailedWithCode(
-        st.s.adminCommand({moveChunk: ns, find: {x: 50}, to: st.shard1.shardName}),
-        ErrorCodes.ConflictingOperationInProgress);
+    // Move chunk [50, inf) to shard1 should succeed.
+    assert.commandWorked(
+        st.s.adminCommand({moveChunk: ns, find: {x: 50}, to: st.shard1.shardName}));
 
     failpoint.off();
 
     st.stop();
 }
 
-function testMigrationFailsWhileDowngradingSource() {
-    jsTestLog("Test fail while downgrading source");
+function testMigrationSucceedsWhileDowngradingSource() {
+    jsTestLog("Test that migration succeeds while downgrading source");
 
     let st = setup();
 
@@ -75,28 +73,27 @@ function testMigrationFailsWhileDowngradingSource() {
     let failpoint = configureFailPoint(shard0Primary, 'failDowngrading');
 
     // Downgrade source.
-    assert.commandFailed(st.shard0.adminCommand({setFeatureCompatibilityVersion: lastStableFCV}));
+    assert.commandFailed(st.shard0.adminCommand({setFeatureCompatibilityVersion: lastLTSFCV}));
 
-    // Move chunk [50, inf) to shard1 should fail.
-    assert.commandFailedWithCode(
-        st.s.adminCommand({moveChunk: ns, find: {x: 50}, to: st.shard1.shardName}),
-        ErrorCodes.ConflictingOperationInProgress);
+    // Move chunk [50, inf) to shard1 should succeed.
+    assert.commandWorked(
+        st.s.adminCommand({moveChunk: ns, find: {x: 50}, to: st.shard1.shardName}));
 
     failpoint.off();
 
     st.stop();
 }
 
-function testMigrationFailsWhileUpgradingDestination() {
-    jsTestLog("Test fail while upgrading destination");
+function testMigrationSucceedsWhileUpgradingDestination() {
+    jsTestLog("Test that migration succeeds while upgrading destination");
 
     let st = setup();
 
-    // Ensure last-stable FCV on shard1.
+    // Ensure last-lts FCV on shard1.
     assert.commandWorked(
-        st.shard1.getDB("admin").runCommand({setFeatureCompatibilityVersion: lastStableFCV}));
+        st.shard1.getDB("admin").runCommand({setFeatureCompatibilityVersion: lastLTSFCV}));
     checkFCV(st.shard0.getDB("admin"), latestFCV);
-    checkFCV(st.shard1.getDB("admin"), lastStableFCV);
+    checkFCV(st.shard1.getDB("admin"), lastLTSFCV);
 
     // Fail while upgrading.
     let shard1Primary = st.rs1.getPrimary();
@@ -105,18 +102,17 @@ function testMigrationFailsWhileUpgradingDestination() {
     // Upgrade destination.
     assert.commandFailed(st.shard1.adminCommand({setFeatureCompatibilityVersion: latestFCV}));
 
-    // Move chunk [50, inf) to shard1 should fail.
-    assert.commandFailedWithCode(
-        st.s.adminCommand({moveChunk: ns, find: {x: 50}, to: st.shard1.shardName}),
-        ErrorCodes.ConflictingOperationInProgress);
+    // Move chunk [50, inf) to shard1 should succeed.
+    assert.commandWorked(
+        st.s.adminCommand({moveChunk: ns, find: {x: 50}, to: st.shard1.shardName}));
 
     failpoint.off();
 
     st.stop();
 }
 
-function testMigrationFailsWhileDowngradingDestination() {
-    jsTestLog("Test fail while downgrading destination");
+function testMigrationSucceedsWhileDowngradingDestination() {
+    jsTestLog("Test that migration succeeds while downgrading destination");
 
     let st = setup();
 
@@ -129,26 +125,25 @@ function testMigrationFailsWhileDowngradingDestination() {
     let failpoint = configureFailPoint(shard1Primary, 'failDowngrading');
 
     // Downgrade destination.
-    assert.commandFailed(st.shard1.adminCommand({setFeatureCompatibilityVersion: lastStableFCV}));
+    assert.commandFailed(st.shard1.adminCommand({setFeatureCompatibilityVersion: lastLTSFCV}));
 
-    // Move chunk [50, inf) to shard1 should fail.
-    assert.commandFailedWithCode(
-        st.s.adminCommand({moveChunk: ns, find: {x: 50}, to: st.shard1.shardName}),
-        ErrorCodes.ConflictingOperationInProgress);
+    // Move chunk [50, inf) to shard1 should succeed.
+    assert.commandWorked(
+        st.s.adminCommand({moveChunk: ns, find: {x: 50}, to: st.shard1.shardName}));
 
     failpoint.off();
 
     st.stop();
 }
 
-function testMigrateFromLastStableToLastStable() {
-    jsTestLog("Test last-stable FCV -> latest FCV");
+function testMigrateFromLastLTSToLastLTS() {
+    jsTestLog("Test last-lts FCV -> last-lts FCV");
     let st = setup();
 
     assert.commandWorked(
-        st.s.getDB("admin").runCommand({setFeatureCompatibilityVersion: lastStableFCV}));
-    checkFCV(st.shard0.getDB("admin"), lastStableFCV);
-    checkFCV(st.shard1.getDB("admin"), lastStableFCV);
+        st.s.getDB("admin").runCommand({setFeatureCompatibilityVersion: lastLTSFCV}));
+    checkFCV(st.shard0.getDB("admin"), lastLTSFCV);
+    checkFCV(st.shard1.getDB("admin"), lastLTSFCV);
 
     // Move chunk [50, inf) to shard1.
     assert.commandWorked(
@@ -157,14 +152,14 @@ function testMigrateFromLastStableToLastStable() {
     st.stop();
 }
 
-function testMigrateFromLatestToLastStable() {
-    jsTestLog("Test latest FCV -> last-stable FCV");
+function testMigrateFromLatestToLastLTS() {
+    jsTestLog("Test latest FCV -> last-lts FCV");
     let st = setup();
 
     assert.commandWorked(
-        st.shard1.getDB("admin").runCommand({setFeatureCompatibilityVersion: lastStableFCV}));
+        st.shard1.getDB("admin").runCommand({setFeatureCompatibilityVersion: lastLTSFCV}));
     checkFCV(st.shard0.getDB("admin"), latestFCV);
-    checkFCV(st.shard1.getDB("admin"), lastStableFCV);
+    checkFCV(st.shard1.getDB("admin"), lastLTSFCV);
 
     // Move chunk [50, inf) to shard1.
     assert.commandWorked(
@@ -173,28 +168,22 @@ function testMigrateFromLatestToLastStable() {
     st.stop();
 }
 
-function testMigrateFromLastStableToLatest() {
-    jsTestLog("Test last-stable FCV -> latest FCV fail");
+function testMigrateFromLastLTSToLatest() {
+    jsTestLog("Test last-lts FCV -> latest FCV fail");
     let st = setup();
 
     assert.commandWorked(
-        st.shard0.getDB("admin").runCommand({setFeatureCompatibilityVersion: lastStableFCV}));
-    checkFCV(st.shard0.getDB("admin"), lastStableFCV);
+        st.shard0.getDB("admin").runCommand({setFeatureCompatibilityVersion: lastLTSFCV}));
+    checkFCV(st.shard0.getDB("admin"), lastLTSFCV);
     checkFCV(st.shard1.getDB("admin"), latestFCV);
 
-    // Move chunk [50, inf) to shard1 should fail. Since shard1 is running the latest FCV, it
-    // expects _recvChunkStart to include explicit writeConcern. Since shard0 is running the last
-    // stable FCV, it will not add it automatically. So we pass explicit writeConcern to the mongos
-    // moveChunk command (which also requires secondaryThrottle: true), which causes it to be passed
-    // through explicitly to shard0, which will use it when calling _recvChunkStart on shard1
-    assert.commandFailedWithCode(st.s.adminCommand({
+    assert.commandWorked(st.s.adminCommand({
         moveChunk: ns,
         find: {x: 50},
         to: st.shard1.shardName,
         secondaryThrottle: true,
         writeConcern: {w: 1}
-    }),
-                                 ErrorCodes.ConflictingOperationInProgress);
+    }));
 
     st.stop();
 }
@@ -206,16 +195,16 @@ let moveChunk = function(ns, shard) {
     assert.commandWorked(adminDb.runCommand({moveChunk: ns, find: {x: 50}, to: shard}));
 };
 
-function testSetFCVBlocksWhileMigratingChunk() {
-    jsTestLog("Testing that setFCV blocks while migrating a chunk");
+function testSetFCVDoesNotBlockWhileMigratingChunk() {
+    jsTestLog("Testing that setFCV does not block while migrating a chunk");
     let st = setup();
 
-    // Set config and shards to last-stable FCV
+    // Set config and shards to last-lts FCV
     assert.commandWorked(
-        st.s.getDB("admin").runCommand({setFeatureCompatibilityVersion: lastStableFCV}));
+        st.s.getDB("admin").runCommand({setFeatureCompatibilityVersion: lastLTSFCV}));
 
-    checkFCV(st.shard0.getDB("admin"), lastStableFCV);
-    checkFCV(st.shard1.getDB("admin"), lastStableFCV);
+    checkFCV(st.shard0.getDB("admin"), lastLTSFCV);
+    checkFCV(st.shard1.getDB("admin"), lastLTSFCV);
 
     // Start migration and block with failpoint.
     let shard0Primary = st.rs0.getPrimary();
@@ -227,10 +216,9 @@ function testSetFCVBlocksWhileMigratingChunk() {
 
     failpoint.wait();
 
-    // Send FCV command and wait for timeout.
-    assert.commandFailedWithCode(st.shard0.getDB("admin").runCommand(
-                                     {setFeatureCompatibilityVersion: latestFCV, maxTimeMS: 1000}),
-                                 ErrorCodes.MaxTimeMSExpired);
+    // Send FCV command with a maxTimeMS and assert that it does not timeout.
+    assert.commandWorked(st.shard0.getDB("admin").runCommand(
+        {setFeatureCompatibilityVersion: latestFCV, maxTimeMS: 1000}));
 
     failpoint.off();
     awaitShell();
@@ -238,13 +226,13 @@ function testSetFCVBlocksWhileMigratingChunk() {
     st.stop();
 }
 
-testMigrationFailsWhileUpgradingSource();
-testMigrationFailsWhileDowngradingSource();
-testMigrationFailsWhileUpgradingDestination();
-testMigrationFailsWhileDowngradingDestination();
+testMigrationSucceedsWhileUpgradingSource();
+testMigrationSucceedsWhileDowngradingSource();
+testMigrationSucceedsWhileUpgradingDestination();
+testMigrationSucceedsWhileDowngradingDestination();
 
-testMigrateFromLastStableToLastStable();
-testMigrateFromLatestToLastStable();
-testMigrateFromLastStableToLatest();
-testSetFCVBlocksWhileMigratingChunk();
+testMigrateFromLastLTSToLastLTS();
+testMigrateFromLatestToLastLTS();
+testMigrateFromLastLTSToLatest();
+testSetFCVDoesNotBlockWhileMigratingChunk();
 })();

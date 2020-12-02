@@ -24,14 +24,6 @@ replSet.startSet();
 replSet.initiate();
 
 const primary = replSet.getPrimary();
-if (!(IndexBuildTest.supportsTwoPhaseIndexBuild(primary) &&
-      IndexBuildTest.indexBuildCommitQuorumEnabled(primary))) {
-    jsTestLog(
-        'Skipping test because two phase index build and index build commit quorum are not supported.');
-    replSet.stopSet();
-    return;
-}
-
 const testDB = primary.getDB('test');
 const coll = testDB.twoPhaseIndexBuild;
 
@@ -61,7 +53,7 @@ assert.eq("votingMembers", res.commitQuorum);
 res = assert.commandWorked(testDB[collName].createIndexes([{j: 1}], {}, 1));
 assert.eq(1, res.commitQuorum);
 
-replSet.waitForAllIndexBuildsToFinish(testDB.getName(), collName);
+replSet.awaitReplication();
 
 let awaitShell;
 try {
@@ -78,7 +70,8 @@ try {
         }));
     }, testDB.getMongo().port);
 
-    checkLog.containsWithCount(replSet.getPrimary(), "Waiting for index build to complete", 5);
+    checkLog.containsWithCount(
+        replSet.getPrimary(), "Index build: waiting for index build to complete", 5);
 
     // Test setting various commit quorums on the index build in our two node replica set.
     assert.commandFailed(testDB.runCommand(

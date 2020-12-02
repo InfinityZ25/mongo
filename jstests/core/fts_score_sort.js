@@ -1,7 +1,7 @@
 // Test sorting with text score metadata.
-//
-// Includes tests for changes to validation around "textScore" $meta that were introduced in 4.4.
-// @tags: [requires_fcv_44]
+// @tags: [
+//   sbe_incompatible,
+// ]
 (function() {
 "use strict";
 

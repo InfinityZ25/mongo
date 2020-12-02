@@ -45,6 +45,7 @@
 
 namespace mongo {
 class Collection;
+class CollectionPtr;
 class Database;
 class NamespaceString;
 class OperationContext;
@@ -148,7 +149,7 @@ void acquireOplogCollectionForLogging(OperationContext* opCtx);
  * Called by catalog::openCatalog() to re-establish the oplog collection pointer while holding onto
  * the global lock in exclusive mode.
  */
-void establishOplogCollectionForLogging(OperationContext* opCtx, Collection* oplog);
+void establishOplogCollectionForLogging(OperationContext* opCtx, const CollectionPtr& oplog);
 
 using IncrementOpsAppliedStatsFn = std::function<void()>;
 
@@ -227,11 +228,6 @@ void initTimestampFromOplog(OperationContext* opCtx, const NamespaceString& oplo
 void setNewTimestamp(ServiceContext* opCtx, const Timestamp& newTime);
 
 /**
- * Detects the current replication mode and sets the "_oplogCollectionName" accordingly.
- */
-void setOplogCollectionName(ServiceContext* service);
-
-/**
  * Signal any waiting AwaitData queries on the oplog that there is new data or metadata available.
  */
 void signalOplogWaiters();
@@ -255,6 +251,18 @@ inline OplogSlot getNextOpTime(OperationContext* opCtx) {
     invariant(slots.size() == 1);
     return slots.back();
 }
+
+using ApplyImportCollectionFn = std::function<void(OperationContext*,
+                                                   const UUID&,
+                                                   const NamespaceString&,
+                                                   long long,
+                                                   long long,
+                                                   const BSONObj&,
+                                                   const BSONObj&,
+                                                   bool,
+                                                   OplogApplication::Mode)>;
+
+void registerApplyImportCollectionFn(ApplyImportCollectionFn func);
 
 }  // namespace repl
 }  // namespace mongo

@@ -25,7 +25,6 @@ selector:
   - jstests/core/diagdata.js # Command not supported in mongos
   - jstests/core/dropdb_race.js  # syncdelay.
   - jstests/core/fsync.js  # uses fsync.
-  - jstests/core/geo_haystack*.js  # geoSearch.
   - jstests/core/geo_s2cursorlimitskip.js  # profiling.
   - jstests/core/geo_update_btree2.js  # notablescan.
   - jstests/core/index_id_options.js  # "local" database.
@@ -149,13 +148,6 @@ selector:
 
   # TODO: SERVER-38207 Cannot insert document with MaxKey shard key.
   - jstests/core/type8.js
-
-  # TODO: SERVER-38686 createIndex should prioritize other errors over
-  # CannotImplicitlyCreateCollection
-  - jstests/core/fts_spanish.js
-  - jstests/core/geo_invalid_polygon.js
-  - jstests/core/geo_s2index.js
-  - jstests/core/wildcard_index_validindex.js
 
   # benchRun bypasses the network_error_and_txn_override.js so it doesn't run under the same
   # transaction and can cause test to timeout because of the 3 hr transactions lifetime setting and
@@ -336,6 +328,8 @@ selector:
   - requires_fastcount
   # Transactions are not allowed to operate on capped collections.
   - requires_profiling
+  # Snapshot reads in transactions are banned on capped collections.
+  - requires_capped
   # Retrying a query can change whether a plan cache entry is active.
   - inspects_whether_plan_cache_entry_is_active
   # $out is not supported in transactions
@@ -343,6 +337,9 @@ selector:
   # Cannot retry a getMore command if a transient transaction or network error occurs during
   # it, since we won't know whether the cursor was advanced or not.
   - requires_getmore
+  # Transaction-continuing commands cannot specify API parameters, so tests that use API parameters
+  # cannot be run with transactions.
+  - uses_api_parameters
 
 executor:
   archive:
@@ -363,9 +360,10 @@ executor:
           networkErrorAndTxnOverrideConfig:
             wrapCRUDinTransactions: true
           sessionOptions:
-            # Tests in this suite only read from primaries and only one node is electable, so causal
-            # consistency is not required to read your own writes.
-            causalConsistency: false
+            # Read your own writes is not guaranteed without causal consistency since the
+            # coordinateCommit commmand returns as soon as the decision is made durable, and
+            # prepare conflicts are explicity ignored for non-causal reads.
+            causalConsistency: true
       readMode: commands
   hooks:
   # The CheckReplDBHash hook waits until all operations have replicated to and have been applied
@@ -397,5 +395,6 @@ executor:
         enableTestCommands: 1
         numInitialSyncAttempts: 1
         writePeriodicNoops: true
+        coordinateCommitReturnImmediatelyAfterPersistingDecision: true
     num_rs_nodes_per_shard: 2
     num_shards: 2

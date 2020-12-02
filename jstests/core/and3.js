@@ -1,8 +1,9 @@
 // Check key match with sub matchers - part of SERVER-3192
 // @tags: [
-//     # Uses $where operator
-//     requires_scripting,
-//     assumes_balancer_off
+//   assumes_balancer_off,
+//   # Uses $where operator
+//   requires_scripting,
+//   sbe_incompatible,
 // ]
 
 t = db.jstests_and3;
@@ -11,7 +12,7 @@ t.drop();
 t.save({a: 1});
 t.save({a: 'foo'});
 
-t.ensureIndex({a: 1});
+t.createIndex({a: 1});
 
 function checkScanMatch(query, docsExamined, n) {
     var e = t.find(query).hint({a: 1}).explain("executionStats");

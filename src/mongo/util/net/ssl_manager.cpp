@@ -28,7 +28,7 @@
  */
 
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -40,11 +40,15 @@
 
 #include "mongo/base/init.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/internal_auth.h"
 #include "mongo/config.h"
+#include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/logv2/log.h"
 #include "mongo/platform/overflow_arithmetic.h"
 #include "mongo/transport/session.h"
+#include "mongo/transport/transport_layer_asio.h"
+#include "mongo/util/ctype.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/icu.h"
 #include "mongo/util/net/ssl_options.h"
@@ -55,23 +59,9 @@
 
 namespace mongo {
 
-SSLManagerInterface* theSSLManager = nullptr;
+SSLManagerCoordinator* theSSLManagerCoordinator;
 
 namespace {
-
-// Some of these duplicate the std::isalpha/std::isxdigit because we don't want them to be
-// affected by the current locale.
-inline bool isAlpha(char ch) {
-    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
-}
-
-inline bool isDigit(char ch) {
-    return (ch >= '0' && ch <= '9');
-}
-
-inline bool isHex(char ch) {
-    return isDigit(ch) || (ch >= 'A' && ch <= 'F') || (ch >= 'a' && ch <= 'f');
-}
 
 // This function returns true if the character is supposed to be escaped according to the rules
 // in RFC4514. The exception to the RFC the space character ' ' and the '#', because we've not
@@ -161,12 +151,12 @@ std::string RFC4514Parser::extractAttributeName() {
     std::function<bool(char ch)> characterCheck;
     // If the first character is a digit, then this is an OID and can only contain
     // numbers and '.'
-    if (isDigit(ch)) {
-        characterCheck = [](char ch) { return (isDigit(ch) || ch == '.'); };
+    if (ctype::isDigit(ch)) {
+        characterCheck = [](char ch) { return ctype::isDigit(ch) || ch == '.'; };
         // If the first character is an alpha, then this is a short name and can only
         // contain alpha/digit/hyphen characters.
-    } else if (isAlpha(ch)) {
-        characterCheck = [](char ch) { return (isAlpha(ch) || isDigit(ch) || ch == '-'); };
+    } else if (ctype::isAlpha(ch)) {
+        characterCheck = [](char ch) { return ctype::isAlnum(ch) || ch == '-'; };
         // Otherwise this is an invalid attribute name
     } else {
         uasserted(ErrorCodes::BadValue,
@@ -211,14 +201,14 @@ std::pair<std::string, RFC4514Parser::ValueTerminator> RFC4514Parser::extractVal
             if (isEscaped(ch)) {
                 sb << ch;
                 trailingSpaces = 0;
-            } else if (isHex(ch)) {
+            } else if (ctype::isXdigit(ch)) {
                 const std::array<char, 2> hexValStr = {ch, _advance()};
 
                 uassert(ErrorCodes::BadValue,
                         str::stream() << "Escaped hex value contains invalid character \'"
                                       << hexValStr[1] << "\'",
-                        isHex(hexValStr[1]));
-                const char hexVal = uassertStatusOK(fromHex(StringData(hexValStr.data(), 2)));
+                        ctype::isXdigit(hexValStr[1]));
+                const char hexVal = hexblob::decodePair(StringData(hexValStr.data(), 2));
                 sb << hexVal;
                 if (hexVal != ' ') {
                     trailingSpaces = 0;
@@ -335,6 +325,77 @@ boost::optional<std::vector<SSLX509Name::Entry>> getClusterMemberDNOverrideParam
     return value->canonicalized;
 }
 }  // namespace
+
+SSLManagerCoordinator* SSLManagerCoordinator::get() {
+    return theSSLManagerCoordinator;
+}
+
+std::shared_ptr<SSLManagerInterface> SSLManagerCoordinator::getSSLManager() {
+    return *_manager;
+}
+
+void logCert(const CertInformationToLog& cert, StringData certType, const int logNum) {
+    auto attrs = cert.getDynamicAttributes();
+    attrs.add("type", certType);
+    LOGV2(logNum, "Certificate information", attrs);
+}
+
+void logCRL(const CRLInformationToLog& crl, const int logNum) {
+    LOGV2(logNum,
+          "CRL information",
+          "thumbprint"_attr = hexblob::encode(crl.thumbprint.data(), crl.thumbprint.size()),
+          "notValidBefore"_attr = crl.validityNotBefore.toString(),
+          "notValidAfter"_attr = crl.validityNotAfter.toString());
+}
+
+void logSSLInfo(const SSLInformationToLog& info,
+                const int logNumPEM,
+                const int logNumCluster,
+                const int logNumCrl) {
+    if (!(sslGlobalParams.sslPEMKeyFile.empty())) {
+        logCert(info.server, "Server", logNumPEM);
+    }
+    if (info.cluster.has_value()) {
+        logCert(info.cluster.get(), "Cluster", logNumCluster);
+    }
+    if (info.crl.has_value()) {
+        logCRL(info.crl.get(), logNumCrl);
+    }
+}
+
+void SSLManagerCoordinator::rotate() {
+    stdx::lock_guard lockGuard(_lock);
+
+    std::shared_ptr<SSLManagerInterface> manager =
+        SSLManagerInterface::create(sslGlobalParams, isSSLServer);
+
+    int clusterAuthMode = serverGlobalParams.clusterAuthMode.load();
+    if (clusterAuthMode == ServerGlobalParams::ClusterAuthMode_x509 ||
+        clusterAuthMode == ServerGlobalParams::ClusterAuthMode_sendX509) {
+        auth::setInternalUserAuthParams(
+            BSON(saslCommandMechanismFieldName
+                 << "MONGODB-X509" << saslCommandUserDBFieldName << "$external"
+                 << saslCommandUserFieldName
+                 << manager->getSSLConfiguration().clientSubjectName.toString()));
+    }
+
+    auto tl = getGlobalServiceContext()->getTransportLayer();
+    invariant(tl != nullptr);
+    uassertStatusOK(tl->rotateCertificates(manager, false));
+
+    std::shared_ptr<SSLManagerInterface> originalManager = *_manager;
+    _manager = manager;
+
+    LOGV2(4913400, "Successfully rotated X509 certificates.");
+    logSSLInfo(_manager->get()->getSSLInformationToLog());
+
+    originalManager->stopJobs();
+}
+
+SSLManagerCoordinator::SSLManagerCoordinator()
+    : _manager(SSLManagerInterface::create(sslGlobalParams, isSSLServer)) {
+    logSSLInfo(_manager->get()->getSSLInformationToLog());
+}
 
 void ClusterMemberDNOverride::append(OperationContext* opCtx,
                                      BSONObjBuilder& b,
@@ -548,10 +609,10 @@ TLSVersionCounts& TLSVersionCounts::get(ServiceContext* serviceContext) {
     return getTLSVersionCounts(serviceContext);
 }
 
-MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManagerLogger, ("SSLManager", "GlobalLogManager"))
+MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManagerLogger, ("SSLManager"))
 (InitializerContext*) {
     if (!isSSLServer || (sslGlobalParams.sslMode.load() != SSLParams::SSLMode_disabled)) {
-        const auto& config = theSSLManager->getSSLConfiguration();
+        const auto& config = SSLManagerCoordinator::get()->getSSLManager()->getSSLConfiguration();
         if (!config.clientSubjectName.empty()) {
             LOGV2_DEBUG(23214,
                         1,
@@ -1134,7 +1195,7 @@ std::string escapeRfc2253(StringData str) {
         while (pos < str.size()) {
             if (static_cast<signed char>(str[pos]) < 0) {
                 ret += '\\';
-                ret += integerToHex(str[pos]);
+                ret += unsignedHex(str[pos]);
             } else {
                 if (std::find(rfc2253EscapeChars.cbegin(), rfc2253EscapeChars.cend(), str[pos]) !=
                     rfc2253EscapeChars.cend()) {
@@ -1207,10 +1268,6 @@ void recordTLSVersion(TLSVersion version, const HostAndPort& hostForLogging) {
               "tlsVersion"_attr = versionString,
               "remoteHost"_attr = hostForLogging);
     }
-}
-
-SSLManagerInterface* getSSLManager() {
-    return theSSLManager;
 }
 
 // TODO SERVER-11601 Use NFC Unicode canonicalization

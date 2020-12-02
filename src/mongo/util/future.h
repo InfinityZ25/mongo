@@ -249,6 +249,14 @@ public:
      */
     ExecutorFuture<T> thenRunOn(ExecutorPtr exec) && noexcept;
 
+    /**
+     * Returns an inline Future type from this SemiFuture.
+     *
+     * WARNING: Do not use this unless you're extremely sure of what you're doing, as callbacks
+     * chained to the resulting Future may run in unexpected places.
+     */
+    Future<T> unsafeToInlineFuture() && noexcept;
+
 private:
     friend class Promise<T>;
     friend class SharedPromise<T>;
@@ -261,7 +269,6 @@ private:
     template <typename>
     friend class SharedSemiFuture;
 
-    Future<T> unsafeToInlineFuture() && noexcept;
 
     explicit SemiFuture(future_details::SharedStateHolder<T_unless_void>&& impl)
         : _impl(std::move(impl)) {}
@@ -336,10 +343,17 @@ public:
     }
 
     /**
-     * This ends the Future continuation chain by calling a callback on completion. Use this to
-     * escape back into a callback-based API.
+     * Attaches a `func` callback that will consume the result of this `Future` when it completes. A
+     * `getAsync` call can be the tail end of a continuation chain, and that is only position at
+     * which it can appear.
      *
-     * For now, the callback must not fail, since there is nowhere to propagate the error to.
+     * The result argument passed to `func` is `Status` if `T` is `void`, otherwise `StatusWith<T>`.
+     * The `func(result)` return type must be `void`, and not a discarded return value.
+     *
+     * `func` must not throw an exception. It is invoked as if by a `noexcept` function, and it will
+     * `std::terminate` the process. This is because there is no appropriate context in which to
+     * handle such an asynchronous exception.
+     *
      * TODO decide how to handle func throwing.
      */
     TEMPLATE(typename Func)
@@ -600,6 +614,10 @@ public:
     // it should be doable, but will be fairly complicated.
     //
 
+    /**
+     * Attach a completion callback to asynchronously consume this `ExecutorFuture`'s result.
+     * \see `Future<T>::getAsync()`.
+     */
     TEMPLATE(typename Func)
     REQUIRES(future_details::isCallableExactR<void, Func, StatusOrStatusWith<T>>)
     void getAsync(Func&& func) && noexcept {
@@ -737,6 +755,7 @@ ExecutorFuture(ExecutorPtr)->ExecutorFuture<void>;
 template <typename T>
 class Promise {
     using SharedStateT = future_details::SharedState<T>;
+    using T_unless_void = typename SemiFuture<T>::T_unless_void;
 
 public:
     using value_type = T;
@@ -792,19 +811,29 @@ public:
      * involved.
      */
     void setFrom(Future<T>&& future) noexcept {
-        setImpl([&](boost::intrusive_ptr<future_details::SharedState<T>>&& sharedState) {
+        setImpl([&](boost::intrusive_ptr<SharedStateT>&& sharedState) {
             std::move(future).propagateResultTo(sharedState.get());
         });
     }
 
     /**
-     * Same as setFrom(Future) above, but takes a SemiFuture instead of a Future.
+     * Sets the value into this Promise immediately.
+     *
+     * This accepts a Status for Promises<void> or a StatusWith<T> for Promise<T>.
      */
-    void setFrom(SemiFuture<T>&& future) noexcept {
-        setImpl([&](boost::intrusive_ptr<future_details::SharedState<T>>&& sharedState) {
-            std::move(future).propagateResultTo(sharedState.get());
+    void setFrom(StatusOrStatusWith<T> sosw) noexcept {
+        setImpl([&](boost::intrusive_ptr<SharedStateT>&& sharedState) {
+            sharedState->setFrom(std::move(sosw));
         });
     }
+
+    // Use emplaceValue(Args&&...) instead.
+    REQUIRES_FOR_NON_TEMPLATE(!std::is_void_v<T>)
+    void setFrom(T_unless_void val) noexcept = delete;
+
+    // Use setError(Status) instead.
+    REQUIRES_FOR_NON_TEMPLATE(!std::is_void_v<T>)
+    void setFrom(Status) noexcept = delete;
 
     TEMPLATE(typename... Args)
     REQUIRES(std::is_constructible_v<T, Args...> || (std::is_void_v<T> && sizeof...(Args) == 0))
@@ -818,13 +847,6 @@ public:
         invariant(!status.isOK());
         setImpl([&](boost::intrusive_ptr<SharedStateT>&& sharedState) {
             sharedState->setError(std::move(status));
-        });
-    }
-
-    // TODO rename to not XXXWith and handle void
-    void setFromStatusWith(StatusWith<T> sw) noexcept {
-        setImpl([&](boost::intrusive_ptr<SharedStateT>&& sharedState) {
-            sharedState->setFromStatusWith(std::move(sw));
         });
     }
 
@@ -952,8 +974,25 @@ public:
         return ExecutorFuture<T>(std::move(exec), toFutureImpl());
     }
 
+    /**
+     * Makes a copy of this SharedSemiFuture that resolves at the same time as the original.
+     */
+    SharedSemiFuture split() const noexcept {
+        return toFutureImpl().share();
+    }
+
     SemiFuture<T> semi() && noexcept {
         return SemiFuture<T>(toFutureImpl());
+    }
+
+    /**
+     * Returns an inline Future type from this SharedSemiFuture.
+     *
+     * WARNING: Do not use this unless you're extremely sure of what you're doing, as callbacks
+     * chained to the resulting Future may run in unexpected places.
+     */
+    Future<T> unsafeToInlineFuture() const noexcept {
+        return Future<T>(toFutureImpl());
     }
 
 private:
@@ -979,10 +1018,6 @@ private:
     void propagateResultTo(U&& arg) const noexcept {
         toFutureImpl().propagateResultTo(std::forward<U>(arg));
     }
-    Future<T> unsafeToInlineFuture() const noexcept {
-        return Future<T>(toFutureImpl());
-    }
-
     explicit SharedSemiFuture(boost::intrusive_ptr<future_details::SharedState<T>> ptr)
         : _shared(std::move(ptr)) {}
     explicit SharedSemiFuture(future_details::SharedStateHolder<T>&& holder)
@@ -1016,6 +1051,9 @@ SharedSemiFuture(StatusWith<T>)->SharedSemiFuture<T>;
  */
 template <typename T>
 class SharedPromise {
+    using SharedStateT = future_details::SharedState<T>;
+    using T_unless_void = std::conditional_t<std::is_void_v<T>, future_details::FakeVoid, T>;
+
 public:
     using value_type = T;
 
@@ -1049,10 +1087,32 @@ public:
         setFrom(Future<void>::makeReady().then(std::forward<Func>(func)));
     }
 
+    /**
+     * Sets the value into this SharedPromise when the passed-in Future completes, which may have
+     * already happened.
+     */
     void setFrom(Future<T>&& future) noexcept {
         invariant(!std::exchange(_haveCompleted, true));
         std::move(future).propagateResultTo(_sharedState.get());
     }
+
+    /**
+     * Sets the value into this SharedPromise immediately.
+     *
+     * This accepts a Status for SharedPromises<void> or a StatusWith<T> for SharedPromise<T>.
+     */
+    void setFrom(StatusOrStatusWith<T> sosw) noexcept {
+        invariant(!std::exchange(_haveCompleted, true));
+        _sharedState->setFrom(std::move(sosw));
+    }
+
+    // Use emplaceValue(Args&&...) instead.
+    REQUIRES_FOR_NON_TEMPLATE(!std::is_void_v<T>)
+    void setFrom(T_unless_void val) noexcept = delete;
+
+    // Use setError(Status) instead.
+    REQUIRES_FOR_NON_TEMPLATE(!std::is_void_v<T>)
+    void setFrom(Status) noexcept = delete;
 
     TEMPLATE(typename... Args)
     REQUIRES(std::is_constructible_v<T, Args...> || (std::is_void_v<T> && sizeof...(Args) == 0))
@@ -1067,20 +1127,13 @@ public:
         _sharedState->setError(std::move(status));
     }
 
-    // TODO rename to not XXXWith and handle void
-    void setFromStatusWith(StatusWith<T> sw) noexcept {
-        invariant(!std::exchange(_haveCompleted, true));
-        _sharedState->setFromStatusWith(std::move(sw));
-    }
-
 private:
     friend class Future<void>;
 
     // This is slightly different from whether the SharedState is in kFinished, because this
     // SharedPromise may have been completed with a Future that isn't ready yet.
     bool _haveCompleted = false;
-    const boost::intrusive_ptr<future_details::SharedState<T>> _sharedState =
-        make_intrusive<future_details::SharedState<T>>();
+    const boost::intrusive_ptr<SharedStateT> _sharedState = make_intrusive<SharedStateT>();
 };
 
 /**

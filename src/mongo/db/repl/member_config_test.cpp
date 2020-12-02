@@ -56,6 +56,7 @@ TEST(MemberConfig, ParseMinimalMemberConfigAndCheckDefaults) {
     ASSERT_FALSE(mc.isNewlyAdded());
     ASSERT_TRUE(mc.shouldBuildIndexes());
     ASSERT_EQUALS(5U, mc.getNumTags());
+    ASSERT_FALSE(mc.hasTags());
 }
 
 TEST(MemberConfig, ParseFailsWithIllegalFieldName) {
@@ -77,19 +78,33 @@ TEST(MemberConfig, ParseFailsWithMissingIdField) {
                        40414);
 }
 
-TEST(MemberConfig, ParseFailsWithIdOutOfRange) {
+TEST(MemberConfig, ParseMemberConfigId) {
     ReplSetTagConfig tagConfig;
+    // Fail case
     {
         ASSERT_THROWS(MemberConfig(BSON("_id" << -1 << "host"
                                               << "localhost:12345"),
                                    &tagConfig),
                       ExceptionFor<ErrorCodes::BadValue>);
     }
+    // Pass cases
     {
-        ASSERT_THROWS(MemberConfig(BSON("_id" << 256 << "host"
-                                              << "localhost:12345"),
-                                   &tagConfig),
-                      ExceptionFor<ErrorCodes::BadValue>);
+        MemberConfig mc(BSON("_id" << 0 << "host"
+                                   << "localhost:12345"),
+                        &tagConfig);
+        ASSERT_EQUALS(MemberId(0), mc.getId());
+    }
+    {
+        MemberConfig mc(BSON("_id" << 255 << "host"
+                                   << "localhost:12345"),
+                        &tagConfig);
+        ASSERT_EQUALS(MemberId(255), mc.getId());
+    }
+    {
+        MemberConfig mc(BSON("_id" << 256 << "host"
+                                   << "localhost:12345"),
+                        &tagConfig);
+        ASSERT_EQUALS(MemberId(256), mc.getId());
     }
 }
 
@@ -212,13 +227,14 @@ TEST(MemberConfig, ParseArbiterOnly) {
         ASSERT_EQUALS(1.0, mc.getPriority());
     }
 }
+}  // namespace
 
+void setNewlyAdded_ForTest(MemberConfig* mc, boost::optional<bool> newlyAdded) {
+    mc->setNewlyAdded(newlyAdded);
+}
+
+namespace {
 TEST(MemberConfig, ParseAndSetNewlyAddedField) {
-    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
-    enableAutomaticReconfig = true;
-    // Set the flag back to false after this test exits.
-    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
-
     ReplSetTagConfig tagConfig;
     {
         MemberConfig mc(BSON("_id" << 0 << "host"
@@ -227,7 +243,7 @@ TEST(MemberConfig, ParseAndSetNewlyAddedField) {
         // Verify that the 'newlyAdded' field is not added by default.
         ASSERT_FALSE(mc.isNewlyAdded());
 
-        mc.setNewlyAdded(true);
+        setNewlyAdded_ForTest(&mc, true);
         ASSERT_TRUE(mc.isNewlyAdded());
     }
     {
@@ -240,11 +256,6 @@ TEST(MemberConfig, ParseAndSetNewlyAddedField) {
 }
 
 TEST(MemberConfig, NewlyAddedSetToFalseShouldThrow) {
-    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
-    enableAutomaticReconfig = true;
-    // Set the flag back to false after this test exits.
-    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
-
     ReplSetTagConfig tagConfig;
     ASSERT_THROWS(MemberConfig(BSON("_id" << 0 << "host"
                                           << "h"
@@ -254,11 +265,6 @@ TEST(MemberConfig, NewlyAddedSetToFalseShouldThrow) {
 }
 
 TEST(MemberConfig, VotingNodeWithNewlyAddedFieldShouldStillHaveVoteAfterToBSON) {
-    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
-    enableAutomaticReconfig = true;
-    // Set the flag back to false after this test exits.
-    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
-
     ReplSetTagConfig tagConfig;
 
     // Create a member with 'newlyAdded: true'.
@@ -273,7 +279,7 @@ TEST(MemberConfig, VotingNodeWithNewlyAddedFieldShouldStillHaveVoteAfterToBSON) 
     ASSERT_EQ(0, mc.getNumVotes());
 
     // Verify that the member is still a voting node.
-    const auto obj = mc.toBSON(tagConfig, false /* omitNewlyAddedField */);
+    const auto obj = mc.toBSON();
     long long votes;
     uassertStatusOK(bsonExtractIntegerField(obj, "votes", &votes));
     ASSERT_EQ(1, votes);
@@ -285,11 +291,6 @@ TEST(MemberConfig, VotingNodeWithNewlyAddedFieldShouldStillHaveVoteAfterToBSON) 
 }
 
 TEST(MemberConfig, NonVotingNodesWithNewlyAddedFieldShouldStillHaveZeroVotesAfterToBSON) {
-    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
-    enableAutomaticReconfig = true;
-    // Set the flag back to false after this test exits.
-    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
-
     ReplSetTagConfig tagConfig;
 
     MemberConfig mc(BSON("_id" << 0 << "host"
@@ -300,7 +301,7 @@ TEST(MemberConfig, NonVotingNodesWithNewlyAddedFieldShouldStillHaveZeroVotesAfte
     ASSERT_FALSE(mc.isVoter());
     ASSERT_EQ(0, mc.getNumVotes());
 
-    const auto obj = mc.toBSON(tagConfig, false /* omitNewlyAddedField */);
+    const auto obj = mc.toBSON();
     long long votes;
     uassertStatusOK(bsonExtractIntegerField(obj, "votes", &votes));
     ASSERT_EQ(0, votes);
@@ -321,7 +322,7 @@ TEST(MemberConfig, NonVotingNodesShouldStillHaveZeroVotesAfterToBSON) {
     ASSERT_FALSE(mc.isVoter());
     ASSERT_EQ(0, mc.getNumVotes());
 
-    const auto obj = mc.toBSON(tagConfig, false /* omitNewlyAddedField */);
+    const auto obj = mc.toBSON();
     long long votes;
     uassertStatusOK(bsonExtractIntegerField(obj, "votes", &votes));
     ASSERT_EQ(0, votes);
@@ -341,7 +342,7 @@ TEST(MemberConfig, VotingNodesShouldStillHaveVoteAfterToBSON) {
     ASSERT_TRUE(mc.isVoter());
     ASSERT_EQ(1, mc.getNumVotes());
 
-    const auto obj = mc.toBSON(tagConfig, false /* omitNewlyAddedField */);
+    const auto obj = mc.toBSON();
     long long votes;
     uassertStatusOK(bsonExtractIntegerField(obj, "votes", &votes));
     ASSERT_EQ(1, votes);
@@ -353,11 +354,6 @@ TEST(MemberConfig, VotingNodesShouldStillHaveVoteAfterToBSON) {
 }
 
 TEST(MemberConfig, NodeWithNewlyAddedFieldShouldStillHavePriorityAfterToBSON) {
-    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
-    enableAutomaticReconfig = true;
-    // Set the flag back to false after this test exits.
-    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
-
     ReplSetTagConfig tagConfig;
 
     // Create a member with 'newlyAdded: true' and 'priority: 3'.
@@ -371,7 +367,7 @@ TEST(MemberConfig, NodeWithNewlyAddedFieldShouldStillHavePriorityAfterToBSON) {
     ASSERT_EQ(0, mc.getPriority());
 
     // Verify that 'toBSON()' returns the underlying priority field.
-    const auto obj = mc.toBSON(tagConfig, false /* omitNewlyAddedField */);
+    const auto obj = mc.toBSON();
     long long priority;
     uassertStatusOK(bsonExtractIntegerField(obj, "priority", &priority));
     ASSERT_EQ(3, priority);
@@ -382,11 +378,6 @@ TEST(MemberConfig, NodeWithNewlyAddedFieldShouldStillHavePriorityAfterToBSON) {
 }
 
 TEST(MemberConfig, PriorityZeroNodeWithNewlyAddedFieldShouldStillHaveZeroPriorityAfterToBSON) {
-    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
-    enableAutomaticReconfig = true;
-    // Set the flag back to false after this test exits.
-    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
-
     ReplSetTagConfig tagConfig;
 
     // Create a member with 'newlyAdded: true' and 'priority: 0'.
@@ -400,7 +391,7 @@ TEST(MemberConfig, PriorityZeroNodeWithNewlyAddedFieldShouldStillHaveZeroPriorit
     ASSERT_EQ(0, mc.getPriority());
 
     // Verify that 'toBSON()' returns the underlying priority field.
-    const auto obj = mc.toBSON(tagConfig, false /* omitNewlyAddedField */);
+    const auto obj = mc.toBSON();
     long long priority;
     uassertStatusOK(bsonExtractIntegerField(obj, "priority", &priority));
     ASSERT_EQ(0, priority);
@@ -426,7 +417,7 @@ TEST(MemberConfig, PriorityZeroNodeShouldStillHaveZeroPriorityAfterToBSON) {
     ASSERT_EQ(0, mc.getPriority());
 
     // Verify that 'toBSON()' returns the underlying priority field.
-    const auto obj = mc.toBSON(tagConfig, false /* omitNewlyAddedField */);
+    const auto obj = mc.toBSON();
     long long priority;
     uassertStatusOK(bsonExtractIntegerField(obj, "priority", &priority));
     ASSERT_EQ(0, priority);
@@ -452,7 +443,7 @@ TEST(MemberConfig, NodeShouldStillHavePriorityAfterToBSON) {
     ASSERT_EQ(3, mc.getPriority());
 
     // Verify that 'toBSON()' returns the underlying priority field.
-    const auto obj = mc.toBSON(tagConfig, false /* omitNewlyAddedField */);
+    const auto obj = mc.toBSON();
     long long priority;
     uassertStatusOK(bsonExtractIntegerField(obj, "priority", &priority));
     ASSERT_EQ(3, priority);
@@ -463,11 +454,6 @@ TEST(MemberConfig, NodeShouldStillHavePriorityAfterToBSON) {
 }
 
 TEST(MemberConfig, CanOmitNewlyAddedFieldInBSONViaToBSONWithoutNewlyAdded) {
-    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
-    enableAutomaticReconfig = true;
-    // Set the flag back to false after this test exits.
-    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
-
     ReplSetTagConfig tagConfig;
 
     // Create a member with 'newlyAdded: true' and 'priority: 0'.
@@ -478,13 +464,13 @@ TEST(MemberConfig, CanOmitNewlyAddedFieldInBSONViaToBSONWithoutNewlyAdded) {
     ASSERT_TRUE(mc.isNewlyAdded());
 
     // Verify that the normal 'toBSON()' return includes the 'newlyAdded' field.
-    auto obj = mc.toBSON(tagConfig, false /* omitNewlyAddedField */);
+    auto obj = mc.toBSON();
     bool newlyAdded;
     uassertStatusOK(bsonExtractBooleanField(obj, "newlyAdded", &newlyAdded));
     ASSERT_EQ(true, newlyAdded);
 
     // Also verify that 'toBSONWithoutNewlyAdded' omits the 'newlyAdded' field.
-    obj = mc.toBSON(tagConfig, true /* omitNewlyAddedField */);
+    obj = mc.toBSON(true /* omitNewlyAddedField */);
     ASSERT_EQ(ErrorCodes::NoSuchKey, bsonExtractBooleanField(obj, "newlyAdded", &newlyAdded));
 
     MemberConfig mc2(obj, &tagConfig);
@@ -493,11 +479,6 @@ TEST(MemberConfig, CanOmitNewlyAddedFieldInBSONViaToBSONWithoutNewlyAdded) {
 }
 
 TEST(MemberConfig, ArbiterCannotHaveNewlyAddedFieldSet) {
-    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
-    enableAutomaticReconfig = true;
-    // Set the flag back to false after this test exits.
-    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
-
     ReplSetTagConfig tagConfig;
 
     // Verify that an exception is thrown when we try to create an arbiter with 'newlyAdded' field.
@@ -798,6 +779,7 @@ TEST(MemberConfig, ParseTags) {
                                        << "k2"
                                        << "v2")),
                     &tagConfig);
+    ASSERT_TRUE(mc.hasTags());
     ASSERT_EQUALS(7U, mc.getNumTags());
     ASSERT_EQUALS(7, std::distance(mc.tagsBegin(), mc.tagsEnd()));
     ASSERT_EQUALS(1, std::count(mc.tagsBegin(), mc.tagsEnd(), tagConfig.findTag("k1", "v1")));
@@ -810,6 +792,31 @@ TEST(MemberConfig, ParseTags) {
                   std::count(mc.tagsBegin(), mc.tagsEnd(), tagConfig.findTag("$configAll", "0")));
     ASSERT_EQUALS(1,
                   std::count(mc.tagsBegin(), mc.tagsEnd(), tagConfig.findTag("$configVoter", "0")));
+}
+
+TEST(MemberConfig, ParseEmptyTags) {
+    ReplSetTagConfig tagConfig;
+    MemberConfig mc(BSON("_id" << 0 << "host"
+                               << "localhost:12345"
+                               << "tags" << BSONObj()),
+                    &tagConfig);
+    ASSERT_EQUALS(5U, mc.getNumTags());
+    ASSERT_FALSE(mc.hasTags());
+    BSONObj obj = mc.toBSON();
+    BSONElement tagField = obj.getField("tags");
+    ASSERT_TRUE(tagField.type() == Object);
+    ASSERT_TRUE(tagField.Obj().isEmpty());
+}
+
+TEST(MemberConfig, TagsSerializedWhenMissing) {
+    ReplSetTagConfig tagConfig;
+    MemberConfig mc(BSON("_id" << 0 << "host"
+                               << "localhost:12345"),
+                    &tagConfig);
+    BSONObj obj = mc.toBSON();
+    BSONElement tagField = obj.getField("tags");
+    ASSERT_TRUE(tagField.type() == Object);
+    ASSERT_TRUE(tagField.Obj().isEmpty());
 }
 
 TEST(MemberConfig, ParseHorizonFields) {

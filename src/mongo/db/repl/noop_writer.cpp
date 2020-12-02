@@ -27,14 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
 #include <functional>
 
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
@@ -45,6 +44,7 @@
 #include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
+#include "mongo/util/testing_proctor.h"
 
 namespace mongo {
 namespace repl {
@@ -174,9 +174,9 @@ void NoopWriter::_writeNoop(OperationContext* opCtx) {
                     "lastAppliedOpTime"_attr = lastAppliedOpTime);
     } else {
         if (writePeriodicNoops.load()) {
-            const auto logLevel = getTestCommandsEnabled() ? 0 : 1;
+            const auto logLevel = TestingProctor::instance().isEnabled() ? 0 : 1;
             LOGV2_DEBUG(21222,
-                        logSeverityV1toV2(logLevel).toInt(),
+                        logLevel,
                         "Writing noop to oplog as there has been no writes to this replica set in "
                         "over {writeInterval}",
                         "Writing noop to oplog as there has been no writes to this replica set "

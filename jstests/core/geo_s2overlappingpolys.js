@@ -1,7 +1,12 @@
+/**
+ * @tags: [
+ *   sbe_incompatible,
+ * ]
+ */
 var t = db.geo_s2overlappingpolys;
 t.drop();
 
-t.ensureIndex({geo: "2dsphere"});
+t.createIndex({geo: "2dsphere"});
 
 var minError = 0.8e-13;
 

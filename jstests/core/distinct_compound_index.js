@@ -1,4 +1,7 @@
-// @tags: [assumes_balancer_off, assumes_unsharded_collection]
+// @tags: [
+//   assumes_balancer_off,
+//   assumes_unsharded_collection,
+// ]
 (function() {
 "use strict";
 

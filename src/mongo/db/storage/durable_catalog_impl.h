@@ -75,17 +75,28 @@ public:
                               RecordId catalogId,
                               StringData idxName) const;
 
+    BSONObj getCatalogEntry(OperationContext* opCtx, RecordId catalogId) const {
+        return _findEntry(opCtx, catalogId);
+    }
+
     BSONCollectionCatalogEntry::MetaData getMetaData(OperationContext* opCtx,
                                                      RecordId catalogId) const;
     void putMetaData(OperationContext* opCtx,
                      RecordId catalogId,
                      BSONCollectionCatalogEntry::MetaData& md);
 
+    Status checkMetaDataForIndex(OperationContext* opCtx,
+                                 RecordId catalogId,
+                                 const std::string& indexName,
+                                 const BSONObj& spec);
+
     std::vector<std::string> getAllIdents(OperationContext* opCtx) const;
 
     bool isUserDataIdent(StringData ident) const;
 
     bool isInternalIdent(StringData ident) const;
+
+    bool isResumableIndexBuildIdent(StringData ident) const;
 
     bool isCollectionIdent(StringData ident) const;
 
@@ -103,12 +114,19 @@ public:
     std::string getFilesystemPathForDb(const std::string& dbName) const;
 
     std::string newInternalIdent();
+    std::string newInternalResumableIndexBuildIdent();
 
     StatusWith<std::pair<RecordId, std::unique_ptr<RecordStore>>> createCollection(
         OperationContext* opCtx,
         const NamespaceString& nss,
         const CollectionOptions& options,
         bool allocateDefaultSpace);
+
+    StatusWith<ImportResult> importCollection(OperationContext* opCtx,
+                                              const NamespaceString& nss,
+                                              const BSONObj& metadata,
+                                              const BSONObj& storageMetadata,
+                                              ImportCollectionUUIDOption uuidOption) override;
 
     Status renameCollection(OperationContext* opCtx,
                             RecordId catalogId,
@@ -143,13 +161,19 @@ public:
                          StringData validationLevel,
                          StringData validationAction);
 
-    Status removeIndex(OperationContext* opCtx, RecordId catalogId, StringData indexName);
+    void removeIndex(OperationContext* opCtx, RecordId catalogId, StringData indexName);
 
     Status prepareForIndexBuild(OperationContext* opCtx,
                                 RecordId catalogId,
                                 const IndexDescriptor* spec,
                                 boost::optional<UUID> buildUUID,
                                 bool isBackgroundSecondaryBuild);
+
+    Status dropAndRecreateIndexIdentForResume(OperationContext* opCtx,
+                                              RecordId catalogId,
+                                              const IndexDescriptor* spec,
+                                              StringData ident,
+                                              KVPrefix prefix);
 
     boost::optional<UUID> getIndexBuildUUID(OperationContext* opCtx,
                                             RecordId catalogId,
@@ -191,11 +215,14 @@ public:
                             RecordId catalogId,
                             StringData indexName) const;
 
+    void setRand_forTest(const std::string& rand);
+
+    std::string getRand_forTest() const;
+
 private:
     class AddIdentChange;
     class RemoveIdentChange;
     class AddIndexChange;
-    class RemoveIndexChange;
 
     friend class StorageEngineImpl;
     friend class DurableCatalogImplTest;
@@ -206,6 +233,9 @@ private:
                                 NamespaceString nss,
                                 const CollectionOptions& options,
                                 KVPrefix prefix);
+    StatusWith<Entry> _importEntry(OperationContext* opCtx,
+                                   NamespaceString nss,
+                                   const BSONObj& metadata);
     Status _replaceEntry(OperationContext* opCtx,
                          RecordId catalogId,
                          const NamespaceString& toNss,
@@ -219,17 +249,23 @@ private:
      */
     std::string _newUniqueIdent(NamespaceString nss, const char* kind);
 
-    // Helpers only used by constructor and init(). Don't call from elsewhere.
+    std::string _newInternalIdent(StringData identStem);
+
     static std::string _newRand();
-    bool _hasEntryCollidingWithRand() const;
+
+    /**
+     * The '_randLock' must be passed in.
+     */
+    bool _hasEntryCollidingWithRand(WithLock) const;
 
     RecordStore* _rs;  // not owned
     const bool _directoryPerDb;
     const bool _directoryForIndexes;
 
-    // These two are only used for ident generation inside _newUniqueIdent.
-    std::string _rand;  // effectively const after init() returns
-    AtomicWord<unsigned long long> _next;
+    // Protects '_rand' and '_next'.
+    mutable Mutex _randLock = MONGO_MAKE_LATCH("DurableCatalogImpl::_rand");
+    std::string _rand;
+    unsigned long long _next;
 
     std::map<RecordId, Entry> _catalogIdToEntryMap;
     mutable Mutex _catalogIdToEntryMapLock =

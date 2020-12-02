@@ -26,7 +26,7 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kExecutor
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kExecutor
 
 #include "mongo/platform/basic.h"
 
@@ -345,7 +345,7 @@ void Fetcher::_callback(const RemoteCommandCallbackArgs& rcbd, const char* batch
     }
 
     batchData.otherFields.metadata = std::move(rcbd.response.data);
-    batchData.elapsedMillis = rcbd.response.elapsedMillis.value_or(Milliseconds{0});
+    batchData.elapsed = rcbd.response.elapsed.value_or(Microseconds{0});
     {
         stdx::lock_guard<Latch> lk(_mutex);
         batchData.first = _first;
@@ -392,14 +392,17 @@ void Fetcher::_sendKillCursors(const CursorId id, const NamespaceString& nss) {
         auto logKillCursorsResult = [](const RemoteCommandCallbackArgs& args) {
             if (!args.response.isOK()) {
                 LOGV2_WARNING(23918,
-                              "killCursors command task failed: {args_response_status}",
-                              "args_response_status"_attr = redact(args.response.status));
+                              "killCursors command task failed: {error}",
+                              "killCursors command task failed",
+                              "error"_attr = redact(args.response.status));
                 return;
             }
             auto status = getStatusFromCommandResult(args.response.data);
             if (!status.isOK()) {
-                LOGV2_WARNING(
-                    23919, "killCursors command failed: {status}", "status"_attr = redact(status));
+                LOGV2_WARNING(23919,
+                              "killCursors command failed: {error}",
+                              "killCursors command failed",
+                              "error"_attr = redact(status));
             }
         };
         auto cmdObj = BSON("killCursors" << nss.coll() << "cursors" << BSON_ARRAY(id));
@@ -407,8 +410,9 @@ void Fetcher::_sendKillCursors(const CursorId id, const NamespaceString& nss) {
             RemoteCommandRequest(_source, _dbname, cmdObj, nullptr), logKillCursorsResult);
         if (!scheduleResult.isOK()) {
             LOGV2_WARNING(23920,
-                          "failed to schedule killCursors command: {scheduleResult_getStatus}",
-                          "scheduleResult_getStatus"_attr = redact(scheduleResult.getStatus()));
+                          "Failed to schedule killCursors command: {error}",
+                          "Failed to schedule killCursors command",
+                          "error"_attr = redact(scheduleResult.getStatus()));
         }
     }
 }

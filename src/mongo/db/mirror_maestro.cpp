@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
@@ -48,7 +47,7 @@
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/mirror_maestro_gen.h"
 #include "mongo/db/mirroring_sampler.h"
-#include "mongo/db/repl/is_master_response.h"
+#include "mongo/db/repl/hello_response.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/topology_version_observer.h"
 #include "mongo/executor/connection_pool.h"
@@ -69,7 +68,6 @@ constexpr auto kMirrorMaestroConnPoolMaxSize = 4ull;       // Never use more tha
 
 constexpr auto kMirroredReadsParamName = "mirrorReads"_sd;
 
-constexpr auto kMirroredReadsName = "mirroredReads"_sd;
 constexpr auto kMirroredReadsSeenKey = "seen"_sd;
 constexpr auto kMirroredReadsSentKey = "sent"_sd;
 constexpr auto kMirroredReadsResolvedKey = "resolved"_sd;
@@ -171,7 +169,8 @@ class MirroredReadsSection final : public ServerStatusSection {
 public:
     using CounterT = long long;
 
-    MirroredReadsSection() : ServerStatusSection(kMirroredReadsName.toString()) {}
+    MirroredReadsSection()
+        : ServerStatusSection(MirrorMaestro::kServerStatusSectionName.toString()) {}
 
     bool includeByDefault() const override {
         return false;
@@ -380,7 +379,12 @@ void MirrorMaestroImpl::_mirror(const std::vector<HostAndPort>& hosts,
                 return;
             }
 
-            if (MONGO_unlikely(!args.response.isOK())) {
+            if (ErrorCodes::isRetriableError(args.response.status)) {
+                LOGV2_WARNING(5089200,
+                              "Received mirroring response with a retriable failure",
+                              "error"_attr = args.response);
+                return;
+            } else if (!args.response.isOK()) {
                 LOGV2_FATAL(4717301,
                             "Received mirroring response with a non-okay status",
                             "error"_attr = args.response);
@@ -409,8 +413,7 @@ void MirrorMaestroImpl::_mirror(const std::vector<HostAndPort>& hosts,
         gMirroredReadsSection.sent.fetchAndAdd(1);
     }
 } catch (const DBException& e) {
-    // TODO SERVER-44570 Invariant this only in testing
-    LOGV2_DEBUG(31456, 2, "Mirroring failed", "reason"_attr = e);
+    tassert(e.toStatus());
 }
 
 void MirrorMaestroImpl::init(ServiceContext* serviceContext) noexcept {

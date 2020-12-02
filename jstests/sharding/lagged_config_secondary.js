@@ -4,6 +4,7 @@
  */
 
 load("jstests/libs/logv2_helpers.js");
+load("jstests/libs/write_concern_util.js");
 
 // Checking UUID and index consistency involves mongos being able to do a read from the config
 // server, but this test is designed to make mongos time out when reading from the config server.
@@ -12,15 +13,28 @@ TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 TestData.skipCheckOrphans = true;
 
 (function() {
-var st =
-    new ShardingTest({shards: 1, configReplSetTestOptions: {settings: {chainingAllowed: false}}});
+
+/* On the config server the lastApplied optime can go past the atClusterTime timestamp due to pings
+ * made on collection config.mongos by sharding uptime reporter thread.
+ * Hence, it will not write the no-op oplog entry on the config server as part of waiting for read
+ * concern. For more deterministic testing of no-op writes to the oplog, disable uptime reporter
+ * threads from reaching out to the config server.
+ */
+var st = new ShardingTest({
+    shards: 1,
+    configReplSetTestOptions: {settings: {chainingAllowed: false}},
+    other: {
+        mongosOptions: {
+            setParameter:
+                {"failpoint.disableShardingUptimeReporterPeriodicThread": "{mode: 'alwaysOn'}"}
+        }
+    }
+});
+
 var testDB = st.s.getDB('test');
 
 assert.commandWorked(testDB.adminCommand({enableSharding: 'test'}));
 assert.commandWorked(testDB.adminCommand({shardCollection: 'test.user', key: {_id: 1}}));
-
-// Ensures that all metadata writes thus far have been replicated to all nodes
-st.configRS.awaitReplication();
 
 var configSecondaryList = st.configRS.getSecondaries();
 var configSecondaryToKill = configSecondaryList[0];
@@ -28,13 +42,15 @@ var delayedConfigSecondary = configSecondaryList[1];
 
 assert.commandWorked(testDB.user.insert({_id: 1}));
 
-delayedConfigSecondary.getDB('admin').adminCommand(
-    {configureFailPoint: 'rsSyncApplyStop', mode: 'alwaysOn'});
+// Ensures that all metadata writes thus far have been replicated to all nodes
+st.configRS.awaitReplication();
+
+stopServerReplication(delayedConfigSecondary);
 
 // Do one metadata write in order to bump the optime on mongos
 assert.commandWorked(st.getDB('config').TestConfigColl.insert({TestKey: 'Test value'}));
 
-st.configRS.stopMaster();
+st.configRS.stopPrimary();
 MongoRunner.stopMongod(configSecondaryToKill);
 
 // Clears all cached info so mongos will be forced to query from the config.
@@ -72,8 +88,6 @@ assert.soon(
     300);
 
 // Can't do clean shutdown with this failpoint on.
-delayedConfigSecondary.getDB('admin').adminCommand(
-    {configureFailPoint: 'rsSyncApplyStop', mode: 'off'});
-
+restartServerReplication(delayedConfigSecondary);
 st.stop();
 }());

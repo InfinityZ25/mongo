@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "mongo/bson/util/builder.h"
+#include "mongo/db/sorter/sorter_gen.h"
 #include "mongo/util/bufreader.h"
 
 /**
@@ -162,6 +163,9 @@ class SortIteratorInterface {
 
 public:
     typedef std::pair<Key, Value> Data;
+    typedef std::pair<typename Key::SorterDeserializeSettings,
+                      typename Value::SorterDeserializeSettings>
+        Settings;
 
     // Unowned objects are only valid until next call to any method
 
@@ -174,13 +178,17 @@ public:
     template <typename Comparator>
     static SortIteratorInterface* merge(
         const std::vector<std::shared_ptr<SortIteratorInterface>>& iters,
-        const std::string& fileName,
         const SortOptions& opts,
         const Comparator& comp);
 
     // Opens and closes the source of data over which this class iterates, if applicable.
     virtual void openSource() = 0;
     virtual void closeSource() = 0;
+
+    virtual SorterRange getRange() const {
+        invariant(false, "Only FileIterator has ranges");
+        MONGO_UNREACHABLE;
+    }
 
 protected:
     SortIteratorInterface() {}  // can only be constructed as a base
@@ -213,13 +221,34 @@ public:
                       typename Value::SorterDeserializeSettings>
         Settings;
 
+    struct PersistedState {
+        std::string fileName;
+        std::vector<SorterRange> ranges;
+    };
+
+    explicit Sorter(const SortOptions& opts);
+
+    /**
+     * ExtSort-only constructor. fileName is the base name of a file in the temp directory.
+     */
+    Sorter(const SortOptions& opts, const std::string& fileName);
+
     template <typename Comparator>
     static Sorter* make(const SortOptions& opts,
                         const Comparator& comp,
                         const Settings& settings = Settings());
 
-    virtual void add(const Key&, const Value&) = 0;
+    template <typename Comparator>
+    static Sorter* makeFromExistingRanges(const std::string& fileName,
+                                          const std::vector<SorterRange> ranges,
+                                          const SortOptions& opts,
+                                          const Comparator& comp,
+                                          const Settings& settings = Settings());
 
+    virtual void add(const Key&, const Value&) = 0;
+    virtual void emplace(Key&& k, Value&& v) {
+        add(k, v);
+    }
     /**
      * Cannot add more data after calling done().
      *
@@ -229,14 +258,36 @@ public:
 
     virtual ~Sorter() {}
 
-    bool usedDisk() const {
-        return _usedDisk;
+    size_t numSpills() const {
+        return _numSpills;
     }
+
+    size_t numSorted() const {
+        return _numSorted;
+    }
+
+    PersistedState persistDataForShutdown();
 
 protected:
     Sorter() {}  // can only be constructed as a base
 
-    bool _usedDisk{false};  // Keeps track of whether the sorter used disk or not
+    virtual void spill() = 0;
+
+    size_t _numSpills = 0;  // Keeps track of the number of times data was spilled to disk.
+    size_t _numSorted = 0;  // Keeps track of the number of keys sorted.
+
+    // Whether the files written by this Sorter should be kept on destruction.
+    bool _shouldKeepFilesOnDestruction = false;
+
+    SortOptions _opts;
+
+    // Used by Sorter::persistDataForShutdown() to return the base file name of the data persisted
+    // by this Sorter.
+    std::string _fileName;
+
+    std::string _fileFullPath;
+
+    std::vector<std::shared_ptr<Iterator>> _iters;  // Data that has already been spilled.
 };
 
 /**
@@ -255,7 +306,7 @@ public:
         Settings;
 
     explicit SortedFileWriter(const SortOptions& opts,
-                              const std::string& fileName,
+                              const std::string& fileFullPath,
                               const std::streampos fileStartOffset,
                               const Settings& settings = Settings());
 
@@ -281,7 +332,7 @@ private:
     void spill();
 
     const Settings _settings;
-    std::string _fileName;
+    std::string _fileFullPath;
     std::ofstream _file;
     BufBuilder _buffer;
 
@@ -301,24 +352,29 @@ private:
  * #include "mongo/db/sorter/sorter.cpp" and call this in a single translation
  * unit once for each unique set of template parameters.
  */
-#define MONGO_CREATE_SORTER(Key, Value, Comparator)                                      \
-    /* public classes */                                                                 \
-    template class ::mongo::Sorter<Key, Value>;                                          \
-    template class ::mongo::SortIteratorInterface<Key, Value>;                           \
-    template class ::mongo::SortedFileWriter<Key, Value>;                                \
-    /* internal classes */                                                               \
-    template class ::mongo::sorter::NoLimitSorter<Key, Value, Comparator>;               \
-    template class ::mongo::sorter::LimitOneSorter<Key, Value, Comparator>;              \
-    template class ::mongo::sorter::TopKSorter<Key, Value, Comparator>;                  \
-    template class ::mongo::sorter::MergeIterator<Key, Value, Comparator>;               \
-    template class ::mongo::sorter::InMemIterator<Key, Value>;                           \
-    template class ::mongo::sorter::FileIterator<Key, Value>;                            \
-    /* factory functions */                                                              \
-    template ::mongo::SortIteratorInterface<Key, Value>* ::mongo::                       \
-        SortIteratorInterface<Key, Value>::merge<Comparator>(                            \
-            const std::vector<std::shared_ptr<SortIteratorInterface>>& iters,            \
-            const std::string& fileName,                                                 \
-            const SortOptions& opts,                                                     \
-            const Comparator& comp);                                                     \
-    template ::mongo::Sorter<Key, Value>* ::mongo::Sorter<Key, Value>::make<Comparator>( \
-        const SortOptions& opts, const Comparator& comp, const Settings& settings);
+#define MONGO_CREATE_SORTER(Key, Value, Comparator)                                            \
+    /* public classes */                                                                       \
+    template class ::mongo::Sorter<Key, Value>;                                                \
+    template class ::mongo::SortIteratorInterface<Key, Value>;                                 \
+    template class ::mongo::SortedFileWriter<Key, Value>;                                      \
+    /* internal classes */                                                                     \
+    template class ::mongo::sorter::NoLimitSorter<Key, Value, Comparator>;                     \
+    template class ::mongo::sorter::LimitOneSorter<Key, Value, Comparator>;                    \
+    template class ::mongo::sorter::TopKSorter<Key, Value, Comparator>;                        \
+    template class ::mongo::sorter::MergeIterator<Key, Value, Comparator>;                     \
+    template class ::mongo::sorter::InMemIterator<Key, Value>;                                 \
+    template class ::mongo::sorter::FileIterator<Key, Value>;                                  \
+    /* factory functions */                                                                    \
+    template ::mongo::SortIteratorInterface<Key, Value>* ::mongo::                             \
+        SortIteratorInterface<Key, Value>::merge<Comparator>(                                  \
+            const std::vector<std::shared_ptr<SortIteratorInterface>>& iters,                  \
+            const SortOptions& opts,                                                           \
+            const Comparator& comp);                                                           \
+    template ::mongo::Sorter<Key, Value>* ::mongo::Sorter<Key, Value>::make<Comparator>(       \
+        const SortOptions& opts, const Comparator& comp, const Settings& settings);            \
+    template ::mongo::Sorter<Key, Value>* ::mongo::Sorter<Key, Value>::makeFromExistingRanges< \
+        Comparator>(const std::string& fileName,                                               \
+                    const std::vector<SorterRange> ranges,                                     \
+                    const SortOptions& opts,                                                   \
+                    const Comparator& comp,                                                    \
+                    const Settings& settings);

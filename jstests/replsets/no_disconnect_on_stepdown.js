@@ -6,7 +6,19 @@
 
 load("jstests/libs/curop_helpers.js");
 
-const rst = new ReplSetTest({nodes: [{}, {rsConfig: {priority: 0}}]});
+const rst = new ReplSetTest({
+    nodes: [
+        {
+            // Each PrimaryOnlyService rebuilds its instances on stepup, and that may involve doing
+            // read and write operations which are interruptible on stepdown so we need to disable
+            // PrimaryOnlyService rebuild to make the userOperationsKilled check below work
+            // reliably.
+            setParameter:
+                {"failpoint.PrimaryOnlyServiceSkipRebuildingInstances": tojson({mode: "alwaysOn"})}
+        },
+        {rsConfig: {priority: 0}}
+    ],
+});
 rst.startSet();
 rst.initiate();
 
@@ -56,7 +68,7 @@ function runStepDownTest({description, failpoint, operation, errorCode}) {
                               assert.commandWorked(db.adminCommand({ping:1}));`;
 
     const waitForShell = startParallelShell(writeCommand, primary.port);
-    waitForCurOpByFilter(primaryAdmin, {"failpointMsg": failpoint});
+    waitForCurOpByFailPointNoNS(primaryAdmin, failpoint);
     assert.commandWorked(primaryAdmin.adminCommand({replSetStepDown: 60, force: true}));
     rst.waitForState(primary, ReplSetTest.State.SECONDARY);
     assert.commandWorked(primaryAdmin.adminCommand({configureFailPoint: failpoint, mode: "off"}));
@@ -73,7 +85,7 @@ function runStepDownTest({description, failpoint, operation, errorCode}) {
         assert.commandWorked(primaryAdmin.adminCommand({serverStatus: 1})).metrics.repl;
     assert.eq(replMetrics.stateTransition.lastStateTransition, "stepDown");
     assert.eq(replMetrics.stateTransition.userOperationsKilled, 1);
-    assert.eq(replMetrics.network.notMasterUnacknowledgedWrites, 0);
+    assert.eq(replMetrics.network.notPrimaryUnacknowledgedWrites, 0);
 
     // Allow the primary to be re-elected, and wait for it.
     assert.commandWorked(primaryAdmin.adminCommand({replSetFreeze: 0}));

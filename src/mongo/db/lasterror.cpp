@@ -68,8 +68,8 @@ void LastError::setLastError(int code, std::string msg) {
     _code = code;
     _msg = std::move(msg);
 
-    if (ErrorCodes::isNotMasterError(ErrorCodes::Error(_code)))
-        _hadNotMasterError = true;
+    if (ErrorCodes::isNotPrimaryError(ErrorCodes::Error(_code)))
+        _hadNotPrimaryError = true;
 }
 
 void LastError::recordUpdate(bool updateObjects, long long nObjects, BSONObj upsertedId) {
@@ -77,9 +77,8 @@ void LastError::recordUpdate(bool updateObjects, long long nObjects, BSONObj ups
     _nObjects = nObjects;
     _updatedExisting = updateObjects ? True : False;
 
-    // Use the latest BSON validation version. We record updates containing decimal data even if
-    // decimal is disabled.
-    if (upsertedId.valid(BSONVersion::kLatest) && upsertedId.hasField(kUpsertedFieldName))
+    // We record updates containing decimal data even if decimal is disabled.
+    if (upsertedId.valid() && upsertedId.hasField(kUpsertedFieldName))
         _upsertedId = upsertedId;
 }
 
@@ -131,7 +130,7 @@ void LastError::disable() {
 void LastError::startRequest() {
     _disabled = false;
     ++_nPrev;
-    _hadNotMasterError = false;
+    _hadNotPrimaryError = false;
 }
 
 }  // namespace mongo

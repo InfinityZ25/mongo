@@ -27,13 +27,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 #include "mongo/platform/basic.h"
 
 #include "mongo/client/streamable_replica_set_monitor.h"
 
 #include <algorithm>
 #include <limits>
+#include <set>
 
 #include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/client/connpool.h"
@@ -49,6 +50,7 @@
 #include "mongo/platform/mutex.h"
 #include "mongo/rpc/metadata/egress_metadata_hook_list.h"
 #include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/unordered_set.h"
 #include "mongo/util/string_map.h"
 #include "mongo/util/timer.h"
 
@@ -89,11 +91,11 @@ bool primaryOrSecondaryPredicate(const ServerDescriptionPtr& server) {
     return serverType == ServerType::kRSPrimary || serverType == ServerType::kRSSecondary;
 }
 
-std::string readPrefToStringWithMinOpTime(const ReadPreferenceSetting& readPref) {
+std::string readPrefToStringFull(const ReadPreferenceSetting& readPref) {
     BSONObjBuilder builder;
     readPref.toInnerBSON(&builder);
-    if (!readPref.minOpTime.isNull()) {
-        builder.append("minOpTime", readPref.minOpTime.toBSON());
+    if (!readPref.minClusterTime.isNull()) {
+        builder.append("minClusterTime", readPref.minClusterTime.toBSON());
     }
     return builder.obj().toString();
 }
@@ -108,14 +110,51 @@ std::string hostListToString(boost::optional<std::vector<HostAndPort>> x) {
     return s.str();
 }
 
-int32_t pingTimeMillis(const ServerDescriptionPtr& serverDescription) {
-    static const Milliseconds maxLatency = Milliseconds::max();
+double pingTimeMillis(const ServerDescriptionPtr& serverDescription) {
     const auto& serverRtt = serverDescription->getRtt();
-    auto latencyMillis = (serverRtt) ? duration_cast<Milliseconds>(*serverRtt) : maxLatency;
-    return std::min(latencyMillis, maxLatency).count();
+    // Convert to micros so we don't lose information if under a ms
+    return (serverRtt) ? durationCount<Microseconds>(*serverRtt) / 1000.0
+                       : durationCount<Milliseconds>(Milliseconds::max());
 }
 
 constexpr auto kZeroMs = Milliseconds(0);
+
+Status makeUnsatisfiedReadPrefError(const std::string& name,
+                                    const ReadPreferenceSetting& criteria) {
+    return Status(ErrorCodes::FailedToSatisfyReadPreference,
+                  str::stream() << "Could not find host matching read preference "
+                                << criteria.toString() << " for set " << name);
+}
+
+Status makeReplicaSetMonitorRemovedError(const std::string& name) {
+    return Status(ErrorCodes::ReplicaSetMonitorRemoved,
+                  str::stream() << "ReplicaSetMonitor for set " << name << " is removed");
+}
+
+bool hasMembershipChange(sdam::TopologyDescriptionPtr oldDescription,
+                         sdam::TopologyDescriptionPtr newDescription) {
+    if (oldDescription->getServers().size() != newDescription->getServers().size())
+        return true;
+
+    for (const auto& server : oldDescription->getServers()) {
+        const auto newServer = newDescription->findServerByAddress(server->getAddress());
+        if (!newServer)
+            return true;
+        const ServerDescription& s = *server;
+        const ServerDescription& ns = **newServer;
+        if (s != ns)
+            return true;
+    }
+
+    for (const auto& server : newDescription->getServers()) {
+        auto oldServer = oldDescription->findServerByAddress(server->getAddress());
+        if (!oldServer)
+            return true;
+    }
+
+    return false;
+}
+
 }  // namespace
 
 
@@ -146,21 +185,32 @@ StreamableReplicaSetMonitor::StreamableReplicaSetMonitor(
     const MongoURI& uri,
     std::shared_ptr<TaskExecutor> executor,
     std::shared_ptr<executor::EgressTagCloser> connectionManager)
-    : _serverSelector(std::make_unique<SdamServerSelector>(kServerSelectionConfig)),
-      _errorHandler(std::make_unique<SdamErrorHandler>(uri.getSetName())),
+    : _errorHandler(std::make_unique<SdamErrorHandler>(uri.getSetName())),
       _queryProcessor(std::make_shared<StreamableReplicaSetMonitorQueryProcessor>()),
       _uri(uri),
       _connectionManager(connectionManager),
       _executor(executor),
       _random(PseudoRandom(SecureRandom().nextInt64())) {
+    // Maintain order of original seed list
+    std::vector<HostAndPort> seedsNoDups;
+    std::set<HostAndPort> alreadyAdded;
 
-    // TODO SERVER-45395: sdam should use the HostAndPort type for ServerAddress
-    std::vector<ServerAddress> seeds;
-    for (const auto& seed : uri.getServers()) {
-        seeds.push_back(seed.toString());
+    const auto& seeds = uri.getServers();
+    for (const auto& seed : seeds) {
+        if (alreadyAdded.find(seed) == alreadyAdded.end()) {
+            seedsNoDups.push_back(seed);
+            alreadyAdded.insert(seed);
+        }
     }
 
-    _sdamConfig = SdamConfiguration(seeds);
+    _sdamConfig = SdamConfiguration(seedsNoDups);
+    _serverSelector = std::make_unique<SdamServerSelector>(_sdamConfig);
+}
+
+StreamableReplicaSetMonitor::~StreamableReplicaSetMonitor() {
+    // `drop` is idempotent and a duplicate call from ReplicaSetMonitorManager::removeMonitor() is
+    // safe.
+    drop();
 }
 
 ReplicaSetMonitorPtr StreamableReplicaSetMonitor::make(
@@ -174,24 +224,29 @@ ReplicaSetMonitorPtr StreamableReplicaSetMonitor::make(
 
 void StreamableReplicaSetMonitor::init() {
     stdx::lock_guard lock(_mutex);
-    LOGV2_DEBUG(4333206, kLowerLogLevel, "Starting Replica Set Monitor {uri}", "uri"_attr = _uri);
+    LOGV2_DEBUG(4333206,
+                kLowerLogLevel,
+                "Starting Replica Set Monitor {uri}",
+                "Starting Replica Set Monitor",
+                "uri"_attr = _uri,
+                "config"_attr = _sdamConfig.toBson());
+
+    invariant(shared_from_this().use_count() > 1,
+              "StreamableReplicaSetMonitor::init() is invoked when there is no owner");
 
     _eventsPublisher = std::make_shared<sdam::TopologyEventsPublisher>(_executor);
     _topologyManager = std::make_unique<TopologyManager>(
         _sdamConfig, getGlobalServiceContext()->getPreciseClockSource(), _eventsPublisher);
 
-    _eventsPublisher->registerListener(shared_from_this());
+    _eventsPublisher->registerListener(weak_from_this());
 
-    _pingMonitor =
-        std::make_unique<ServerPingMonitor>(_uri,
-                                            _eventsPublisher.get(),
-                                            sdam::SdamConfiguration::kDefaultHeartbeatFrequencyMs,
-                                            _executor);
+    _pingMonitor = std::make_unique<ServerPingMonitor>(
+        _uri, _eventsPublisher.get(), _sdamConfig.getHeartBeatFrequency(), _executor);
     _eventsPublisher->registerListener(_pingMonitor);
 
-    _isMasterMonitor = std::make_unique<ServerIsMasterMonitor>(
+    _serverDiscoveryMonitor = std::make_unique<ServerDiscoveryMonitor>(
         _uri, _sdamConfig, _eventsPublisher, _topologyManager->getTopologyDescription(), _executor);
-    _eventsPublisher->registerListener(_isMasterMonitor);
+    _eventsPublisher->registerListener(_serverDiscoveryMonitor);
 
     _isDropped.store(false);
 
@@ -209,18 +264,25 @@ void StreamableReplicaSetMonitor::drop() {
             lock, Status{ErrorCodes::ShutdownInProgress, "the ReplicaSetMonitor is shutting down"});
     }
 
-    LOGV2(4333209, "Closing Replica Set Monitor {replicaSet}", "replicaSet"_attr = getName());
+    LOGV2(4333209,
+          "Closing Replica Set Monitor {replicaSet}",
+          "Closing Replica Set Monitor",
+          "replicaSet"_attr = getName());
     _queryProcessor->shutdown();
     _pingMonitor->shutdown();
-    _isMasterMonitor->shutdown();
+    _serverDiscoveryMonitor->shutdown();
 
     ReplicaSetMonitorManager::get()->getNotifier().onDroppedSet(getName());
-    LOGV2(4333210, "Done closing Replica Set Monitor {replicaSet}", "replicaSet"_attr = getName());
+    LOGV2(4333210,
+          "Done closing Replica Set Monitor {replicaSet}",
+          "Done closing Replica Set Monitor",
+          "replicaSet"_attr = getName());
 }
 
 SemiFuture<HostAndPort> StreamableReplicaSetMonitor::getHostOrRefresh(
-    const ReadPreferenceSetting& criteria, Milliseconds maxWait) {
-    return getHostsOrRefresh(criteria, maxWait)
+    const ReadPreferenceSetting& criteria, const CancelationToken& cancelToken) {
+
+    return getHostsOrRefresh(criteria, cancelToken)
         .thenRunOn(_executor)
         .then([self = shared_from_this()](const std::vector<HostAndPort>& result) {
             invariant(result.size());
@@ -239,14 +301,15 @@ std::vector<HostAndPort> StreamableReplicaSetMonitor::_extractHosts(
 }
 
 SemiFuture<std::vector<HostAndPort>> StreamableReplicaSetMonitor::getHostsOrRefresh(
-    const ReadPreferenceSetting& criteria, Milliseconds maxWait) {
+    const ReadPreferenceSetting& criteria, const CancelationToken& cancelToken) {
     // In the fast case (stable topology), we avoid mutex acquisition.
     if (_isDropped.load()) {
-        return _makeReplicaSetMonitorRemovedError();
+        return makeReplicaSetMonitorRemovedError(getName());
     }
 
     // start counting from the beginning of the operation
-    const auto deadline = _executor->now() + ((maxWait > kZeroMs) ? maxWait : kZeroMs);
+    const auto deadline = _executor->now() +
+        duration_cast<Milliseconds>(ReplicaSetMonitorInterface::kDefaultFindHostTimeout);
 
     // try to satisfy query immediately
     auto immediateResult = _getHosts(criteria);
@@ -254,84 +317,97 @@ SemiFuture<std::vector<HostAndPort>> StreamableReplicaSetMonitor::getHostsOrRefr
         return {*immediateResult};
     }
 
-    _isMasterMonitor->requestImmediateCheck();
+    _serverDiscoveryMonitor->requestImmediateCheck();
     LOGV2_DEBUG(4333212,
                 kLowerLogLevel,
                 "RSM {replicaSet} start async getHosts with {readPref}",
+                "RSM start async getHosts",
                 "replicaSet"_attr = getName(),
-                "readPref"_attr = readPrefToStringWithMinOpTime(criteria));
+                "readPref"_attr = readPrefToStringFull(criteria));
 
-    // fail fast on timeout
+    // Fail fast on timeout or cancelation.
     const Date_t& now = _executor->now();
-    if (deadline <= now) {
-        return _makeUnsatisfiedReadPrefError(criteria);
+    if (deadline <= now || cancelToken.isCanceled()) {
+        return makeUnsatisfiedReadPrefError(getName(), criteria);
     }
 
-    {
-        stdx::lock_guard lk(_mutex);
+    return _topologyManager->executeWithLock(
+        [this, criteria, cancelToken, deadline](const TopologyDescriptionPtr& topologyDescription)
+            -> SemiFuture<std::vector<HostAndPort>> {
+            stdx::lock_guard lk(_mutex);
 
-        // We check if we are closed under the mutex here since someone could have called
-        // close() concurrently with the code above.
-        if (_isDropped.load()) {
-            return _makeReplicaSetMonitorRemovedError();
-        }
+            // We check if we are closed under the mutex here since someone could have called
+            // close() concurrently with the code above.
+            if (_isDropped.load()) {
+                return makeReplicaSetMonitorRemovedError(getName());
+            }
+            // try to satisfy the query again while holding both the StreamableRSM mutex and
+            // TopologyManager mutex to avoid missing any topology change that has occurred
+            // since the last check.
+            auto immediateResult = _getHosts(topologyDescription, criteria);
+            if (immediateResult) {
+                return {*immediateResult};
+            }
 
-        return _enqueueOutstandingQuery(lk, criteria, deadline);
-    }
+            return _enqueueOutstandingQuery(lk, criteria, cancelToken, deadline);
+        });
 }
 
 SemiFuture<std::vector<HostAndPort>> StreamableReplicaSetMonitor::_enqueueOutstandingQuery(
-    WithLock, const ReadPreferenceSetting& criteria, const Date_t& deadline) {
-    using HostAndPortList = std::vector<HostAndPort>;
-    Future<HostAndPortList> result;
+    WithLock,
+    const ReadPreferenceSetting& criteria,
+    const CancelationToken& cancelToken,
+    const Date_t& deadline) {
 
     auto query = std::make_shared<HostQuery>();
     query->criteria = criteria;
-    query->deadline = deadline;
 
-    auto pf = makePromiseFuture<HostAndPortList>();
+    auto pf = makePromiseFuture<std::vector<HostAndPort>>();
     query->promise = std::move(pf.promise);
 
-    auto deadlineCb =
-        [this, query, self = shared_from_this()](const TaskExecutor::CallbackArgs& cbArgs) {
-            stdx::lock_guard lock(_mutex);
-            if (query->done) {
-                return;
-            }
+    // Make the deadline task cancelable for when the query is satisfied or when the input
+    // cancelToken is canceled.
+    query->deadlineCancelSource = CancelationSource(cancelToken);
+    query->start = _executor->now();
 
-            const auto cbStatus = cbArgs.status;
-            if (!cbStatus.isOK()) {
-                query->promise.setError(cbStatus);
-                query->done = true;
-                return;
-            }
-
-            const auto errorStatus = _makeUnsatisfiedReadPrefError(query->criteria);
-            query->promise.setError(errorStatus);
-            query->done = true;
-            LOGV2_INFO(4333208,
-                       "RSM {replicaSet} host selection timeout: {status}",
-                       "replicaSet"_attr = getName(),
-                       "error"_attr = errorStatus.toString());
-        };
-    auto swDeadlineHandle = _executor->scheduleWorkAt(query->deadline, deadlineCb);
-
-    if (!swDeadlineHandle.isOK()) {
-        LOGV2_INFO(4333207,
-                   "RSM {replicaSet} error scheduling deadline handler: {status}",
-                   "replicaSet"_attr = getName(),
-                   "error"_attr = swDeadlineHandle.getStatus());
-        return SemiFuture<HostAndPortList>::makeReady(swDeadlineHandle.getStatus());
-    }
-    query->deadlineHandle = swDeadlineHandle.getValue();
-    _outstandingQueries.push_back(query);
+    // Add the query to the list of outstanding queries.
+    auto queryIter = _outstandingQueries.insert(_outstandingQueries.end(), query);
 
     // Send topology changes to the query processor to satisfy the future.
     // It will be removed as a listener when all waiting queries have been satisfied.
     _eventsPublisher->registerListener(_queryProcessor);
 
+    // After a deadline or when the input cancelation token is canceled, cancel this query. If the
+    // query completes first, the deadlineCancelSource will be used to cancel this task.
+    _executor->sleepUntil(deadline, query->deadlineCancelSource.token())
+        .getAsync([this, query, queryIter, self = shared_from_this(), cancelToken](Status status) {
+            // If the deadline was reached or cancelation occurred on the input cancelation token,
+            // mark the query as canceled. Otherwise, the deadlineCancelSource must have been
+            // canceled due to the query completing successfully.
+            if (status.isOK() || cancelToken.isCanceled()) {
+                auto errorStatus = makeUnsatisfiedReadPrefError(self->getName(), query->criteria);
+                // Mark query as done, and if it wasn't already done, remove it from the list of
+                // outstanding queries.
+                if (query->tryCancel(errorStatus)) {
+                    LOGV2_INFO(4333208,
+                               "RSM {replicaSet} host selection timeout: {error}",
+                               "RSM host selection timeout",
+                               "replicaSet"_attr = self->getName(),
+                               "error"_attr = errorStatus.toString());
+
+                    stdx::lock_guard lk(_mutex);
+                    // Check that the RSM hasn't been dropped (and _outstandingQueries has not
+                    // been cleared) before erasing.
+                    if (!_isDropped.load()) {
+                        invariant(_outstandingQueries.size() > 0);
+                        _eraseQueryFromOutstandingQueries(lk, queryIter);
+                    }
+                }
+            }
+        });
+
     return std::move(pf.future).semi();
-}  // namespace mongo
+}
 
 boost::optional<std::vector<HostAndPort>> StreamableReplicaSetMonitor::_getHosts(
     const TopologyDescriptionPtr& topology, const ReadPreferenceSetting& criteria) {
@@ -346,8 +422,8 @@ boost::optional<std::vector<HostAndPort>> StreamableReplicaSetMonitor::_getHosts
     return _getHosts(_currentTopology(), criteria);
 }
 
-HostAndPort StreamableReplicaSetMonitor::getMasterOrUassert() {
-    return getHostOrRefresh(kPrimaryOnlyReadPreference).get();
+HostAndPort StreamableReplicaSetMonitor::getPrimaryOrUassert() {
+    return getHostOrRefresh(kPrimaryOnlyReadPreference, CancelationToken::uncancelable()).get();
 }
 
 sdam::TopologyEventsPublisherPtr StreamableReplicaSetMonitor::getEventsPublisher() {
@@ -395,12 +471,12 @@ void StreamableReplicaSetMonitor::_doErrorActions(
             _connectionManager->dropConnections(host);
 
         if (errorActions.requestImmediateCheck)
-            _isMasterMonitor->requestImmediateCheck();
+            _serverDiscoveryMonitor->requestImmediateCheck();
     }
 
     // Call outside of the lock since this may generate a topology change event.
-    if (errorActions.isMasterOutcome)
-        _topologyManager->onServerDescription(*errorActions.isMasterOutcome);
+    if (errorActions.helloOutcome)
+        _topologyManager->onServerDescription(*errorActions.helloOutcome);
 }
 
 boost::optional<ServerDescriptionPtr> StreamableReplicaSetMonitor::_currentPrimary() const {
@@ -409,18 +485,19 @@ boost::optional<ServerDescriptionPtr> StreamableReplicaSetMonitor::_currentPrima
 
 bool StreamableReplicaSetMonitor::isPrimary(const HostAndPort& host) const {
     const auto currentPrimary = _currentPrimary();
-    return (currentPrimary ? (*currentPrimary)->getAddress() == host.toString() : false);
+    return (currentPrimary ? (*currentPrimary)->getAddress() == host : false);
 }
 
 bool StreamableReplicaSetMonitor::isHostUp(const HostAndPort& host) const {
     auto currentTopology = _currentTopology();
-    const auto& serverDescription = currentTopology->findServerByAddress(host.toString());
+    const auto& serverDescription = currentTopology->findServerByAddress(host);
     return serverDescription && (*serverDescription)->getType() != ServerType::kUnknown;
 }
 
 int StreamableReplicaSetMonitor::getMinWireVersion() const {
     auto currentTopology = _currentTopology();
-    const std::vector<ServerDescriptionPtr>& servers = currentTopology->getServers();
+    const std::vector<ServerDescriptionPtr>& servers = currentTopology->findServers(
+        [](const ServerDescriptionPtr& s) { return s->getType() != ServerType::kUnknown; });
     if (servers.size() > 0) {
         const auto& serverDescription =
             *std::min_element(servers.begin(), servers.end(), minWireCompare);
@@ -432,7 +509,8 @@ int StreamableReplicaSetMonitor::getMinWireVersion() const {
 
 int StreamableReplicaSetMonitor::getMaxWireVersion() const {
     auto currentTopology = _currentTopology();
-    const std::vector<ServerDescriptionPtr>& servers = currentTopology->getServers();
+    const std::vector<ServerDescriptionPtr>& servers = currentTopology->findServers(
+        [](const ServerDescriptionPtr& s) { return s->getType() != ServerType::kUnknown; });
     if (servers.size() > 0) {
         const auto& serverDescription =
             *std::max_element(servers.begin(), servers.end(), maxWireCompare);
@@ -468,7 +546,7 @@ const MongoURI& StreamableReplicaSetMonitor::getOriginalUri() const {
 }
 
 bool StreamableReplicaSetMonitor::contains(const HostAndPort& host) const {
-    return static_cast<bool>(_currentTopology()->findServerByAddress(host.toString()));
+    return static_cast<bool>(_currentTopology()->findServerByAddress(host));
 }
 
 void StreamableReplicaSetMonitor::appendInfo(BSONObjBuilder& bsonObjBuilder, bool forFTDC) const {
@@ -477,7 +555,7 @@ void StreamableReplicaSetMonitor::appendInfo(BSONObjBuilder& bsonObjBuilder, boo
     BSONObjBuilder monitorInfo(bsonObjBuilder.subobjStart(getName()));
     if (forFTDC) {
         for (auto serverDescription : topologyDescription->getServers()) {
-            monitorInfo.appendNumber(serverDescription->getAddress(),
+            monitorInfo.appendNumber(serverDescription->getAddress().toString(),
                                      pingTimeMillis(serverDescription));
         }
         return;
@@ -487,14 +565,14 @@ void StreamableReplicaSetMonitor::appendInfo(BSONObjBuilder& bsonObjBuilder, boo
     BSONArrayBuilder hosts(monitorInfo.subarrayStart("hosts"));
     for (const auto& serverDescription : topologyDescription->getServers()) {
         bool isUp = false;
-        bool isMaster = false;
+        bool isWritablePrimary = false;
         bool isSecondary = false;
         bool isHidden = false;
 
         switch (serverDescription->getType()) {
             case ServerType::kRSPrimary:
                 isUp = true;
-                isMaster = true;
+                isWritablePrimary = true;
                 break;
             case ServerType::kRSSecondary:
                 isUp = true;
@@ -517,9 +595,9 @@ void StreamableReplicaSetMonitor::appendInfo(BSONObjBuilder& bsonObjBuilder, boo
         }
 
         BSONObjBuilder builder(hosts.subobjStart());
-        builder.append("addr", serverDescription->getAddress());
+        builder.append("addr", serverDescription->getAddress().toString());
         builder.append("ok", isUp);
-        builder.append("ismaster", isMaster);  // intentionally not camelCase
+        builder.append("ismaster", isWritablePrimary);  // intentionally not camelCase
         builder.append("hidden", isHidden);
         builder.append("secondary", isSecondary);
         builder.append("pingTimeMillis", pingTimeMillis(serverDescription));
@@ -543,50 +621,37 @@ void StreamableReplicaSetMonitor::_setConfirmedNotifierState(
     WithLock, const ServerDescriptionPtr& primaryDescription) {
     invariant(primaryDescription && primaryDescription->getType() == sdam::ServerType::kRSPrimary);
 
-    const auto& hosts = primaryDescription->getHosts();
-    const auto& passives = primaryDescription->getPassives();
+    auto hosts = primaryDescription->getHosts();
+    auto passives = primaryDescription->getPassives();
+    hosts.insert(passives.begin(), passives.end());
 
-    // TODO SERVER-45395: remove need for HostAndPort conversion
-    std::set<HostAndPort> confirmedHosts;
-    std::transform(hosts.begin(),
-                   hosts.end(),
-                   std::inserter(confirmedHosts, confirmedHosts.end()),
-                   [](const ServerAddress& addr) -> HostAndPort { return HostAndPort(addr); });
-
-    std::set<HostAndPort> confirmedPassives;
-    std::transform(passives.begin(),
-                   passives.end(),
-                   std::inserter(confirmedPassives, confirmedPassives.end()),
-                   [](const ServerAddress& addr) -> HostAndPort { return HostAndPort(addr); });
-
-    confirmedHosts.insert(confirmedPassives.begin(), confirmedPassives.end());
-
-    _confirmedNotifierState = ChangeNotifierState{
-        HostAndPort(primaryDescription->getAddress()),
-        confirmedPassives,
-        ConnectionString::forReplicaSet(
-            getName(), std::vector<HostAndPort>(confirmedHosts.begin(), confirmedHosts.end()))};
+    _confirmedNotifierState =
+        ChangeNotifierState{primaryDescription->getAddress(),
+                            passives,
+                            ConnectionString::forReplicaSet(
+                                getName(), std::vector<HostAndPort>(hosts.begin(), hosts.end()))};
 }
 
 void StreamableReplicaSetMonitor::onTopologyDescriptionChangedEvent(
-    UUID topologyId,
-    TopologyDescriptionPtr previousDescription,
-    TopologyDescriptionPtr newDescription) {
-    stdx::lock_guard lock(_mutex);
+    TopologyDescriptionPtr previousDescription, TopologyDescriptionPtr newDescription) {
+    stdx::unique_lock<Latch> lock(_mutex);
     if (_isDropped.load())
         return;
 
     // Notify external components if there are membership changes in the topology.
-    if (_hasMembershipChange(previousDescription, newDescription)) {
+    if (hasMembershipChange(previousDescription, newDescription)) {
         LOGV2(4333213,
-              "RSM {replicaSet} Topology Change: {topologyDescription}",
+              "RSM {replicaSet} Topology Change: {newTopologyDescription}",
+              "RSM Topology Change",
               "replicaSet"_attr = getName(),
-              "topologyDescription"_attr = newDescription->toString());
+              "newTopologyDescription"_attr = newDescription->toString(),
+              "previousTopologyDescription"_attr = previousDescription->toString());
 
         auto maybePrimary = newDescription->getPrimary();
         if (maybePrimary) {
             _setConfirmedNotifierState(lock, *maybePrimary);
 
+            lock.unlock();
             ReplicaSetMonitorManager::get()->getNotifier().onConfirmedSet(
                 _confirmedNotifierState->connectionString,
                 _confirmedNotifierState->primaryAddress,
@@ -594,6 +659,7 @@ void StreamableReplicaSetMonitor::onTopologyDescriptionChangedEvent(
         } else {
             if (_confirmedNotifierState) {
                 const auto& connectionString = _confirmedNotifierState->connectionString;
+                lock.unlock();
                 ReplicaSetMonitorManager::get()->getNotifier().onPossibleSet(connectionString);
             } else {
                 // No confirmed hosts yet, just send list of hosts that are routable base on type.
@@ -610,39 +676,41 @@ void StreamableReplicaSetMonitor::onTopologyDescriptionChangedEvent(
 
                 const auto connectionString = ConnectionString::forReplicaSet(
                     getName(), _extractHosts(primaryAndSecondaries));
+
+                lock.unlock();
                 ReplicaSetMonitorManager::get()->getNotifier().onPossibleSet(connectionString);
             }
         }
     }
 }
 
-void StreamableReplicaSetMonitor::onServerHeartbeatSucceededEvent(const ServerAddress& hostAndPort,
+void StreamableReplicaSetMonitor::onServerHeartbeatSucceededEvent(const HostAndPort& hostAndPort,
                                                                   const BSONObj reply) {
-    // After the inital handshake, isMasterResponses should not update the RTT with durationMs.
-    IsMasterOutcome outcome(hostAndPort, reply, boost::none);
+    // After the inital handshake, hello responses should not update the RTT with durationMs.
+    HelloOutcome outcome(hostAndPort, reply, boost::none);
     _topologyManager->onServerDescription(outcome);
 }
 
 void StreamableReplicaSetMonitor::onServerHeartbeatFailureEvent(Status errorStatus,
-                                                                const ServerAddress& hostAndPort,
+                                                                const HostAndPort& hostAndPort,
                                                                 const BSONObj reply) {
     _failedHost(
         HostAndPort(hostAndPort), errorStatus, reply, HandshakeStage::kPostHandshake, false);
 }
 
-void StreamableReplicaSetMonitor::onServerPingFailedEvent(const ServerAddress& hostAndPort,
+void StreamableReplicaSetMonitor::onServerPingFailedEvent(const HostAndPort& hostAndPort,
                                                           const Status& status) {
     _failedHost(HostAndPort(hostAndPort), status, BSONObj(), HandshakeStage::kPostHandshake, false);
 }
 
-void StreamableReplicaSetMonitor::onServerHandshakeFailedEvent(const sdam::ServerAddress& address,
+void StreamableReplicaSetMonitor::onServerHandshakeFailedEvent(const HostAndPort& address,
                                                                const Status& status,
                                                                const BSONObj reply) {
     _failedHost(HostAndPort(address), status, reply, HandshakeStage::kPreHandshake, false);
 };
 
-void StreamableReplicaSetMonitor::onServerPingSucceededEvent(sdam::IsMasterRTT durationMS,
-                                                             const ServerAddress& hostAndPort) {
+void StreamableReplicaSetMonitor::onServerPingSucceededEvent(sdam::HelloRTT durationMS,
+                                                             const HostAndPort& hostAndPort) {
     LOGV2_DEBUG(4668132,
                 kLowerLogLevel,
                 "ReplicaSetMonitor ping success",
@@ -652,10 +720,10 @@ void StreamableReplicaSetMonitor::onServerPingSucceededEvent(sdam::IsMasterRTT d
     _topologyManager->onServerRTTUpdated(hostAndPort, durationMS);
 }
 
-void StreamableReplicaSetMonitor::onServerHandshakeCompleteEvent(sdam::IsMasterRTT durationMs,
-                                                                 const ServerAddress& hostAndPort,
+void StreamableReplicaSetMonitor::onServerHandshakeCompleteEvent(sdam::HelloRTT durationMs,
+                                                                 const HostAndPort& hostAndPort,
                                                                  const BSONObj reply) {
-    IsMasterOutcome outcome(hostAndPort, reply, durationMs);
+    HelloOutcome outcome(hostAndPort, reply, durationMs);
     _topologyManager->onServerDescription(outcome);
 }
 
@@ -665,39 +733,22 @@ std::string StreamableReplicaSetMonitor::_logPrefix() {
 
 void StreamableReplicaSetMonitor::_failOutstandingWithStatus(WithLock, Status status) {
     for (const auto& query : _outstandingQueries) {
-        if (query->done)
-            continue;
-
-        query->done = true;
-        _executor->cancel(query->deadlineHandle);
-        query->promise.setError(status);
+        (void)query->tryCancel(status);
     }
     _outstandingQueries.clear();
 }
 
-bool StreamableReplicaSetMonitor::_hasMembershipChange(
-    sdam::TopologyDescriptionPtr oldDescription, sdam::TopologyDescriptionPtr newDescription) {
+std::list<StreamableReplicaSetMonitor::HostQueryPtr>::iterator
+StreamableReplicaSetMonitor::_eraseQueryFromOutstandingQueries(
+    WithLock, std::list<HostQueryPtr>::iterator iter) {
 
-    if (oldDescription->getServers().size() != newDescription->getServers().size())
-        return true;
-
-    for (const auto& server : oldDescription->getServers()) {
-        const auto newServer = newDescription->findServerByAddress(server->getAddress());
-        if (!newServer)
-            return true;
-        const ServerDescription& s = *server;
-        const ServerDescription& ns = **newServer;
-        if (s != ns)
-            return true;
+    auto retVal = _outstandingQueries.erase(iter);
+    if (_outstandingQueries.size() == 0) {
+        // If there are no more outstanding queries, no need to listen for topology
+        // changes in this monitor.
+        _eventsPublisher->removeListener(_queryProcessor);
     }
-
-    for (const auto& server : newDescription->getServers()) {
-        auto oldServer = oldDescription->findServerByAddress(server->getAddress());
-        if (!oldServer)
-            return true;
-    }
-
-    return false;
+    return retVal;
 }
 
 void StreamableReplicaSetMonitor::_processOutstanding(
@@ -709,54 +760,50 @@ void StreamableReplicaSetMonitor::_processOutstanding(
 
     stdx::lock_guard lock(_mutex);
 
-    bool shouldRemove;
     auto it = _outstandingQueries.begin();
+    bool hadUnresolvedQuery{false};
+
+    // Iterate through the outstanding queries and try to resolve them via calls to _getHosts. If we
+    // succeed in resolving a query, the query is removed from the list. If a query has already been
+    // canceled, or there are no results, it will be skipped. Cancelation logic elsewhere will
+    // handle removing the canceled queries from the list.
     while (it != _outstandingQueries.end()) {
         auto& query = *it;
-        shouldRemove = false;
 
-        if (query->done) {
-            shouldRemove = true;
-        } else {
+        // If query has not been canceled yet, try to satisfy it.
+        if (!query->hasBeenResolved()) {
             auto result = _getHosts(topologyDescription, query->criteria);
             if (result) {
-                _executor->cancel(query->deadlineHandle);
-                query->done = true;
-                query->promise.emplaceValue(std::move(*result));
-                const auto latency = _executor->now() - query->start;
-                LOGV2_DEBUG(433214,
-                            kLowerLogLevel,
-                            "RSM {replicaSet} finished async getHosts: {readPref} ({latency})",
-                            "replicaSet"_attr = getName(),
-                            "readPref"_attr = readPrefToStringWithMinOpTime(query->criteria),
-                            "latency"_attr = latency.toString());
-                shouldRemove = true;
+                if (query->tryResolveWithSuccess(std::move(*result))) {
+                    const auto latency = _executor->now() - query->start;
+                    LOGV2_DEBUG(433214,
+                                kLowerLogLevel,
+                                "RSM {replicaSet} finished async getHosts: {readPref} ({duration})",
+                                "RSM finished async getHosts",
+                                "replicaSet"_attr = getName(),
+                                "readPref"_attr = readPrefToStringFull(query->criteria),
+                                "duration"_attr = Milliseconds(latency));
+
+                    it = _eraseQueryFromOutstandingQueries(lock, it);
+                } else {
+                    // The query was canceled, so skip to the next entry without erasing it.
+                    ++it;
+                }
+            } else {
+                // Results were not available, so skip to the next entry without erasing it.
+                ++it;
+                hadUnresolvedQuery = true;
             }
+        } else {
+            // The query was canceled, so skip to the next entry without erasing it.
+            ++it;
         }
-
-        it = (shouldRemove) ? _outstandingQueries.erase(it) : ++it;
     }
 
-    if (_outstandingQueries.size()) {
-        // enable expedited mode
-        _isMasterMonitor->requestImmediateCheck();
-    } else {
-        // if no more outstanding queries, no need to listen for topology changes in
-        // this monitor.
-        _eventsPublisher->removeListener(_queryProcessor);
+    // If there remain unresolved queries, enable expedited mode.
+    if (hadUnresolvedQuery) {
+        _serverDiscoveryMonitor->requestImmediateCheck();
     }
-}
-
-Status StreamableReplicaSetMonitor::_makeUnsatisfiedReadPrefError(
-    const ReadPreferenceSetting& criteria) const {
-    return Status(ErrorCodes::FailedToSatisfyReadPreference,
-                  str::stream() << "Could not find host matching read preference "
-                                << criteria.toString() << " for set " << getName());
-}
-
-Status StreamableReplicaSetMonitor::_makeReplicaSetMonitorRemovedError() const {
-    return Status(ErrorCodes::ReplicaSetMonitorRemoved,
-                  str::stream() << "ReplicaSetMonitor for set " << getName() << " is removed");
 }
 
 void StreamableReplicaSetMonitor::runScanForMockReplicaSet() {

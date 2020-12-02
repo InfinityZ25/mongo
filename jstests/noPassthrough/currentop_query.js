@@ -90,17 +90,31 @@ function runTests({conn, readMode, currentOp, truncatedOps, localOps}) {
      * Captures currentOp() for a given test command/operation and confirms that namespace,
      * operation type and planSummary are correct.
      *
-     *  @param {Object} testObj - Contains test arguments.
-     *  @param {function} testObj.test - A function that runs the desired test op/cmd.
-     *  @param {string} testObj.planSummary - A string containing the expected planSummary.
-     *  @param {Object} testObj.currentOpFilter - A filter to be used to narrow currentOp()
-     *  output to only the relevant operation or command.
-     *  @param {string} [testObj.command] - The command to test against. Will look for this to
-     *  be a key in the currentOp().query object.
-     *  @param {string} [testObj.operation] - The operation to test against. Will look for this
-     *  to be the value of the currentOp().op field.
+     *  - 'testObj' - Contains test arguments.
+     *  - 'testObj.test' - A function that runs the desired test op/cmd.
+     *  - 'testObj.planSummary' - A string containing the expected planSummary.
+     *  - 'testObj.currentOpFilter' - A filter to be used to narrow currentOp() output to only the
+     *  relevant operation or command.
+     *  - 'testObj.command]' - The command to test against. Will look for this to be a key in the
+     *  currentOp().query object.
+     *  - 'testObj.operation' - The operation to test against. Will look for this to be the value
+     *  of the currentOp().op field.
+     *  - 'testObj.useSbe' - True if the server should be configured to use the slot-based execution
+     *  engine rather than the classic query execution engine.
      */
     function confirmCurrentOpContents(testObj) {
+        const useSbe = testObj.useSbe || false;
+        // TODO SERVER-50712: SBE is not currently expected to be able to run queries that require
+        // shard filtering. If the test asks for SBE and we are running against mongos, just skip
+        // this case.
+        if (useSbe && FixtureHelpers.isMongos(conn.getDB("admin"))) {
+            return;
+        }
+        FixtureHelpers.runCommandOnEachPrimary({
+            db: conn.getDB("admin"),
+            cmdObj: {setParameter: 1, internalQueryEnableSlotBasedExecutionEngine: useSbe}
+        });
+
         // Force queries to hang on yield to allow for currentOp capture.
         FixtureHelpers.runCommandOnEachPrimary({
             db: conn.getDB("admin"),
@@ -243,6 +257,17 @@ function runTests({conn, readMode, currentOp, truncatedOps, localOps}) {
                 command: "find",
                 planSummary: "COLLSCAN",
                 currentOpFilter: {"command.comment": "currentop_query"}
+            },
+            {
+                test: function(db) {
+                    assert.eq(
+                        db.currentop_query.find({a: 1}).comment("currentop_query_sbe").itcount(),
+                        1);
+                },
+                command: "find",
+                useSbe: true,
+                planSummary: "COLLSCAN",
+                currentOpFilter: {"command.comment": "currentop_query_sbe", numYields: {$gt: 0}}
             },
             {
                 test: function(db) {
@@ -514,6 +539,9 @@ function runTests({conn, readMode, currentOp, truncatedOps, localOps}) {
 
         let currentOpFilter;
 
+        // Verify that the currentOp command removes the comment field from the command while
+        // truncating the command. Command {find: <coll>, comment: <comment>, filter: {XYZ}} should
+        // be represented as {$truncated: "{find: <coll>, filter: {XY...", comment: <comment>}.
         currentOpFilter = {
             "command.$truncated": {$regex: truncatedQueryString},
             "command.comment": "currentop_query"
@@ -521,10 +549,31 @@ function runTests({conn, readMode, currentOp, truncatedOps, localOps}) {
 
         confirmCurrentOpContents({
             test: function(db) {
-                assert.eq(db.currentop_query.find(TestData.queryFilter)
-                              .comment("currentop_query")
-                              .itcount(),
-                          0);
+                // We put the 'comment' field before the large 'filter' in the command object so
+                // that, when the object is truncated in the currentOp output, we can confirm that
+                // the 'comment' field has been removed from the object and promoted to a top-level
+                // field.
+                assert.commandWorked(db.runCommand({
+                    find: "currentop_query",
+                    comment: "currentop_query",
+                    filter: TestData.queryFilter
+                }));
+            },
+            planSummary: "COLLSCAN",
+            currentOpFilter: currentOpFilter
+        });
+
+        // Verify that a command without the "comment" field appears as {$truncated: <string>} when
+        // truncated by currentOp.
+        currentOpFilter = {
+            "command.$truncated": {$regex: truncatedQueryString},
+            "command.comment": {$exists: false}
+        };
+
+        confirmCurrentOpContents({
+            test: function(db) {
+                assert.commandWorked(
+                    db.runCommand({find: "currentop_query", filter: TestData.queryFilter}));
             },
             planSummary: "COLLSCAN",
             currentOpFilter: currentOpFilter
@@ -534,8 +583,8 @@ function runTests({conn, readMode, currentOp, truncatedOps, localOps}) {
         // <string>, comment: <string> }.
         const cmdRes = testDB.runCommand({
             find: "currentop_query",
-            filter: TestData.queryFilter,
             comment: "currentop_query",
+            filter: TestData.queryFilter,
             batchSize: 0
         });
         assert.commandWorked(cmdRes);
@@ -572,11 +621,12 @@ function runTests({conn, readMode, currentOp, truncatedOps, localOps}) {
 
         confirmCurrentOpContents({
             test: function(db) {
-                assert.eq(
-                    db.currentop_query
-                        .aggregate([{$match: TestData.queryFilter}], {comment: "currentop_query"})
-                        .itcount(),
-                    0);
+                assert.commandWorked(db.runCommand({
+                    aggregate: "currentop_query",
+                    comment: "currentop_query",
+                    pipeline: [{$match: TestData.queryFilter}],
+                    cursor: {}
+                }));
             },
             planSummary: "COLLSCAN",
             currentOpFilter: currentOpFilter

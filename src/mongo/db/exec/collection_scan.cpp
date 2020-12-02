@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/db/exec/collection_scan.h"
 
@@ -57,7 +57,7 @@ using std::vector;
 const char* CollectionScan::kStageType = "COLLSCAN";
 
 CollectionScan::CollectionScan(ExpressionContext* expCtx,
-                               const Collection* collection,
+                               const CollectionPtr& collection,
                                const CollectionScanParams& params,
                                WorkingSet* workingSet,
                                const MatchExpression* filter)
@@ -78,6 +78,15 @@ CollectionScan::CollectionScan(ExpressionContext* expCtx,
         invariant(!params.resumeAfterRecordId);
     }
     invariant(!_params.shouldTrackLatestOplogTimestamp || collection->ns().isOplog());
+
+    // We should never see 'assertMinTsHasNotFallenOffOplog' if 'minTS' is not present.
+    if (params.assertMinTsHasNotFallenOffOplog) {
+        invariant(params.shouldTrackLatestOplogTimestamp);
+        uassert(ErrorCodes::InvalidOptions,
+                str::stream() << "assertMinTsHasNotFallenOffOplog cannot be applied to a query "
+                                 "which does not imply a minimum 'ts' value ",
+                params.minTs);
+    }
 
     if (params.resumeAfterRecordId) {
         // The 'resumeAfterRecordId' parameter is used for resumable collection scans, which we
@@ -133,12 +142,10 @@ PlanStage::StageState CollectionScan::doWork(WorkingSetID* out) {
                 // only time we'd need to create a cursor after already getting a record out of it
                 // and updating our _lastSeenId.
                 if (!_cursor->seekExact(_lastSeenId)) {
-                    Status status(ErrorCodes::CappedPositionLost,
-                                  str::stream() << "CollectionScan died due to failure to restore "
-                                                << "tailable cursor position. "
-                                                << "Last seen record id: " << _lastSeenId);
-                    *out = WorkingSetCommon::allocateStatusMember(_workingSet, status);
-                    return PlanStage::FAILURE;
+                    uasserted(ErrorCodes::CappedPositionLost,
+                              str::stream() << "CollectionScan died due to failure to restore "
+                                            << "tailable cursor position. "
+                                            << "Last seen record id: " << _lastSeenId);
                 }
             }
 
@@ -152,14 +159,12 @@ PlanStage::StageState CollectionScan::doWork(WorkingSetID* out) {
                 // returned this one prior to the resume.
                 auto recordIdToSeek = *_params.resumeAfterRecordId;
                 if (!_cursor->seekExact(recordIdToSeek)) {
-                    Status status(
+                    uasserted(
                         ErrorCodes::KeyNotFound,
                         str::stream()
                             << "Failed to resume collection scan: the recordId from which we are "
                             << "attempting to resume no longer exists in the collection. "
                             << "recordId: " << recordIdToSeek);
-                    *out = WorkingSetCommon::allocateStatusMember(_workingSet, status);
-                    return PlanStage::FAILURE;
                 }
             }
 
@@ -191,25 +196,22 @@ PlanStage::StageState CollectionScan::doWork(WorkingSetID* out) {
     }
 
     if (!record) {
-        // We just hit EOF. If we are tailable and have already returned data, leave us in a
-        // state to pick up where we left off on the next call to work(). Otherwise EOF is
-        // permanent.
+        // We hit EOF. If we are tailable and have already seen data, leave us in a state to pick up
+        // where we left off on the next call to work(). Otherwise, the EOF is permanent.
         if (_params.tailable && !_lastSeenId.isNull()) {
             _cursor.reset();
         } else {
             _commonStats.isEOF = true;
         }
-
         return PlanStage::IS_EOF;
     }
 
     _lastSeenId = record->id;
+    if (_params.assertMinTsHasNotFallenOffOplog) {
+        assertMinTsHasNotFallenOffOplog(*record);
+    }
     if (_params.shouldTrackLatestOplogTimestamp) {
-        auto status = setLatestOplogEntryTimestamp(*record);
-        if (!status.isOK()) {
-            *out = WorkingSetCommon::allocateStatusMember(_workingSet, status);
-            return PlanStage::FAILURE;
-        }
+        setLatestOplogEntryTimestamp(*record);
     }
 
     WorkingSetID id = _workingSet->allocate();
@@ -221,17 +223,31 @@ PlanStage::StageState CollectionScan::doWork(WorkingSetID* out) {
     return returnIfMatches(member, id, out);
 }
 
-Status CollectionScan::setLatestOplogEntryTimestamp(const Record& record) {
+void CollectionScan::setLatestOplogEntryTimestamp(const Record& record) {
     auto tsElem = record.data.toBson()[repl::OpTime::kTimestampFieldName];
-    if (tsElem.type() != BSONType::bsonTimestamp) {
-        Status status(ErrorCodes::InternalError,
-                      str::stream() << "CollectionScan was asked to track latest operation time, "
-                                       "but found a result without a valid 'ts' field: "
-                                    << record.data.toBson().toString());
-        return status;
-    }
+    uassert(ErrorCodes::Error(4382100),
+            str::stream() << "CollectionScan was asked to track latest operation time, "
+                             "but found a result without a valid 'ts' field: "
+                          << record.data.toBson().toString(),
+            tsElem.type() == BSONType::bsonTimestamp);
     _latestOplogEntryTimestamp = std::max(_latestOplogEntryTimestamp, tsElem.timestamp());
-    return Status::OK();
+}
+
+void CollectionScan::assertMinTsHasNotFallenOffOplog(const Record& record) {
+    // If the first entry we see in the oplog is the replset initialization, then it doesn't matter
+    // if its timestamp is later than the specified minTs; no events earlier than the minTs can have
+    // fallen off this oplog. Otherwise, verify that the timestamp of the first observed oplog entry
+    // is earlier than or equal to the minTs time.
+    auto oplogEntry = invariantStatusOK(repl::OplogEntry::parse(record.data.toBson()));
+    invariant(_specificStats.docsTested == 0);
+    const bool isNewRS =
+        oplogEntry.getObject().binaryEqual(BSON("msg" << repl::kInitiatingSetMsg)) &&
+        oplogEntry.getOpType() == repl::OpTypeEnum::kNoop;
+    uassert(ErrorCodes::OplogQueryMinTsMissing,
+            "Specified minTs has already fallen off the oplog",
+            isNewRS || oplogEntry.getTimestamp() <= *_params.minTs);
+    // We don't need to check this assertion again after we've confirmed the first oplog event.
+    _params.assertMinTsHasNotFallenOffOplog = false;
 }
 
 PlanStage::StageState CollectionScan::returnIfMatches(WorkingSetMember* member,

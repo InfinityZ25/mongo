@@ -93,7 +93,7 @@ __block_destroy(WT_SESSION_IMPL *session, WT_BLOCK *block)
     uint64_t bucket;
 
     conn = S2C(session);
-    bucket = block->name_hash % WT_HASH_ARRAY_SIZE;
+    bucket = block->name_hash & (conn->hash_size - 1);
     WT_CONN_BLOCK_REMOVE(conn, block, bucket);
 
     __wt_free(session, block->name);
@@ -147,7 +147,7 @@ __wt_block_open(WT_SESSION_IMPL *session, const char *filename, const char *cfg[
 
     conn = S2C(session);
     hash = __wt_hash_city64(filename, strlen(filename));
-    bucket = hash % WT_HASH_ARRAY_SIZE;
+    bucket = hash & (conn->hash_size - 1);
     __wt_spin_lock(session, &conn->block_lock);
     TAILQ_FOREACH (block, &conn->blockhash[bucket], hashq) {
         if (strcmp(filename, block->name) == 0) {
@@ -207,6 +207,13 @@ __wt_block_open(WT_SESSION_IMPL *session, const char *filename, const char *cfg[
 
     /* Set the file's size. */
     WT_ERR(__wt_filesize(session, block->fh, &block->size));
+    /*
+     * If we're opening a file and it only contains a header and we're doing incremental backup
+     * indicate this so that the first checkpoint is sure to set all the bits as dirty to cover the
+     * header so that the header gets copied.
+     */
+    if (block->size == allocsize && F_ISSET(conn, WT_CONN_INCR_BACKUP))
+        block->created_during_backup = true;
 
     /* Initialize the live checkpoint's lock. */
     WT_ERR(__wt_spin_init(session, &block->live_lock, "block manager"));
@@ -326,9 +333,9 @@ __desc_read(WT_SESSION_IMPL *session, uint32_t allocsize, WT_BLOCK *block)
      * In the general case, we should return a generic error and signal that we've detected data
      * corruption.
      *
-     * FIXME: MongoDB relies heavily on the error codes reported when opening cursors (which hits
-     * this logic if the relevant data handle isn't already open). However this code gets run in
-     * rollback to stable as part of recovery where we want to skip any corrupted data files
+     * FIXME-WT-5832: MongoDB relies heavily on the error codes reported when opening cursors (which
+     * hits this logic if the relevant data handle isn't already open). However this code gets run
+     * in rollback to stable as part of recovery where we want to skip any corrupted data files
      * temporarily to allow MongoDB to initiate salvage. This is why we've been forced into this
      * situation. We should address this as part of WT-5832 and clarify what error codes we expect
      * to be returning across the API boundary.
@@ -377,15 +384,26 @@ __desc_read(WT_SESSION_IMPL *session, uint32_t allocsize, WT_BLOCK *block)
     if (desc->magic != WT_BLOCK_MAGIC || !checksum_matched) {
         if (strcmp(block->name, WT_METAFILE) == 0 || strcmp(block->name, WT_HS_FILE) == 0)
             WT_ERR_MSG(session, WT_TRY_SALVAGE, "%s is corrupted", block->name);
-        WT_ERR_MSG(session, WT_ERROR, "%s does not appear to be a WiredTiger file", block->name);
+        /*
+         * If we're doing an import, we can't expect to be able to verify checksums since we don't
+         * know the allocation size being used. This isn't an error so we should just return success
+         * and let import get whatever information it needs.
+         */
+        if (F_ISSET(session, WT_SESSION_IMPORT_REPAIR))
+            goto err;
+
+        if (F_ISSET(session, WT_SESSION_ROLLBACK_TO_STABLE))
+            ret = ENOENT;
+        else
+            WT_ERR_MSG(
+              session, WT_ERROR, "%s does not appear to be a WiredTiger file", block->name);
     }
 
     if (desc->majorv > WT_BLOCK_MAJOR_VERSION ||
       (desc->majorv == WT_BLOCK_MAJOR_VERSION && desc->minorv > WT_BLOCK_MINOR_VERSION))
         WT_ERR_MSG(session, WT_ERROR,
-          "unsupported WiredTiger file version: this build only "
-          "supports major/minor versions up to %d/%d, and the file "
-          "is version %" PRIu16 "/%" PRIu16,
+          "unsupported WiredTiger file version: this build only supports major/minor versions up "
+          "to %d/%d, and the file is version %" PRIu16 "/%" PRIu16,
           WT_BLOCK_MAJOR_VERSION, WT_BLOCK_MINOR_VERSION, desc->majorv, desc->minorv);
 
     __wt_verbose(session, WT_VERB_BLOCK, "%s: magic %" PRIu32 ", major/minor: %" PRIu32 "/%" PRIu32,

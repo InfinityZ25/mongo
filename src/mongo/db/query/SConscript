@@ -15,10 +15,26 @@ env.SConscript(
 )
 
 env.Library(
-    target='query_planner',
+    target='canonical_query',
     source=[
         "canonical_query.cpp",
         "canonical_query_encoder.cpp",
+    ],
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/db/cst/cst",
+        "$BUILD_DIR/mongo/db/matcher/expressions",
+        "collation/collator_factory_interface",
+        "collation/collator_interface",
+        "projection_ast",
+        "sort_pattern",
+    ],
+    LIBDEPS_PRIVATE=[
+    ],
+)
+
+env.Library(
+    target='query_planner',
+    source=[
         "index_tag.cpp",
         "plan_cache.cpp",
         "plan_cache_indexability.cpp",
@@ -36,26 +52,37 @@ env.Library(
         "query_planner_common.cpp",
         "query_settings.cpp",
         "query_solution.cpp",
-        env.Idlc("expression_index_knobs.idl")[0],
+        "expression_index_knobs.idl",
+        "stage_types.cpp",
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
         "$BUILD_DIR/mongo/db/bson/dotted_path_support",
         '$BUILD_DIR/mongo/db/commands/server_status_core',
         "$BUILD_DIR/mongo/db/exec/projection_executor",
+        "$BUILD_DIR/mongo/db/exec/sbe/query_sbe_plan_stats",
         "$BUILD_DIR/mongo/db/index/expression_params",
         "$BUILD_DIR/mongo/db/index/key_generator",
         "$BUILD_DIR/mongo/db/index_names",
-        "$BUILD_DIR/mongo/db/matcher/expressions",
         "$BUILD_DIR/mongo/db/mongohasher",
-        "collation/collator_factory_interface",
-        "collation/collator_interface",
+        'canonical_query',
         "command_request_response",
-        "projection_ast",
         "query_knobs",
     ],
     LIBDEPS_PRIVATE=[
         "$BUILD_DIR/mongo/idl/server_parameter",
+    ],
+)
+
+env.Library(
+    target='sbe_stage_builder_helpers',
+    source=[
+        "sbe_stage_builder_helpers.cpp",
+    ],
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/base",
+        '$BUILD_DIR/mongo/db/exec/sbe/query_sbe',
+        "$BUILD_DIR/mongo/db/matcher/expressions",
     ],
 )
 
@@ -75,7 +102,7 @@ env.Library(
 env.Library(
     target='distinct_command_idl',
     source=[
-        env.Idlc('distinct_command.idl')[0],
+        'distinct_command.idl',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/idl/idl_parser',
@@ -113,6 +140,7 @@ env.Library(
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
+        "$BUILD_DIR/mongo/idl/idl_parser",
     ],
 )
 
@@ -134,12 +162,11 @@ env.Library(
         "count_request.cpp",
         'cursor_request.cpp',
         'cursor_response.cpp',
-        'find_and_modify_request.cpp',
         'getmore_request.cpp',
-        'killcursors_request.cpp',
         'killcursors_response.cpp',
         'view_response_formatter.cpp',
-        env.Idlc('count_command.idl')[0],
+        'count_command.idl',
+        'kill_cursors.idl',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -147,11 +174,11 @@ env.Library(
         '$BUILD_DIR/mongo/db/common',
         '$BUILD_DIR/mongo/db/namespace_string',
         '$BUILD_DIR/mongo/db/ops/write_ops_parsers',
+        '$BUILD_DIR/mongo/db/query/hint_parser',
         '$BUILD_DIR/mongo/db/repl/optime',
-        "$BUILD_DIR/mongo/idl/idl_parser",
+        '$BUILD_DIR/mongo/idl/idl_parser',
         '$BUILD_DIR/mongo/rpc/command_status',
         '$BUILD_DIR/mongo/rpc/rpc',
-        '$BUILD_DIR/mongo/db/query/hint_parser',
         'query_request',
     ]
 )
@@ -161,10 +188,11 @@ env.Library(
     source=[
         "query_request.cpp",
         "tailable_mode.cpp",
-        env.Idlc("tailable_mode.idl")[0],
+        "tailable_mode.idl",
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
+        "$BUILD_DIR/mongo/db/api_parameters",
         "$BUILD_DIR/mongo/db/catalog/collection_catalog",
         # TODO: This dependency edge can be removed when the 'allowDiskUse' option no longer depends
         # on enabling test commands.
@@ -177,7 +205,7 @@ env.Library(
 env.Library(
     target="query_knobs",
     source=[
-        env.Idlc('query_knobs.idl')[0]
+        'query_knobs.idl',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/idl/server_parameter'
@@ -190,9 +218,9 @@ env.Library(
         "query_test_service_context.cpp",
     ],
     LIBDEPS=[
-        "collation/collator_factory_mock",
         "$BUILD_DIR/mongo/db/logical_session_id",
         "$BUILD_DIR/mongo/db/service_context",
+        "collation/collator_factory_mock",
     ],
     LIBDEPS_PRIVATE=[
     ],
@@ -204,8 +232,8 @@ env.Library(
         "query_planner_test_fixture.cpp",
     ],
     LIBDEPS=[
-        "query_planner_test_lib",
         "$BUILD_DIR/mongo/unittest/unittest",
+        "query_planner_test_lib",
     ],
 )
 
@@ -225,7 +253,7 @@ env.Library(
     target="hint_parser",
     source=[
         "hint_parser.cpp",
-        env.Idlc('hint.idl')[0],
+        'hint.idl',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -233,15 +261,30 @@ env.Library(
 )
 
 env.Library(
-     target="sort_pattern",
-     source=[
-         "sort_pattern.cpp",
-     ],
-     LIBDEPS=[
-         '$BUILD_DIR/mongo/base',
-         '$BUILD_DIR/mongo/db/exec/document_value/document_value',
-         '$BUILD_DIR/mongo/db/pipeline/expression_context',
-     ],
+    target="sort_pattern",
+    source=[
+        "sort_pattern.cpp",
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/exec/document_value/document_value',
+        '$BUILD_DIR/mongo/db/pipeline/expression_context',
+    ],
+ )
+
+env.Library(
+    target="plan_yield_policy",
+    source=[
+        "plan_yield_policy.cpp",
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/util/elapsed_tracker',
+        '$BUILD_DIR/mongo/util/fail_point',
+    ],
+    LIBDEPS_TYPEINFO=[
+        '$BUILD_DIR/mongo/db/service_context',
+    ],
  )
 
 env.CppUnitTest(
@@ -249,10 +292,10 @@ env.CppUnitTest(
     source=[
         "canonical_query_encoder_test.cpp",
         "canonical_query_test.cpp",
+        "classic_stage_builder_test.cpp",
         "count_command_test.cpp",
         "cursor_response_test.cpp",
         "explain_options_test.cpp",
-        "find_and_modify_request_test.cpp",
         "get_executor_test.cpp",
         "getmore_request_test.cpp",
         "hint_parser_test.cpp",
@@ -292,17 +335,24 @@ env.CppUnitTest(
         "query_request_test.cpp",
         "query_settings_test.cpp",
         "query_solution_test.cpp",
+        "sbe_stage_builder_test_fixture.cpp",
+        "sbe_stage_builder_test.cpp",
+        "sbe_shard_filter_test.cpp",
+        "shard_filterer_factory_mock.cpp",
         "view_response_formatter_test.cpp",
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/db/auth/authmocks",
         "$BUILD_DIR/mongo/db/concurrency/lock_manager",
+        "$BUILD_DIR/mongo/db/exec/sbe/sbe_plan_stage_test",
         "$BUILD_DIR/mongo/db/pipeline/aggregation_request",
         "$BUILD_DIR/mongo/db/query_exec",
         "$BUILD_DIR/mongo/db/service_context_d",
+        "$BUILD_DIR/mongo/db/service_context_d_test_fixture",
         "$BUILD_DIR/mongo/db/service_context_test_fixture",
         "$BUILD_DIR/mongo/dbtests/mocklib",
         "$BUILD_DIR/mongo/rpc/rpc",
+        "$BUILD_DIR/mongo/util/clock_source_mock",
         "collation/collator_factory_mock",
         "collation/collator_interface_mock",
         "command_request_response",

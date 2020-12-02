@@ -2,6 +2,7 @@
 //   requires_fastcount,
 //   requires_non_retryable_writes,
 //   uses_multiple_connections,
+//   uses_parallel_shell,
 // ]
 
 // Test removal of Records that have been reused since the remove operation began.  SERVER-5198
@@ -12,7 +13,7 @@
 const t = db.jstests_removeb;
 t.drop();
 
-t.ensureIndex({a: 1});
+t.createIndex({a: 1});
 
 // Make the index multikey to trigger cursor dedup checking.
 t.insert({a: [-1, -2]});

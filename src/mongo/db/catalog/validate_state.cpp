@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -53,22 +53,21 @@ namespace CollectionValidation {
 
 ValidateState::ValidateState(OperationContext* opCtx,
                              const NamespaceString& nss,
-                             bool background,
-                             ValidateOptions options,
+                             ValidateMode mode,
+                             RepairMode repairMode,
                              bool turnOnExtraLoggingForTest)
     : _nss(nss),
-      _background(background),
-      _options(options),
+      _mode(mode),
+      _repairMode(repairMode),
       _dataThrottle(opCtx),
       _extraLoggingForTest(turnOnExtraLoggingForTest) {
 
     // Subsequent re-locks will use the UUID when 'background' is true.
-    if (_background) {
-        // We need to hold the global lock throughout the entire validation to avoid having to save
-        // and restore our cursors used throughout. This is done in order to avoid abandoning the
-        // snapshot and invalidating our cursors. Avoid taking the PBWM lock, which will stall
-        // replication if this is a secondary node being validated.
-        ShouldNotConflictWithSecondaryBatchApplicationBlock noConflict(opCtx->lockState());
+    if (isBackground()) {
+        // Avoid taking the PBWM lock, which will stall replication if this is a secondary node
+        // being validated.
+        _noPBWM.emplace(opCtx->lockState());
+
         _globalLock.emplace(opCtx, MODE_IS);
         _databaseLock.emplace(opCtx, _nss.db(), MODE_IS);
         _collectionLock.emplace(opCtx, _nss, MODE_IS);
@@ -78,8 +77,8 @@ ValidateState::ValidateState(OperationContext* opCtx,
     }
 
     _database = _databaseLock->getDb() ? _databaseLock->getDb() : nullptr;
-    _collection = _database ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, _nss)
-                            : nullptr;
+    if (_database)
+        _collection = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, _nss);
 
     if (!_collection) {
         if (_database && ViewCatalog::get(_database)->lookup(opCtx, _nss.ns())) {
@@ -90,20 +89,46 @@ ValidateState::ValidateState(OperationContext* opCtx,
                   str::stream() << "Collection '" << _nss << "' does not exist to validate.");
     }
 
+    // RepairMode is incompatible with the ValidateModes kBackground and
+    // kForegroundFullEnforceFastCount.
+    if (shouldRunRepair()) {
+        invariant(!isBackground());
+        invariant(!shouldEnforceFastCount());
+    }
+
     _uuid = _collection->uuid();
     _catalogGeneration = opCtx->getServiceContext()->getCatalogGeneration();
 }
 
-void ValidateState::yield(OperationContext* opCtx) {
-    if (_background) {
-        _yieldLocks(opCtx);
-    } else {
-        _yieldCursors(opCtx);
+bool ValidateState::shouldEnforceFastCount() const {
+    if (_mode == ValidateMode::kForegroundFullEnforceFastCount) {
+        if (_nss.isOplog()) {
+            // Oplog writers only take a global IX lock, so the oplog can still be written to even
+            // during full validation despite its collection X lock. This can cause validate to
+            // incorrectly report an incorrect fast count on the oplog when run in enforceFastCount
+            // mode.
+            return false;
+        } else if (_nss == NamespaceString::kIndexBuildEntryNamespace) {
+            // Do not enforce fast count on the 'config.system.indexBuilds' collection. This is an
+            // internal collection that should not be queried and is empty most of the time.
+            return false;
+        }
+
+        return true;
     }
+
+    return false;
+}
+
+void ValidateState::yield(OperationContext* opCtx) {
+    if (isBackground()) {
+        _yieldLocks(opCtx);
+    }
+    _yieldCursors(opCtx);
 }
 
 void ValidateState::_yieldLocks(OperationContext* opCtx) {
-    invariant(_background);
+    invariant(isBackground());
 
     // Drop and reacquire the locks.
     _relockDatabaseAndCollection(opCtx);
@@ -125,8 +150,6 @@ void ValidateState::_yieldLocks(OperationContext* opCtx) {
 };
 
 void ValidateState::_yieldCursors(OperationContext* opCtx) {
-    invariant(!_background);
-
     // Save all the cursors.
     for (const auto& indexCursor : _indexCursors) {
         indexCursor.second->save();
@@ -135,32 +158,61 @@ void ValidateState::_yieldCursors(OperationContext* opCtx) {
     _traverseRecordStoreCursor->save();
     _seekRecordStoreCursor->save();
 
+    if (isBackground() && _validateTs) {
+        // End current transaction and begin a new one, to help ameliorate WiredTiger cache
+        // pressure.
+
+        // First, move all cursor objects off our operation context, which has the effect of closing
+        // all storage engine cursors in the active transaction.
+        for (const auto& indexCursor : _indexCursors) {
+            indexCursor.second->detachFromOperationContext();
+        }
+        _traverseRecordStoreCursor->detachFromOperationContext();
+        _seekRecordStoreCursor->detachFromOperationContext();
+
+        // This begins a new transaction and then ends the current transaction, in order to preserve
+        // the history required to construct the same snapshot as before.
+        opCtx->recoveryUnit()->refreshSnapshot();
+
+        // Move the cursor objects back in preparation for restoring.
+        for (const auto& indexCursor : _indexCursors) {
+            indexCursor.second->reattachToOperationContext(opCtx);
+        }
+        _traverseRecordStoreCursor->reattachToOperationContext(opCtx);
+        _seekRecordStoreCursor->reattachToOperationContext(opCtx);
+    }
+
     // Restore all the cursors.
     for (const auto& indexCursor : _indexCursors) {
         indexCursor.second->restore();
     }
 
-    // Restore cannot fail while holding an exclusive collection lock.
-    invariant(_traverseRecordStoreCursor->restore());
-    invariant(_seekRecordStoreCursor->restore());
+    uassert(ErrorCodes::Interrupted,
+            "Interrupted due to: failure to restore yielded traverse cursor",
+            _traverseRecordStoreCursor->restore());
+    uassert(ErrorCodes::Interrupted,
+            "Interrupted due to: failure to restore yielded seek cursor",
+            _seekRecordStoreCursor->restore());
 }
 
 void ValidateState::initializeCursors(OperationContext* opCtx) {
     invariant(!_traverseRecordStoreCursor && !_seekRecordStoreCursor && _indexCursors.size() == 0 &&
               _indexes.size() == 0);
 
-    // Background validation will read from a snapshot opened on the kNoOverlap read source, which
-    // is the minimum of the last applied and all durable timestamps, instead of the latest data.
-    // Using the kNoOverlap read source prevents us from having to take the PBWM lock, which blocks
-    // replication. We cannot solely rely on the all durable timestamp as it can be set while we're
-    // in the middle of applying a batch on secondary nodes.
-    if (_background) {
-        invariant(!opCtx->lockState()->isCollectionLockedForMode(_nss, MODE_X));
+    // Background validation (on replica sets) will read from a snapshot opened on the kNoOverlap
+    // read source, which is the minimum of the last applied and all durable timestamps, instead of
+    // the latest data. Using the kNoOverlap read source prevents us from having to take the PBWM
+    // lock, which blocks replication. We cannot solely rely on the all durable timestamp as it can
+    // be set while we're in the middle of applying a batch on secondary nodes.
+    // Background validation on standalones uses the kNoTimestamp read source because standalones
+    // have no timestamps to use for maintaining a consistent snapshot.
+    RecoveryUnit::ReadSource rs = RecoveryUnit::ReadSource::kNoTimestamp;
+    if (isBackground()) {
         opCtx->recoveryUnit()->abandonSnapshot();
         // Background validation is expecting to read from the no overlap timestamp, but
         // standalones do not support timestamps. Therefore, if this process is currently running as
         // a standalone, don't use a timestamp.
-        RecoveryUnit::ReadSource rs;
+
         if (repl::ReplicationCoordinator::get(opCtx)->isReplEnabled()) {
             rs = RecoveryUnit::ReadSource::kNoOverlap;
         } else {
@@ -172,7 +224,7 @@ void ValidateState::initializeCursors(OperationContext* opCtx) {
     // We want to share the same data throttle instance across all the cursors used during this
     // validation. Validations started on other collections will not share the same data
     // throttle instance.
-    if (!_background) {
+    if (!isBackground()) {
         _dataThrottle.turnThrottlingOff();
     }
 
@@ -180,7 +232,12 @@ void ValidateState::initializeCursors(OperationContext* opCtx) {
         opCtx, _collection->getRecordStore(), &_dataThrottle);
     _seekRecordStoreCursor = std::make_unique<SeekableRecordThrottleCursor>(
         opCtx, _collection->getRecordStore(), &_dataThrottle);
-    _validateTs = opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
+
+    if (rs != RecoveryUnit::ReadSource::kNoTimestamp) {
+        invariant(rs == RecoveryUnit::ReadSource::kNoOverlap);
+        invariant(isBackground());
+        _validateTs = opCtx->recoveryUnit()->getPointInTimeReadTimestamp(opCtx);
+    }
 
     const IndexCatalog* indexCatalog = _collection->getIndexCatalog();
     // The index iterator for ready indexes is timestamp-aware and will only return indexes that
@@ -211,7 +268,7 @@ void ValidateState::initializeCursors(OperationContext* opCtx) {
 }
 
 void ValidateState::_relockDatabaseAndCollection(OperationContext* opCtx) {
-    invariant(_background);
+    invariant(isBackground());
 
     _collectionLock.reset();
     _databaseLock.reset();
@@ -240,7 +297,7 @@ void ValidateState::_relockDatabaseAndCollection(OperationContext* opCtx) {
         uasserted(ErrorCodes::Interrupted, collErrMsg);
     }
 
-    _collection = CollectionCatalog::get(opCtx).lookupCollectionByUUID(opCtx, *_uuid);
+    _collection = CollectionCatalog::get(opCtx)->lookupCollectionByUUID(opCtx, *_uuid);
     uassert(ErrorCodes::Interrupted, collErrMsg, _collection);
 
     // The namespace of the collection can be changed during a same database collection rename.

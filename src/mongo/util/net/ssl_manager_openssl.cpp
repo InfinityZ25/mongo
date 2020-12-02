@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -48,9 +48,11 @@
 #include "mongo/base/secure_allocator.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/config.h"
+#include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/transport/session.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/exit.h"
@@ -62,6 +64,7 @@
 #include "mongo/util/net/socket_exception.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/net/ssl_parameters_gen.h"
+#include "mongo/util/net/ssl_peer_info.h"
 #include "mongo/util/net/ssl_types.h"
 #include "mongo/util/periodic_runner.h"
 #include "mongo/util/read_through_cache.h"
@@ -83,6 +86,15 @@
 #include <openssl/x509v3.h>
 #ifdef MONGO_CONFIG_HAVE_SSL_EC_KEY_NEW
 #include <openssl/ec.h>
+#endif
+
+#if OPENSSL_VERSION_NUMBER < 0x1010100FL
+int SSL_CTX_set_ciphersuites(SSL_CTX*, const char*) {
+    uasserted(
+        4877400,
+        "Setting OpenSSL cipher suites is not allowed for OpenSSL versions older than 1.1.1.");
+    return 0;
+}
 #endif
 
 namespace mongo {
@@ -281,6 +293,10 @@ inline void X509_OBJECT_free(X509_OBJECT* a) {
     OPENSSL_free(a);
 }
 
+void X509_STORE_CTX_set0_untrusted(X509_STORE_CTX* ctx, STACK_OF(X509) * sk) {
+    X509_STORE_CTX_set_chain(ctx, sk);
+}
+
 X509_OBJECT* X509_STORE_CTX_get_obj_by_subject(X509_STORE_CTX* vs, int type, X509_NAME* name) {
     X509_OBJECT* ret;
     ret = (X509_OBJECT*)OPENSSL_malloc(sizeof(X509_OBJECT));
@@ -364,11 +380,50 @@ UniqueVerifiedChainPolyfill SSLgetVerifiedChain(SSL* s) {
     return UniqueVerifiedChainPolyfill(SSL_get0_verified_chain(s));
 }
 
+SSLX509Name convertX509ToSSLX509Name(X509_NAME* x509Name) {
+    std::vector<std::vector<SSLX509Name::Entry>> entries;
+
+    int count = X509_NAME_entry_count(x509Name);
+    int prevSet = -1;
+    std::vector<SSLX509Name::Entry> rdn;
+    for (int i = count - 1; i >= 0; --i) {
+        auto* entry = X509_NAME_get_entry(x509Name, i);
+
+        const auto currentSet = X509_NAME_ENTRY_set(entry);
+        if (currentSet != prevSet) {
+            if (!rdn.empty()) {
+                entries.push_back(std::move(rdn));
+                rdn = std::vector<SSLX509Name::Entry>();
+            }
+            prevSet = currentSet;
+        }
+
+        char buffer[128];
+        // OBJ_obj2txt can only fail if we pass a nullptr from get_object,
+        // or if OpenSSL's BN library falls over.
+        // In either case, just panic.
+        uassert(ErrorCodes::InvalidSSLConfiguration,
+                "Unable to parse certificate subject name",
+                OBJ_obj2txt(buffer, sizeof(buffer), X509_NAME_ENTRY_get_object(entry), 1) > 0);
+
+        const auto* str = X509_NAME_ENTRY_get_data(entry);
+        rdn.emplace_back(
+            buffer, str->type, std::string(reinterpret_cast<const char*>(str->data), str->length));
+    }
+    if (!rdn.empty()) {
+        entries.push_back(std::move(rdn));
+    }
+
+    SSLX509Name sslX509Name = SSLX509Name(std::move(entries));
+    uassertStatusOK(sslX509Name.normalizeStrings());
+    return sslX509Name;
+}
+
 /*
  * Converts time from OpenSSL return value to Date_t representing the time on
  * the ASN1_TIME object.
  */
-Date_t convertASN1ToMillis(ASN1_TIME* asn1time) {
+Date_t convertASN1ToMillis(const ASN1_TIME* asn1time) {
     static const int DATE_LEN = 128;
 
     BIO* outBIO = BIO_new(BIO_s_mem());
@@ -423,6 +478,7 @@ public:
 
 using UniqueSSLContext =
     std::unique_ptr<SSL_CTX, OpenSSLDeleter<decltype(::SSL_CTX_free), ::SSL_CTX_free>>;
+using UniqueSSL = std::unique_ptr<SSL, OpenSSLDeleter<decltype(::SSL_free), ::SSL_free>>;
 static const int BUFFER_SIZE = 8 * 1024;
 
 using UniqueX509 = std::unique_ptr<X509, OpenSSLDeleter<decltype(X509_free), ::X509_free>>;
@@ -460,18 +516,32 @@ struct X509_OBJECTFree {
 
 using UniqueX509Object = std::unique_ptr<X509_OBJECT, X509_OBJECTFree>;
 
-StatusWith<UniqueCertId> getCertIdForCert(SSL_CTX* context, X509* cert) {
-    // Look in the certificate store for the certificate that issued cert
+StatusWith<UniqueCertId> getCertIdForCert(SSL_CTX* context,
+                                          X509* cert,
+                                          STACK_OF(X509) * intermediateCerts) {
+    // First search the intermediate certificates for the issuer.
+    for (int i = 0; i < sk_X509_num(intermediateCerts); i++) {
+        if (X509_NAME_cmp(X509_get_issuer_name(cert),
+                          X509_get_subject_name(sk_X509_value(intermediateCerts, i))) == 0) {
+            return UniqueCertId(
+                OCSP_cert_to_id(nullptr, cert, sk_X509_value(intermediateCerts, i)));
+        }
+    }
+
     UniqueX509StoreCtx storeCtx(X509_STORE_CTX_new());
+
     if (!storeCtx) {
         return getSSLFailure("Could not create X509 store.");
     }
+
+    // Look in the certificate store for the certificate that issued cert
     if (X509_STORE_CTX_init(storeCtx.get(), SSL_CTX_get_cert_store(context), NULL, NULL) == 0) {
-        return getSSLFailure("Could not initialize the X509 Store Context.");
+        return getSSLFailure("Could not initialize the X509 Store Context for the SSL Context.");
     }
 
     UniqueX509Object obj(X509_STORE_CTX_get_obj_by_subject(
         storeCtx.get(), X509_LU_X509, X509_get_issuer_name(cert)));
+
     if (obj == nullptr) {
         return getSSLFailure("Could not get X509 Object from store.");
     }
@@ -524,6 +594,16 @@ struct OCSPFetchResponse {
             return Milliseconds(0);
         }
 
+        // If the setParameter for OCSPStaplingRefreshPeriodSecs is too high, we want to
+        // make sure that we are never left without a stapled OCSP response because we
+        // were not refreshing fast enough.
+        if (kOCSPStaplingRefreshPeriodSecs != -1 &&
+            kOCSPStaplingRefreshPeriodSecs <
+                durationCount<Seconds>(timeBeforeNextUpdate -
+                                       Seconds(60 + gTLSOCSPStaplingTimeoutSecs))) {
+
+            return Milliseconds(Seconds(kOCSPStaplingRefreshPeriodSecs));
+        }
         return timeBeforeNextUpdate / 2;
     }
 
@@ -595,7 +675,8 @@ StatusWith<std::vector<std::string>> addOCSPUrlToMap(
     SSL_CTX* context,
     X509* cert,
     std::map<std::string, OCSPRequestAndIDs>& ocspRequestMap,
-    OCSPCertIDSet& uniqueCertIds) {
+    OCSPCertIDSet& uniqueCertIds,
+    STACK_OF(X509) * intermediateCerts) {
 
     UniqueOpenSSLStringStack aiaOCSP(X509_get1_ocsp(cert));
     std::vector<std::string> responders;
@@ -627,7 +708,7 @@ StatusWith<std::vector<std::string>> addOCSPUrlToMap(
 
         HostAndPort hostAndPort(str::stream() << host << ":" << port);
 
-        auto swCertId = getCertIdForCert(context, cert);
+        auto swCertId = getCertIdForCert(context, cert, intermediateCerts);
         if (!swCertId.isOK()) {
             return swCertId.getStatus();
         }
@@ -637,7 +718,7 @@ StatusWith<std::vector<std::string>> addOCSPUrlToMap(
             return getSSLFailure("Could not get certificate ID for Map.");
         }
 
-        swCertId = getCertIdForCert(context, cert);
+        swCertId = getCertIdForCert(context, cert, intermediateCerts);
         if (!swCertId.isOK()) {
             return swCertId.getStatus();
         }
@@ -658,7 +739,7 @@ StatusWith<std::vector<std::string>> addOCSPUrlToMap(
         mapIter->second.certIDs.insert(std::move(certIDForArray));
     }
 
-    auto swCertId = getCertIdForCert(context, cert);
+    auto swCertId = getCertIdForCert(context, cert, intermediateCerts);
     if (!swCertId.isOK()) {
         return swCertId.getStatus();
     }
@@ -674,7 +755,8 @@ StatusWith<std::vector<std::string>> addOCSPUrlToMap(
 }
 
 Future<UniqueOCSPResponse> retrieveOCSPResponse(const std::string& host,
-                                                OCSPRequestAndIDs& ocspRequestAndIDs) {
+                                                OCSPRequestAndIDs& ocspRequestAndIDs,
+                                                OCSPPurpose purpose) {
     auto& [ocspReq, certIDs] = ocspRequestAndIDs;
 
     // Decompose the OCSP request into a DER encoded OCSP request
@@ -691,8 +773,8 @@ Future<UniqueOCSPResponse> retrieveOCSPResponse(const std::string& host,
     }
 
     // Query the OCSP responder
-    return OCSPManager::get()
-        ->requestStatus(buffer, host)
+    return OCSPManager::get(getGlobalServiceContext())
+        ->requestStatus(buffer, host, purpose)
         .then([](std::vector<uint8_t> responseData) mutable -> StatusWith<UniqueOCSPResponse> {
             const uint8_t* respDataPtr = responseData.data();
 
@@ -713,9 +795,9 @@ Future<UniqueOCSPResponse> retrieveOCSPResponse(const std::string& host,
  * and returns a set of Certificate IDs that are there in the response and a date object
  * which represents the time when the Response needs to be refreshed.
  */
-StatusWith<std::pair<OCSPCertIDSet, Date_t>> iterateResponse(OCSP_BASICRESP* basicResp,
-                                                             STACK_OF(X509) * intermediateCerts) {
-    Date_t earliestNextUpdate = Date_t::max();
+StatusWith<std::pair<OCSPCertIDSet, boost::optional<Date_t>>> iterateResponse(
+    OCSP_BASICRESP* basicResp, STACK_OF(X509) * intermediateCerts) {
+    boost::optional<Date_t> earliestNextUpdate = boost::none;
 
     OCSPCertIDSet certIdsInResponse;
 
@@ -732,7 +814,6 @@ StatusWith<std::pair<OCSPCertIDSet, Date_t>> iterateResponse(OCSP_BASICRESP* bas
             OCSP_CERTID_dup(const_cast<OCSP_CERTID*>(OCSP_SINGLERESP_get0_id(singleResp))));
 
         int reason;
-        // TODO SERVER-45798 the updated time will be implemented in the cache
         ASN1_GENERALIZEDTIME *revtime, *thisupd, *nextupd;
 
         auto status = OCSP_single_get0_status(singleResp, &reason, &revtime, &thisupd, &nextupd);
@@ -746,8 +827,12 @@ StatusWith<std::pair<OCSPCertIDSet, Date_t>> iterateResponse(OCSP_BASICRESP* bas
                                  << "Unexpected OCSP Certificate Status. Reason: " << status);
         }
 
-        Date_t nextUpdateDate(convertASN1ToMillis(static_cast<ASN1_TIME*>(nextupd)));
-        earliestNextUpdate = std::min(earliestNextUpdate, nextUpdateDate);
+        if (nextupd) {
+            Date_t nextUpdateDate(convertASN1ToMillis(static_cast<ASN1_TIME*>(nextupd)));
+            earliestNextUpdate = earliestNextUpdate
+                ? boost::optional<Date_t>(std::min(earliestNextUpdate.get(), nextUpdateDate))
+                : boost::optional<Date_t>(nextUpdateDate);
+        }
     }
 
     if (earliestNextUpdate < Date_t::now()) {
@@ -762,7 +847,7 @@ StatusWith<std::pair<OCSPCertIDSet, Date_t>> iterateResponse(OCSP_BASICRESP* bas
  * the IDs of the certificates that the OCSP Response contains. The Date_t object is the
  * earliest expiration date on the OCSPResponse.
  */
-StatusWith<std::pair<OCSPCertIDSet, Date_t>> parseAndValidateOCSPResponse(
+StatusWith<std::pair<OCSPCertIDSet, boost::optional<Date_t>>> parseAndValidateOCSPResponse(
     SSL_CTX* context, OCSP_RESPONSE* response, STACK_OF(X509) * intermediateCerts) {
     // Read the overall status of the OCSP response
     int responseStatus = OCSP_response_status(response);
@@ -777,7 +862,6 @@ StatusWith<std::pair<OCSPCertIDSet, Date_t>> parseAndValidateOCSPResponse(
                                  << "Response Status: " << responseStatus);
         case OCSP_RESPONSE_STATUS_TRYLATER:
         case OCSP_RESPONSE_STATUS_INTERNALERROR:
-            // TODO: SERVER-42936 Add support for tlsAllowInvalidCertificates
             return getSSLFailure(str::stream()
                                  << "Error querying the OCSP responder, an error occured in the "
                                  << "responder itself. Response Status: " << responseStatus);
@@ -805,7 +889,8 @@ StatusWith<std::pair<OCSPCertIDSet, Date_t>> parseAndValidateOCSPResponse(
 
 Future<OCSPFetchResponse> dispatchRequests(SSL_CTX* context,
                                            std::shared_ptr<STACK_OF(X509)> intermediateCerts,
-                                           OCSPValidationContext& ocspContext) {
+                                           OCSPValidationContext& ocspContext,
+                                           OCSPPurpose purpose) {
     auto& [ocspRequestMap, _, leafResponders] = ocspContext;
 
     struct OCSPCompletionState {
@@ -825,7 +910,8 @@ Future<OCSPFetchResponse> dispatchRequests(SSL_CTX* context,
 
     for (auto host : leafResponders) {
         auto& ocspRequestAndIDs = ocspRequestMap[host];
-        Future<UniqueOCSPResponse> futureResponse = retrieveOCSPResponse(host, ocspRequestAndIDs);
+        Future<UniqueOCSPResponse> futureResponse =
+            retrieveOCSPResponse(host, ocspRequestAndIDs, purpose);
         futureResponses.push_back(std::move(futureResponse));
     };
 
@@ -858,7 +944,7 @@ Future<OCSPFetchResponse> dispatchRequests(SSL_CTX* context,
                     // If not, we pass down a bogus response, and let the caller deal with it down
                     // there.
                     boost::optional<Date_t> nextUpdate = swCertIDSetAndDuration.isOK()
-                        ? boost::optional<Date_t>(swCertIDSetAndDuration.getValue().second)
+                        ? swCertIDSetAndDuration.getValue().second
                         : boost::none;
 
                     if (state->finishLine.arriveStrongly()) {
@@ -894,7 +980,8 @@ StatusWith<OCSPValidationContext> extractOcspUris(SSL_CTX* context,
     std::map<std::string, OCSPRequestAndIDs> ocspRequestMap;
     OCSPCertIDSet uniqueCertIds;
 
-    auto swLeafResponders = addOCSPUrlToMap(context, peerCert, ocspRequestMap, uniqueCertIds);
+    auto swLeafResponders =
+        addOCSPUrlToMap(context, peerCert, ocspRequestMap, uniqueCertIds, intermediateCerts);
     if (!swLeafResponders.isOK()) {
         return swLeafResponders.getStatus();
     }
@@ -911,7 +998,7 @@ StatusWith<OCSPValidationContext> extractOcspUris(SSL_CTX* context,
 class OCSPCache : public ReadThroughCache<OCSPCacheKey, OCSPFetchResponse> {
 public:
     OCSPCache(ServiceContext* service)
-        : ReadThroughCache(_mutex, service, _threadPool, tlsOCSPCacheSize) {
+        : ReadThroughCache(_mutex, service, _threadPool, _lookup, tlsOCSPCacheSize) {
         _threadPool.startup();
     }
 
@@ -928,29 +1015,32 @@ public:
     }
 
 private:
-    boost::optional<OCSPFetchResponse> lookup(OperationContext* opCtx,
-                                              const OCSPCacheKey& key) final {
+    static LookupResult _lookup(OperationContext* opCtx,
+                                const OCSPCacheKey& key,
+                                const ValueHandle& unusedCachedValue) {
         // If there is a CRL file, we expect the CRL file to cover the certificate status
         // information, and therefore we don't need to make a roundtrip.
         if (!getSSLGlobalParams().sslCRLFile.empty()) {
-            return boost::none;
+            return LookupResult(boost::none);
         }
 
         auto swOCSPContext =
             extractOcspUris(key.context, key.peerCert.get(), key.intermediateCerts.get());
         if (!swOCSPContext.isOK()) {
-            return boost::none;
+            return LookupResult(boost::none);
         }
 
         auto ocspContext = std::move(swOCSPContext.getValue());
 
         auto swResponse =
-            dispatchRequests(key.context, key.intermediateCerts, ocspContext).getNoThrow();
+            dispatchRequests(
+                key.context, key.intermediateCerts, ocspContext, OCSPPurpose::kClientVerify)
+                .getNoThrow();
         if (!swResponse.isOK()) {
-            return boost::none;
+            return LookupResult(boost::none);
         }
 
-        return std::move(swResponse.getValue());
+        return LookupResult(std::move(swResponse.getValue()));
     }
 
     static const ServiceContext::Decoration<boost::optional<OCSPCache>> getOCSPCache;
@@ -978,9 +1068,69 @@ ServiceContext::ConstructorActionRegisterer OCSPCacheRegisterer("CreateOCSPCache
 
 using OCSPCacheVal = OCSPCache::ValueHandle;
 
-class SSLManagerOpenSSL : public SSLManagerInterface {
+struct OCSPStaplingContext {
+    OCSPStaplingContext(UniqueOCSPResponse response, Date_t nextUpdate)
+        : sharedResponseForServer(std::move(response)), sharedResponseNextUpdate(nextUpdate) {}
+
+    OCSPStaplingContext() = default;
+
+    std::shared_ptr<OCSP_RESPONSE> sharedResponseForServer;
+    Date_t sharedResponseNextUpdate;
+};
+
+class SSLManagerOpenSSL;
+
+/**
+ * OCSPFetcher is responsible for periodically fetching OCSP responses.
+ *
+ * The first response can be optionally waited for.
+ */
+class OCSPFetcher {
+public:
+    OCSPFetcher(SSLManagerOpenSSL* manager) : _manager(manager) {}
+
+    /**
+     * Start fetching OCSP responses. The first one can be optionally waited for.
+     */
+    Status start(SSL_CTX* context, bool asyncOCSPStaple);
+
+    /**
+     * Stop fetching.
+     */
+    void shutdown();
+
+private:
+    Future<Milliseconds> fetchAndStaple(Promise<void>* promise);
+
+    void startPeriodicJob(StatusWith<Milliseconds> swDurationInitial);
+
+    void doPeriodicJob();
+
+private:
+    // Hack
+    // OpenSSL 1.1.0 = Since OpenSSL is ref counted underneath, we should use SSL_CTX_up_ref.
+    // But we support older versions, we workaround the lack of SSL_CTX_up_ref so instead we create
+    // a SSL* off the SSL_CTX to bump the ref count in SSL_CTX
+    UniqueSSL _ssl{nullptr};
+    SSL_CTX* _context{nullptr};
+    X509* _cert{nullptr};
+
+    // Note: A ref is kept by all futures and the periodic job on the SSLManagerOpenSSL ensure this
+    // object is alive.
+    SSLManagerOpenSSL* _manager;
+
+    Mutex _staplingMutex = MONGO_MAKE_LATCH("OCSPStaplingJobRunner::_mutex");
+    PeriodicRunner::JobAnchor _ocspStaplingAnchor;
+    bool _shutdown{false};
+};
+
+class SSLManagerOpenSSL : public SSLManagerInterface,
+                          public std::enable_shared_from_this<SSLManagerOpenSSL> {
 public:
     explicit SSLManagerOpenSSL(const SSLParams& params, bool isServer);
+    ~SSLManagerOpenSSL() final {
+        stopJobs();
+    }
 
     /**
      * Initializes an OpenSSL context according to the provided settings. Only settings which are
@@ -988,6 +1138,7 @@ public:
      */
     Status initSSLContext(SSL_CTX* context,
                           const SSLParams& params,
+                          const TransientSSLParams& transientParams,
                           ConnectionDirection direction) final;
 
     SSLConnectionInterface* connect(Socket* socket) final;
@@ -1008,7 +1159,9 @@ public:
      * Sets the OCSP Response to be stapled to the TLS Connection. Sets the _ocspStaplingAnchor
      * object in the class.
      */
-    Status stapleOCSPResponse(SSL_CTX* context) final;
+    Status stapleOCSPResponse(SSL_CTX* context, bool asyncOCSPStaple) final;
+
+    void stopJobs() final;
 
     const SSLConfiguration& getSSLConfiguration() const final {
         return _sslConfiguration;
@@ -1021,6 +1174,15 @@ public:
     int SSL_shutdown(SSLConnectionInterface* conn) final;
 
     Future<void> ocspClientVerification(SSL* ssl, const ExecutorPtr& reactor);
+
+    SSLInformationToLog getSSLInformationToLog() const final;
+
+    const std::shared_ptr<OCSPStaplingContext> getOcspStaplingContext() {
+        stdx::lock_guard<mongo::Mutex> guard(_sharedResponseMutex);
+        return _ocspStaplingContext;
+    }
+
+    Milliseconds updateOcspStaplingContextWithResponse(StatusWith<OCSPFetchResponse> swResponse);
 
 private:
     const int _rolesNid = OBJ_create(mongodbRolesOID.identifier.c_str(),
@@ -1035,8 +1197,10 @@ private:
     bool _suppressNoCertificateWarning;
     SSLConfiguration _sslConfiguration;
 
-    Mutex _staplingMutex = MONGO_MAKE_LATCH("OCSPStaplingJobRunner::_mutex");
-    PeriodicRunner::JobAnchor _ocspStaplingAnchor;
+    Mutex _sharedResponseMutex = MONGO_MAKE_LATCH("OCSPStaplingJobRunner::_sharedResponseMutex");
+    std::shared_ptr<OCSPStaplingContext> _ocspStaplingContext;
+
+    OCSPFetcher _fetcher;
 
     /** Password caching helper class.
      * Objects of this type will remember the config provided password they had access to at
@@ -1076,6 +1240,19 @@ private:
 
             _password = SecureString(pwBuf.data());
             return StringData(_password->c_str());
+        }
+
+        /**
+         * This method can only return a cached password and never prompts.
+         * @returns cached password if available, error if password is not cached.
+         */
+        StatusWith<StringData> fetchCachedPasswordNoPrompt() {
+            stdx::lock_guard<Latch> lock(_mutex);
+            if (_password->size()) {
+                return StringData(_password->c_str());
+            }
+            return Status(ErrorCodes::UnknownError,
+                          "Failed to return a cached password, cannot prompt.");
         }
 
     private:
@@ -1122,13 +1299,75 @@ private:
                                       SSLX509Name* subjectName,
                                       Date_t* serverNotAfter);
 
+    /*
+     * Parse and return x509 object from the provided keyfile.
+     * @param keyFile referencing the PEM file to be read.
+     * @param keyPassword password to the PEM file.
+     * @return UniqueX509 object parsed from the keyfile.
+     */
+    UniqueX509 _getX509Object(StringData keyFile, const PasswordFetcher* keyPassword) const;
+
+    /*
+     * Retrieve and store certificate information from the provided UniqueX509 object.
+     * @param x509 referencing the UniqueX509 object to query.
+     * @param info as a pointer to the CertInformationToLog struct to populate
+     * with the information.
+     */
+    static void _getX509CertInfo(UniqueX509& x509,
+                                 CertInformationToLog* info,
+                                 std::optional<StringData> keyFile,
+                                 std::optional<StringData> targetClusterURI);
+
+    /*
+     * Retrieve and store CRL information from the provided CRL filename.
+     * @param crlFile referencing the CRL filename
+     * @param info as a pointer to the CRLInformationToLog struct to populate
+     * with the information.
+     */
+    void _getCRLInfo(StringData crlFile, CRLInformationToLog* info) const;
 
     StatusWith<stdx::unordered_set<RoleName>> _parsePeerRoles(X509* peerCert) const;
 
     StatusWith<boost::optional<std::vector<DERInteger>>> _parseTLSFeature(X509* peerCert) const;
 
     /** @return true if was successful, otherwise false */
-    bool _setupPEM(SSL_CTX* context, const std::string& keyFile, PasswordFetcher* password);
+    bool _setupPEM(SSL_CTX* context, const std::string& keyFile, PasswordFetcher* password) const;
+
+    /**
+     * @param payload in-memory payload of a PEM file
+     * @return true if was successful, otherwise false
+     */
+    bool _setupPEMFromMemoryPayload(SSL_CTX* context,
+                                    const std::string& payload,
+                                    PasswordFetcher* password,
+                                    StringData targetClusterURI) const;
+
+    /**
+     * Setup PEM from BIO, which could be file or memory input abstraction.
+     * @param inBio input BIO, where smart pointer is created with a custom deleter to call
+     * 'BIO_free()'.
+     * @param keyFile if the certificate was loaded from file, this is the file name. If empty,
+     * it means the certificate came from memory payload.
+     * @param targetClusterURI If the certificate targets a particular cluster, this is cluster URI.
+     * If empty, it means the certificate is the default one for the local cluster.
+     * @return true if was successful, otherwise false
+     */
+    bool _setupPEMFromBIO(SSL_CTX* context,
+                          UniqueBIO inBio,
+                          PasswordFetcher* password,
+                          std::optional<StringData> keyFile,
+                          std::optional<StringData> targetClusterURI) const;
+
+    /**
+     * Loads a certificate chain from memory into context.
+     * This method is intended to be a repalcement of API call SSL_CTX_use_certificate_chain_file()
+     * but using memory instead of file.
+     * @return true if was successful, otherwise false
+     */
+    static bool _readCertificateChainFromMemory(SSL_CTX* context,
+                                                const std::string& payload,
+                                                PasswordFetcher* password,
+                                                std::optional<StringData> targetClusterURI);
 
     /*
      * Set up an SSL context for certificate validation by loading a CA
@@ -1156,10 +1395,26 @@ private:
      */
     void _flushNetworkBIO(SSLConnectionOpenSSL* conn);
 
+    /*
+     * Utility method to process the result returned by password Fetcher.
+     */
+    static int _processPasswordFetcherOutput(StatusWith<StringData>* fetcherResult,
+                                             char* buf,
+                                             int num,
+                                             int rwflag);
+
     /**
      * Callbacks for SSL functions.
      */
+
     static int password_cb(char* buf, int num, int rwflag, void* userdata);
+
+    /**
+     * Special flawor of password callback, which always fails.
+     * @return -1.
+     */
+    static int always_error_password_cb(char* buf, int num, int rwflag, void* userdata);
+    static int servername_cb(SSL* s, int* al, void* arg);
     static int verify_cb(int ok, X509_STORE_CTX* ctx);
 };
 
@@ -1168,59 +1423,24 @@ private:
 // Global variable indicating if this is a server or a client instance
 bool isSSLServer = false;
 
-extern SSLManagerInterface* theSSLManager;
+extern SSLManagerCoordinator* theSSLManagerCoordinator;
 
 MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManager, ("SetupOpenSSL", "EndStartupOptionHandling"))
 (InitializerContext*) {
     if (!isSSLServer || (sslGlobalParams.sslMode.load() != SSLParams::SSLMode_disabled)) {
-        theSSLManager = new SSLManagerOpenSSL(sslGlobalParams, isSSLServer);
+        theSSLManagerCoordinator = new SSLManagerCoordinator();
     }
     return Status::OK();
 }
 
-std::unique_ptr<SSLManagerInterface> SSLManagerInterface::create(const SSLParams& params,
+std::shared_ptr<SSLManagerInterface> SSLManagerInterface::create(const SSLParams& params,
                                                                  bool isServer) {
-    return std::make_unique<SSLManagerOpenSSL>(params, isServer);
+    return std::make_shared<SSLManagerOpenSSL>(params, isServer);
 }
 
 SSLX509Name getCertificateSubjectX509Name(X509* cert) {
-    std::vector<std::vector<SSLX509Name::Entry>> entries;
-
     auto name = X509_get_subject_name(cert);
-    int count = X509_NAME_entry_count(name);
-    int prevSet = -1;
-    std::vector<SSLX509Name::Entry> rdn;
-    for (int i = count - 1; i >= 0; --i) {
-        auto* entry = X509_NAME_get_entry(name, i);
-
-        const auto currentSet = X509_NAME_ENTRY_set(entry);
-        if (currentSet != prevSet) {
-            if (!rdn.empty()) {
-                entries.push_back(std::move(rdn));
-                rdn = std::vector<SSLX509Name::Entry>();
-            }
-            prevSet = currentSet;
-        }
-
-        char buffer[128];
-        // OBJ_obj2txt can only fail if we pass a nullptr from get_object,
-        // or if OpenSSL's BN library falls over.
-        // In either case, just panic.
-        uassert(ErrorCodes::InvalidSSLConfiguration,
-                "Unable to parse certiciate subject name",
-                OBJ_obj2txt(buffer, sizeof(buffer), X509_NAME_ENTRY_get_object(entry), 1) > 0);
-
-        const auto* str = X509_NAME_ENTRY_get_data(entry);
-        rdn.emplace_back(
-            buffer, str->type, std::string(reinterpret_cast<const char*>(str->data), str->length));
-    }
-    if (!rdn.empty()) {
-        entries.push_back(std::move(rdn));
-    }
-
-    SSLX509Name subjectName = SSLX509Name(std::move(entries));
-    uassertStatusOK(subjectName.normalizeStrings());
-    return subjectName;
+    return convertX509ToSSLX509Name(name);
 }
 
 int verifyDHParameters(const UniqueDHParams& dhparams) {
@@ -1282,8 +1502,7 @@ SSLConnectionOpenSSL::SSLConnectionOpenSSL(SSL_CTX* context,
     : socket(sock) {
     ssl = SSL_new(context);
 
-    std::string sslErr =
-        nullptr != getSSLManager() ? getSSLManager()->getSSLErrorMessage(ERR_get_error()) : "";
+    std::string sslErr = SSLManagerInterface::getSSLErrorMessage(ERR_get_error());
     massert(15861, "Error creating new SSL object " + sslErr, ssl);
 
     BIO_new_bio_pair(&internalBIO, BUFFER_SIZE, &networkBIO, BUFFER_SIZE);
@@ -1314,6 +1533,7 @@ SSLManagerOpenSSL::SSLManagerOpenSSL(const SSLParams& params, bool isServer)
       _allowInvalidCertificates(params.sslAllowInvalidCertificates),
       _allowInvalidHostnames(params.sslAllowInvalidHostnames),
       _suppressNoCertificateWarning(params.suppressNoTLSPeerCertificateWarning),
+      _fetcher(this),
       _serverPEMPassword(params.sslPEMKeyPassword, "Enter PEM passphrase"),
       _clusterPEMPassword(params.sslClusterPassword, "Enter cluster certificate passphrase") {
     if (!_initSynchronousSSLContext(&_clientContext, params, ConnectionDirection::kOutgoing)) {
@@ -1356,32 +1576,46 @@ SSLManagerOpenSSL::SSLManagerOpenSSL(const SSLParams& params, bool isServer)
 
         uassertStatusOK(_sslConfiguration.setServerSubjectName(std::move(serverSubjectName)));
 
-        static CertificateExpirationMonitor task =
-            CertificateExpirationMonitor(_sslConfiguration.serverCertificateExpirationDate);
+        CertificateExpirationMonitor::get()->updateExpirationDeadline(
+            _sslConfiguration.serverCertificateExpirationDate);
     }
 }
 
 int SSLManagerOpenSSL::password_cb(char* buf, int num, int rwflag, void* userdata) {
-    // Unless OpenSSL misbehaves, num should always be positive
-    fassert(17314, num > 0);
     invariant(userdata);
-
     auto pwFetcher = static_cast<PasswordFetcher*>(userdata);
     auto swPassword = pwFetcher->fetchPassword();
-    if (!swPassword.isOK()) {
-        LOGV2_ERROR(23239,
-                    "Unable to fetch password: {status}",
-                    "Unable to fetch password",
-                    "status"_attr = swPassword.getStatus());
+    return _processPasswordFetcherOutput(&swPassword, buf, num, rwflag);
+}
+
+int SSLManagerOpenSSL::always_error_password_cb(char* buf, int num, int rwflag, void* userdata) {
+    return -1;
+}
+
+int SSLManagerOpenSSL::_processPasswordFetcherOutput(StatusWith<StringData>* swPassword,
+                                                     char* buf,
+                                                     int num,
+                                                     int rwflag) {
+    // Unless OpenSSL misbehaves, num should always be positive
+    fassert(17314, num > 0);
+
+    if (!swPassword->isOK()) {
+        LOGV2_ERROR(23239, "Unable to fetch password", "error"_attr = swPassword->getStatus());
         return -1;
     }
-    StringData password = std::move(swPassword.getValue());
+    StringData password = std::move(swPassword->getValue());
 
     const size_t copyCount = std::min(password.size(), static_cast<size_t>(num));
     std::copy_n(password.begin(), copyCount, buf);
     buf[copyCount] = '\0';
 
     return copyCount;
+}
+
+int SSLManagerOpenSSL::servername_cb(SSL* s, int* al, void* arg) {
+    // Unconditionally accept the SNI presented by the client. This will ensure that if the client
+    // later performs session resumption, subsequent connections will still have access to the SNI.
+    return SSL_TLSEXT_ERR_OK;
 }
 
 int SSLManagerOpenSSL::verify_cb(int ok, X509_STORE_CTX* ctx) {
@@ -1424,41 +1658,22 @@ int SSLManagerOpenSSL::SSL_shutdown(SSLConnectionInterface* connInterface) {
     return status;
 }
 
-struct OCSPStaplingContext {
-    OCSPStaplingContext(UniqueOCSPResponse response, Date_t nextUpdate)
-        : sharedResponseForServer(std::move(response)), sharedResponseNextUpdate(nextUpdate) {}
-
-    OCSPStaplingContext() = default;
-
-    std::shared_ptr<OCSP_RESPONSE> sharedResponseForServer;
-    Date_t sharedResponseNextUpdate;
-};
-
-mongo::Mutex sharedResponseMutex;
-std::shared_ptr<OCSPStaplingContext> ocspStaplingContext;
-
 int ocspServerCallback(SSL* ssl, void* arg) {
-    {
-        std::shared_ptr<OCSPStaplingContext> context;
+    std::shared_ptr<OCSPStaplingContext> context =
+        static_cast<SSLManagerOpenSSL*>(arg)->getOcspStaplingContext();
 
-        {
-            stdx::lock_guard<mongo::Mutex> guard(sharedResponseMutex);
-            context = ocspStaplingContext;
-        }
-
-        if (!context || !context->sharedResponseForServer) {
-            return SSL_TLSEXT_ERR_NOACK;
-        }
-
-        unsigned char* ocspResponseBuffer = NULL;
-        int length = i2d_OCSP_RESPONSE(context->sharedResponseForServer.get(), &ocspResponseBuffer);
-
-        if (length == 0) {
-            return SSL_TLSEXT_ERR_NOACK;
-        }
-
-        SSL_set_tlsext_status_ocsp_resp(ssl, ocspResponseBuffer, length);
+    if (!context || !context->sharedResponseForServer) {
+        return SSL_TLSEXT_ERR_NOACK;
     }
+
+    unsigned char* ocspResponseBuffer = NULL;
+    int length = i2d_OCSP_RESPONSE(context->sharedResponseForServer.get(), &ocspResponseBuffer);
+
+    if (length == 0) {
+        return SSL_TLSEXT_ERR_NOACK;
+    }
+
+    SSL_set_tlsext_status_ocsp_resp(ssl, ocspResponseBuffer, length);
 
     return SSL_TLSEXT_ERR_OK;
 }
@@ -1477,7 +1692,7 @@ StatusWith<bool> verifyStapledResponse(SSL* conn, X509* peerCert, OCSP_RESPONSE*
     auto intermediateCerts = SSLgetVerifiedChain(conn);
     OCSPCertIDSet emptyCertIDSet{};
 
-    auto swCertId = getCertIdForCert(SSL_get_SSL_CTX(conn), peerCert);
+    auto swCertId = getCertIdForCert(SSL_get_SSL_CTX(conn), peerCert, intermediateCerts.get());
     if (!swCertId.isOK()) {
         return swCertId.getStatus();
     }
@@ -1545,11 +1760,16 @@ int ocspClientCallback(SSL* ssl, void* arg) {
         if (swStapleOK.getStatus() == ErrorCodes::OCSPCertificateStatusRevoked) {
             LOGV2_DEBUG(23225,
                         1,
-                        "Stapled Certificate validation failed: {error}",
-                        "Stapled Certificate validation failed",
+                        "Stapled OCSP Response validation failed: {error}",
+                        "Stapled OCSP Response validation failed",
                         "error"_attr = swStapleOK.getStatus());
             return OCSP_CLIENT_RESPONSE_NOT_ACCEPTABLE;
         }
+
+        LOGV2_ERROR(4781101,
+                    "Stapled OCSP Response validation threw an error: {error}",
+                    "Stapled OCSP Response validation threw an error",
+                    "error"_attr = swStapleOK.getStatus());
 
         return OCSP_CLIENT_RESPONSE_ERROR;
     } else if (!swStapleOK.getValue()) {
@@ -1681,144 +1901,218 @@ Future<void> SSLManagerOpenSSL::ocspClientVerification(SSL* ssl, const ExecutorP
 
 using StoreCtxVerifiedChain = std::unique_ptr<STACK_OF(X509), X509StackDeleter>;
 
-#if OPENSSL_VERSION_NUMBER >= 0x10002000L
-Status SSLManagerOpenSSL::stapleOCSPResponse(SSL_CTX* context) {
+/** getCertificateForContext provides access to the X509* used by the provided SSL_CTX*.
+ * OpenSSL 1.0.2 provides SSL_CTX_get0_certificate, which provides direct access to the pointer.
+ * OpenSSL 1.0.1 only exposes the pointer on a per-connection basis via SSL_get_certificate.
+ * We must provide different implementations depending on the symbols available at compile-time.
+ * On 1.0.1, we must ensure that the lifetime of SSL object is longer than the X509 pointer we're
+ * inspecting.
+ */
+#if OPENSSL_VERSION_NUMBER < 0x10002000L
+std::tuple<UniqueSSL, X509*> getCertificateForContext(SSL_CTX* context) {
+    UniqueSSL ssl(SSL_new(context));
+    X509* ret = SSL_get_certificate(ssl.get());
+    return std::make_tuple(std::move(ssl), ret);
+}
+#else
+std::tuple<X509*> getCertificateForContext(SSL_CTX* context) {
+    return std::make_tuple(SSL_CTX_get0_certificate(context));
+}
+#endif
+
+Status SSLManagerOpenSSL::stapleOCSPResponse(SSL_CTX* context, bool asyncOCSPStaple) {
     if (MONGO_unlikely(disableStapling.shouldFail()) || !tlsOCSPEnabled) {
         return Status::OK();
     }
 
-    X509* cert = SSL_CTX_get0_certificate(context);
-    if (!cert) {
+    return _fetcher.start(context, asyncOCSPStaple);
+}
+
+Status OCSPFetcher::start(SSL_CTX* context, bool asyncOCSPStaple) {
+    // Increment the ref count on SSL_CTX by creating a SSL object so that our context lives with
+    // the OCSPFetcher
+    _ssl = UniqueSSL(SSL_new(context));
+    _context = context;
+
+    auto certificateHolder = getCertificateForContext(_context);
+    _cert = std::get<X509*>(certificateHolder);
+    if (!_cert) {
         return getSSLFailure(
             "Could not staple because could not get certificate from SSL Context.");
     }
 
-    UniqueOpenSSLStringStack aiaOCSP(X509_get1_ocsp(cert));
+    UniqueOpenSSLStringStack aiaOCSP(X509_get1_ocsp(_cert));
 
     if (!aiaOCSP) {
         return Status::OK();
     }
 
-    auto fetchAndStaple = [context, cert]() -> Future<Milliseconds> {
-        // Generate a new verified X509StoreContext to get our own certificate chain
-        UniqueX509StoreCtx storeCtx(X509_STORE_CTX_new());
-        if (!storeCtx) {
-            return getSSLFailure("Could not create X509 store.");
-        }
+    auto pf = makePromiseFuture<void>();
 
-        if (X509_STORE_CTX_init(storeCtx.get(), SSL_CTX_get_cert_store(context), NULL, NULL) == 0) {
-            return getSSLFailure("Could not initialize the X509 Store Context.");
-        }
+    auto promisePtr = &pf.promise;
+    if (asyncOCSPStaple) {
+        promisePtr = nullptr;
+    }
 
-        X509_STORE_CTX_set_cert(storeCtx.get(), cert);
-
-        if (X509_verify_cert(storeCtx.get()) <= 0) {
-            return getSSLFailure("Could not verify X509 certificate store for OCSP Stapling.");
-        }
-
-        // Extract the chain from the verified X509StoreCtx
-        StoreCtxVerifiedChain intermediateCerts(X509_STORE_CTX_get1_chain(storeCtx.get()));
-
-        // Continue with OCSP Stapling logic
-        auto swOCSPContext = extractOcspUris(context, cert, intermediateCerts.get());
-        if (!swOCSPContext.isOK()) {
-            LOGV2_WARNING(23232, "Could not staple OCSP response to outgoing certificate.");
-            return swOCSPContext.getStatus();
-        }
-
-        auto ocspContext = std::move(swOCSPContext.getValue());
-
-        return dispatchRequests(context, std::move(intermediateCerts), ocspContext)
-            .onCompletion([](StatusWith<OCSPFetchResponse> swResponse) -> Milliseconds {
-                if (!swResponse.isOK()) {
-                    LOGV2_WARNING(23233, "Could not staple OCSP response to outgoing certificate.");
-
-                    stdx::lock_guard<mongo::Mutex> guard(sharedResponseMutex);
-
-                    if (ocspStaplingContext && ocspStaplingContext->sharedResponseForServer &&
-                        ocspStaplingContext->sharedResponseNextUpdate <
-                            (Date_t::now() + kOCSPUnknownStatusRefreshRate)) {
-
-                        ocspStaplingContext = std::make_shared<OCSPStaplingContext>();
-
-                        LOGV2_WARNING(
-                            4633601,
-                            "Server will remove and not staple the expiring OCSP Response.");
-                    }
-
-                    return kOCSPUnknownStatusRefreshRate;
-                }
-
-                stdx::lock_guard<mongo::Mutex> guard(sharedResponseMutex);
-
-                ocspStaplingContext = std::make_shared<OCSPStaplingContext>(
-                    std::move(swResponse.getValue().response),
-                    swResponse.getValue().nextStapleRefresh());
-
-                return swResponse.getValue().fetchNewResponseDuration();
-            });
-    };
-
-    fetchAndStaple().getAsync(
-        [this, fetchAndStaple](StatusWith<Milliseconds> swDurationInitial) mutable {
-            stdx::lock_guard<Latch> lock(this->_staplingMutex);
-
-            if (this->_ocspStaplingAnchor) {
-                return;
-            }
-
-            // determine the OCSP validation refresh period
-            Milliseconds duration;
-            if (swDurationInitial.isOK()) {
-                // if the validation refresh period was set manually, use it
-                if (kOCSPValidationRefreshPeriodSecs != -1) {
-                    duration = Seconds(kOCSPValidationRefreshPeriodSecs);
-                } else {
-                    duration = swDurationInitial.getValue();
-                }
-            } else {
-                duration = kOCSPUnknownStatusRefreshRate;
-            }
-
-            this->_ocspStaplingAnchor =
-                getGlobalServiceContext()->getPeriodicRunner()->makeJob(PeriodicRunner::PeriodicJob(
-                    "OCSP Fetch and Staple",
-                    [this, fetchAndStaple](Client* client) {
-                        fetchAndStaple().getAsync([this](StatusWith<Milliseconds> swDuration) {
-                            stdx::lock_guard<Latch> lock(this->_staplingMutex);
-
-                            if (!swDuration.isOK()) {
-                                this->_ocspStaplingAnchor.setPeriod(kOCSPUnknownStatusRefreshRate);
-                                return;
-                            } else {
-                                // if the validation refresh period was set manually, use it
-                                if (kOCSPValidationRefreshPeriodSecs != -1) {
-                                    this->_ocspStaplingAnchor.setPeriod(
-                                        Seconds(kOCSPValidationRefreshPeriodSecs));
-                                } else {
-                                    this->_ocspStaplingAnchor.setPeriod(swDuration.getValue());
-                                }
-                            }
-                        });
-                    },
-                    duration));
-
-            this->_ocspStaplingAnchor.start();
+    fetchAndStaple(promisePtr)
+        .getAsync([this, sm = _manager->shared_from_this()](
+                      StatusWith<Milliseconds> swDurationInitial) mutable {
+            startPeriodicJob(swDurationInitial);
         });
 
     SSL_CTX_set_tlsext_status_cb(context, ocspServerCallback);
-    SSL_CTX_set_tlsext_status_arg(context, nullptr);
+    SSL_CTX_set_tlsext_status_arg(context, static_cast<void*>(_manager));
+
+    if (!asyncOCSPStaple) {
+        Status stapleStatus = pf.future.getNoThrow();
+        if (stapleStatus == ErrorCodes::OCSPCertificateStatusRevoked) {
+            return Status(ErrorCodes::OCSPCertificateStatusRevoked,
+                          str::stream()
+                              << "Certificate is revoked"
+                              << SSLManagerInterface::getSSLErrorMessage(ERR_get_error()));
+        }
+    }
 
     return Status::OK();
 }
-#else
-Status SSLManagerOpenSSL::stapleOCSPResponse(SSL_CTX* context) {
-    return Status::OK();
+
+Milliseconds getPeriodForStapleJob(StatusWith<Milliseconds> swDuration) {
+    if (!swDuration.isOK()) {
+        return kOCSPUnknownStatusRefreshRate;
+    } else {
+        return swDuration.getValue();
+    }
 }
-#endif
+
+void OCSPFetcher::startPeriodicJob(StatusWith<Milliseconds> swDurationInitial) {
+    stdx::lock_guard<Latch> lock(_staplingMutex);
+
+    if (_ocspStaplingAnchor) {
+        return;
+    }
+
+    if (_shutdown) {
+        return;
+    }
+
+    _ocspStaplingAnchor =
+        getGlobalServiceContext()->getPeriodicRunner()->makeJob(PeriodicRunner::PeriodicJob(
+            "OCSP Fetch and Staple",
+            [this, sm = _manager->shared_from_this()](Client* client) { doPeriodicJob(); },
+            getPeriodForStapleJob(swDurationInitial)));
+
+    _ocspStaplingAnchor.start();
+}
+
+void OCSPFetcher::doPeriodicJob() {
+    fetchAndStaple(nullptr).getAsync(
+        [this, sm = _manager->shared_from_this()](StatusWith<Milliseconds> swDuration) {
+            stdx::lock_guard<Latch> lock(this->_staplingMutex);
+
+            if (_shutdown) {
+                return;
+            }
+
+            this->_ocspStaplingAnchor.setPeriod(getPeriodForStapleJob(swDuration));
+        });
+}
+
+Future<Milliseconds> OCSPFetcher::fetchAndStaple(Promise<void>* promise) {
+    // Generate a new verified X509StoreContext to get our own certificate chain
+    UniqueX509StoreCtx storeCtx(X509_STORE_CTX_new());
+    if (!storeCtx) {
+        return getSSLFailure("Could not create X509 store.");
+    }
+
+    if (X509_STORE_CTX_init(storeCtx.get(), SSL_CTX_get_cert_store(_context), NULL, NULL) == 0) {
+        return getSSLFailure("Could not initialize the X509 Store Context.");
+    }
+
+    X509_STORE_CTX_set_cert(storeCtx.get(), _cert);
+
+    if (X509_verify_cert(storeCtx.get()) <= 0) {
+        return getSSLFailure("Could not verify X509 certificate store for OCSP Stapling.");
+    }
+
+    // Extract the chain from the verified X509StoreCtx
+    StoreCtxVerifiedChain intermediateCerts(X509_STORE_CTX_get1_chain(storeCtx.get()));
+
+    // Continue with OCSP Stapling logic
+    auto swOCSPContext = extractOcspUris(_context, _cert, intermediateCerts.get());
+    if (!swOCSPContext.isOK()) {
+        LOGV2_WARNING(23232, "Could not staple OCSP response to outgoing certificate.");
+        return swOCSPContext.getStatus();
+    }
+
+    auto ocspContext = std::move(swOCSPContext.getValue());
+
+    return dispatchRequests(
+               _context, std::move(intermediateCerts), ocspContext, OCSPPurpose::kStaple)
+        .onCompletion(
+            [this, promise](StatusWith<OCSPFetchResponse> swResponse) mutable -> Milliseconds {
+                stdx::lock_guard<Latch> lock(this->_staplingMutex);
+
+                if (_shutdown) {
+                    return kOCSPUnknownStatusRefreshRate;
+                }
+
+                // protect against pf going out of scope when asynchronous
+                if (promise != nullptr) {
+                    promise->setWith([&] {
+                        return (swResponse == ErrorCodes::OCSPCertificateStatusUnknown)
+                            ? Status::OK()
+                            : swResponse.getValue().statusOfResponse;
+                    });
+                }
+
+                return _manager->updateOcspStaplingContextWithResponse(std::move(swResponse));
+            });
+}
+
+void OCSPFetcher::shutdown() {
+    stdx::lock_guard<Mutex> lock(_staplingMutex);
+
+    _shutdown = true;
+
+    if (_ocspStaplingAnchor.isValid()) {
+        _ocspStaplingAnchor.stop();
+        _ocspStaplingAnchor.detach();
+    }
+}
+
+void SSLManagerOpenSSL::stopJobs() {
+    _fetcher.shutdown();
+}
+
+Milliseconds SSLManagerOpenSSL::updateOcspStaplingContextWithResponse(
+    StatusWith<OCSPFetchResponse> swResponse) {
+    stdx::lock_guard<mongo::Mutex> guard(_sharedResponseMutex);
+
+    if (!swResponse.isOK()) {
+        LOGV2_WARNING(23233, "Could not staple OCSP response to outgoing certificate.");
+
+        if (_ocspStaplingContext && _ocspStaplingContext->sharedResponseForServer &&
+            _ocspStaplingContext->sharedResponseNextUpdate <
+                (Date_t::now() + kOCSPUnknownStatusRefreshRate)) {
+
+            _ocspStaplingContext = std::make_shared<OCSPStaplingContext>();
+
+            LOGV2_WARNING(4633601, "Server will remove and not staple the expiring OCSP Response.");
+        }
+
+        return kOCSPUnknownStatusRefreshRate;
+    }
+
+    _ocspStaplingContext = std::make_shared<OCSPStaplingContext>(
+        std::move(swResponse.getValue().response), swResponse.getValue().nextStapleRefresh());
+
+    return swResponse.getValue().fetchNewResponseDuration();
+}
+
 
 Status SSLManagerOpenSSL::initSSLContext(SSL_CTX* context,
                                          const SSLParams& params,
+                                         const TransientSSLParams& transientParams,
                                          ConnectionDirection direction) {
     // SSL_OP_ALL - Activate all bug workaround options, to support buggy client SSL's.
     // SSL_OP_NO_SSLv2 - Disable SSL v2 support
@@ -1845,21 +2139,23 @@ Status SSLManagerOpenSSL::initSSLContext(SSL_CTX* context,
 
     ::SSL_CTX_set_options(context, options);
 
-    // HIGH - Enable strong ciphers
-    // !EXPORT - Disable export ciphers (40/56 bit)
-    // !aNULL - Disable anonymous auth ciphers
-    // @STRENGTH - Sort ciphers based on strength
-    std::string cipherConfig = "HIGH:!EXPORT:!aNULL@STRENGTH";
-
-    // Allow the cipher configuration string to be overriden by --sslCipherConfig
-    if (!params.sslCipherConfig.empty()) {
-        cipherConfig = params.sslCipherConfig;
+    if (0 == ::SSL_CTX_set_cipher_list(context, params.sslCipherConfig.c_str())) {
+        return Status(ErrorCodes::InvalidSSLConfiguration,
+                      str::stream() << "Can not set supported cipher suites with config string \""
+                                    << params.sslCipherConfig
+                                    << "\": " << getSSLErrorMessage(ERR_get_error()));
     }
 
-    if (0 == ::SSL_CTX_set_cipher_list(context, cipherConfig.c_str())) {
-        return Status(ErrorCodes::InvalidSSLConfiguration,
-                      str::stream() << "Can not set supported cipher suites: "
-                                    << getSSLErrorMessage(ERR_get_error()));
+    if (!params.sslCipherSuiteConfig.empty()) {
+        // OpenSSL versions older than version 1.1.1 are not allowed to configure their cipher
+        // suites using the sslCipherSuiteConfig flag.
+        if (0 == ::SSL_CTX_set_ciphersuites(context, params.sslCipherSuiteConfig.c_str())) {
+            return Status(ErrorCodes::InvalidSSLConfiguration,
+                          str::stream()
+                              << "Can not set supported cipher suites with config string \""
+                              << params.sslCipherSuiteConfig
+                              << "\": " << getSSLErrorMessage(ERR_get_error()));
+        }
     }
 
     // We use the address of the context as the session id context.
@@ -1871,7 +2167,28 @@ Status SSLManagerOpenSSL::initSSLContext(SSL_CTX* context,
                                     << getSSLErrorMessage(ERR_get_error()));
     }
 
-    if (direction == ConnectionDirection::kOutgoing && params.tlsWithholdClientCertificate) {
+    // We should accept all SNI extensions advertised by clients
+    if (1 != SSL_CTX_set_tlsext_servername_callback(context, &SSLManagerOpenSSL::servername_cb)) {
+        return Status(ErrorCodes::InvalidSSLConfiguration,
+                      str::stream() << "Can not set servername callback: "
+                                    << getSSLErrorMessage(ERR_get_error()));
+    }
+
+
+    if (direction == ConnectionDirection::kOutgoing &&
+        !transientParams.sslClusterPEMPayload.empty()) {
+
+        // Transient params for outgoing connection have priority over global params.
+        if (!_setupPEMFromMemoryPayload(
+                context,
+                transientParams.sslClusterPEMPayload,
+                &_clusterPEMPassword,
+                transientParams.targetedClusterConnectionString.toString())) {
+            return Status(ErrorCodes::InvalidSSLConfiguration,
+                          str::stream() << "Can not set up transient ssl cluster certificate for "
+                                        << transientParams.targetedClusterConnectionString);
+        }
+    } else if (direction == ConnectionDirection::kOutgoing && params.tlsWithholdClientCertificate) {
         // Do not send a client certificate if they have been suppressed.
 
     } else if (direction == ConnectionDirection::kOutgoing && !params.sslClusterFile.empty()) {
@@ -1969,7 +2286,7 @@ bool SSLManagerOpenSSL::_initSynchronousSSLContext(UniqueSSLContext* contextPtr,
                                                    ConnectionDirection direction) {
     *contextPtr = UniqueSSLContext(SSL_CTX_new(SSLv23_method()));
 
-    uassertStatusOK(initSSLContext(contextPtr->get(), params, direction));
+    uassertStatusOK(initSSLContext(contextPtr->get(), params, TransientSSLParams(), direction));
 
     // If renegotiation is needed, don't return from recv() or send() until it's successful.
     // Note: this is for blocking sockets only.
@@ -1985,7 +2302,6 @@ bool SSLManagerOpenSSL::_parseAndValidateCertificate(const std::string& keyFile,
     BIO* inBIO = BIO_new(BIO_s_file());
     if (inBIO == nullptr) {
         LOGV2_ERROR(23243,
-                    "failed to allocate BIO object: {error}",
                     "Failed to allocate BIO object",
                     "error"_attr = getSSLErrorMessage(ERR_get_error()));
         return false;
@@ -1994,7 +2310,6 @@ bool SSLManagerOpenSSL::_parseAndValidateCertificate(const std::string& keyFile,
     ON_BLOCK_EXIT([&] { BIO_free(inBIO); });
     if (BIO_read_filename(inBIO, keyFile.c_str()) <= 0) {
         LOGV2_ERROR(23244,
-                    "cannot read key file when setting subject name: {keyFile} {error}",
                     "Cannot read key file when setting subject name",
                     "keyFile"_attr = keyFile,
                     "error"_attr = getSSLErrorMessage(ERR_get_error()));
@@ -2005,7 +2320,6 @@ bool SSLManagerOpenSSL::_parseAndValidateCertificate(const std::string& keyFile,
         inBIO, nullptr, &SSLManagerOpenSSL::password_cb, static_cast<void*>(&keyPassword));
     if (x509 == nullptr) {
         LOGV2_ERROR(23245,
-                    "cannot retrieve certificate from keyfile: {keyFile} {error}",
                     "Cannot retrieve certificate from keyfile",
                     "keyFile"_attr = keyFile,
                     "error"_attr = getSSLErrorMessage(ERR_get_error()));
@@ -2037,66 +2351,177 @@ bool SSLManagerOpenSSL::_parseAndValidateCertificate(const std::string& keyFile,
     return true;
 }
 
+// static
+bool SSLManagerOpenSSL::_readCertificateChainFromMemory(
+    SSL_CTX* context,
+    const std::string& payload,
+    PasswordFetcher* password,
+    std::optional<StringData> targetClusterURI) {
+
+    logv2::DynamicAttributes errorAttrs;
+    if (targetClusterURI) {
+        errorAttrs.add("targetClusterURI", *targetClusterURI);
+    }
+
+    ERR_clear_error();  // Clear error stack for SSL_CTX_use_certificate().
+
+    // Note: old versions of SSL take (void*) here but it's still R/O.
+#if OPENSSL_VERSION_NUMBER <= 0x1000114fL
+    UniqueBIO inBio(BIO_new_mem_buf(const_cast<char*>(payload.c_str()), payload.length()));
+#else
+    UniqueBIO inBio(BIO_new_mem_buf(payload.c_str(), payload.length()));
+#endif
+
+    if (!inBio) {
+        CaptureSSLErrorInAttrs capture(errorAttrs);
+        LOGV2_ERROR(5159905, "Failed to allocate BIO from in memory payload", errorAttrs);
+        return false;
+    }
+
+    auto password_cb =
+        &SSLManagerOpenSSL::always_error_password_cb;  // We don't expect a password to be required.
+    void* userdata = static_cast<void*>(password);
+    UniqueX509 x509cert(PEM_read_bio_X509_AUX(inBio.get(), NULL, password_cb, userdata));
+
+    if (!x509cert) {
+        CaptureSSLErrorInAttrs capture(errorAttrs);
+        LOGV2_ERROR(5159906, "Failed to read the X509 certificate from memory", errorAttrs);
+        return false;
+    }
+
+    CertInformationToLog debugInfo;
+    _getX509CertInfo(x509cert, &debugInfo, std::nullopt, targetClusterURI);
+    logCert(debugInfo, "", 5159903);
+
+    // SSL_CTX_use_certificate increments the refcount on cert.
+    if (1 != SSL_CTX_use_certificate(context, x509cert.get())) {
+        CaptureSSLErrorInAttrs capture(errorAttrs);
+        LOGV2_ERROR(5159907, "Failed to use the X509 certificate loaded from memory", errorAttrs);
+        return false;
+    }
+
+    // If we could set up our certificate, now proceed to the CA certificates.
+    UniqueX509 ca;
+#if OPENSSL_VERSION_NUMBER >= 0x100010fFL
+    SSL_CTX_clear_chain_certs(context);
+#else
+    SSL_CTX_clear_extra_chain_certs(context);
+#endif
+    while ((ca = UniqueX509(PEM_read_bio_X509(inBio.get(), NULL, password_cb, userdata)))) {
+#if OPENSSL_VERSION_NUMBER >= 0x100010fFL
+        if (1 != SSL_CTX_add1_chain_cert(context, ca.get())) {
+#else
+        if (1 != SSL_CTX_add_extra_chain_cert(context, ca.release())) {
+#endif
+            CaptureSSLErrorInAttrs capture(errorAttrs);
+            LOGV2_ERROR(
+                5159908, "Failed to use the CA X509 certificate loaded from memory", errorAttrs);
+            return false;
+        }
+        _getX509CertInfo(ca, &debugInfo, std::nullopt, targetClusterURI);
+        logCert(debugInfo, "", 5159902);
+    }
+    // When the while loop ends, it's usually just EOF.
+    auto err = ERR_peek_last_error();
+    if (ERR_GET_LIB(err) == ERR_LIB_PEM && ERR_GET_REASON(err) == PEM_R_NO_START_LINE) {
+        ERR_clear_error();
+    } else {
+        CaptureSSLErrorInAttrs capture(errorAttrs);
+        LOGV2_ERROR(
+            5159909, "Error remained after scanning all X509 certificates from memory", errorAttrs);
+        return false;  // Some real error.
+    }
+
+    return true;
+}
+
 bool SSLManagerOpenSSL::_setupPEM(SSL_CTX* context,
                                   const std::string& keyFile,
-                                  PasswordFetcher* password) {
+                                  PasswordFetcher* password) const {
+    logv2::DynamicAttributes errorAttrs;
+    errorAttrs.add("keyFile", keyFile);
+
     if (SSL_CTX_use_certificate_chain_file(context, keyFile.c_str()) != 1) {
-        LOGV2_ERROR(23248,
-                    "cannot read certificate file: {keyFile} {error}",
-                    "Cannot read certificate file",
-                    "keyFile"_attr = keyFile,
-                    "error"_attr = getSSLErrorMessage(ERR_get_error()));
+        CaptureSSLErrorInAttrs capture(errorAttrs);
+        LOGV2_ERROR(23248, "Cannot read certificate file", errorAttrs);
         return false;
     }
 
-    BIO* inBio = BIO_new(BIO_s_file());
+    UniqueBIO inBio(BIO_new(BIO_s_file()));
+
     if (!inBio) {
-        LOGV2_ERROR(23249,
-                    "failed to allocate BIO object: {error}",
-                    "Failed to allocate BIO object",
-                    "error"_attr = getSSLErrorMessage(ERR_get_error()));
+        CaptureSSLErrorInAttrs capture(errorAttrs);
+        LOGV2_ERROR(23249, "Failed to allocate BIO object", errorAttrs);
         return false;
     }
-    const auto bioGuard = makeGuard([&inBio]() { BIO_free(inBio); });
 
-    if (BIO_read_filename(inBio, keyFile.c_str()) <= 0) {
-        LOGV2_ERROR(23250,
-                    "cannot read PEM key file: {keyFile} {error}",
-                    "Cannot read PEM key file",
-                    "keyFile"_attr = keyFile,
-                    "error"_attr = getSSLErrorMessage(ERR_get_error()));
+    if (BIO_read_filename(inBio.get(), keyFile.c_str()) <= 0) {
+        CaptureSSLErrorInAttrs capture(errorAttrs);
+        LOGV2_ERROR(23250, "Cannot read PEM key file", errorAttrs);
         return false;
+    }
+    return _setupPEMFromBIO(context, std::move(inBio), password, keyFile, std::nullopt);
+}
+
+bool SSLManagerOpenSSL::_setupPEMFromMemoryPayload(SSL_CTX* context,
+                                                   const std::string& payload,
+                                                   PasswordFetcher* password,
+                                                   StringData targetClusterURI) const {
+    logv2::DynamicAttributes errorAttrs;
+    errorAttrs.add("targetClusterURI", targetClusterURI);
+
+    if (!_readCertificateChainFromMemory(context, payload, password, targetClusterURI)) {
+        return false;
+    }
+#if OPENSSL_VERSION_NUMBER <= 0x1000114fL
+    UniqueBIO inBio(BIO_new_mem_buf(const_cast<char*>(payload.c_str()), payload.length()));
+#else
+    UniqueBIO inBio(BIO_new_mem_buf(payload.c_str(), payload.length()));
+#endif
+
+    if (!inBio) {
+        CaptureSSLErrorInAttrs capture(errorAttrs);
+        LOGV2_ERROR(5159901, "Failed to allocate BIO object from in-memory payload", errorAttrs);
+        return false;
+    }
+
+    return _setupPEMFromBIO(context, std::move(inBio), password, std::nullopt, targetClusterURI);
+}
+
+bool SSLManagerOpenSSL::_setupPEMFromBIO(SSL_CTX* context,
+                                         UniqueBIO inBio,
+                                         PasswordFetcher* password,
+                                         std::optional<StringData> keyFile,
+                                         std::optional<StringData> targetClusterURI) const {
+    logv2::DynamicAttributes errorAttrs;
+    if (keyFile) {
+        errorAttrs.add("keyFile", *keyFile);
+    }
+    if (targetClusterURI) {
+        errorAttrs.add("targetClusterURI", *targetClusterURI);
     }
 
     // Obtain the private key, using our callback to acquire a decryption password if necessary.
-    decltype(&SSLManagerOpenSSL::password_cb) password_cb = &SSLManagerOpenSSL::password_cb;
+    auto password_cb = &SSLManagerOpenSSL::password_cb;
     void* userdata = static_cast<void*>(password);
-    EVP_PKEY* privateKey = PEM_read_bio_PrivateKey(inBio, nullptr, password_cb, userdata);
+    EVP_PKEY* privateKey = PEM_read_bio_PrivateKey(inBio.get(), nullptr, password_cb, userdata);
     if (!privateKey) {
-        LOGV2_ERROR(23251,
-                    "cannot read PEM key file: {keyFile} {error}",
-                    "Cannot read PEM key file",
-                    "keyFile"_attr = keyFile,
-                    "error"_attr = getSSLErrorMessage(ERR_get_error()));
+        CaptureSSLErrorInAttrs capture(errorAttrs);
+        LOGV2_ERROR(23251, "Cannot read PEM key", errorAttrs);
         return false;
     }
     const auto privateKeyGuard = makeGuard([&privateKey]() { EVP_PKEY_free(privateKey); });
 
     if (SSL_CTX_use_PrivateKey(context, privateKey) != 1) {
-        LOGV2_ERROR(23252,
-                    "cannot use PEM key file: {keyFile} {error}",
-                    "Cannot use PEM key file",
-                    "keyFile"_attr = keyFile,
-                    "error"_attr = getSSLErrorMessage(ERR_get_error()));
+        CaptureSSLErrorInAttrs capture(errorAttrs);
+        LOGV2_ERROR(23252, "Cannot use PEM key", errorAttrs);
         return false;
     }
 
     // Verify that the certificate and the key go together.
     if (SSL_CTX_check_private_key(context) != 1) {
-        LOGV2_ERROR(23253,
-                    "SSL certificate validation failed: {error}",
-                    "SSL certificate validation failed",
-                    "error"_attr = getSSLErrorMessage(ERR_get_error()));
+        CaptureSSLErrorInAttrs capture(errorAttrs);
+        LOGV2_ERROR(23253, "SSL certificate validation failed", errorAttrs);
         return false;
     }
 
@@ -2729,6 +3154,136 @@ void SSLManagerOpenSSL::_handleSSLError(SSLConnectionOpenSSL* conn, int ret) {
     }
     _flushNetworkBIO(conn);
     throwSocketError(errToThrow, conn->socket->remoteString());
+}
+
+UniqueX509 SSLManagerOpenSSL::_getX509Object(StringData keyFile,
+                                             const PasswordFetcher* keyPassword) const {
+    BIO* inBIO = BIO_new(BIO_s_file());
+    if (inBIO == nullptr) {
+        uasserted(4913000, "failed to allocate BIO object");
+    }
+
+    ON_BLOCK_EXIT([&] { BIO_free(inBIO); });
+    if (BIO_read_filename(inBIO, keyFile.toString().c_str()) <= 0) {
+        uasserted(4913001,
+                  str::stream() << "cannot read key file when setting subject name: " << keyFile
+                                << " " << SSLManagerInterface::getSSLErrorMessage(ERR_get_error()));
+    }
+
+    UniqueX509 x509(PEM_read_bio_X509(
+        inBIO, nullptr, &SSLManagerOpenSSL::password_cb, static_cast<void*>(&keyPassword)));
+    if (x509 == nullptr) {
+        uasserted(4913002,
+                  str::stream() << "cannot retrieve certificate from keyfile: " << keyFile << " "
+                                << SSLManagerInterface::getSSLErrorMessage(ERR_get_error()));
+    }
+    return x509;
+}
+
+constexpr size_t kSHA1HashBytes = 20;
+
+// static
+void SSLManagerOpenSSL::_getX509CertInfo(UniqueX509& x509,
+                                         CertInformationToLog* info,
+                                         std::optional<StringData> keyFile,
+                                         std::optional<StringData> targetClusterURI) {
+    info->subject = getCertificateSubjectX509Name(x509.get());
+    info->issuer = convertX509ToSSLX509Name(X509_get_issuer_name(x509.get()));
+
+    info->thumbprint.resize(kSHA1HashBytes);
+    X509_digest(
+        x509.get(), EVP_sha1(), reinterpret_cast<unsigned char*>(info->thumbprint.data()), nullptr);
+    info->hexEncodedThumbprint = hexblob::encode(info->thumbprint.data(), info->thumbprint.size());
+
+    auto notBeforeMillis = convertASN1ToMillis(X509_get_notBefore(x509.get()));
+
+    uassert(4913003, "date conversion failed", notBeforeMillis != Date_t());
+
+    info->validityNotBefore = notBeforeMillis;
+
+    auto notAfterMillis = convertASN1ToMillis(X509_get_notAfter(x509.get()));
+
+    info->validityNotAfter = notAfterMillis;
+
+    uassert(4913004, "date conversion failed", notAfterMillis != Date_t());
+
+    if (keyFile)
+        info->keyFile = keyFile->toString();
+    if (targetClusterURI)
+        info->targetClusterURI = targetClusterURI->toString();
+}
+
+
+void SSLManagerOpenSSL::_getCRLInfo(StringData crlFile, CRLInformationToLog* info) const {
+    BIO* inBIO = BIO_new(BIO_s_file());
+    if (inBIO == nullptr) {
+        uasserted(4913005, "failed to allocate BIO object");
+    }
+
+    ON_BLOCK_EXIT([&] { BIO_free(inBIO); });
+
+    if (BIO_read_filename(inBIO, crlFile.toString().c_str()) <= 0) {
+        uasserted(4913006,
+                  str::stream() << "cannot read crl file when setting subject name: " << crlFile
+                                << " " << SSLManagerInterface::getSSLErrorMessage(ERR_get_error()));
+    }
+
+
+    X509_CRL* x509 =
+        PEM_read_bio_X509_CRL(inBIO, nullptr, &SSLManagerOpenSSL::password_cb, nullptr);
+    if (x509 == nullptr) {
+        uasserted(4913007,
+                  str::stream() << "cannot retrieve CRL information from crl file: " << crlFile
+                                << " " << SSLManagerInterface::getSSLErrorMessage(ERR_get_error()));
+    }
+    ON_BLOCK_EXIT([&] { X509_CRL_free(x509); });
+
+    info->thumbprint.resize(kSHA1HashBytes);
+    X509_CRL_digest(
+        x509, EVP_sha1(), reinterpret_cast<unsigned char*>(info->thumbprint.data()), nullptr);
+
+    auto notBeforeMillis = convertASN1ToMillis(X509_CRL_get_lastUpdate(x509));
+
+    uassert(4913008, "date conversion failed", notBeforeMillis != Date_t());
+
+    info->validityNotBefore = notBeforeMillis;
+
+    auto notAfterMillis = convertASN1ToMillis(X509_CRL_get_nextUpdate(x509));
+
+    uassert(4913009, "date conversion failed", notAfterMillis != Date_t());
+
+    info->validityNotAfter = notAfterMillis;
+}
+
+
+SSLInformationToLog SSLManagerOpenSSL::getSSLInformationToLog() const {
+    SSLInformationToLog info;
+    if (!(sslGlobalParams.sslPEMKeyFile.empty())) {
+        UniqueX509 serverX509Cert =
+            _getX509Object(sslGlobalParams.sslPEMKeyFile, &_serverPEMPassword);
+        _getX509CertInfo(serverX509Cert, &info.server, sslGlobalParams.sslPEMKeyFile, std::nullopt);
+    }
+
+    if (!(sslGlobalParams.sslClusterFile.empty())) {
+        CertInformationToLog clusterInfo;
+        UniqueX509 clusterX509Cert =
+            _getX509Object(sslGlobalParams.sslClusterFile, &_clusterPEMPassword);
+        _getX509CertInfo(
+            clusterX509Cert, &clusterInfo, sslGlobalParams.sslClusterFile, std::nullopt);
+        info.cluster = clusterInfo;
+    } else {
+        info.cluster = boost::none;
+    }
+
+    if (!sslGlobalParams.sslCRLFile.empty()) {
+        CRLInformationToLog crlInfo;
+        _getCRLInfo(getSSLGlobalParams().sslCRLFile, &crlInfo);
+        info.crl = crlInfo;
+    } else {
+        info.crl = boost::none;
+    }
+
+    return info;
 }
 
 }  // namespace mongo

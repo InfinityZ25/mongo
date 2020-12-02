@@ -3,16 +3,18 @@
 import os.path
 import time
 from enum import Enum
+from collections import namedtuple
+from typing import List
 
 import pymongo
 import pymongo.errors
 
-from ... import config
-from ... import errors
-from ... import logging
-from ... import multiversionconstants as multiversion
-from ... import utils
-from ...utils import registry
+from buildscripts.resmokelib import config
+from buildscripts.resmokelib import errors
+from buildscripts.resmokelib import logging
+from buildscripts.resmokelib import multiversionconstants as multiversion
+from buildscripts.resmokelib import utils
+from buildscripts.resmokelib.utils import registry
 
 _FIXTURES = {}  # type: ignore
 
@@ -45,9 +47,9 @@ class Fixture(object, metaclass=registry.make_registry_metaclass(_FIXTURES)):
     # is defined for all subclasses of Fixture.
     REGISTERED_NAME = "Fixture"
 
-    _LAST_STABLE_FCV = multiversion.LAST_STABLE_FCV
+    _LAST_LTS_FCV = multiversion.LAST_LTS_FCV
     _LATEST_FCV = multiversion.LATEST_FCV
-    _LAST_STABLE_BIN_VERSION = multiversion.LAST_STABLE_BIN_VERSION
+    _LAST_LTS_BIN_VERSION = multiversion.LAST_LTS_BIN_VERSION
 
     def __init__(self, logger, job_num, dbpath_prefix=None):
         """Initialize the fixture with a logger instance."""
@@ -111,6 +113,10 @@ class Fixture(object, metaclass=registry.make_registry_metaclass(_FIXTURES)):
     def is_running(self):  # pylint: disable=no-self-use
         """Return true if the fixture is still operating and more tests and can be run."""
         return True
+
+    def get_node_info(self):  # pylint: disable=no-self-use
+        """Return a list of NodeInfo objects."""
+        return []
 
     def get_dbpath_prefix(self):
         """Return dbpath prefix."""
@@ -283,3 +289,55 @@ class FixtureTeardownHandler(object):
             self._message = message
         else:
             self._message = "{} - {}".format(self._message, message)
+
+
+def create_fixture_table(fixture):
+    """Get fixture node info, make it a pretty table. Return it or None if fixture is invalid target."""
+    info: List[NodeInfo] = fixture.get_node_info()
+    if not info:
+        return None
+
+    columns = {}
+    longest = {}
+    for key in NodeInfo._fields:
+        longest[key] = len(key)
+        columns[key] = []
+        for node in info:
+            value = str(getattr(node, key))
+            columns[key].append(value)
+            longest[key] = max(longest[key], len(value))
+
+    def horizontal_separator():
+        row = ""
+        for key in columns:
+            row += "+" + "-" * (longest[key])
+        row += "+"
+        return row
+
+    def title_row():
+        row = ""
+        for key in columns:
+            row += "|" + key + " " * (longest[key] - len(key))
+        row += "|"
+        return row
+
+    def data_row(i):
+        row = ""
+        for key in columns:
+            row += "|" + columns[key][i] + " " * (longest[key] - len(columns[key][i]))
+        row += "|"
+        return row
+
+    table = ""
+    table += horizontal_separator() + "\n"
+    table += title_row() + "\n"
+    table += horizontal_separator() + "\n"
+    for i in range(len(info)):
+        table += data_row(i) + "\n"
+    table += horizontal_separator()
+
+    return "Fixture status:\n" + table
+
+
+# Represents a row in a node info table.
+NodeInfo = namedtuple('NodeInfo', ['name', 'port', 'pid'])

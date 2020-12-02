@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -93,7 +93,15 @@ public:
 
     void attachCurOpErrInfo(OperationContext*, const BSONObj&) const override {}
 
-    void handleException(const DBException& e, OperationContext* opCtx) const override {}
+    bool refreshDatabase(OperationContext* opCtx, const StaleDbRoutingVersion& se) const
+        noexcept override {
+        return false;
+    }
+
+    bool refreshCollection(OperationContext* opCtx, const StaleConfigInfo& se) const
+        noexcept override {
+        return false;
+    }
 
     void advanceConfigOpTimeFromRequestMetadata(OperationContext* opCtx) const override {}
 
@@ -110,13 +118,14 @@ public:
                              BSONObjBuilder* metadataBob) const override {}
 };
 
-DbResponse ServiceEntryPointEmbedded::handleRequest(OperationContext* opCtx, const Message& m) {
+Future<DbResponse> ServiceEntryPointEmbedded::handleRequest(OperationContext* opCtx,
+                                                            const Message& m) noexcept {
     // Only one thread will pump at a time and concurrent calls to this will skip the pumping and go
     // directly to handleRequest. This means that the jobs in the periodic runner can't provide any
     // guarantees of the state (that they have run).
     checked_cast<PeriodicRunnerEmbedded*>(opCtx->getServiceContext()->getPeriodicRunner())
         ->tryPump();
-    return ServiceEntryPointCommon::handleRequest(opCtx, m, Hooks{});
+    return ServiceEntryPointCommon::handleRequest(opCtx, m, std::make_unique<Hooks>());
 }
 
 void ServiceEntryPointEmbedded::startSession(transport::SessionHandle session) {

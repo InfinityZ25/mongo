@@ -27,12 +27,15 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/base/counter.h"
 #include "mongo/db/collection_index_usage_tracker.h"
+
+#include <atomic>
+
+#include "mongo/base/counter.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/clock_source.h"
@@ -49,15 +52,25 @@ ServerStatusMetricField<Counter64> displayCollectionScansNonTailable(
 }  // namespace
 
 CollectionIndexUsageTracker::CollectionIndexUsageTracker(ClockSource* clockSource)
-    : _clockSource(clockSource) {
+    : _indexUsageStatsMap(std::make_shared<CollectionIndexUsageMap>()), _clockSource(clockSource) {
     invariant(_clockSource);
 }
 
 void CollectionIndexUsageTracker::recordIndexAccess(StringData indexName) {
     invariant(!indexName.empty());
-    dassert(_indexUsageMap.find(indexName) != _indexUsageMap.end());
 
-    _indexUsageMap[indexName].accesses.fetchAndAdd(1);
+    // The following update after fetching the map can race with the removal of this index entry
+    // from the map. However, that race is inconsequential and remains memory safe.
+    auto mapSharedPtr = atomic_load(&_indexUsageStatsMap);
+
+    auto it = mapSharedPtr->find(indexName);
+    if (it == mapSharedPtr->end()) {
+        // We are using an index that has been removed from the catalog, no need to track usage
+        return;
+    }
+
+    // Increment the index usage atomic counter.
+    it->second->accesses.fetchAndAdd(1);
 }
 
 void CollectionIndexUsageTracker::recordCollectionScans(unsigned long long collectionScans) {
@@ -73,20 +86,39 @@ void CollectionIndexUsageTracker::recordCollectionScansNonTailable(
 
 void CollectionIndexUsageTracker::registerIndex(StringData indexName, const BSONObj& indexKey) {
     invariant(!indexName.empty());
-    dassert(_indexUsageMap.find(indexName) == _indexUsageMap.end());
 
-    // Create map entry.
-    _indexUsageMap[indexName] = IndexUsageStats(_clockSource->now(), indexKey);
+    // Create a copy of the map to modify.
+    auto mapSharedPtr = atomic_load(&_indexUsageStatsMap);
+    auto mapCopy = std::make_shared<CollectionIndexUsageMap>(*mapSharedPtr);
+
+    dassert(mapCopy->find(indexName) == mapCopy->end());
+
+    // Create the map entry.
+    auto inserted = mapCopy->try_emplace(
+        indexName, make_intrusive<IndexUsageStats>(_clockSource->now(), indexKey));
+    invariant(inserted.second);
+
+    // Swap the modified map into place atomically.
+    atomic_store(&_indexUsageStatsMap, std::move(mapCopy));
 }
 
 void CollectionIndexUsageTracker::unregisterIndex(StringData indexName) {
     invariant(!indexName.empty());
 
-    _indexUsageMap.erase(indexName);
+    // Create a copy of the map to modify.
+    auto mapSharedPtr = atomic_load(&_indexUsageStatsMap);
+    auto mapCopy = std::make_shared<CollectionIndexUsageMap>(*mapSharedPtr);
+
+    // Remove the map entry.
+    mapCopy->erase(indexName);
+
+    // Swap the modified map into place atomically.
+    atomic_store(&_indexUsageStatsMap, std::move(mapCopy));
 }
 
-CollectionIndexUsageMap CollectionIndexUsageTracker::getUsageStats() const {
-    return _indexUsageMap;
+std::shared_ptr<CollectionIndexUsageTracker::CollectionIndexUsageMap>
+CollectionIndexUsageTracker::getUsageStats() const {
+    return atomic_load(&_indexUsageStatsMap);
 }
 
 CollectionIndexUsageTracker::CollectionScanStats

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kExecutor
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kExecutor
 
 #include "mongo/platform/basic.h"
 
@@ -35,10 +35,10 @@
 
 #include "mongo/logv2/log.h"
 #include "mongo/stdx/thread.h"
-#include "mongo/transport/service_entry_point_utils.h"
 #include "mongo/transport/service_executor_gen.h"
-#include "mongo/transport/service_executor_task_names.h"
+#include "mongo/transport/service_executor_utils.h"
 #include "mongo/util/processinfo.h"
+#include "mongo/util/thread_safety_context.h"
 
 namespace mongo {
 namespace transport {
@@ -46,13 +46,22 @@ namespace {
 constexpr auto kThreadsRunning = "threadsRunning"_sd;
 constexpr auto kExecutorLabel = "executor"_sd;
 constexpr auto kExecutorName = "passthrough"_sd;
+
+const auto getServiceExecutorSynchronous =
+    ServiceContext::declareDecoration<std::unique_ptr<ServiceExecutorSynchronous>>();
+
+const auto serviceExecutorSynchronousRegisterer = ServiceContext::ConstructorActionRegisterer{
+    "ServiceExecutorSynchronous", [](ServiceContext* ctx) {
+        getServiceExecutorSynchronous(ctx) = std::make_unique<ServiceExecutorSynchronous>(ctx);
+    }};
 }  // namespace
 
 thread_local std::deque<ServiceExecutor::Task> ServiceExecutorSynchronous::_localWorkQueue = {};
 thread_local int ServiceExecutorSynchronous::_localRecursionDepth = 0;
 thread_local int64_t ServiceExecutorSynchronous::_localThreadIdleCounter = 0;
 
-ServiceExecutorSynchronous::ServiceExecutorSynchronous(ServiceContext* ctx) {}
+ServiceExecutorSynchronous::ServiceExecutorSynchronous(ServiceContext* ctx)
+    : _shutdownCondition(std::make_shared<stdx::condition_variable>()) {}
 
 Status ServiceExecutorSynchronous::start() {
     _numHardwareCores = static_cast<size_t>(ProcessInfo::getNumAvailableCores());
@@ -68,7 +77,7 @@ Status ServiceExecutorSynchronous::shutdown(Milliseconds timeout) {
     _stillRunning.store(false);
 
     stdx::unique_lock<Latch> lock(_shutdownMutex);
-    bool result = _shutdownCondition.wait_for(lock, timeout.toSystemDuration(), [this]() {
+    bool result = _shutdownCondition->wait_for(lock, timeout.toSystemDuration(), [this]() {
         return _numRunningWorkerThreads.load() == 0;
     });
 
@@ -78,9 +87,13 @@ Status ServiceExecutorSynchronous::shutdown(Milliseconds timeout) {
                  "passthrough executor couldn't shutdown all worker threads within time limit.");
 }
 
-Status ServiceExecutorSynchronous::schedule(Task task,
-                                            ScheduleFlags flags,
-                                            ServiceExecutorTaskName taskName) {
+ServiceExecutorSynchronous* ServiceExecutorSynchronous::get(ServiceContext* ctx) {
+    auto& ref = getServiceExecutorSynchronous(ctx);
+    invariant(ref);
+    return ref.get();
+}
+
+Status ServiceExecutorSynchronous::scheduleTask(Task task, ScheduleFlags flags) {
     if (!_stillRunning.load()) {
         return Status{ErrorCodes::ShutdownInProgress, "Executor is not running"};
     }
@@ -111,24 +124,29 @@ Status ServiceExecutorSynchronous::schedule(Task task,
         return Status::OK();
     }
 
-    // First call to schedule() for this connection, spawn a worker thread that will push jobs
+    // First call to scheduleTask() for this connection, spawn a worker thread that will push jobs
     // into the thread local job queue.
     LOGV2_DEBUG(22983, 3, "Starting new executor thread in passthrough mode");
 
-    Status status = launchServiceWorkerThread([this, task = std::move(task)] {
-        _numRunningWorkerThreads.addAndFetch(1);
+    Status status = launchServiceWorkerThread(
+        [this, condVarAnchor = _shutdownCondition, task = std::move(task)]() mutable {
+            _numRunningWorkerThreads.addAndFetch(1);
 
-        _localWorkQueue.emplace_back(std::move(task));
-        while (!_localWorkQueue.empty() && _stillRunning.loadRelaxed()) {
-            _localRecursionDepth = 1;
-            _localWorkQueue.front()();
-            _localWorkQueue.pop_front();
-        }
+            _localWorkQueue.emplace_back(std::move(task));
+            while (!_localWorkQueue.empty() && _stillRunning.loadRelaxed()) {
+                _localRecursionDepth = 1;
+                _localWorkQueue.front()();
+                _localWorkQueue.pop_front();
+            }
 
-        if (_numRunningWorkerThreads.subtractAndFetch(1) == 0) {
-            _shutdownCondition.notify_all();
-        }
-    });
+            // We maintain an anchor to "_shutdownCondition" to ensure it remains alive even if the
+            // service executor is freed. Any access to the service executor (through "this") is
+            // prohibited (and unsafe) after the following line. For more context, see SERVER-49432.
+            auto numWorkerThreadsStillRunning = _numRunningWorkerThreads.subtractAndFetch(1);
+            if (numWorkerThreadsStillRunning == 0) {
+                condVarAnchor->notify_all();
+            }
+        });
 
     return status;
 }
@@ -137,6 +155,12 @@ void ServiceExecutorSynchronous::appendStats(BSONObjBuilder* bob) const {
     *bob << kExecutorLabel << kExecutorName << kThreadsRunning
          << static_cast<int>(_numRunningWorkerThreads.loadRelaxed());
 }
+
+void ServiceExecutorSynchronous::runOnDataAvailable(Session* session,
+                                                    OutOfLineExecutor::Task onCompletionCallback) {
+    scheduleCallbackOnDataAvailable(session, std::move(onCompletionCallback), this);
+}
+
 
 }  // namespace transport
 }  // namespace mongo

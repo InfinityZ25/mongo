@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -46,19 +46,22 @@ namespace mongo {
 Mutex ConnectionString::_connectHookMutex = MONGO_MAKE_LATCH();
 ConnectionString::ConnectionHook* ConnectionString::_connectHook = nullptr;
 
-std::unique_ptr<DBClientBase> ConnectionString::connect(StringData applicationName,
-                                                        std::string& errmsg,
-                                                        double socketTimeout,
-                                                        const MongoURI* uri) const {
+std::unique_ptr<DBClientBase> ConnectionString::connect(
+    StringData applicationName,
+    std::string& errmsg,
+    double socketTimeout,
+    const MongoURI* uri,
+    const ClientAPIVersionParameters* apiParameters) const {
     MongoURI newURI{};
     if (uri) {
         newURI = *uri;
     }
 
     switch (_type) {
-        case MASTER: {
+        case ConnectionType::kStandalone: {
             for (const auto& server : _servers) {
-                auto c = std::make_unique<DBClientConnection>(true, 0, newURI);
+                auto c = std::make_unique<DBClientConnection>(
+                    true, 0, newURI, DBClientConnection::HandshakeValidationHook(), apiParameters);
 
                 c->setSoTimeout(socketTimeout);
                 LOGV2_DEBUG(20109,
@@ -75,9 +78,13 @@ std::unique_ptr<DBClientBase> ConnectionString::connect(StringData applicationNa
             return nullptr;
         }
 
-        case SET: {
-            auto set = std::make_unique<DBClientReplicaSet>(
-                _setName, _servers, applicationName, socketTimeout, std::move(newURI));
+        case ConnectionType::kReplicaSet: {
+            auto set = std::make_unique<DBClientReplicaSet>(_replicaSetName,
+                                                            _servers,
+                                                            applicationName,
+                                                            socketTimeout,
+                                                            std::move(newURI),
+                                                            apiParameters);
             if (!set->connect()) {
                 errmsg = "connect failed to replica set ";
                 errmsg += toString();
@@ -86,7 +93,7 @@ std::unique_ptr<DBClientBase> ConnectionString::connect(StringData applicationNa
             return std::move(set);
         }
 
-        case CUSTOM: {
+        case ConnectionType::kCustom: {
             // Lock in case other things are modifying this at the same time
             stdx::lock_guard<Latch> lk(_connectHookMutex);
 
@@ -98,7 +105,8 @@ std::unique_ptr<DBClientBase> ConnectionString::connect(StringData applicationNa
                     _connectHook);
 
             // Double-checked lock, since this will never be active during normal operation
-            auto replacementConn = _connectHook->connect(*this, errmsg, socketTimeout);
+            auto replacementConn =
+                _connectHook->connect(*this, errmsg, socketTimeout, apiParameters);
 
             LOGV2(20111,
                   "Replacing connection to {oldConnString} with {newConnString}",
@@ -110,8 +118,8 @@ std::unique_ptr<DBClientBase> ConnectionString::connect(StringData applicationNa
             return replacementConn;
         }
 
-        case LOCAL:
-        case INVALID:
+        case ConnectionType::kLocal:
+        case ConnectionType::kInvalid:
             MONGO_UNREACHABLE;
     }
 

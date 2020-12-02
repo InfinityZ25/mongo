@@ -16,14 +16,32 @@
  * makes sure the validate command does not accept a non local read concern or afterClusterTime and
  * that it is therefore safe to ignore prepare conflicts during its execution.
  *
- * @tags: [uses_transactions, uses_prepare_transaction, requires_fcv_44]
+ * @tags: [
+ *   uses_prepare_transaction,
+ *   uses_transactions,
+ * ]
  */
 
 (function() {
 "use strict";
 load("jstests/core/txns/libs/prepare_helpers.js");
 
-const replTest = new ReplSetTest({nodes: 2});
+// This test completes with a prepared transaction still active, so we cannot enforce an accurate
+// fast count.
+TestData.skipEnforceFastCountOnValidate = true;
+// Snapshot read concern for the dbHash command is only available when enableTestCommands=true.
+// To test correctly client behavior with dbHash, we set enableTestCommands=false. We modify the
+// values of roleGraphInvalidationIsFatal and authenticationDatabase in order for this test to work
+// on inMemory build variants.
+TestData.enableTestCommands = false;
+TestData.roleGraphInvalidationIsFatal = false;
+TestData.authenticationDatabase = "local";
+const replTest = new ReplSetTest({
+    nodes: {
+        node0: {setParameter: "enableTestCommands=1"},
+        node1: {setParameter: "enableTestCommands=0"}
+    }
+});
 replTest.startSet();
 replTest.initiate();
 
@@ -131,8 +149,9 @@ function runTest() {
                 {documents: [{_id: 4, in_prepared_txn: false}], writeConcern: {w: "majority"}}))
             .operationTime;
 
-    jsTestLog("prepareTimestamp: " + prepareTimestamp + " clusterTimeBeforePrepare: " +
-              clusterTimeBeforePrepare + " clusterTimeAfterPrepare: " + clusterTimeAfterPrepare);
+    jsTestLog("prepareTimestamp: " + tojson(prepareTimestamp) +
+              " clusterTimeBeforePrepare: " + tojson(clusterTimeBeforePrepare) +
+              " clusterTimeAfterPrepare: " + tojson(clusterTimeAfterPrepare));
 
     assert.gt(prepareTimestamp, clusterTimeBeforePrepare);
     assert.gt(clusterTimeAfterPrepare, prepareTimestamp);

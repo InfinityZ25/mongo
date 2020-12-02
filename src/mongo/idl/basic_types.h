@@ -33,6 +33,7 @@
 
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/stdx/variant.h"
 
 namespace mongo {
 
@@ -104,4 +105,72 @@ private:
     boost::optional<bool> _value;
 };
 
+/**
+ * Class to represent a BSON element with any type from IDL. The caller must ensure that the backing
+ * BSON stays alive while this type is in use.
+ */
+class IDLAnyType {
+public:
+    static IDLAnyType parseFromBSON(const BSONElement& element) {
+        return IDLAnyType(element);
+    }
+
+    IDLAnyType() = default;
+    IDLAnyType(const BSONElement& element) : _element(element) {}
+
+    void serializeToBSON(StringData fieldName, BSONObjBuilder* builder) const {
+        builder->appendAs(_element, fieldName);
+    }
+
+    void serializeToBSON(BSONArrayBuilder* builder) const {
+        builder->append(_element);
+    }
+
+    const BSONElement& getElement() const {
+        return _element;
+    }
+
+private:
+    BSONElement _element;
+};
+class WriteConcernW {
+public:
+    static WriteConcernW deserializeWriteConcernW(BSONElement wEl) {
+        if (wEl.isNumber()) {
+            return WriteConcernW{wEl.safeNumberLong()};
+        } else if (wEl.type() == BSONType::String) {
+            return WriteConcernW{wEl.valuestrsafe()};
+        } else if (wEl.eoo() || wEl.type() == BSONType::jstNULL ||
+                   wEl.type() == BSONType::Undefined) {
+            return WriteConcernW{};
+        }
+        uasserted(ErrorCodes::FailedToParse, "w has to be a number or string");
+    }
+
+    void serializeWriteConcernW(BSONObjBuilder* builder) const {
+        if (auto stringVal = stdx::get_if<std::string>(&_w)) {
+            builder->append("w", *stringVal);
+            return;
+        }
+        auto intVal = stdx::get_if<std::int64_t>(&_w);
+        invariant(intVal);
+        builder->appendIntOrLL("w", *intVal);
+    }
+
+    WriteConcernW() : _w{1}, _usedDefault{true} {};
+
+    bool usedDefault() const {
+        return _usedDefault;
+    }
+
+    stdx::variant<std::string, std::int64_t> getValue() const {
+        return _w;
+    }
+
+private:
+    WriteConcernW(std::int64_t w) : _w{w}, _usedDefault{false} {};
+    WriteConcernW(std::string&& w) : _w(std::move(w)), _usedDefault{false} {};
+    stdx::variant<std::string, std::int64_t> _w;
+    bool _usedDefault;
+};
 }  // namespace mongo

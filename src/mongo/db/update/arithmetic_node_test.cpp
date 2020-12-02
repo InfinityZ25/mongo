@@ -120,14 +120,15 @@ TEST_F(ArithmeticNodeTest, ApplyIncNoOp) {
     ASSERT_OK(node.init(update["$inc"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 5}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 5}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+
+    assertOplogEntryIsNoop();
     ASSERT_EQUALS(getModifiedPaths(), "{a}");
 }
 
@@ -138,14 +139,15 @@ TEST_F(ArithmeticNodeTest, ApplyMulNoOp) {
     ASSERT_OK(node.init(update["$mul"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 5}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 5}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+
+    assertOplogEntryIsNoop();
     ASSERT_EQUALS(getModifiedPaths(), "{a}");
 }
 
@@ -156,14 +158,15 @@ TEST_F(ArithmeticNodeTest, ApplyRoundingNoOp) {
     ASSERT_OK(node.init(update["$inc"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 6.022e23}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 6.022e23}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+
+    assertOplogEntryIsNoop();
     ASSERT_EQUALS(getModifiedPaths(), "{a}");
 }
 
@@ -174,14 +177,15 @@ TEST_F(ArithmeticNodeTest, ApplyEmptyPathToCreate) {
     ASSERT_OK(node.init(update["$inc"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 5}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 11}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {a: 11}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$set: {a: 11}}"), fromjson("{$v: 2, diff: {u: {a: 11}}}"));
     ASSERT_EQUALS(getModifiedPaths(), "{a}");
 }
 
@@ -193,14 +197,16 @@ TEST_F(ArithmeticNodeTest, ApplyCreatePath) {
 
     mutablebson::Document doc(fromjson("{a: {d: 5}}"));
     setPathToCreate("b.c");
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {d: 5, b: {c: 6}}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {'a.b.c': 6}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$set: {'a.b.c': 6}}"),
+                     fromjson("{$v: 2, diff: {sa: {i: {b: {c: 6}}}}}"));
     ASSERT_EQUALS(getModifiedPaths(), "{a.b.c}");
 }
 
@@ -212,7 +218,7 @@ TEST_F(ArithmeticNodeTest, ApplyExtendPath) {
 
     mutablebson::Document doc(fromjson("{a: {c: 1}}"));
     setPathToCreate("b");
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a.b");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
@@ -236,7 +242,8 @@ TEST_F(ArithmeticNodeTest, ApplyCreatePathFromRoot) {
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{c: 5, a: {b: 6}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {'a.b': 6}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$set: {'a.b': 6}}"), fromjson("{$v: 2, diff: {i: {a: {b: 6}}}}"));
     ASSERT_EQUALS(getModifiedPaths(), "{a.b}");
 }
 
@@ -247,7 +254,7 @@ TEST_F(ArithmeticNodeTest, ApplyPositional) {
     ASSERT_OK(node.init(update["$inc"]["a.$"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: [0, 1, 2]}"));
-    setPathTaken("a.1");
+    setPathTaken(makeRuntimeUpdatePathForTest("a.1"));
     setMatchedField("1");
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"][1]), getUpdateNodeApplyParams());
@@ -255,7 +262,9 @@ TEST_F(ArithmeticNodeTest, ApplyPositional) {
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [0, 7, 2]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {'a.1': 7}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$set: {'a.1': 7}}"),
+                     fromjson("{$v: 2, diff: {sa: {a: true, u1: 7}}}"));
     ASSERT_EQUALS(getModifiedPaths(), "{a.1}");
 }
 
@@ -267,7 +276,7 @@ TEST_F(ArithmeticNodeTest, ApplyNonViablePathToInc) {
 
     mutablebson::Document doc(fromjson("{a: 5}"));
     setPathToCreate("b");
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     ASSERT_THROWS_CODE_AND_WHAT(
         node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams()),
@@ -284,7 +293,7 @@ TEST_F(ArithmeticNodeTest, ApplyNonViablePathToCreateFromReplicationIsNoOp) {
 
     mutablebson::Document doc(fromjson("{a: 5}"));
     setPathToCreate("b");
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     setFromOplogApplication(true);
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
@@ -292,7 +301,8 @@ TEST_F(ArithmeticNodeTest, ApplyNonViablePathToCreateFromReplicationIsNoOp) {
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 5}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+
+    assertOplogEntryIsNoop();
     ASSERT_EQUALS(getModifiedPaths(), "{a.b}");
 }
 
@@ -303,7 +313,7 @@ TEST_F(ArithmeticNodeTest, ApplyNoIndexDataNoLogBuilder) {
     ASSERT_OK(node.init(update["$inc"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 5}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     setLogBuilderToNull();
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
@@ -320,7 +330,7 @@ TEST_F(ArithmeticNodeTest, ApplyDoesNotAffectIndexes) {
     ASSERT_OK(node.init(update["$inc"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 5}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("b");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
@@ -337,7 +347,7 @@ TEST_F(ArithmeticNodeTest, IncTypePromotionIsNotANoOp) {
     ASSERT_OK(node.init(update["$inc"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: NumberInt(2)}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
@@ -354,7 +364,7 @@ TEST_F(ArithmeticNodeTest, MulTypePromotionIsNotANoOp) {
     ASSERT_OK(node.init(update["$mul"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: NumberInt(2)}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
@@ -371,14 +381,16 @@ TEST_F(ArithmeticNodeTest, TypePromotionFromIntToDecimalIsNotANoOp) {
     ASSERT_OK(node.init(update["$inc"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: NumberInt(5)}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: NumberDecimal(\"5.0\")}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {a: NumberDecimal(\"5.0\")}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$set: {a: NumberDecimal('5.0')}}"),
+                     fromjson("{$v: 2, diff: {u: {a: NumberDecimal('5.0')}}}"));
     ASSERT_EQUALS(getModifiedPaths(), "{a}");
 }
 
@@ -389,14 +401,16 @@ TEST_F(ArithmeticNodeTest, TypePromotionFromLongToDecimalIsNotANoOp) {
     ASSERT_OK(node.init(update["$inc"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: NumberLong(5)}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: NumberDecimal(\"5.0\")}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {a: NumberDecimal(\"5.0\")}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$set: {a: NumberDecimal('5.0')}}"),
+                     fromjson("{$v: 2, diff: {u: {a: NumberDecimal('5.0')}}}"));
     ASSERT_EQUALS(getModifiedPaths(), "{a}");
 }
 
@@ -407,14 +421,20 @@ TEST_F(ArithmeticNodeTest, TypePromotionFromDoubleToDecimalIsNotANoOp) {
     ASSERT_OK(node.init(update["$inc"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 5.25}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: NumberDecimal(\"5.25\")}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {a: NumberDecimal(\"5.25\")}}"), getLogDoc());
+
+    assertOplogEntry(
+        fromjson("{$set: {a: NumberDecimal('5.25')}}"),
+        fromjson("{$v: 2, diff: {u: {a: NumberDecimal('5.25')}}}"),
+        false  // Not checking binary equality because the NumberDecimal in the expected output may
+               // not be bitwise identical to the result produced by the update system.
+    );
     ASSERT_EQUALS(getModifiedPaths(), "{a}");
 }
 
@@ -425,7 +445,7 @@ TEST_F(ArithmeticNodeTest, ApplyPromoteToFloatingPoint) {
     ASSERT_OK(node.init(update["$inc"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: NumberLong(1)}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
@@ -442,14 +462,20 @@ TEST_F(ArithmeticNodeTest, IncrementedDecimalStaysDecimal) {
     ASSERT_OK(node.init(update["$inc"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: NumberDecimal(\"6.25\")}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: NumberDecimal(\"11.5\")}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {a: NumberDecimal(\"11.5\")}}"), getLogDoc());
+
+    assertOplogEntry(
+        fromjson("{$set: {a: NumberDecimal('11.5')}}"),
+        fromjson("{$v: 2, diff: {u: {a: NumberDecimal('11.5')}}}"),
+        false  // Not checking binary equality because the NumberDecimal in the expected output may
+               // not be bitwise identical to the result produced by the update system.
+    );
     ASSERT_EQUALS(getModifiedPaths(), "{a}");
 }
 
@@ -462,7 +488,7 @@ TEST_F(ArithmeticNodeTest, OverflowIntToLong) {
     const int initialValue = std::numeric_limits<int>::max();
     mutablebson::Document doc(BSON("a" << initialValue));
     ASSERT_EQUALS(mongo::NumberInt, doc.root()["a"].getType());
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
@@ -482,7 +508,7 @@ TEST_F(ArithmeticNodeTest, UnderflowIntToLong) {
     const int initialValue = std::numeric_limits<int>::min();
     mutablebson::Document doc(BSON("a" << initialValue));
     ASSERT_EQUALS(mongo::NumberInt, doc.root()["a"].getType());
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
@@ -501,7 +527,7 @@ TEST_F(ArithmeticNodeTest, IncModeCanBeReused) {
 
     mutablebson::Document doc1(fromjson("{a: 1}"));
     mutablebson::Document doc2(fromjson("{a: 2}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc1.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
@@ -511,7 +537,7 @@ TEST_F(ArithmeticNodeTest, IncModeCanBeReused) {
     ASSERT_EQUALS(getModifiedPaths(), "{a}");
 
     resetApplyParams();
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     result = node.apply(getApplyParams(doc2.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
@@ -579,7 +605,7 @@ TEST_F(ArithmeticNodeTest, ApplyIncToObjectFails) {
     ASSERT_OK(node.init(update["$inc"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{_id: 'test_object', a: {b: 1}}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     ASSERT_THROWS_CODE_AND_WHAT(
         node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams()),
@@ -596,7 +622,7 @@ TEST_F(ArithmeticNodeTest, ApplyIncToArrayFails) {
     ASSERT_OK(node.init(update["$inc"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{_id: 'test_object', a: []}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     ASSERT_THROWS_CODE_AND_WHAT(
         node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams()),
@@ -613,7 +639,7 @@ TEST_F(ArithmeticNodeTest, ApplyIncToStringFails) {
     ASSERT_OK(node.init(update["$inc"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{_id: 'test_object', a: \"foo\"}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     ASSERT_THROWS_CODE_AND_WHAT(
         node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams()),
@@ -630,7 +656,7 @@ TEST_F(ArithmeticNodeTest, OverflowingOperationFails) {
     ASSERT_OK(node.init(update["$mul"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{_id: 'test_object', a: NumberLong(9223372036854775807)}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     ASSERT_THROWS_CODE_AND_WHAT(
         node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams()),
@@ -665,12 +691,12 @@ TEST_F(ArithmeticNodeTest, ApplyEmptyIndexData) {
     ASSERT_OK(node.init(update["$inc"]["a"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: 1}"));
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_EQUALS(fromjson("{a: 3}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(countChildren(getLogDoc().root()), 1u);
-    ASSERT_EQUALS(fromjson("{$set: {a: 3}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$set: {a: 3}}"), fromjson("{$v: 2, diff: {u: {a: 3}}}"));
     ASSERT_EQUALS(getModifiedPaths(), "{a}");
 }
 
@@ -681,7 +707,7 @@ TEST_F(ArithmeticNodeTest, ApplyNoOpDottedPath) {
     ASSERT_OK(node.init(update["$inc"]["a.b"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: {b: 2}}"));
-    setPathTaken("a.b");
+    setPathTaken(makeRuntimeUpdatePathForTest("a.b"));
     addIndexedPath("a.b");
     auto result = node.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
@@ -698,7 +724,7 @@ TEST_F(ArithmeticNodeTest, TypePromotionOnDottedPathIsNotANoOp) {
     ASSERT_OK(node.init(update["$inc"]["a.b"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: {b: NumberInt(2)}}"));
-    setPathTaken("a.b");
+    setPathTaken(makeRuntimeUpdatePathForTest("a.b"));
     addIndexedPath("a.b");
     auto result = node.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
@@ -716,7 +742,7 @@ TEST_F(ArithmeticNodeTest, ApplyPathNotViableArray) {
 
     mutablebson::Document doc(fromjson("{a:[{b:1}]}"));
     setPathToCreate("b");
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     ASSERT_THROWS_CODE_AND_WHAT(
         node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams()),
         AssertionException,
@@ -731,7 +757,7 @@ TEST_F(ArithmeticNodeTest, ApplyInPlaceDottedPath) {
     ASSERT_OK(node.init(update["$inc"]["a.b"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: {b: 1}}"));
-    setPathTaken("a.b");
+    setPathTaken(makeRuntimeUpdatePathForTest("a.b"));
     addIndexedPath("a.b");
     auto result = node.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
@@ -748,7 +774,7 @@ TEST_F(ArithmeticNodeTest, ApplyPromotionDottedPath) {
     ASSERT_OK(node.init(update["$inc"]["a.b"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: {b: NumberInt(3)}}"));
-    setPathTaken("a.b");
+    setPathTaken(makeRuntimeUpdatePathForTest("a.b"));
     addIndexedPath("a.b");
     auto result = node.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
@@ -799,7 +825,7 @@ TEST_F(ArithmeticNodeTest, ApplyNoOpArrayIndex) {
     ASSERT_OK(node.init(update["$inc"]["a.2.b"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: [{b: 0},{b: 1},{b: 2}]}"));
-    setPathTaken("a.2.b");
+    setPathTaken(makeRuntimeUpdatePathForTest("a.2.b"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"][2]["b"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
@@ -817,7 +843,7 @@ TEST_F(ArithmeticNodeTest, TypePromotionInArrayIsNotANoOp) {
 
     mutablebson::Document doc(
         fromjson("{a: [{b: NumberInt(0)},{b: NumberInt(1)},{b: NumberInt(2)}]}"));
-    setPathTaken("a.2.b");
+    setPathTaken(makeRuntimeUpdatePathForTest("a.2.b"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"][2]["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
@@ -835,7 +861,7 @@ TEST_F(ArithmeticNodeTest, ApplyNonViablePathThroughArray) {
 
     mutablebson::Document doc(fromjson("{a: 0}"));
     setPathToCreate("2.b");
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     ASSERT_THROWS_CODE_AND_WHAT(
         node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams()),
         AssertionException,
@@ -850,7 +876,7 @@ TEST_F(ArithmeticNodeTest, ApplyInPlaceArrayIndex) {
     ASSERT_OK(node.init(update["$inc"]["a.2.b"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: [{b: 0},{b: 1},{b: 1}]}"));
-    setPathTaken("a.2.b");
+    setPathTaken(makeRuntimeUpdatePathForTest("a.2.b"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"][2]["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
@@ -868,7 +894,7 @@ TEST_F(ArithmeticNodeTest, ApplyAppendArray) {
 
     mutablebson::Document doc(fromjson("{a: [{b: 0},{b: 1}]}"));
     setPathToCreate("2.b");
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
@@ -886,7 +912,7 @@ TEST_F(ArithmeticNodeTest, ApplyPaddingArray) {
 
     mutablebson::Document doc(fromjson("{a: [{b: 0}]}"));
     setPathToCreate("2.b");
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
@@ -904,7 +930,7 @@ TEST_F(ArithmeticNodeTest, ApplyNumericObject) {
 
     mutablebson::Document doc(fromjson("{a: {b: 0}}"));
     setPathToCreate("2.b");
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
@@ -921,7 +947,10 @@ TEST_F(ArithmeticNodeTest, ApplyNumericField) {
     ASSERT_OK(node.init(update["$inc"]["a.2.b"], expCtx));
 
     mutablebson::Document doc(fromjson("{a: {'2': {b: 1}}}"));
-    setPathTaken("a.2.b");
+    setPathTaken(RuntimeUpdatePath(FieldRef("a.2.b"),
+                                   {RuntimeUpdatePath::ComponentType::kFieldName,
+                                    RuntimeUpdatePath::ComponentType::kFieldName,
+                                    RuntimeUpdatePath::ComponentType::kFieldName}));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]["2"]["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
@@ -939,7 +968,9 @@ TEST_F(ArithmeticNodeTest, ApplyExtendNumericField) {
 
     mutablebson::Document doc(fromjson("{a: {'2': {c: 1}}}"));
     setPathToCreate("b");
-    setPathTaken("a.2");
+    setPathTaken(RuntimeUpdatePath(FieldRef("a.2"),
+                                   {RuntimeUpdatePath::ComponentType::kFieldName,
+                                    RuntimeUpdatePath::ComponentType::kFieldName}));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]["2"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
@@ -957,7 +988,7 @@ TEST_F(ArithmeticNodeTest, ApplyNumericFieldToEmptyObject) {
 
     mutablebson::Document doc(fromjson("{a: {}}"));
     setPathToCreate("2.b");
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
@@ -975,7 +1006,7 @@ TEST_F(ArithmeticNodeTest, ApplyEmptyArray) {
 
     mutablebson::Document doc(fromjson("{a: []}"));
     setPathToCreate("2.b");
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
@@ -993,12 +1024,13 @@ TEST_F(ArithmeticNodeTest, ApplyLogDottedPath) {
 
     mutablebson::Document doc(fromjson("{a: [{b:0}, {b:1}]}"));
     setPathToCreate("2.b");
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_EQUALS(fromjson("{a: [{b:0}, {b:1}, {b:2}]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(countChildren(getLogDoc().root()), 1u);
-    ASSERT_EQUALS(fromjson("{$set: {'a.2.b': 2}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$set: {'a.2.b': 2}}"),
+                     fromjson("{$v: 2, diff: {sa: {a: true, u2: {b: 2}}}}"));
     ASSERT_EQUALS(getModifiedPaths(), "{a}");
 }
 
@@ -1010,12 +1042,13 @@ TEST_F(ArithmeticNodeTest, LogEmptyArray) {
 
     mutablebson::Document doc(fromjson("{a: []}"));
     setPathToCreate("2.b");
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_EQUALS(fromjson("{a: [null, null, {b:2}]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(countChildren(getLogDoc().root()), 1u);
-    ASSERT_EQUALS(fromjson("{$set: {'a.2.b': 2}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$set: {'a.2.b': 2}}"),
+                     fromjson("{$v: 2, diff: {sa: {a: true, u2: {b: 2}}}}"));
     ASSERT_EQUALS(getModifiedPaths(), "{a}");
 }
 
@@ -1027,12 +1060,13 @@ TEST_F(ArithmeticNodeTest, LogEmptyObject) {
 
     mutablebson::Document doc(fromjson("{a: {}}"));
     setPathToCreate("2.b");
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_EQUALS(fromjson("{a: {'2': {b: 2}}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(countChildren(getLogDoc().root()), 1u);
-    ASSERT_EQUALS(fromjson("{$set: {'a.2.b': 2}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$set: {'a.2.b': 2}}"),
+                     fromjson("{$v: 2, diff: {sa: {i: {'2': {b: 2}}}}}"));
     ASSERT_EQUALS(getModifiedPaths(), "{a.2.b}");
 }
 
@@ -1052,7 +1086,8 @@ TEST_F(ArithmeticNodeTest, ApplyDeserializedDocNotNoOp) {
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 1, b: NumberInt(0)}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {b: NumberInt(0)}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$set: {b: NumberInt(0)}}"), fromjson("{$v: 2, diff: {i: {b: 0}}}"));
     ASSERT_EQUALS(getModifiedPaths(), "{b}");
 }
 
@@ -1066,13 +1101,14 @@ TEST_F(ArithmeticNodeTest, ApplyToDeserializedDocNoOp) {
     // De-serialize the int.
     doc.root()["a"].setValueInt(2).transitional_ignore();
 
-    setPathTaken("a");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: NumberInt(2)}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+
+    assertOplogEntryIsNoop();
     ASSERT_EQUALS(getModifiedPaths(), "{a}");
 }
 
@@ -1086,13 +1122,14 @@ TEST_F(ArithmeticNodeTest, ApplyToDeserializedDocNestedNoop) {
     // De-serialize the int.
     doc.root().appendObject("a", BSON("b" << static_cast<int>(1))).transitional_ignore();
 
-    setPathTaken("a.b");
+    setPathTaken(makeRuntimeUpdatePathForTest("a.b"));
     auto result = node.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {b: NumberInt(1)}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+
+    assertOplogEntryIsNoop();
     ASSERT_EQUALS(getModifiedPaths(), "{a.b}");
 }
 
@@ -1106,13 +1143,14 @@ TEST_F(ArithmeticNodeTest, ApplyToDeserializedDocNestedNotNoop) {
     // De-serialize the int.
     doc.root().appendObject("a", BSON("b" << static_cast<int>(1))).transitional_ignore();
 
-    setPathTaken("a.b");
+    setPathTaken(makeRuntimeUpdatePathForTest("a.b"));
     auto result = node.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {b: 3}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {'a.b': 3}}"), getLogDoc());
+
+    assertOplogEntry(fromjson("{$set: {'a.b': 3}}"), fromjson("{$v: 2, diff: {sa: {u: {b: 3}}}}"));
     ASSERT_EQUALS(getModifiedPaths(), "{a.b}");
 }
 

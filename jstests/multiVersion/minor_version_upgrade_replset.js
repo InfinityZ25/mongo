@@ -5,7 +5,7 @@
 load('./jstests/multiVersion/libs/multi_rs.js');
 load('./jstests/libs/test_background_ops.js');
 
-var oldVersion = "last-stable";
+var oldVersion = "last-lts";
 
 var nodes = {
     n1: {binVersion: oldVersion},
@@ -72,8 +72,8 @@ printjson(rst.status());
 sleep(10 * 1000);
 
 // Since the old primary was restarted as part of the upgrade process, we explicitly reconnect to it
-// so that sending it an update operation silently fails with an unchecked NotMaster error rather
-// than a network error.
+// so that sending it an update operation silently fails with an unchecked NotWritablePrimary error
+// rather than a network error.
 reconnect(oldPrimary.getDB("admin"));
 joinFindInsert();
 

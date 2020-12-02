@@ -27,17 +27,19 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/generic_gen.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/log_process_details.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/processinfo.h"
-#include "mongo/util/ramlog.h"
 
 #include <sstream>
 #include <string>
@@ -50,10 +52,8 @@ using std::string;
 using std::stringstream;
 using std::vector;
 
-class PingCommand : public BasicCommand {
+class PingCommand : public PingCmdVersion1Gen<PingCommand> {
 public:
-    PingCommand() : BasicCommand("ping") {}
-
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
@@ -61,25 +61,30 @@ public:
         return "a way to check that the server is alive. responds immediately even if server is "
                "in a db lock.";
     }
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return false;
-    }
-    virtual bool allowsAfterClusterTime(const BSONObj& cmdObj) const override {
-        return false;
-    }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
                                        std::vector<Privilege>* out) const {}  // No auth required
     virtual bool requiresAuth() const override {
         return false;
     }
-    virtual bool run(OperationContext* opCtx,
-                     const string& badns,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
-        // IMPORTANT: Don't put anything in here that might lock db - including authentication
-        return true;
-    }
+    class Invocation final : public InvocationBaseGen {
+    public:
+        using InvocationBaseGen::InvocationBaseGen;
+        virtual bool supportsWriteConcern() const override {
+            return false;
+        }
+        virtual bool allowsAfterClusterTime() const override {
+            return false;
+        }
+        NamespaceString ns() const override {
+            return NamespaceString(request().getDbName());
+        }
+        void doCheckAuthorization(OperationContext* opCtx) const override {}
+        virtual Reply typedRun(OperationContext* opCtx) override {
+            // IMPORTANT: Don't put anything in here that might lock db - including authentication
+            return Reply{};
+        }
+    };
 } pingCmd;
 
 class EchoCommand final : public TypedCommand<EchoCommand> {
@@ -158,10 +163,10 @@ public:
                      const string& ns,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
-        // sort the commands before building the result BSON
+        // Sort the command names before building the result BSON.
         std::vector<Command*> commands;
-        for (const auto command : globalCommandRegistry()->allCommands()) {
-            // don't show oldnames
+        for (const auto& command : globalCommandRegistry()->allCommands()) {
+            // Don't show oldnames
             if (command.first == command.second->getName())
                 commands.push_back(command.second);
         }
@@ -170,26 +175,112 @@ public:
         });
 
         BSONObjBuilder b(result.subobjStart("commands"));
-        for (const auto& c : commands) {
-            BSONObjBuilder temp(b.subobjStart(c->getName()));
-            temp.append("help", c->help());
-            temp.append("requiresAuth", c->requiresAuth());
-            temp.append("slaveOk",
-                        c->secondaryAllowed(opCtx->getServiceContext()) ==
+        for (const auto& command : commands) {
+            BSONObjBuilder temp(b.subobjStart(command->getName()));
+            temp.append("help", command->help());
+            temp.append("requiresAuth", command->requiresAuth());
+            temp.append("secondaryOk",
+                        command->secondaryAllowed(opCtx->getServiceContext()) ==
                             Command::AllowedOnSecondary::kAlways);
-            temp.append("adminOnly", c->adminOnly());
-            // optionally indicates that the command can be forced to run on a slave/secondary
-            if (c->secondaryAllowed(opCtx->getServiceContext()) ==
+            temp.append("adminOnly", command->adminOnly());
+            // Optionally indicates that the command can be forced to run on a secondary.
+            if (command->secondaryAllowed(opCtx->getServiceContext()) ==
                 Command::AllowedOnSecondary::kOptIn)
-                temp.append("slaveOverrideOk", true);
+                temp.append("secondaryOverrideOk", true);
+            temp.append("apiVersions", command->apiVersions());
+            temp.append("deprecatedApiVersions", command->deprecatedApiVersions());
             temp.done();
         }
+
         b.done();
 
         return 1;
     }
 
 } listCommandsCmd;
+
+class CmdLogMessage : public TypedCommand<CmdLogMessage> {
+public:
+    using Request = LogMessageCommand;
+
+    class Invocation final : public InvocationBase {
+    public:
+        using InvocationBase::InvocationBase;
+
+        void typedRun(OperationContext* opCtx) {
+            auto cmd = request();
+
+            logv2::DynamicAttributes attrs;
+            attrs.add("msg", cmd.getCommandParameter());
+            if (auto extra = cmd.getExtra()) {
+                attrs.add("extra", *extra);
+            }
+
+            auto options = logv2::LogOptions{logv2::LogComponent::kDefault};
+            LOGV2_IMPL(5060500, getSeverity(cmd), options, "logMessage", attrs);
+        }
+
+    private:
+        static logv2::LogSeverity getSeverity(const Request& cmd) {
+            auto severity = cmd.getSeverity();
+            auto optDebugLevel = cmd.getDebugLevel();
+
+            if (optDebugLevel && (severity != MessageSeverityEnum::kDebug)) {
+                auto obj = cmd.toBSON({});
+                LOGV2_DEBUG(5060599,
+                            3,
+                            "Non-debug severity levels must not pass 'debugLevel'",
+                            "severity"_attr = obj[Request::kSeverityFieldName].valueStringData(),
+                            "debugLevel"_attr = optDebugLevel.get());
+            }
+
+            switch (severity) {
+                case MessageSeverityEnum::kSevere:
+                    return logv2::LogSeverity::Severe();
+                case MessageSeverityEnum::kError:
+                    return logv2::LogSeverity::Error();
+                case MessageSeverityEnum::kWarning:
+                    return logv2::LogSeverity::Warning();
+                case MessageSeverityEnum::kInfo:
+                    return logv2::LogSeverity::Info();
+                case MessageSeverityEnum::kLog:
+                    return logv2::LogSeverity::Log();
+                case MessageSeverityEnum::kDebug:
+                    return logv2::LogSeverity::Debug(
+                        boost::get_optional_value_or(optDebugLevel, 1));
+            }
+
+            MONGO_UNREACHABLE;
+        }
+
+        bool supportsWriteConcern() const final {
+            return false;
+        }
+
+        void doCheckAuthorization(OperationContext* opCtx) const final {
+            auto* client = opCtx->getClient();
+            auto* as = AuthorizationSession::get(client);
+            uassert(ErrorCodes::Unauthorized,
+                    "Not authorized to send custom message to log",
+                    as->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                         ActionType::applicationMessage));
+        }
+
+        NamespaceString ns() const final {
+            return NamespaceString(request().getDbName(), "");
+        }
+    };
+
+    bool adminOnly() const final {
+        return true;
+    }
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
+        return AllowedOnSecondary::kAlways;
+    }
+};
+
+MONGO_REGISTER_TEST_COMMAND(CmdLogMessage);
 
 }  // namespace
 }  // namespace mongo

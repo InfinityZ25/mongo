@@ -7,7 +7,6 @@
 
 (function() {
 "use strict";
-load("jstests/aggregation/extras/utils.js");
 load("jstests/core/txns/libs/prepare_helpers.js");
 load("jstests/replsets/libs/rollback_test.js");
 
@@ -18,8 +17,8 @@ const rollbackTest = new RollbackTest(dbName);
 let primary = rollbackTest.getPrimary();
 
 // Create collection we're using beforehand.
-const testDB = primary.getDB(dbName);
-const testColl = testDB.getCollection(collName);
+let testDB = primary.getDB(dbName);
+let testColl = testDB.getCollection(collName);
 assert.commandWorked(testDB.runCommand({create: collName}));
 
 // Start a session on the primary.
@@ -78,10 +77,12 @@ assert.eq(1, metrics.transactions.currentInactive);
 assert.eq(1, metrics.transactions.currentOpen);
 
 // Make sure we cannot see the writes from the prepared transaction yet.
-arrayEq(testColl.find().toArray(), [{_id: 0}, {_id: 2}]);
+assert.sameMembers(testColl.find().toArray(), [{_id: 0}, {_id: 2}]);
 
 // Get the correct primary after the topology changes.
 primary = rollbackTest.getPrimary();
+testDB = primary.getDB(dbName);
+testColl = testDB.getCollection(collName);
 rollbackTest.awaitReplication();
 
 // Make sure we can successfully commit the recovered prepared transaction.
@@ -117,7 +118,7 @@ assert.commandWorked(sessionDB.adminCommand({
 }));
 
 // Make sure we can see the effects of the prepared transaction.
-arrayEq(testColl.find().toArray(), [{_id: 0, a: 1}, {_id: 1}, {_id: 2}]);
+assert.sameMembers(testColl.find().toArray(), [{_id: 0, a: 1}, {_id: 1}, {_id: 2}]);
 assert.eq(testColl.count(), 3);
 
 rollbackTest.stop();

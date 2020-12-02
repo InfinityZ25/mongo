@@ -147,7 +147,6 @@ void DropDatabaseTest::setUp() {
     auto replCoord = std::make_unique<repl::ReplicationCoordinatorMock>(service);
     _replCoord = replCoord.get();
     repl::ReplicationCoordinator::set(service, std::move(replCoord));
-    repl::setOplogCollectionName(service);
     repl::createOplog(_opCtx.get());
 
     // Ensure that we are primary.
@@ -213,12 +212,12 @@ TEST_F(DropDatabaseTest, DropDatabaseReturnsNamespaceNotFoundIfDatabaseDoesNotEx
                   dropDatabaseForApplyOps(_opCtx.get(), _nss.db().toString()));
 }
 
-TEST_F(DropDatabaseTest, DropDatabaseReturnsNotMasterIfNotPrimary) {
+TEST_F(DropDatabaseTest, DropDatabaseReturnsNotWritablePrimaryIfNotPrimary) {
     _createCollection(_opCtx.get(), _nss);
     ASSERT_OK(_replCoord->setFollowerMode(repl::MemberState::RS_SECONDARY));
     ASSERT_TRUE(_opCtx->writesAreReplicated());
     ASSERT_FALSE(_replCoord->canAcceptWritesForDatabase(_opCtx.get(), _nss.db()));
-    ASSERT_EQUALS(ErrorCodes::NotMaster,
+    ASSERT_EQUALS(ErrorCodes::NotWritablePrimary,
                   dropDatabaseForApplyOps(_opCtx.get(), _nss.db().toString()));
 }
 

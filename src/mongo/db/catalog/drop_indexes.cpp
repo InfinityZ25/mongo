@@ -27,13 +27,12 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/catalog/drop_indexes.h"
 
-#include "mongo/db/background.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -44,6 +43,8 @@
 #include "mongo/db/op_observer.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl_set_member_in_standalone_mode.h"
+#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/logv2/log.h"
@@ -51,13 +52,15 @@
 namespace mongo {
 namespace {
 
+MONGO_FAIL_POINT_DEFINE(hangAfterAbortingIndexes);
+
 // Field name in dropIndexes command for indexes to drop.
 constexpr auto kIndexFieldName = "index"_sd;
 
 Status checkView(OperationContext* opCtx,
                  const NamespaceString& nss,
                  Database* db,
-                 Collection* collection) {
+                 const CollectionPtr& collection) {
     if (!collection) {
         if (db && ViewCatalog::get(db)->lookup(opCtx, nss.ns())) {
             return Status(ErrorCodes::CommandNotSupportedOnView,
@@ -68,15 +71,29 @@ Status checkView(OperationContext* opCtx,
     return Status::OK();
 }
 
-Status checkReplState(OperationContext* opCtx, NamespaceStringOrUUID dbAndUUID) {
-    bool writesAreReplicatedAndNotPrimary = opCtx->writesAreReplicated() &&
-        !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, dbAndUUID);
+Status checkReplState(OperationContext* opCtx,
+                      NamespaceStringOrUUID dbAndUUID,
+                      const CollectionPtr& collection) {
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    auto canAcceptWrites = replCoord->canAcceptWritesFor(opCtx, dbAndUUID);
+    bool writesAreReplicatedAndNotPrimary = opCtx->writesAreReplicated() && !canAcceptWrites;
 
     if (writesAreReplicatedAndNotPrimary) {
-        return Status(ErrorCodes::NotMaster,
+        return Status(ErrorCodes::NotWritablePrimary,
                       str::stream() << "Not primary while dropping indexes on database "
                                     << dbAndUUID.db() << " with collection " << dbAndUUID.uuid());
     }
+
+    // Disallow index drops on drop-pending namespaces (system.drop.*) if we are primary.
+    auto isPrimary = replCoord->getSettings().usingReplSets() && canAcceptWrites;
+    const auto& nss = collection->ns();
+    if (isPrimary && nss.isDropPendingNamespace()) {
+        return Status(ErrorCodes::NamespaceNotFound,
+                      str::stream() << "Cannot drop indexes on drop-pending namespace " << nss
+                                    << " in database " << dbAndUUID.db() << " with uuid "
+                                    << dbAndUUID.uuid());
+    }
+
     return Status::OK();
 }
 
@@ -84,7 +101,7 @@ Status checkReplState(OperationContext* opCtx, NamespaceStringOrUUID dbAndUUID) 
  * Validates the key pattern passed through the command.
  */
 StatusWith<const IndexDescriptor*> getDescriptorByKeyPattern(OperationContext* opCtx,
-                                                             IndexCatalog* indexCatalog,
+                                                             const IndexCatalog* indexCatalog,
                                                              const BSONElement& keyPattern) {
     const bool includeUnfinished = true;
     std::vector<const IndexDescriptor*> indexes;
@@ -125,7 +142,7 @@ StatusWith<const IndexDescriptor*> getDescriptorByKeyPattern(OperationContext* o
  * to be held to look up the index name from the key pattern.
  */
 StatusWith<std::vector<std::string>> getIndexNames(OperationContext* opCtx,
-                                                   Collection* collection,
+                                                   const CollectionPtr& collection,
                                                    const BSONElement& indexElem) {
     invariant(opCtx->lockState()->isCollectionLockedForMode(collection->ns(), MODE_IX));
 
@@ -170,7 +187,7 @@ std::vector<UUID> abortIndexBuildByIndexNames(OperationContext* opCtx,
  * Drops single index given a descriptor.
  */
 Status dropIndexByDescriptor(OperationContext* opCtx,
-                             Collection* collection,
+                             const CollectionPtr& collection,
                              IndexCatalog* indexCatalog,
                              const IndexDescriptor* desc) {
     if (desc->isIdIndex()) {
@@ -194,13 +211,16 @@ Status dropIndexByDescriptor(OperationContext* opCtx,
                           << "can't drop unfinished index with name: " << desc->indexName());
     }
 
+    // Log the operation first, which reserves an optime in the oplog and sets the timestamp for
+    // future writes. This guarantees the durable catalog's metadata change to share the same
+    // timestamp when dropping the index below.
+    opCtx->getServiceContext()->getOpObserver()->onDropIndex(
+        opCtx, collection->ns(), collection->uuid(), desc->indexName(), desc->infoObj());
+
     auto s = indexCatalog->dropIndex(opCtx, desc);
     if (!s.isOK()) {
         return s;
     }
-
-    opCtx->getServiceContext()->getOpObserver()->onDropIndex(
-        opCtx, collection->ns(), collection->uuid(), desc->indexName(), desc->infoObj());
 
     return Status::OK();
 }
@@ -265,6 +285,33 @@ Status dropReadyIndexes(OperationContext* opCtx,
     return Status::OK();
 }
 
+void assertMovePrimaryInProgress(OperationContext* opCtx, const NamespaceString& ns) {
+    auto dss = DatabaseShardingState::get(opCtx, ns.db());
+    auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, dss);
+
+    try {
+        const auto collDesc =
+            CollectionShardingState::get(opCtx, ns)->getCollectionDescription(opCtx);
+        if (!collDesc.isSharded()) {
+            auto mpsm = dss->getMovePrimarySourceManager(dssLock);
+
+            if (mpsm) {
+                LOGV2(
+                    4976500, "assertMovePrimaryInProgress", "movePrimaryNss"_attr = ns.toString());
+
+                uasserted(ErrorCodes::MovePrimaryInProgress,
+                          "movePrimary is in progress for namespace " + ns.toString());
+            }
+        }
+    } catch (const DBException& ex) {
+        if (ex.toStatus() != ErrorCodes::MovePrimaryInProgress) {
+            LOGV2(4976501, "Error when getting colleciton description", "what"_attr = ex.what());
+            return;
+        }
+        throw;
+    }
+}
+
 }  // namespace
 
 Status dropIndexes(OperationContext* opCtx,
@@ -273,20 +320,19 @@ Status dropIndexes(OperationContext* opCtx,
                    BSONObjBuilder* result) {
     // We only need to hold an intent lock to send abort signals to the active index builder(s) we
     // intend to abort.
-    boost::optional<AutoGetCollection> autoColl;
-    autoColl.emplace(opCtx, nss, MODE_IX);
+    boost::optional<AutoGetCollection> collection;
+    collection.emplace(opCtx, nss, MODE_IX);
 
-    Database* db = autoColl->getDb();
-    Collection* collection = autoColl->getCollection();
-    Status status = checkView(opCtx, nss, db, collection);
+    Database* db = collection->getDb();
+    Status status = checkView(opCtx, nss, db, collection->getCollection());
     if (!status.isOK()) {
         return status;
     }
 
-    const UUID collectionUUID = collection->uuid();
+    const UUID collectionUUID = (*collection)->uuid();
     const NamespaceStringOrUUID dbAndUUID = {nss.db().toString(), collectionUUID};
 
-    status = checkReplState(opCtx, dbAndUUID);
+    status = checkReplState(opCtx, dbAndUUID, collection->getCollection());
     if (!status.isOK()) {
         return status;
     }
@@ -295,10 +341,11 @@ Status dropIndexes(OperationContext* opCtx,
         LOGV2(51806,
               "CMD: dropIndexes",
               "namespace"_attr = nss,
+              "uuid"_attr = collectionUUID,
               "indexes"_attr = cmdObj[kIndexFieldName].toString(false));
     }
 
-    result->appendNumber("nIndexesWas", collection->getIndexCatalog()->numIndexesTotal(opCtx));
+    result->appendNumber("nIndexesWas", (*collection)->getIndexCatalog()->numIndexesTotal(opCtx));
 
     // Validate basic user input.
     BSONElement indexElem = cmdObj.getField(kIndexFieldName);
@@ -310,7 +357,7 @@ Status dropIndexes(OperationContext* opCtx,
             if (indexNameElem.type() != String) {
                 return Status(ErrorCodes::TypeMismatch,
                               str::stream()
-                                  << "dropIndexes " << collection->ns() << " (" << collectionUUID
+                                  << "dropIndexes " << (*collection)->ns() << " (" << collectionUUID
                                   << ") failed to drop multiple indexes "
                                   << indexElem.toString(false) << ": index name must be a string");
             }
@@ -325,7 +372,7 @@ Status dropIndexes(OperationContext* opCtx,
     std::vector<UUID> abortedIndexBuilders;
     std::vector<std::string> indexNames;
     while (true) {
-        auto swIndexNames = getIndexNames(opCtx, collection, indexElem);
+        auto swIndexNames = getIndexNames(opCtx, collection->getCollection(), indexElem);
         if (!swIndexNames.isOK()) {
             return swIndexNames.getStatus();
         }
@@ -333,11 +380,11 @@ Status dropIndexes(OperationContext* opCtx,
         indexNames = swIndexNames.getValue();
 
         // Copy the namespace and UUID before dropping locks.
-        auto collUUID = collection->uuid();
-        auto collNs = collection->ns();
+        auto collUUID = (*collection)->uuid();
+        auto collNs = (*collection)->ns();
 
         // Release locks before aborting index builds. The helper will acquire locks on our behalf.
-        autoColl = boost::none;
+        collection = boost::none;
 
         // Send the abort signal to any index builders that match the users request. Waits until all
         // aborted builders complete.
@@ -345,23 +392,28 @@ Status dropIndexes(OperationContext* opCtx,
         abortedIndexBuilders.insert(
             abortedIndexBuilders.end(), justAborted.begin(), justAborted.end());
 
-        // Take an exclusive lock on the collection now to be able to perform index catalog writes
-        // when removing ready indexes from disk.
-        autoColl.emplace(opCtx, dbAndUUID, MODE_X);
+        if (MONGO_unlikely(hangAfterAbortingIndexes.shouldFail())) {
+            LOGV2(4731900, "Hanging on hangAfterAbortingIndexes fail point");
+            hangAfterAbortingIndexes.pauseWhileSet();
+        }
 
         // Abandon the snapshot as the index catalog will compare the in-memory state to the disk
         // state, which may have changed when we released the lock temporarily.
         opCtx->recoveryUnit()->abandonSnapshot();
 
-        db = autoColl->getDb();
-        collection = autoColl->getCollection();
-        if (!collection) {
+        // Take an exclusive lock on the collection now to be able to perform index catalog writes
+        // when removing ready indexes from disk.
+        collection.emplace(opCtx, dbAndUUID, MODE_X);
+
+        db = collection->getDb();
+        if (!*collection) {
             return Status(ErrorCodes::NamespaceNotFound,
-                          str::stream() << "ns not found on database " << dbAndUUID.db()
-                                        << " with collection " << dbAndUUID.uuid());
+                          str::stream()
+                              << "Collection '" << nss << "' with UUID " << dbAndUUID.uuid()
+                              << " in database " << dbAndUUID.db() << " does not exist.");
         }
 
-        status = checkReplState(opCtx, dbAndUUID);
+        status = checkReplState(opCtx, dbAndUUID, collection->getCollection());
         if (!status.isOK()) {
             return status;
         }
@@ -375,29 +427,42 @@ Status dropIndexes(OperationContext* opCtx,
         }
 
         if (!abortAgain) {
+            assertMovePrimaryInProgress(opCtx, nss);
             break;
         }
     }
 
-    // If the "*" wildcard was not specified, verify that all the index names belonging to the
-    // index builder were aborted.
+    // Drop any ready indexes that were created while we yielded our locks while aborting using
+    // similar index specs.
     if (!isWildcard && !abortedIndexBuilders.empty()) {
-        // This is necessary to check shard version.
-        OldClientContext ctx(opCtx, collection->ns().ns());
+        return writeConflictRetry(opCtx, "dropIndexes", dbAndUUID.toString(), [&] {
+            WriteUnitOfWork wuow(opCtx);
 
-        // Iterate through all aborted indexes and verify none of them are ready. This would
-        // indicate a flaw with the abort logic that allows indexes to complete despite the
-        // dropIndexes command reporting they were aborted.
-        auto indexCatalog = collection->getIndexCatalog();
-        const bool includeUnfinished = false;
-        const bool noneReady = std::none_of(indexNames.begin(), indexNames.end(), [&](auto name) {
-            return indexCatalog->findIndexByName(opCtx, name, includeUnfinished);
+            // This is necessary to check shard version.
+            OldClientContext ctx(opCtx, (*collection)->ns().ns());
+
+            // Iterate through all the aborted indexes and drop any indexes that are ready in the
+            // index catalog. This would indicate that while we yielded our locks during the abort
+            // phase, a new identical index was created.
+            auto indexCatalog = collection->getWritableCollection()->getIndexCatalog();
+            const bool includeUnfinished = false;
+            for (const auto& indexName : indexNames) {
+                auto desc = indexCatalog->findIndexByName(opCtx, indexName, includeUnfinished);
+                if (!desc) {
+                    // A similar index wasn't created while we yielded the locks during abort.
+                    continue;
+                }
+
+                Status status =
+                    dropIndexByDescriptor(opCtx, collection->getCollection(), indexCatalog, desc);
+                if (!status.isOK()) {
+                    return status;
+                }
+            }
+
+            wuow.commit();
+            return Status::OK();
         });
-
-        invariant(noneReady,
-                  str::stream() << "Found completed indexes despite aborting index build: "
-                                << abortedIndexBuilders.front());
-        return Status::OK();
     }
 
     if (!abortedIndexBuilders.empty()) {
@@ -406,11 +471,10 @@ Status dropIndexes(OperationContext* opCtx,
         invariant(isWildcard);
         invariant(indexNames.size() == 1);
         invariant(indexNames.front() == "*");
-        invariant(collection->getIndexCatalog()->numIndexesInProgress(opCtx) == 0);
+        invariant((*collection)->getIndexCatalog()->numIndexesInProgress(opCtx) == 0);
     } else {
         // The index catalog requires that no active index builders are running when dropping
         // indexes.
-        BackgroundOperation::assertNoBgOpInProgForNs(collection->ns());
         IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(collectionUUID);
     }
 
@@ -419,11 +483,12 @@ Status dropIndexes(OperationContext* opCtx,
             WriteUnitOfWork wunit(opCtx);
 
             // This is necessary to check shard version.
-            OldClientContext ctx(opCtx, collection->ns().ns());
+            OldClientContext ctx(opCtx, (*collection)->ns().ns());
 
             // Use an empty BSONObjBuilder to avoid duplicate appends to result on retry loops.
             BSONObjBuilder tempObjBuilder;
-            Status status = dropReadyIndexes(opCtx, collection, indexNames, &tempObjBuilder);
+            Status status = dropReadyIndexes(
+                opCtx, collection->getWritableCollection(), indexNames, &tempObjBuilder);
             if (!status.isOK()) {
                 return status;
             }
@@ -441,12 +506,11 @@ Status dropIndexesForApplyOps(OperationContext* opCtx,
                               const BSONObj& cmdObj,
                               BSONObjBuilder* result) {
     return writeConflictRetry(opCtx, "dropIndexes", nss.db(), [opCtx, &nss, &cmdObj, result] {
-        AutoGetCollection autoColl(opCtx, nss, MODE_X);
+        AutoGetCollection collection(opCtx, nss, MODE_X);
 
         // If db/collection does not exist, short circuit and return.
-        Database* db = autoColl.getDb();
-        Collection* collection = autoColl.getCollection();
-        Status status = checkView(opCtx, nss, db, collection);
+        Database* db = collection.getDb();
+        Status status = checkView(opCtx, nss, db, collection.getCollection());
         if (!status.isOK()) {
             return status;
         }
@@ -458,12 +522,11 @@ Status dropIndexesForApplyOps(OperationContext* opCtx,
                   "indexes"_attr = cmdObj[kIndexFieldName].toString(false));
         }
 
-        BackgroundOperation::assertNoBgOpInProgForNs(nss);
         IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(
             collection->uuid());
 
         BSONElement indexElem = cmdObj.getField(kIndexFieldName);
-        auto swIndexNames = getIndexNames(opCtx, collection, indexElem);
+        auto swIndexNames = getIndexNames(opCtx, collection.getCollection(), indexElem);
         if (!swIndexNames.isOK()) {
             return swIndexNames.getStatus();
         }
@@ -475,7 +538,8 @@ Status dropIndexesForApplyOps(OperationContext* opCtx,
 
         // Use an empty BSONObjBuilder to avoid duplicate appends to result on retry loops.
         BSONObjBuilder tempObjBuilder;
-        status = dropReadyIndexes(opCtx, collection, swIndexNames.getValue(), &tempObjBuilder);
+        status = dropReadyIndexes(
+            opCtx, collection.getWritableCollection(), swIndexNames.getValue(), &tempObjBuilder);
         if (!status.isOK()) {
             return status;
         }

@@ -7,7 +7,6 @@
 "use strict";
 load("jstests/replsets/rslib.js");
 load('jstests/noPassthrough/libs/index_build.js');
-load("jstests/libs/parallel_shell_helpers.js");  // funWithArgs
 
 var rst = new ReplSetTest({nodes: [{}, {rsConfig: {priority: 0}}]});
 rst.startSet();
@@ -19,14 +18,6 @@ const indexName = "x_1";
 
 const primary = rst.getPrimary();
 const secondary = rst.getSecondary();
-
-if (!(IndexBuildTest.supportsTwoPhaseIndexBuild(primary) &&
-      IndexBuildTest.indexBuildCommitQuorumEnabled(primary))) {
-    jsTestLog(
-        'Skipping test because two phase index build and index build commit quorum are not supported.');
-    rst.stopSet();
-    return;
-}
 
 const primaryDB = primary.getDB(dbName);
 const primaryColl = primaryDB[collName];

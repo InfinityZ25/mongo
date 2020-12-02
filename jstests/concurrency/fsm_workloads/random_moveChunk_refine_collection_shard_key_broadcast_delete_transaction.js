@@ -5,6 +5,7 @@
  * 1. Refine a collection's shard key.
  * 2. Perform deletes in transactions without the shard key.
  * 3. Move random chunks.
+ * 4. Flushes the router's cached metadata for all sharded collections.
  *
  * @tags: [
  *   assumes_autosplit_off,
@@ -14,7 +15,6 @@
  *   # therefore unsafe to automatically run inside a multi-statement transaction because its
  *   # progress will continually be interrupted.
  *   operations_longer_than_stepdown_interval_in_txns,
- *   requires_fcv_44,
  *   requires_non_retryable_writes,
  *   requires_sharding,
  *   uses_transactions,
@@ -54,37 +54,59 @@ var $config = extendWorkload($config, function($config, $super) {
     };
 
     $config.transitions = {
-        init: {moveChunk: 0.2, refineCollectionShardKey: 0.2, exactIdDelete: 0.3, multiDelete: 0.3},
-        moveChunk: {
+        init: {
             moveChunk: 0.2,
             refineCollectionShardKey: 0.2,
-            exactIdDelete: 0.2,
-            multiDelete: 0.2,
-            verifyDocuments: 0.2
+            exactIdDelete: 0.25,
+            multiDelete: 0.25,
+            flushRouterConfig: 0.1
+        },
+        moveChunk: {
+            moveChunk: 0.18,
+            refineCollectionShardKey: 0.18,
+            exactIdDelete: 0.18,
+            multiDelete: 0.18,
+            verifyDocuments: 0.18,
+            flushRouterConfig: 0.1
         },
         refineCollectionShardKey: {
-            moveChunk: 0.3,
+            moveChunk: 0.2,
             refineCollectionShardKey: 0.1,
             exactIdDelete: 0.2,
             multiDelete: 0.2,
-            verifyDocuments: 0.2
+            verifyDocuments: 0.2,
+            flushRouterConfig: 0.1
         },
         exactIdDelete: {
-            moveChunk: 0.2,
-            refineCollectionShardKey: 0.2,
-            exactIdDelete: 0.2,
-            multiDelete: 0.2,
-            verifyDocuments: 0.2
+            moveChunk: 0.18,
+            refineCollectionShardKey: 0.18,
+            exactIdDelete: 0.18,
+            multiDelete: 0.18,
+            verifyDocuments: 0.18,
+            flushRouterConfig: 0.1
         },
         multiDelete: {
+            moveChunk: 0.18,
+            refineCollectionShardKey: 0.18,
+            exactIdDelete: 0.18,
+            multiDelete: 0.18,
+            verifyDocuments: 0.18,
+            flushRouterConfig: 0.1
+        },
+        verifyDocuments: {
+            moveChunk: 0.2,
+            refineCollectionShardKey: 0.2,
+            exactIdDelete: 0.2,
+            multiDelete: 0.2,
+            flushRouterConfig: 0.1
+        },
+        flushRouterConfig: {
             moveChunk: 0.2,
             refineCollectionShardKey: 0.2,
             exactIdDelete: 0.2,
             multiDelete: 0.2,
             verifyDocuments: 0.2
         },
-        verifyDocuments:
-            {moveChunk: 0.2, refineCollectionShardKey: 0.2, exactIdDelete: 0.3, multiDelete: 0.3},
     };
 
     return $config;

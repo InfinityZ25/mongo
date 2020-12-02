@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -148,18 +148,30 @@ void applyCursorReadConcern(OperationContext* opCtx, repl::ReadConcernArgs rcArg
         switch (rcArgs.getMajorityReadMechanism()) {
             case repl::ReadConcernArgs::MajorityReadMechanism::kMajoritySnapshot: {
                 // Make sure we read from the majority snapshot.
+                opCtx->recoveryUnit()->abandonSnapshot();
                 opCtx->recoveryUnit()->setTimestampReadSource(
                     RecoveryUnit::ReadSource::kMajorityCommitted);
-                uassertStatusOK(opCtx->recoveryUnit()->obtainMajorityCommittedSnapshot());
+                uassertStatusOK(opCtx->recoveryUnit()->majorityCommittedSnapshotAvailable());
                 break;
             }
             case repl::ReadConcernArgs::MajorityReadMechanism::kSpeculative: {
                 // Mark the operation as speculative and select the correct read source.
                 repl::SpeculativeMajorityReadInfo::get(opCtx).setIsSpeculativeRead();
+                opCtx->recoveryUnit()->abandonSnapshot();
                 opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoOverlap);
                 break;
             }
         }
+    }
+
+    if (replicationMode == repl::ReplicationCoordinator::modeReplSet &&
+        rcArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern &&
+        !opCtx->inMultiDocumentTransaction()) {
+        auto atClusterTime = rcArgs.getArgsAtClusterTime();
+        invariant(atClusterTime && *atClusterTime != LogicalTime::kUninitialized);
+        opCtx->recoveryUnit()->abandonSnapshot();
+        opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kProvided,
+                                                      atClusterTime->asTimestamp());
     }
 
     // For cursor commands that take locks internally, the read concern on the
@@ -208,6 +220,7 @@ void setUpOperationContextStateForGetMore(OperationContext* opCtx,
                                           bool disableAwaitDataFailpointActive) {
     applyCursorReadConcern(opCtx, cursor.getReadConcernArgs());
     opCtx->setWriteConcern(cursor.getWriteConcernOptions());
+    APIParameters::get(opCtx) = cursor.getAPIParameters();
     setUpOperationDeadline(opCtx, cursor, request, disableAwaitDataFailpointActive);
 
     // If the originating command had a 'comment' field, we extract it and set it on opCtx. Note
@@ -228,6 +241,12 @@ void setUpOperationContextStateForGetMore(OperationContext* opCtx,
 class GetMoreCmd final : public Command {
 public:
     GetMoreCmd() : Command("getMore") {}
+
+    // Do not currently use apiVersions because clients are prohibited from calling
+    // getMore with apiVersion.
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
 
     std::unique_ptr<CommandInvocation> parse(OperationContext* opCtx,
                                              const OpMsgRequest& opMsgRequest) override {
@@ -273,31 +292,28 @@ public:
          * Uses 'cursor' and 'request' to fill out 'nextBatch' with the batch of result documents to
          * be returned by this getMore.
          *
-         * Returns the number of documents in the batch in *numResults, which must be initialized to
-         * zero by the caller. Returns the final ExecState returned by the cursor in *state.
+         * Returns true if the cursor should be saved for subsequent getMores, and false otherwise.
+         * Fills out *numResults with the number of documents in the batch, which must be
+         * initialized to zero by the caller.
          *
-         * Returns an OK status if the batch was successfully generated, and a non-OK status if the
-         * PlanExecutor encounters a failure.
+         * Throws an exception on failure.
          */
-        Status generateBatch(OperationContext* opCtx,
-                             ClientCursor* cursor,
-                             const GetMoreRequest& request,
-                             CursorResponseBuilder* nextBatch,
-                             PlanExecutor::ExecState* state,
-                             std::uint64_t* numResults) {
+        bool generateBatch(OperationContext* opCtx,
+                           ClientCursor* cursor,
+                           const GetMoreRequest& request,
+                           const bool isTailable,
+                           CursorResponseBuilder* nextBatch,
+                           std::uint64_t* numResults) {
             PlanExecutor* exec = cursor->getExecutor();
 
             // If an awaitData getMore is killed during this process due to our max time expiring at
             // an interrupt point, we just continue as normal and return rather than reporting a
             // timeout to the user.
-            Document doc;
+            BSONObj obj;
+            PlanExecutor::ExecState state;
             try {
                 while (!FindCommon::enoughForGetMore(request.batchSize.value_or(0), *numResults) &&
-                       PlanExecutor::ADVANCED == (*state = exec->getNext(&doc, nullptr))) {
-                    // Note that "needsMerge" implies a find or aggregate operation, which should
-                    // always have a non-NULL 'expCtx' value.
-                    BSONObj obj = cursor->needsMerge() ? doc.toBsonWithMetaData() : doc.toBson();
-
+                       PlanExecutor::ADVANCED == (state = exec->getNext(&obj, nullptr))) {
                     // If adding this object will cause us to exceed the message size limit, then we
                     // stash it for later.
                     if (!FindCommon::haveSpaceForNext(obj, *numResults, nextBatch->bytesUsed())) {
@@ -314,38 +330,35 @@ public:
                     (*numResults)++;
                 }
             } catch (const ExceptionFor<ErrorCodes::CloseChangeStream>&) {
-                // FAILURE state will make getMore command close the cursor even if it's tailable.
-                *state = PlanExecutor::FAILURE;
-                return Status::OK();
+                // This exception indicates that we should close the cursor without reporting an
+                // error.
+                return false;
+            } catch (DBException& exception) {
+                nextBatch->abandon();
+
+                auto&& explainer = exec->getPlanExplainer();
+                auto&& [stats, _] =
+                    explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
+                LOGV2_WARNING(20478,
+                              "getMore command executor error: {error}, stats: {stats}, cmd: {cmd}",
+                              "getMore command executor error",
+                              "error"_attr = exception.toStatus(),
+                              "stats"_attr = redact(stats),
+                              "cmd"_attr = request.toBSON());
+
+                exception.addContext("Executor error during getMore");
+                throw;
             }
 
-            switch (*state) {
-                case PlanExecutor::FAILURE: {
-                    // We should always have a valid status member object at this point.
-                    auto status = WorkingSetCommon::getMemberObjectStatus(doc);
-                    invariant(!status.isOK());
-                    // Log an error message and then perform the cleanup.
-                    LOGV2_WARNING(20478,
-                                  "GetMore command executor error: {PlanExecutor_statestr_state}, "
-                                  "status: {status}, stats: {Explain_getWinningPlanStats_exec}",
-                                  "PlanExecutor_statestr_state"_attr =
-                                      PlanExecutor::statestr(*state),
-                                  "status"_attr = status,
-                                  "Explain_getWinningPlanStats_exec"_attr =
-                                      redact(Explain::getWinningPlanStats(exec)));
-
-                    nextBatch->abandon();
-                    return status;
-                }
-                case PlanExecutor::IS_EOF:
-                    // The latest oplog timestamp may advance even when there are no results. Ensure
-                    // that we have the latest postBatchResumeToken produced by the plan executor.
-                    nextBatch->setPostBatchResumeToken(exec->getPostBatchResumeToken());
-                default:
-                    return Status::OK();
+            if (state == PlanExecutor::IS_EOF) {
+                // The latest oplog timestamp may advance even when there are no results. Ensure
+                // that we have the latest postBatchResumeToken produced by the plan executor.
+                // The getMore command does not accept a batchSize of 0, so empty batches are
+                // always caused by hitting EOF and do not need to be handled separately.
+                nextBatch->setPostBatchResumeToken(exec->getPostBatchResumeToken());
             }
 
-            MONGO_UNREACHABLE;
+            return shouldSaveCursorGetMore(exec, isTailable);
         }
 
         void acquireLocksAndIterateCursor(OperationContext* opCtx,
@@ -371,53 +384,27 @@ public:
             // CurOp and Top. We avoid using AutoGetCollectionForReadCommand because we may need to
             // drop and reacquire locks when the cursor is awaitData, but we don't want to update
             // the stats twice.
-            boost::optional<AutoGetCollectionForRead> readLock;
+            boost::optional<AutoGetCollectionForReadMaybeLockFree> readLock;
             boost::optional<AutoStatsTracker> statsTracker;
 
-            {
-                // We call RecoveryUnit::setTimestampReadSource() before acquiring a lock on the
-                // collection via AutoGetCollectionForRead in order to ensure the comparison to the
-                // collection's minimum visible snapshot is accurate.
-                PlanExecutor* exec = cursorPin->getExecutor();
-                const auto* cq = exec->getCanonicalQuery();
-
-                if (auto clusterTime =
-                        (cq ? cq->getQueryRequest().getReadAtClusterTime() : boost::none)) {
-                    // We don't compare 'clusterTime' to the last applied opTime or to the
-                    // all-committed timestamp because the testing infrastructure won't use the
-                    // $_internalReadAtClusterTime option in any test suite where rollback is
-                    // expected to occur.
-
-                    // The $_internalReadAtClusterTime option causes any storage-layer cursors
-                    // created during plan execution to read from a consistent snapshot of data at
-                    // the supplied clusterTime, even across yields.
-                    opCtx->recoveryUnit()->setTimestampReadSource(
-                        RecoveryUnit::ReadSource::kProvided, clusterTime);
-
-                    // The $_internalReadAtClusterTime option also causes any storage-layer cursors
-                    // created during plan execution to block on prepared transactions. Since the
-                    // getMore command ignores prepare conflicts by default, change the behavior.
-                    opCtx->recoveryUnit()->setPrepareConflictBehavior(
-                        PrepareConflictBehavior::kEnforce);
-                }
-            }
-            if (cursorPin->lockPolicy() == ClientCursorParams::LockPolicy::kLocksInternally) {
+            if (cursorPin->getExecutor()->lockPolicy() ==
+                PlanExecutor::LockPolicy::kLocksInternally) {
                 if (!_request.nss.isCollectionlessCursorNamespace()) {
-                    const boost::optional<int> dbProfilingLevel = boost::none;
-                    statsTracker.emplace(opCtx,
-                                         _request.nss,
-                                         Top::LockType::NotLocked,
-                                         AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
-                                         dbProfilingLevel);
+                    statsTracker.emplace(
+                        opCtx,
+                        _request.nss,
+                        Top::LockType::NotLocked,
+                        AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
+                        CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(_request.nss.db()));
                 }
             } else {
-                invariant(cursorPin->lockPolicy() ==
-                          ClientCursorParams::LockPolicy::kLockExternally);
+                invariant(cursorPin->getExecutor()->lockPolicy() ==
+                          PlanExecutor::LockPolicy::kLockExternally);
 
                 if (MONGO_unlikely(GetMoreHangBeforeReadLock.shouldFail())) {
                     LOGV2(20477,
                           "GetMoreHangBeforeReadLock fail point enabled. Blocking until fail "
-                          "point is disabled.");
+                          "point is disabled");
                     GetMoreHangBeforeReadLock.pauseWhileSet(opCtx);
                 }
 
@@ -433,13 +420,12 @@ public:
                 // Otherwise, these two namespaces will match.
                 readLock.emplace(opCtx, cursorPin->getExecutor()->nss());
 
-                const int doNotChangeProfilingLevel = 0;
-                statsTracker.emplace(opCtx,
-                                     _request.nss,
-                                     Top::LockType::ReadLocked,
-                                     AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
-                                     readLock->getDb() ? readLock->getDb()->getProfilingLevel()
-                                                       : doNotChangeProfilingLevel);
+                statsTracker.emplace(
+                    opCtx,
+                    _request.nss,
+                    Top::LockType::ReadLocked,
+                    AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
+                    CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(_request.nss.db()));
 
                 // Check whether we are allowed to read from this node after acquiring our locks.
                 uassertStatusOK(repl::ReplicationCoordinator::get(opCtx)->checkCanServeReadsFor(
@@ -533,9 +519,9 @@ public:
                 opCtx->recoveryUnit()->setReadOnce(true);
             }
             exec->reattachToOperationContext(opCtx);
-            exec->restoreState();
+            exec->restoreState(readLock ? &readLock->getCollection() : nullptr);
 
-            auto planSummary = Explain::getPlanSummary(exec);
+            auto planSummary = exec->getPlanExplainer().getPlanSummary();
             {
                 stdx::lock_guard<Client> lk(*opCtx->getClient());
                 curOp->setPlanSummary_inlock(planSummary);
@@ -568,17 +554,19 @@ public:
                 });
 
             CursorId respondWithId = 0;
-
-            CursorResponseBuilder nextBatch(reply, CursorResponseBuilder::Options());
+            CursorResponseBuilder::Options options;
+            if (!opCtx->inMultiDocumentTransaction()) {
+                options.atClusterTime = repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime();
+            }
+            CursorResponseBuilder nextBatch(reply, options);
             BSONObj obj;
-            PlanExecutor::ExecState state = PlanExecutor::ADVANCED;
             std::uint64_t numResults = 0;
 
             // We report keysExamined and docsExamined to OpDebug for a given getMore operation. To
             // obtain these values we need to take a diff of the pre-execution and post-execution
             // metrics, as they accumulate over the course of a cursor's lifetime.
             PlanSummaryStats preExecutionStats;
-            Explain::getSummaryStats(*exec, &preExecutionStats);
+            exec->getPlanExplainer().getSummaryStats(&preExecutionStats);
 
             // Mark this as an AwaitData operation if appropriate.
             if (cursorPin->isAwaitData() && !disableAwaitDataFailpointActive) {
@@ -599,10 +587,10 @@ public:
             // of this operation's CurOp to signal that we've hit this point and then spin until the
             // failpoint is released.
             std::function<void()> saveAndRestoreStateWithReadLockReacquisition =
-                [exec, dropAndReacquireReadLock]() {
+                [exec, dropAndReacquireReadLock, &readLock]() {
                     exec->saveState();
                     dropAndReacquireReadLock();
-                    exec->restoreState();
+                    exec->restoreState(&readLock->getCollection());
                 };
 
             waitWithPinnedCursorDuringGetMoreBatch.execute([&](const BSONObj& data) {
@@ -617,11 +605,15 @@ public:
                     _request.nss);
             });
 
-            uassertStatusOK(generateBatch(
-                opCtx, cursorPin.getCursor(), _request, &nextBatch, &state, &numResults));
+            const auto shouldSaveCursor = generateBatch(opCtx,
+                                                        cursorPin.getCursor(),
+                                                        _request,
+                                                        cursorPin->isTailable(),
+                                                        &nextBatch,
+                                                        &numResults);
 
             PlanSummaryStats postExecutionStats;
-            Explain::getSummaryStats(*exec, &postExecutionStats);
+            exec->getPlanExplainer().getSummaryStats(&postExecutionStats);
             postExecutionStats.totalKeysExamined -= preExecutionStats.totalKeysExamined;
             postExecutionStats.totalDocsExamined -= preExecutionStats.totalDocsExamined;
             curOp->debug().setPlanSummaryMetrics(postExecutionStats);
@@ -631,14 +623,16 @@ public:
             // would be useful to have this info for an aggregation, but the source PlanExecutor
             // could be destroyed before we know if we need 'execStats' and we do not want to
             // generate the stats eagerly for all operations due to cost.
-            if (cursorPin->lockPolicy() != ClientCursorParams::LockPolicy::kLocksInternally &&
-                curOp->shouldDBProfile()) {
-                BSONObjBuilder execStatsBob;
-                Explain::getWinningPlanStats(exec, &execStatsBob);
-                curOp->debug().execStats = execStatsBob.obj();
+            if (cursorPin->getExecutor()->lockPolicy() !=
+                    PlanExecutor::LockPolicy::kLocksInternally &&
+                curOp->shouldDBProfile(opCtx)) {
+                auto&& explainer = exec->getPlanExplainer();
+                auto&& [stats, _] =
+                    explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
+                curOp->debug().execStats = std::move(stats);
             }
 
-            if (shouldSaveCursorGetMore(state, exec, cursorPin->isTailable())) {
+            if (shouldSaveCursor) {
                 respondWithId = _request.cursorid;
 
                 exec->saveState();
@@ -680,15 +674,24 @@ public:
             auto curOp = CurOp::get(opCtx);
             curOp->debug().cursorid = _request.cursorid;
 
-            // Validate term before acquiring locks, if provided.
+            // The presence of a term in the request indicates that this is an internal replication
+            // oplog read request.
             if (_request.term && _request.nss == NamespaceString::kRsOplogNamespace) {
+                // Validate term before acquiring locks.
                 auto replCoord = repl::ReplicationCoordinator::get(opCtx);
                 // Note: updateTerm returns ok if term stayed the same.
                 uassertStatusOK(replCoord->updateTerm(opCtx, *_request.term));
+
                 // If the term field is present in an oplog request, it means this is an oplog
                 // getMore for replication oplog fetching because the term field is only allowed for
                 // internal clients (see checkAuthForGetMore).
-                curOp->debug().isReplOplogFetching = true;
+                curOp->debug().isReplOplogGetMore = true;
+
+                // We do not want to take tickets for internal (replication) oplog reads. Stalling
+                // on ticket acquisition can cause complicated deadlocks. Primaries may depend on
+                // data reaching secondaries in order to proceed; and secondaries may get stalled
+                // replicating because of an inability to acquire a read ticket.
+                opCtx->lockState()->skipAcquireTicket();
             }
 
             auto cursorManager = CursorManager::get(opCtx);
@@ -750,6 +753,10 @@ public:
         // when it exceeds the goal batch size. In the case that we are just below the limit and
         // then read a large document, the extra 1K helps prevent a final realloc+memcpy.
         return FindCommon::kMaxBytesToReturnToClientAtOnce + 1024u;
+    }
+
+    bool collectsResourceConsumptionMetrics() const override {
+        return true;
     }
 
     /**

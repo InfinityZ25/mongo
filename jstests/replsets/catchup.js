@@ -37,7 +37,7 @@ rst.nodes.forEach(function(node) {
 });
 
 function checkOpInOplog(node, op, count) {
-    node.getDB("admin").getMongo().setSlaveOk();
+    node.getDB("admin").getMongo().setSecondaryOk();
     var oplog = node.getDB("local")['oplog.rs'];
     var oplogArray = oplog.find().toArray();
     assert.eq(oplog.count(op), count, "op: " + tojson(op) + ", oplog: " + tojson(oplogArray));
@@ -47,7 +47,7 @@ function reconfigElectionAndCatchUpTimeout(electionTimeout, catchupTimeout) {
     // Reconnect all nodes to make sure reconfig succeeds.
     rst.nodes.forEach(reconnect);
     // Wait for the config with the new term to propagate.
-    waitForConfigReplication(rst.getPrimary());
+    rst.waitForConfigReplication(rst.getPrimary());
     // Reconfigure replica set to decrease catchup timeout.
     var newConfig = rst.getReplSetConfigFromNode();
     newConfig.version++;
@@ -65,9 +65,7 @@ let initialNewPrimaryStatus =
     assert.commandWorked(rst.getSecondary().adminCommand({serverStatus: 1}));
 
 // Should complete transition to primary immediately.
-var newPrimary = rst.stepUpNoAwaitReplication(rst.getSecondary());
-// Should win an election and finish the transition very quickly.
-assert.eq(newPrimary, rst.getPrimary());
+var newPrimary = rst.stepUp(rst.getSecondary(), {awaitReplicationBeforeStepUp: false});
 rst.awaitReplication();
 
 // Check that the 'numCatchUps' field has not been incremented in serverStatus.

@@ -87,6 +87,19 @@ def get_session_catalog():
     return session_catalog_dec[1]
 
 
+def get_session_kv_pairs():
+    """Return the SessionRuntimeInfoMap stored in the global SessionCatalog object.
+
+    Returns a list of (LogicalSessionId, std::unique_ptr<SessionRuntimeInfo>) key-value pairs. For
+    key-value pair 'session_kv', access the key with 'session_kv["first"]' and access the value with
+    'session_kv["second"]'.
+    """
+    session_catalog = get_session_catalog()
+    if session_catalog is None:
+        return list()
+    return list(absl_get_nodes(session_catalog["_sessions"]))  # pylint: disable=undefined-variable
+
+
 def get_decorations(obj):
     """Return an iterator to all decorations on a given object.
 
@@ -266,8 +279,7 @@ class DumpMongoDSessionCatalog(gdb.Command):
                 "No SessionCatalog object was found on the ServiceContext. Not dumping any sessions."
             )
             return
-        lsid_map = session_catalog["_sessions"]
-        session_kv_pairs = list(absl_get_nodes(lsid_map))  # pylint: disable=undefined-variable
+        session_kv_pairs = get_session_kv_pairs()
         print("Dumping %d Session objects from the SessionCatalog" % len(session_kv_pairs))
 
         # Optionally search for a specified session, based on its id.
@@ -433,6 +445,100 @@ class MongoDBDumpLocks(gdb.Command):
 MongoDBDumpLocks()
 
 
+class MongoDBDumpRecoveryUnits(gdb.Command):
+    """Dump recovery unit info for each client and session in a mongod process."""
+
+    def __init__(self):
+        """Initialize MongoDBDumpRecoveryUnits."""
+        RegisterMongoCommand.register(self, "mongodb-dump-recovery-units", gdb.COMMAND_DATA)
+
+    def invoke(self, arg, _from_tty):
+        """Invoke MongoDBDumpRecoveryUnits."""
+        print("Dumping recovery unit info for all clients and sessions")
+
+        if not arg:
+            arg = "mongo::WiredTigerRecoveryUnit"  # default to "mongo::WiredTigerRecoveryUnit"
+
+        main_binary_name = get_process_name()
+        if main_binary_name == "mongod":
+            self.dump_recovery_units(arg)
+        else:
+            print("Not invoking mongod recovery unit dump for: %s" % (main_binary_name))
+
+    @staticmethod
+    def dump_recovery_units(recovery_unit_impl_type):  # pylint: disable=too-many-locals
+        """GDB in-process python supplement."""
+
+        # Temporarily disable printing static members to make the output more readable
+        out = gdb.execute("show print static-members", from_tty=False, to_string=True)
+        enabled_at_start = False
+        if out.startswith("Printing of C++ static members is on"):
+            enabled_at_start = True
+            gdb.execute("set print static-members off")
+
+        # Dump active recovery unit info for each client in a mongod process
+        service_context = get_global_service_context()
+        client_set = absl_get_nodes(service_context["_clients"])  # pylint: disable=undefined-variable
+
+        for client_handle in client_set:
+            client = client_handle.dereference().dereference()
+
+            # Prepare structured output doc
+            client_name = str(client["_desc"])[1:-1]
+            operation_context_handle = client["_opCtx"]
+            output_doc = {"client": client_name, "opCtx": hex(operation_context_handle)}
+
+            recovery_unit_handle = None
+            recovery_unit = None
+            if operation_context_handle:
+                operation_context = operation_context_handle.dereference()
+                recovery_unit_handle = get_unique_ptr(operation_context["_recoveryUnit"])  # pylint: disable=undefined-variable
+                # By default, cast the recovery unit as "mongo::WiredTigerRecoveryUnit"
+                recovery_unit = recovery_unit_handle.dereference().cast(
+                    gdb.lookup_type(recovery_unit_impl_type))
+
+            output_doc["recoveryUnit"] = hex(recovery_unit_handle) if recovery_unit else "0x0"
+            print(json.dumps(output_doc))
+            if recovery_unit:
+                print(recovery_unit)
+
+        # Dump stashed recovery unit info for each session in a mongod process
+        for session_kv in get_session_kv_pairs():
+            session_runtime_info = get_unique_ptr(session_kv["second"]).dereference()  # pylint: disable=undefined-variable
+            session = session_runtime_info["session"]
+
+            # Prepare structured output doc
+            session_lsid = str(session["_sessionId"]["_id"])[1:-1]
+            txn_participant_dec = get_decoration(session, "TransactionParticipant")
+            output_doc = {"session": session_lsid, "txnResourceStash": "0x0"}
+
+            recovery_unit_handle = None
+            recovery_unit = None
+            if txn_participant_dec:
+                txn_participant_observable_state = txn_participant_dec[1]["_o"]
+                txn_resource_stash = get_boost_optional(
+                    txn_participant_observable_state["txnResourceStash"])
+
+                if txn_resource_stash:
+                    output_doc["txnResourceStash"] = str(txn_resource_stash.address)
+                    recovery_unit_handle = get_unique_ptr(txn_resource_stash["_recoveryUnit"])  # pylint: disable=undefined-variable
+                    # By default, cast the recovery unit as "mongo::WiredTigerRecoveryUnit"
+                    recovery_unit = recovery_unit_handle.dereference().cast(
+                        gdb.lookup_type(recovery_unit_impl_type))
+
+            output_doc["recoveryUnit"] = hex(recovery_unit_handle) if recovery_unit else "0x0"
+            print(json.dumps(output_doc))
+            if recovery_unit:
+                print(recovery_unit)
+
+        if enabled_at_start:
+            gdb.execute("set print static-members on")
+
+
+# Register command
+MongoDBDumpRecoveryUnits()
+
+
 class BtIfActive(gdb.Command):
     """Print stack trace or a short message if the current thread is idle."""
 
@@ -549,6 +655,14 @@ MongoDBUniqueStack()
 class MongoDBJavaScriptStack(gdb.Command):
     """Print the JavaScript stack from a MongoDB process."""
 
+    # Looking to test your changes to this? Really easy!
+    # 1. install-core to build the mongo shell binary (mongo)
+    # 2. launch it: ./path/to/bin/mongo --nodb
+    # 3. in the shell, run: sleep(99999999999). (do not use --eval)
+    # 4. ps ax | grep nodb to find the PID
+    # 5. gdb -p <PID>.
+    # 6. Run this command, mongodb-javascript-stack
+
     def __init__(self):
         """Initialize MongoDBJavaScriptStack."""
         RegisterMongoCommand.register(self, "mongodb-javascript-stack", gdb.COMMAND_STATUS)
@@ -562,6 +676,24 @@ class MongoDBJavaScriptStack(gdb.Command):
             self.javascript_stack()
         else:
             print("No JavaScript stack print done for: %s" % (main_binary_name))
+
+    @staticmethod
+    def atomic_get_ptr(atomic_scope: gdb.Value):
+        """Fetch the underlying pointer from std::atomic."""
+
+        # Awkwardly, the gdb.Value type does not support a check like
+        # `'_M_b' in atomic_scope`, so exceptions for flow control it is. :|
+        try:
+            # reach into std::atomic and grab the pointer. This is for libc++
+            return atomic_scope['_M_b']['_M_p']
+        except gdb.error:
+            # Worst case scenario: try and use .load(), but it's probably
+            # inlined. parse_and_eval required because you can't call methods
+            # in gdb on the Python API
+            return gdb.parse_and_eval(
+                f"((std::atomic<mongo::mozjs::MozJSImplScope*> *)({atomic_scope.address}))->load()")
+
+        return None
 
     @staticmethod
     def javascript_stack():
@@ -584,13 +716,29 @@ class MongoDBJavaScriptStack(gdb.Command):
                 continue
 
             try:
-                if gdb.parse_and_eval(
-                        'mongo::mozjs::kCurrentScope && mongo::mozjs::kCurrentScope->_inOp'):
-                    gdb.execute('thread', from_tty=False, to_string=False)
-                    gdb.execute(
-                        'printf "%s\\n", ' +
-                        'mongo::mozjs::kCurrentScope->buildStackString().c_str()', from_tty=False,
-                        to_string=False)
+                # The following block is roughly equivalent to this:
+                # namespace mongo::mozjs {
+                #   std::atomic<MozJSImplScope*> kCurrentScope = ...;
+                # }
+                # if (!scope || scope->_inOp == 0) { continue; }
+                # print(scope->buildStackString()->c_str());
+                atomic_scope = gdb.parse_and_eval("mongo::mozjs::kCurrentScope")
+                ptr = MongoDBJavaScriptStack.atomic_get_ptr(atomic_scope)
+                if not ptr:
+                    continue
+
+                scope = ptr.dereference()
+                if scope['_inOp'] == 0:
+                    continue
+
+                gdb.execute('thread', from_tty=False, to_string=False)
+                # gdb continues to not support calling methods through Python,
+                # so work around it by casting the raw ptr back to its type,
+                # and calling the method through execute darkness
+                gdb.execute(
+                    f'printf "%s\\n", ((mongo::mozjs::MozJSImplScope*)({ptr}))->buildStackString().c_str()',
+                    from_tty=False, to_string=False)
+
             except gdb.error as err:
                 print("Ignoring GDB error '%s' in javascript_stack" % str(err))
                 continue

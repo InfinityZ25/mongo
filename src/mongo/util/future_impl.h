@@ -52,20 +52,6 @@
 
 namespace mongo {
 
-namespace {
-// std::is_copy_constructible incorrectly returns true for containers of move-only types, so we use
-// our own modified version instead. Note this version is brittle at the moment, since it determines
-// whether or not the type is a container by the presense of a value_type field. After we switch to
-// C++20 we can use the Container concept for this instread.
-template <typename T, typename = void>
-struct is_really_copy_constructible : std::is_copy_constructible<T> {};
-template <typename T>
-struct is_really_copy_constructible<T, std::void_t<typename T::value_type>>
-    : std::is_copy_constructible<typename T::value_type> {};
-template <typename T>
-constexpr bool is_really_copy_constructible_v = is_really_copy_constructible<T>::value;
-}  // namespace
-
 template <typename T>
 class Promise;
 
@@ -101,6 +87,18 @@ template <typename T>
 inline constexpr bool isFutureLike<ExecutorFuture<T>> = true;
 template <typename T>
 inline constexpr bool isFutureLike<SharedSemiFuture<T>> = true;
+
+// std::is_copy_constructible incorrectly returns true for containers of move-only types, so we use
+// our own modified version instead. Note this version is brittle at the moment, since it determines
+// whether or not the type is a container by the presense of a value_type field. After we switch to
+// C++20 we can use the Container concept for this instread.
+template <typename T, typename = void>
+struct is_really_copy_constructible : std::is_copy_constructible<T> {};
+template <typename T>
+struct is_really_copy_constructible<T, std::void_t<typename T::value_type>>
+    : is_really_copy_constructible<typename T::value_type> {};
+template <typename T>
+constexpr bool is_really_copy_constructible_v = is_really_copy_constructible<T>::value;
 
 template <typename T>
 struct UnstatusTypeImpl {
@@ -594,11 +592,20 @@ struct SharedStateImpl final : SharedStateBase {
         transitionToFinished();
     }
 
-    void setFromStatusWith(StatusWith<T> sw) {
-        if (sw.isOK()) {
-            emplaceValue(std::move(sw.getValue()));
+    void setFrom(StatusWith<T> sosw) {
+        if (sosw.isOK()) {
+            emplaceValue(std::move(sosw.getValue()));
         } else {
-            setError(std::move(sw.getStatus()));
+            setError(std::move(sosw.getStatus()));
+        }
+    }
+
+    REQUIRES_FOR_NON_TEMPLATE(std::is_same_v<T, FakeVoid>)
+    void setFrom(Status status) {
+        if (status.isOK()) {
+            emplaceValue();
+        } else {
+            setError(std::move(status));
         }
     }
 
@@ -898,7 +905,7 @@ public:
                         if (!input->status.isOK())
                             return output->setError(std::move(input->status));
 
-                        output->setFromStatusWith(statusCall(func, std::move(*input->data)));
+                        output->setFrom(statusCall(func, std::move(*input->data)));
                     });
                 });
         } else {
@@ -955,11 +962,10 @@ public:
                     return makeContinuation<Result>([func = std::forward<Func>(func)](
                         SharedState<T> * input, SharedState<Result> * output) mutable noexcept {
                         if (!input->status.isOK())
-                            return output->setFromStatusWith(
+                            return output->setFrom(
                                 statusCall(func, Wrapper(std::move(input->status))));
 
-                        output->setFromStatusWith(
-                            statusCall(func, Wrapper(std::move(*input->data))));
+                        output->setFrom(statusCall(func, Wrapper(std::move(*input->data))));
                     });
                 });
         } else {
@@ -1032,7 +1038,7 @@ public:
                         if (input->status.isOK())
                             return output->emplaceValue(std::move(*input->data));
 
-                        output->setFromStatusWith(statusCall(func, std::move(input->status)));
+                        output->setFrom(statusCall(func, std::move(input->status)));
                     });
                 });
         } else {

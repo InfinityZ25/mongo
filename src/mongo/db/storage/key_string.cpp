@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -39,6 +39,7 @@
 #include "mongo/base/data_cursor.h"
 #include "mongo/base/data_view.h"
 #include "mongo/bson/bson_depth.h"
+#include "mongo/db/exec/sbe/values/value_builder.h"
 #include "mongo/platform/bits.h"
 #include "mongo/platform/strnlen.h"
 #include "mongo/util/decimal_counter.h"
@@ -1212,12 +1213,13 @@ void BuilderBase<BufferT>::_appendBytes(const void* source, size_t bytes, bool i
 // ----------------------------------------------------------------------
 
 namespace {
+template <class Stream>
 void toBsonValue(uint8_t ctype,
                  BufReader* reader,
                  TypeBits::Reader* typeBits,
                  bool inverted,
                  Version version,
-                 BSONObjBuilderValueStream* stream,
+                 Stream* stream,
                  uint32_t depth);
 
 void toBson(BufReader* reader,
@@ -1276,12 +1278,13 @@ Decimal128 readDecimalContinuation(BufReader* reader, bool inverted, Decimal128 
     return num;
 }
 
+template <class Stream>
 void toBsonValue(uint8_t ctype,
                  BufReader* reader,
                  TypeBits::Reader* typeBits,
                  bool inverted,
                  Version version,
-                 BSONObjBuilderValueStream* stream,
+                 Stream* stream,
                  uint32_t depth) {
     keyStringAssert(ErrorCodes::Overflow,
                     "KeyString encoding exceeded maximum allowable BSON nesting depth",
@@ -2171,11 +2174,11 @@ Decimal128 adjustDecimalExponent(TypeBits::Reader* typeBits, Decimal128 num) {
 
 template <class BufferT>
 std::string BuilderBase<BufferT>::toString() const {
-    return toHex(getBuffer(), getSize());
+    return hexblob::encode(getBuffer(), getSize());
 }
 
 std::string Value::toString() const {
-    return toHex(getBuffer(), getSize());
+    return hexblob::encode(getBuffer(), getSize());
 }
 
 TypeBits& TypeBits::operator=(const TypeBits& tb) {
@@ -2379,76 +2382,6 @@ size_t getKeySize(const char* buffer, size_t len, Ordering ord, const TypeBits& 
     return (len - (remainingBytes - 1));
 }
 
-// Unlike toBsonSafe(), this function will convert the discriminator byte back.
-// This discriminator byte only exists in KeyStrings for queries, not in KeyStrings stored in an
-// index. This function is only used by EphemeralForTest because it uses BSON with discriminator
-// rather than KeyString to compare.
-BSONObj toBsonSafeWithDiscriminator(const char* buffer,
-                                    size_t len,
-                                    Ordering ord,
-                                    const TypeBits& typeBits) {
-    boost::optional<std::string> discriminatorFieldName;
-    int fieldNo = -1;  // Record which field should add the discriminator field name.
-
-    // First pass, get the discriminator byte if there is any.
-    {
-        BSONObjBuilder builder;
-        BufReader reader(buffer, len);
-        TypeBits::Reader typeBitsReader(typeBits);
-        for (int i = 0; reader.remaining(); i++) {
-            const bool invert = (ord.get(i) == -1);
-            uint8_t ctype = readType<uint8_t>(&reader, invert);
-            if (ctype == kLess || ctype == kGreater) {
-                // Discriminator byte should not be inverted. It's possible when `ord` has more
-                // fields than keystring and `invert` got mistakenly applied to discriminator byte.
-                if (invert)
-                    ctype = ~ctype;  // Invert it back.
-                discriminatorFieldName = ctype == kLess ? "l" : "g";
-                fieldNo = i - 1;
-                ctype = readType<uint8_t>(&reader, false);
-                invariant(ctype == kEnd);
-            }
-
-            if (ctype == kEnd) {
-                break;
-            }
-
-            toBsonValue(
-                ctype, &reader, &typeBitsReader, invert, typeBits.version, &(builder << ""), 1);
-        }
-        // Early return if there is no discriminator byte.
-        if (!discriminatorFieldName)
-            return builder.obj();
-    }
-
-    // Second pass, add discriminator byte as the fieldName.
-    {
-        BSONObjBuilder builder;
-        BufReader reader(buffer, len);
-        TypeBits::Reader typeBitsReader(typeBits);
-        for (int i = 0; reader.remaining(); i++) {
-            const bool invert = (ord.get(i) == -1);
-            uint8_t ctype = readType<uint8_t>(&reader, invert);
-            if (ctype == kLess || ctype == kGreater) {
-                // Invert it back if discriminator byte got mistakenly inverted.
-                if (invert)
-                    ctype = ~ctype;
-                ctype = readType<uint8_t>(&reader, false);
-                invariant(ctype == kEnd);
-            }
-
-            if (ctype == kEnd) {
-                break;
-            }
-
-            auto fn = i == fieldNo ? discriminatorFieldName.get() : "";
-            toBsonValue(
-                ctype, &reader, &typeBitsReader, invert, typeBits.version, &(builder << fn), 1);
-        }
-        return builder.obj();
-    }
-}
-
 // This discriminator byte only exists in KeyStrings for queries, not in KeyStrings stored in an
 // index.
 Discriminator decodeDiscriminator(const char* buffer,
@@ -2566,6 +2499,34 @@ int compare(const char* leftBuf, const char* rightBuf, size_t leftSize, size_t r
 
 int Value::compareWithTypeBits(const Value& other) const {
     return KeyString::compare(getBuffer(), other.getBuffer(), _buffer.size(), other._buffer.size());
+}
+
+bool readSBEValue(BufReader* reader,
+                  TypeBits::Reader* typeBits,
+                  bool inverted,
+                  Version version,
+                  sbe::value::ValueBuilder* valueBuilder) {
+    uint8_t ctype;
+    if (!reader->remaining() || (ctype = readType<uint8_t>(reader, inverted)) == kEnd) {
+        return false;
+    }
+
+    // This function is only intended to read stored index entries. The 'kLess' and 'kGreater'
+    // "discriminator" types are used for querying and are never stored in an index.
+    invariant(ctype > kLess && ctype < kGreater);
+
+    const uint32_t depth = 1;  // This function only gets called for a top-level KeyString::Value.
+    toBsonValue(ctype, reader, typeBits, inverted, version, valueBuilder, depth);
+    return true;
+}
+
+void Value::serializeWithoutRecordId(BufBuilder& buf) const {
+    dassert(decodeRecordIdAtEnd(_buffer.get(), _ksSize).isValid());
+
+    const int32_t sizeWithoutRecordId = sizeWithoutRecordIdAtEnd(_buffer.get(), _ksSize);
+    buf.appendNum(sizeWithoutRecordId);                 // Serialize size of KeyString
+    buf.appendBuf(_buffer.get(), sizeWithoutRecordId);  // Serialize KeyString
+    buf.appendBuf(_buffer.get() + _ksSize, _buffer.size() - _ksSize);  // Serialize TypeBits
 }
 
 template class BuilderBase<Builder>;

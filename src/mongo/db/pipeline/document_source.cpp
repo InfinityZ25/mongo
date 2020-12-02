@@ -80,6 +80,14 @@ void DocumentSource::registerParser(
     parserMap[name] = {parser, requiredMinVersion};
 }
 
+bool DocumentSource::hasQuery() const {
+    return false;
+}
+
+BSONObj DocumentSource::getQuery() const {
+    MONGO_UNREACHABLE;
+}
+
 list<intrusive_ptr<DocumentSource>> DocumentSource::parse(
     const intrusive_ptr<ExpressionContext>& expCtx, BSONObj stageObj) {
     uassert(16435,
@@ -209,7 +217,7 @@ bool DocumentSource::pushMatchBefore(Pipeline::SourceContainer::iterator itr,
 bool DocumentSource::pushSampleBefore(Pipeline::SourceContainer::iterator itr,
                                       Pipeline::SourceContainer* container) {
     auto nextSample = dynamic_cast<DocumentSourceSample*>((*std::next(itr)).get());
-    if (constraints().canSwapWithLimitAndSample && nextSample) {
+    if (constraints().canSwapWithSkippingOrLimitingStage && nextSample) {
 
         container->insert(itr, std::move(nextSample));
         container->erase(std::next(itr));

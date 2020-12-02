@@ -5,14 +5,13 @@
 //   # This test attempts to perform queries and introspect/manipulate the server's plan cache
 //   # entries. The former operation may be routed to a secondary in the replica set, whereas the
 //   # latter must be routed to the primary.
-//   # If all chunks are moved off of a shard, it can cause the plan cache to miss commands.
-//   assumes_read_preference_unchanged,
 //   assumes_read_concern_unchanged,
+//   assumes_read_preference_unchanged,
 //   does_not_support_stepdowns,
+//   # If all chunks are moved off of a shard, it can cause the plan cache to miss commands.
 //   assumes_balancer_off,
 //   assumes_unsharded_collection,
-//   # Sharding support for $planCacheStats requires all nodes to be binary version 4.4.
-//   requires_fcv_44,
+//   sbe_incompatible,
 // ]
 
 (function() {
@@ -113,7 +112,7 @@ assert.commandWorked(nonExistentColl.runCommand('planCacheClear'));
 //     Confirm that cache is empty.
 // (Only standalone mode supports the reIndex command.)
 const isMongos = db.adminCommand({isdbgrid: 1}).isdbgrid;
-const isStandalone = !isMongos && !db.runCommand({isMaster: 1}).hasOwnProperty('setName');
+const isStandalone = !isMongos && !db.runCommand({hello: 1}).hasOwnProperty('setName');
 if (isStandalone) {
     assert.eq(1, coll.find({a: 1, b: 1}).itcount());
     assert.eq(1, numPlanCacheEntries(), dumpPlanCacheState());

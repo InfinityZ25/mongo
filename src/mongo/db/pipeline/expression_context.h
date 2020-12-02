@@ -43,8 +43,8 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/aggregation_request.h"
 #include "mongo/db/pipeline/javascript_execution.h"
+#include "mongo/db/pipeline/legacy_runtime_constants_gen.h"
 #include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
-#include "mongo/db/pipeline/runtime_constants_gen.h"
 #include "mongo/db/pipeline/variables.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/datetime/date_time_support.h"
@@ -88,7 +88,7 @@ public:
          * This constructor is private, all CollatorStashes should be created by calling
          * ExpressionContext::temporarilyChangeCollator().
          */
-        CollatorStash(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        CollatorStash(ExpressionContext* const expCtx,
                       std::unique_ptr<CollatorInterface> newCollator);
 
         friend class ExpressionContext;
@@ -123,14 +123,13 @@ public:
                       bool bypassDocumentValidation,
                       bool isMapReduceCommand,
                       const NamespaceString& ns,
-                      const boost::optional<RuntimeConstants>& runtimeConstants,
+                      const boost::optional<LegacyRuntimeConstants>& runtimeConstants,
                       std::unique_ptr<CollatorInterface> collator,
                       const std::shared_ptr<MongoProcessInterface>& mongoProcessInterface,
                       StringMap<ExpressionContext::ResolvedNamespace> resolvedNamespaces,
                       boost::optional<UUID> collUUID,
-                      bool mayDbProfile,
-                      const boost::optional<BSONObj>& letParameters = boost::none);
-
+                      const boost::optional<BSONObj>& letParameters = boost::none,
+                      bool mayDbProfile = true);
 
     /**
      * Constructs an ExpressionContext suitable for use outside of the aggregation system, including
@@ -141,8 +140,10 @@ public:
     ExpressionContext(OperationContext* opCtx,
                       std::unique_ptr<CollatorInterface> collator,
                       const NamespaceString& ns,
-                      const boost::optional<RuntimeConstants>& runtimeConstants = boost::none,
-                      bool mayDbProfile = true);
+                      const boost::optional<LegacyRuntimeConstants>& runtimeConstants = boost::none,
+                      const boost::optional<BSONObj>& letParameters = boost::none,
+                      bool mayDbProfile = true,
+                      boost::optional<ExplainOptions::Verbosity> explain = boost::none);
 
     /**
      * Used by a pipeline to check for interrupts so that killOp() works. Throws a UserAssertion if
@@ -265,10 +266,6 @@ public:
         _resolvedNamespaces = std::move(resolvedNamespaces);
     }
 
-    const RuntimeConstants& getRuntimeConstants() const {
-        return variables.getRuntimeConstants();
-    }
-
     /**
      * Retrieves the Javascript Scope for the current thread or creates a new one if it has not been
      * created yet. Initializes the Scope with the 'jsScope' variables from the runtimeConstants.
@@ -281,15 +278,17 @@ public:
         uassert(31264,
                 "Cannot run server-side javascript without the javascript engine enabled",
                 getGlobalScriptEngine());
-        const auto& runtimeConstants = getRuntimeConstants();
-        const boost::optional<bool> isMapReduceCommand = runtimeConstants.getIsMapReduce();
+        const auto isMapReduce =
+            (variables.hasValue(Variables::kIsMapReduceId) &&
+             variables.getValue(Variables::kIsMapReduceId).getType() == BSONType::Bool &&
+             variables.getValue(Variables::kIsMapReduceId).coerceToBool());
         if (inMongos) {
             invariant(!forceLoadOfStoredProcedures);
-            invariant(!isMapReduceCommand);
+            invariant(!isMapReduce);
         }
 
         // Stored procedures are only loaded for the $where expression and MapReduce command.
-        const bool loadStoredProcedures = forceLoadOfStoredProcedures || isMapReduceCommand;
+        const bool loadStoredProcedures = forceLoadOfStoredProcedures || isMapReduce;
 
         if (hasWhereClause && !loadStoredProcedures) {
             uasserted(4649200,
@@ -297,9 +296,13 @@ public:
                       "$where.");
         }
 
-        const boost::optional<mongo::BSONObj>& scope = runtimeConstants.getJsScope();
-        return JsExecution::get(
-            opCtx, scope.get_value_or(BSONObj()), ns.db(), loadStoredProcedures, jsHeapLimitMB);
+        auto scopeObj = BSONObj();
+        if (variables.hasValue(Variables::kJsScopeId)) {
+            auto scopeVar = variables.getValue(Variables::kJsScopeId);
+            invariant(scopeVar.isObject());
+            scopeObj = scopeVar.getDocument().toBson();
+        }
+        return JsExecution::get(opCtx, scopeObj, ns.db(), loadStoredProcedures, jsHeapLimitMB);
     }
 
     // The explain verbosity requested by the user, or boost::none if no explain was requested.
@@ -326,10 +329,6 @@ public:
     // getJsExecWithScope(). This limit is ignored if larger than the global limit dictated by the
     // 'jsHeapLimitMB' server parameter.
     boost::optional<int> jsHeapLimitMB;
-
-    // When set this timeout limits the allowed execution time for a JavaScript function invocation
-    // under any Scope returned by getJsExecWithScope().
-    int jsFnTimeoutMillis;
 
     // An interface for accessing information or performing operations that have different
     // implementations on mongod and mongos, or that only make sense on one of the two.

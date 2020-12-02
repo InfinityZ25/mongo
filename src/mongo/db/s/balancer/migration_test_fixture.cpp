@@ -29,11 +29,11 @@
 
 #include "mongo/platform/basic.h"
 
-#include <memory>
-
 #include "mongo/db/s/balancer/migration_test_fixture.h"
 
 namespace mongo {
+
+using unittest::assertGet;
 
 void MigrationTestFixture::setUp() {
     setUpAndInitializeConfigDb();
@@ -46,16 +46,13 @@ std::shared_ptr<RemoteCommandTargeterMock> MigrationTestFixture::shardTargeterMo
 }
 
 void MigrationTestFixture::setUpDatabase(const std::string& dbName, const ShardId primaryShard) {
-    DatabaseType db(dbName, primaryShard, true, databaseVersion::makeNew());
+    DatabaseType db(dbName, primaryShard, true, DatabaseVersion(UUID::gen()));
     ASSERT_OK(catalogClient()->insertConfigDocument(
         operationContext(), DatabaseType::ConfigNS, db.toBSON(), kMajorityWriteConcern));
 }
 
 void MigrationTestFixture::setUpCollection(const NamespaceString& collName, ChunkVersion version) {
-    CollectionType coll;
-    coll.setNs(collName);
-    coll.setEpoch(version.epoch());
-    coll.setUpdatedAt(Date_t::fromMillisSinceEpoch(version.toLong()));
+    CollectionType coll(collName, version.epoch(), Date_t::now(), UUID::gen());
     coll.setKeyPattern(kKeyPattern);
     coll.setUnique(false);
     ASSERT_OK(catalogClient()->insertConfigDocument(

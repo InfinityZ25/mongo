@@ -32,10 +32,10 @@
 #include "mongo/db/repl/oplog_applier_impl_test_fixture.h"
 
 #include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/op_observer_registry.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
@@ -46,6 +46,7 @@
 #include "mongo/db/repl/replication_recovery_mock.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_impl.h"
+#include "mongo/db/vector_clock_mutable.h"
 
 namespace mongo {
 namespace repl {
@@ -88,7 +89,7 @@ void OplogApplierImplOpObserver::onUpdate(OperationContext* opCtx,
 }
 
 void OplogApplierImplOpObserver::onCreateCollection(OperationContext* opCtx,
-                                                    Collection* coll,
+                                                    const CollectionPtr& coll,
                                                     const NamespaceString& collectionName,
                                                     const CollectionOptions& options,
                                                     const BSONObj& idIndex,
@@ -112,7 +113,6 @@ void OplogApplierImplTest::setUp() {
 
     DropPendingCollectionReaper::set(
         serviceContext, std::make_unique<DropPendingCollectionReaper>(getStorageInterface()));
-    repl::setOplogCollectionName(serviceContext);
     repl::createOplog(_opCtx.get());
 
     _consistencyMarkers = std::make_unique<ReplicationConsistencyMarkersMock>();
@@ -126,12 +126,13 @@ void OplogApplierImplTest::setUp() {
     // Initialize the featureCompatibilityVersion server parameter. This is necessary because this
     // test fixture does not create a featureCompatibilityVersion document from which to initialize
     // the server parameter.
-    serverGlobalParams.featureCompatibility.setVersion(
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo46);
+    // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
+    serverGlobalParams.mutableFeatureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::kLatest);
 
     // This is necessary to generate ghost timestamps for index builds that are not 0, since 0 is an
     // invalid timestamp.
-    ASSERT_OK(LogicalClock::get(_opCtx.get())->advanceClusterTime(LogicalTime(Timestamp(1, 0))));
+    VectorClockMutable::get(_opCtx.get())->tickClusterTimeTo(LogicalTime(Timestamp(1, 0)));
 }
 
 void OplogApplierImplTest::tearDown() {
@@ -172,7 +173,7 @@ void OplogApplierImplTest::_testApplyOplogEntryOrGroupedInsertsCrudOperation(
         ASSERT_TRUE(
             opCtx->lockState()->isCollectionLockedForMode(NamespaceString("test.t"), MODE_IX));
         ASSERT_FALSE(opCtx->writesAreReplicated());
-        ASSERT_TRUE(documentValidationDisabled(opCtx));
+        ASSERT_TRUE(DocumentValidationSettings::get(opCtx).isSchemaValidationDisabled());
     };
 
     _opObserver->onInsertsFn =
@@ -269,11 +270,17 @@ Status OplogApplierImplTest::runOpsInitialSync(std::vector<OplogEntry> ops) {
     // its own batch and update oplog visibility after each batch to make sure all previously
     // applied entries are visible to subsequent batches.
     for (auto& op : ops) {
-        auto status = oplogApplier.applyOplogBatch(_opCtx.get(), {op});
-        if (!status.isOK()) {
-            return status.getStatus();
+        auto applyResult = oplogApplier.applyOplogBatch(_opCtx.get(), {op});
+        if (!applyResult.isOK()) {
+            std::vector<BSONObj> docsFromOps;
+            for (const auto& opForContext : ops) {
+                docsFromOps.push_back(opForContext.toBSON());
+            }
+            auto status = applyResult.getStatus();
+            return status.withContext(str::stream() << "failed to apply operation: " << op.toBSON()
+                                                    << ". " << BSON("ops" << docsFromOps));
         }
-        auto lastApplied = status.getValue();
+        auto lastApplied = applyResult.getValue();
         const bool orderedCommit = true;
         // Update oplog visibility by notifying the storage engine of the new oplog entries.
         storageInterface->oplogDiskLocRegister(
@@ -315,8 +322,8 @@ CollectionReader::CollectionReader(OperationContext* opCtx, const NamespaceStrin
     : _collToScan(opCtx, nss),
       _exec(InternalPlanner::collectionScan(opCtx,
                                             nss.ns(),
-                                            _collToScan.getCollection(),
-                                            PlanExecutor::NO_YIELD,
+                                            &_collToScan.getCollection(),
+                                            PlanYieldPolicy::YieldPolicy::NO_YIELD,
                                             InternalPlanner::FORWARD)) {}
 
 StatusWith<BSONObj> CollectionReader::next() {
@@ -338,5 +345,88 @@ bool docExists(OperationContext* opCtx, const NamespaceString& nss, const BSONOb
     auto result = client.findOne(nss.ns(), {doc});
     return !result.isEmpty();
 }
+
+/**
+ * Creates an OplogEntry with given parameters and preset defaults for this test suite.
+ */
+OplogEntry makeOplogEntry(OpTypeEnum opType,
+                          NamespaceString nss,
+                          OptionalCollectionUUID uuid,
+                          BSONObj o,
+                          boost::optional<BSONObj> o2) {
+    return OplogEntry(OpTime(Timestamp(1, 1), 1),  // optime
+                      boost::none,                 // hash
+                      opType,                      // opType
+                      nss,                         // namespace
+                      uuid,                        // uuid
+                      boost::none,                 // fromMigrate
+                      OplogEntry::kOplogVersion,   // version
+                      o,                           // o
+                      o2,                          // o2
+                      {},                          // sessionInfo
+                      boost::none,                 // upsert
+                      Date_t(),                    // wall clock time
+                      boost::none,                 // statement id
+                      boost::none,   // optime of previous write within same transaction
+                      boost::none,   // pre-image optime
+                      boost::none,   // post-image optime
+                      boost::none,   // ShardId of resharding recipient
+                      boost::none);  // _id
+}
+
+OplogEntry makeOplogEntry(OpTypeEnum opType, NamespaceString nss, OptionalCollectionUUID uuid) {
+    return makeOplogEntry(opType, nss, uuid, BSON("_id" << 0), boost::none);
+}
+
+CollectionOptions createOplogCollectionOptions() {
+    CollectionOptions options;
+    options.capped = true;
+    options.cappedSize = 64 * 1024 * 1024LL;
+    options.autoIndexId = CollectionOptions::NO;
+    return options;
+}
+
+CollectionOptions createRecordPreImageCollectionOptions() {
+    CollectionOptions options;
+    options.recordPreImages = true;
+    return options;
+}
+
+void createCollection(OperationContext* opCtx,
+                      const NamespaceString& nss,
+                      const CollectionOptions& options) {
+    writeConflictRetry(opCtx, "createCollection", nss.ns(), [&] {
+        Lock::DBLock dblk(opCtx, nss.db(), MODE_IX);
+        Lock::CollectionLock collLk(opCtx, nss, MODE_X);
+        OldClientContext ctx(opCtx, nss.ns());
+        auto db = ctx.db();
+        ASSERT_TRUE(db);
+        mongo::WriteUnitOfWork wuow(opCtx);
+        auto coll = db->createCollection(opCtx, nss, options);
+        ASSERT_TRUE(coll);
+        wuow.commit();
+    });
+}
+
+UUID createCollectionWithUuid(OperationContext* opCtx, const NamespaceString& nss) {
+    CollectionOptions options;
+    options.uuid = UUID::gen();
+    createCollection(opCtx, nss, options);
+    return options.uuid.get();
+}
+
+void createDatabase(OperationContext* opCtx, StringData dbName) {
+    Lock::GlobalWrite globalLock(opCtx);
+    bool justCreated;
+    auto databaseHolder = DatabaseHolder::get(opCtx);
+    auto db = databaseHolder->openDb(opCtx, dbName, &justCreated);
+    ASSERT_TRUE(db);
+    ASSERT_TRUE(justCreated);
+}
+
+bool collectionExists(OperationContext* opCtx, const NamespaceString& nss) {
+    return AutoGetCollectionForRead(opCtx, nss).getCollection() != nullptr;
+}
+
 }  // namespace repl
 }  // namespace mongo

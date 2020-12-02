@@ -1,4 +1,7 @@
-// @tags: [requires_getmore]
+// @tags: [
+//   requires_getmore,
+//   sbe_incompatible,
+// ]
 
 t = db.geo_box1;
 t.drop();
@@ -11,7 +14,7 @@ for (x = 0; x <= 20; x++) {
     }
 }
 
-t.ensureIndex({loc: "2d"});
+t.createIndex({loc: "2d"});
 
 searches = [
     [[1, 2], [4, 5]],

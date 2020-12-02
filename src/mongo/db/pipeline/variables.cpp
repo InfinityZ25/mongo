@@ -30,8 +30,9 @@
 #include "mongo/db/pipeline/variables.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/client.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/variable_validation.h"
+#include "mongo/db/vector_clock.h"
 #include "mongo/platform/basic.h"
 #include "mongo/platform/random.h"
 #include "mongo/util/str.h"
@@ -44,97 +45,57 @@ using namespace std::string_literals;
 constexpr Variables::Id Variables::kRootId;
 constexpr Variables::Id Variables::kRemoveId;
 
-const StringMap<Variables::Id> Variables::kBuiltinVarNameToId = {{"ROOT", kRootId},
-                                                                 {"REMOVE", kRemoveId},
-                                                                 {"NOW", kNowId},
-                                                                 {"CLUSTER_TIME", kClusterTimeId},
-                                                                 {"JS_SCOPE", kJsScopeId},
-                                                                 {"IS_MR", kIsMapReduceId}};
+constexpr StringData kRootName = "ROOT"_sd;
+constexpr StringData kRemoveName = "REMOVE"_sd;
+constexpr StringData kNowName = "NOW"_sd;
+constexpr StringData kClusterTimeName = "CLUSTER_TIME"_sd;
+constexpr StringData kJsScopeName = "JS_SCOPE"_sd;
+constexpr StringData kIsMapReduceName = "IS_MR"_sd;
+
+const StringMap<Variables::Id> Variables::kBuiltinVarNameToId = {
+    {kRootName.rawData(), kRootId},
+    {kRemoveName.rawData(), kRemoveId},
+    {kNowName.rawData(), kNowId},
+    {kClusterTimeName.rawData(), kClusterTimeId},
+    {kJsScopeName.rawData(), kJsScopeId},
+    {kIsMapReduceName.rawData(), kIsMapReduceId}};
 
 const std::map<Variables::Id, std::string> Variables::kIdToBuiltinVarName = {
-    {kRootId, "ROOT"},
-    {kRemoveId, "REMOVE"},
-    {kNowId, "NOW"},
-    {kClusterTimeId, "CLUSTER_TIME"},
-    {kJsScopeId, "JS_SCOPE"},
-    {kIsMapReduceId, "IS_MR"}};
+    {kRootId, kRootName.rawData()},
+    {kRemoveId, kRemoveName.rawData()},
+    {kNowId, kNowName.rawData()},
+    {kClusterTimeId, kClusterTimeName.rawData()},
+    {kJsScopeId, kJsScopeName.rawData()},
+    {kIsMapReduceId, kIsMapReduceName.rawData()}};
 
 const std::map<StringData, std::function<void(const Value&)>> Variables::kSystemVarValidators = {
-    {"NOW"_sd,
+    {kNowName,
      [](const auto& value) {
          uassert(ErrorCodes::TypeMismatch,
                  str::stream() << "$$NOW must have a date value, found "
                                << typeName(value.getType()),
                  value.getType() == BSONType::Date);
      }},
-    {"CLUSTER_TIME"_sd,
+    {kClusterTimeName,
      [](const auto& value) {
          uassert(ErrorCodes::TypeMismatch,
                  str::stream() << "$$CLUSTER_TIME must have a timestamp value, found "
                                << typeName(value.getType()),
                  value.getType() == BSONType::bsonTimestamp);
      }},
-    {"JS_SCOPE"_sd,
+    {kJsScopeName,
      [](const auto& value) {
          uassert(ErrorCodes::TypeMismatch,
                  str::stream() << "$$JS_SCOPE must have an object value, found "
                                << typeName(value.getType()),
                  value.getType() == BSONType::Object);
      }},
-    {"IS_MR"_sd, [](const auto& value) {
+    {kIsMapReduceName, [](const auto& value) {
          uassert(ErrorCodes::TypeMismatch,
                  str::stream() << "$$IS_MR must have a bool value, found "
                                << typeName(value.getType()),
                  value.getType() == BSONType::Bool);
      }}};
-
-void Variables::validateName(StringData varName,
-                             std::function<bool(char)> prefixPred,
-                             std::function<bool(char)> suffixPred,
-                             int prefixLen) {
-    uassert(16866, "empty variable names are not allowed", !varName.empty());
-    for (int i = 0; i < prefixLen; ++i)
-        if (!prefixPred(varName[i]))
-            uasserted(16867,
-                      str::stream()
-                          << "'" << varName
-                          << "' starts with an invalid character for a user variable name");
-
-    for (size_t i = prefixLen; i < varName.size(); i++)
-        if (!suffixPred(varName[i]))
-            uasserted(16868,
-                      str::stream() << "'" << varName << "' contains an invalid character "
-                                    << "for a variable name: '" << varName[i] << "'");
-}
-
-void Variables::validateNameForUserWrite(StringData varName) {
-    // System variables users allowed to write to (currently just one)
-    if (varName == "CURRENT") {
-        return;
-    }
-    validateName(varName,
-                 [](char ch) -> bool {
-                     return (ch >= 'a' && ch <= 'z') || (ch & '\x80');  // non-ascii
-                 },
-                 [](char ch) -> bool {
-                     return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-                         (ch >= '0' && ch <= '9') || (ch == '_') || (ch & '\x80');  // non-ascii
-                 },
-                 1);
-}
-
-void Variables::validateNameForUserRead(StringData varName) {
-    validateName(varName,
-                 [](char ch) -> bool {
-                     return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-                         (ch & '\x80');  // non-ascii
-                 },
-                 [](char ch) -> bool {
-                     return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-                         (ch >= '0' && ch <= '9') || (ch == '_') || (ch & '\x80');  // non-ascii
-                 },
-                 1);
-}
 
 void Variables::setValue(Id id, const Value& value, bool isConstant) {
     uassert(17199, "can't use Variables::setValue to set a reserved builtin variable", id >= 0);
@@ -142,7 +103,7 @@ void Variables::setValue(Id id, const Value& value, bool isConstant) {
     // If a value has already been set for 'id', and that value was marked as constant, then it
     // is illegal to modify.
     invariant(!hasConstantValue(id));
-    _values[id] = {value, isConstant};
+    _definitions[id] = {value, isConstant};
 }
 
 void Variables::setValue(Variables::Id id, const Value& value) {
@@ -158,8 +119,8 @@ void Variables::setConstantValue(Variables::Id id, const Value& value) {
 Value Variables::getUserDefinedValue(Variables::Id id) const {
     invariant(isUserDefinedVariable(id));
 
-    auto it = _values.find(id);
-    uassert(40434, str::stream() << "Undefined variable id: " << id, it != _values.end());
+    auto it = _definitions.find(id);
+    uassert(40434, str::stream() << "Undefined variable id: " << id, it != _definitions.end());
     return it->second.value;
 }
 
@@ -173,17 +134,14 @@ Value Variables::getValue(Id id, const Document& root) const {
                 return Value();
             case Variables::kNowId:
             case Variables::kClusterTimeId:
-                if (auto it = _runtimeConstantsMap.find(id); it != _runtimeConstantsMap.end()) {
-                    return it->second;
+            case Variables::kJsScopeId:
+            case Variables::kIsMapReduceId:
+                if (auto it = _definitions.find(id); it != _definitions.end()) {
+                    return it->second.value;
                 }
                 uasserted(51144,
                           str::stream() << "Builtin variable '$$" << getBuiltinVariableName(id)
                                         << "' is not available");
-                MONGO_UNREACHABLE;
-            case Variables::kJsScopeId:
-                uasserted(4631100, "Use of undefined variable '$$JS_SCOPE'.");
-            case Variables::kIsMapReduceId:
-                uasserted(4631101, "Use of undefined variable '$$IS_MR'.");
             default:
                 MONGO_UNREACHABLE;
         }
@@ -205,80 +163,101 @@ Document Variables::getDocument(Id id, const Document& root) const {
     return Document();
 }
 
-const RuntimeConstants& Variables::getRuntimeConstants() const {
-    invariant(_runtimeConstants);
-    return *_runtimeConstants;
-}
-
-void Variables::setRuntimeConstants(const RuntimeConstants& constants) {
-    invariant(!_runtimeConstants);
-    _runtimeConstantsMap[kNowId] = Value(constants.getLocalNow());
+void Variables::setLegacyRuntimeConstants(const LegacyRuntimeConstants& constants) {
+    const bool constant = true;
+    _definitions[kNowId] = {Value(constants.getLocalNow()), constant};
     // We use a null Timestamp to indicate that the clusterTime is not available; this can happen if
     // the logical clock is not running. We do not use boost::optional because this would allow the
     // IDL to serialize a RuntimConstants without clusterTime, which should always be an error.
     if (!constants.getClusterTime().isNull()) {
-        _runtimeConstantsMap[kClusterTimeId] = Value(constants.getClusterTime());
+        _definitions[kClusterTimeId] = {Value(constants.getClusterTime()), constant};
     }
 
     if (constants.getJsScope()) {
-        _runtimeConstantsMap[kJsScopeId] = Value(constants.getJsScope().get());
+        _definitions[kJsScopeId] = {Value(*constants.getJsScope()), constant};
     }
     if (constants.getIsMapReduce()) {
-        _runtimeConstantsMap[kIsMapReduceId] = Value(constants.getIsMapReduce().get());
+        _definitions[kIsMapReduceId] = {Value(*constants.getIsMapReduce()), constant};
     }
-    _runtimeConstants = constants;
 }
 
 void Variables::setDefaultRuntimeConstants(OperationContext* opCtx) {
-    setRuntimeConstants(Variables::generateRuntimeConstants(opCtx));
+    setLegacyRuntimeConstants(Variables::generateRuntimeConstants(opCtx));
 }
 
-BSONObj Variables::serializeLetParameters(const VariablesParseState& vps) const {
-    auto bob = BSONObjBuilder{};
-    for (auto&& [id, value] : _letParametersMap)
-        bob << kIdToBuiltinVarName.at(id) << value;
-    return bob.appendElements(vps.serialize(*this)).obj();
-}
-void Variables::seedVariablesWithLetParameters(boost::intrusive_ptr<ExpressionContext> expCtx,
-                                               const BSONObj letParams) {
-    for (auto&& elem : letParams) {
-        Variables::validateNameForUserWrite(elem.fieldName());
-        auto expr = Expression::parseOperand(expCtx, elem, expCtx->variablesParseState);
-        auto foldedExpr = expr->optimize();
-        uassert(31474,
-                "Command let Expression does not evaluate to constant "s + elem.toString(),
-                ExpressionConstant::isNullOrConstant(foldedExpr));
-        auto value = static_cast<ExpressionConstant&>(*foldedExpr).getValue();
-        const auto sysVarName = [&]() -> boost::optional<StringData> {
-            // ROOT and REMOVE are excluded since they're not constants.
-            auto name = elem.fieldNameStringData();
-            if (auto it = kSystemVarValidators.find(name); it != kSystemVarValidators.end()) {
-                auto&& [ignore, validator] = *it;
-                validator(value);
-                return name;
-            }
-            return boost::none;
-        }();
-        if (sysVarName) {
-            if (!(sysVarName == "CLUSTER_TIME"_sd && value.getTimestamp().isNull())) {
-                // Avoid populating a value for CLUSTER_TIME if the value is null.
-                _runtimeConstantsMap[kBuiltinVarNameToId.at(*sysVarName)] = value;
-            }
-        } else {
-            setConstantValue(expCtx->variablesParseState.defineVariable(elem.fieldName()), value);
+void Variables::appendSystemVariables(BSONObjBuilder& bob) const {
+    for (auto&& [name, id] : kBuiltinVarNameToId) {
+        if (hasValue(id)) {
+            bob << name << getValue(id);
         }
     }
 }
 
-RuntimeConstants Variables::generateRuntimeConstants(OperationContext* opCtx) {
+namespace {
+
+/**
+ * Returns a callback function which can be used to verify the value conforms to expectations if
+ * 'varName' is a reserved system variable. Throws an exception if 'varName' is a reserved name
+ * (e.g. capital letter) but not one of the known variables. Returns boost::none for normal
+ * variables.
+ */
+boost::optional<std::function<void(const Value&)>> validateVariable(OperationContext* opCtx,
+                                                                    StringData varName) {
+    auto validateStatus = variableValidation::isValidNameForUserWrite(varName);
+    if (validateStatus.isOK()) {
+        return boost::none;
+    }
+    // Reserved field name. It may be an internal propogation of a constant. Otherwise we need to
+    // reject it.
+    const auto& knownConstantIt = Variables::kSystemVarValidators.find(varName);
+    if (knownConstantIt == Variables::kSystemVarValidators.end()) {
+        uassertStatusOKWithContext(validateStatus, "Invalid 'let' parameter");
+    }
+
+    uassert(4738901,
+            str::stream() << "Attempt to set internal constant: " << varName,
+            opCtx->getClient()->session() &&
+                (opCtx->getClient()->session()->getTags() & transport::Session::kInternalClient));
+
+    return knownConstantIt->second;
+}
+
+}  // namespace
+
+void Variables::seedVariablesWithLetParameters(ExpressionContext* const expCtx,
+                                               const BSONObj letParams) {
+    for (auto&& elem : letParams) {
+        const auto fieldName = elem.fieldNameStringData();
+        auto maybeSystemVarValidator = validateVariable(expCtx->opCtx, fieldName);
+        auto expr = Expression::parseOperand(expCtx, elem, expCtx->variablesParseState);
+
+        uassert(4890500,
+                "Command let Expression tried to access a field, but this is not allowed because "
+                "Command let Expressions run before the query examines any documents.",
+                expr->getDependencies().hasNoRequirements());
+        Value value = expr->evaluate(Document{}, &expCtx->variables);
+
+        if (maybeSystemVarValidator) {
+            (*maybeSystemVarValidator)(value);
+            if (!(fieldName == kClusterTimeName && value.getTimestamp().isNull())) {
+                // Avoid populating a value for CLUSTER_TIME if the value is null.
+                _definitions[kBuiltinVarNameToId.at(fieldName)] = {value, true};
+            }
+        } else {
+            setConstantValue(expCtx->variablesParseState.defineVariable(fieldName), value);
+        }
+    }
+}
+
+LegacyRuntimeConstants Variables::generateRuntimeConstants(OperationContext* opCtx) {
     // On a standalone, the clock may not be running and $$CLUSTER_TIME is unavailable. If the
     // logical clock is available, set the clusterTime in the runtime constants. Otherwise, the
     // clusterTime is set to the null Timestamp.
     if (opCtx->getClient()) {
-        if (auto logicalClock = LogicalClock::get(opCtx); logicalClock) {
-            auto clusterTime = logicalClock->getClusterTime();
-            if (clusterTime != LogicalTime::kUninitialized) {
-                return {Date_t::now(), clusterTime.asTimestamp()};
+        if (const auto vectorClock = VectorClock::get(opCtx)) {
+            const auto now = vectorClock->getTime();
+            if (now.clusterTime() != LogicalTime::kUninitialized) {
+                return {Date_t::now(), now.clusterTime().asTimestamp()};
             }
         }
     }
@@ -290,8 +269,43 @@ void Variables::copyToExpCtx(const VariablesParseState& vps, ExpressionContext* 
     expCtx->variablesParseState = vps.copyWith(expCtx->variables.useIdGenerator());
 }
 
+LegacyRuntimeConstants Variables::transitionalExtractRuntimeConstants() const {
+    LegacyRuntimeConstants extracted;
+    for (auto&& [builtinName, ignoredValidator] : kSystemVarValidators) {
+        const auto builtinId = kBuiltinVarNameToId.at(builtinName);
+        if (auto it = _definitions.find(builtinId); it != _definitions.end()) {
+            const auto& [value, unusedIsConstant] = it->second;
+            switch (builtinId) {
+                case kNowId: {
+                    invariant(value.getType() == BSONType::Date);
+                    extracted.setLocalNow(value.getDate());
+                    break;
+                }
+                case kClusterTimeId: {
+                    invariant(value.getType() == BSONType::bsonTimestamp);
+                    extracted.setClusterTime(value.getTimestamp());
+                    break;
+                }
+                case kJsScopeId: {
+                    invariant(value.getType() == BSONType::Object);
+                    extracted.setJsScope(value.getDocument().toBson());
+                    break;
+                }
+                case kIsMapReduceId: {
+                    invariant(value.getType() == BSONType::Bool);
+                    extracted.setIsMapReduce(value.getBool());
+                    break;
+                }
+                default:
+                    MONGO_UNREACHABLE;
+            }
+        }
+    }
+    return extracted;
+}
+
 Variables::Id VariablesParseState::defineVariable(StringData name) {
-    // Caller should have validated before hand by using Variables::validateNameForUserWrite.
+    // Caller should have validated before hand by using variableValidationvalidateNameForUserWrite.
     massert(17275,
             "Can't redefine a non-user-writable variable",
             Variables::kBuiltinVarNameToId.find(name) == Variables::kBuiltinVarNameToId.end());
@@ -337,6 +351,20 @@ BSONObj VariablesParseState::serialize(const Variables& vars) const {
     for (auto&& [var_name, id] : _variables)
         if (vars.hasValue(id))
             bob << var_name << vars.getValue(id);
+
+    // System variables have to be added separately since the variable IDs are reserved and not
+    // allocated like normal variables, and so not present in '_variables'.
+    vars.appendSystemVariables(bob);
     return bob.obj();
+}
+
+std::pair<LegacyRuntimeConstants, BSONObj> VariablesParseState::transitionalCompatibilitySerialize(
+    const Variables& vars) const {
+    auto bob = BSONObjBuilder{};
+    for (auto&& [var_name, id] : _variables)
+        if (vars.hasValue(id))
+            bob << var_name << vars.getValue(id);
+
+    return {vars.transitionalExtractRuntimeConstants(), bob.obj()};
 }
 }  // namespace mongo

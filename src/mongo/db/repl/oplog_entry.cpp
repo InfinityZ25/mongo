@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -61,8 +61,6 @@ OplogEntry::CommandType parseCommandType(const BSONObj& objectField) {
         return OplogEntry::CommandType::kDropDatabase;
     } else if (commandString == "emptycapped") {
         return OplogEntry::CommandType::kEmptyCapped;
-    } else if (commandString == "convertToCapped") {
-        return OplogEntry::CommandType::kConvertToCapped;
     } else if (commandString == "createIndexes") {
         return OplogEntry::CommandType::kCreateIndexes;
     } else if (commandString == "startIndexBuild") {
@@ -79,6 +77,8 @@ OplogEntry::CommandType parseCommandType(const BSONObj& objectField) {
         return OplogEntry::CommandType::kCommitTransaction;
     } else if (commandString == "abortTransaction") {
         return OplogEntry::CommandType::kAbortTransaction;
+    } else if (commandString == "importCollection") {
+        return OplogEntry::CommandType::kImportCollection;
     } else {
         uasserted(ErrorCodes::BadValue,
                   str::stream() << "Unknown oplog entry command type: " << commandString
@@ -91,7 +91,7 @@ OplogEntry::CommandType parseCommandType(const BSONObj& objectField) {
  * Returns a document representing an oplog entry with the given fields.
  */
 BSONObj makeOplogEntryDoc(OpTime opTime,
-                          const boost::optional<long long> hash,
+                          const boost::optional<int64_t> hash,
                           OpTypeEnum opType,
                           const NamespaceString& nss,
                           const boost::optional<UUID>& uuid,
@@ -105,8 +105,13 @@ BSONObj makeOplogEntryDoc(OpTime opTime,
                           const boost::optional<StmtId>& statementId,
                           const boost::optional<OpTime>& prevWriteOpTimeInTransaction,
                           const boost::optional<OpTime>& preImageOpTime,
-                          const boost::optional<OpTime>& postImageOpTime) {
+                          const boost::optional<OpTime>& postImageOpTime,
+                          const boost::optional<ShardId>& destinedRecipient,
+                          const boost::optional<Value>& idField) {
     BSONObjBuilder builder;
+    if (idField) {
+        idField->addToBsonObj(&builder, OplogEntryBase::k_idFieldName);
+    }
     sessionInfo.serialize(&builder);
     builder.append(OplogEntryBase::kTimestampFieldName, opTime.getTimestamp());
     builder.append(OplogEntryBase::kTermFieldName, opTime.getTerm());
@@ -145,6 +150,10 @@ BSONObj makeOplogEntryDoc(OpTime opTime,
     if (postImageOpTime) {
         const BSONObj localObject = postImageOpTime.get().toBSON();
         builder.append(OplogEntryBase::kPostImageOpTimeFieldName, localObject);
+    }
+    if (destinedRecipient) {
+        builder.append(OplogEntryBase::kDestinedRecipientFieldName,
+                       destinedRecipient.get().toString());
     }
     return builder.obj();
 }
@@ -294,7 +303,7 @@ OplogEntry::OplogEntry(BSONObj rawInput) : _raw(std::move(rawInput)) {
 }
 
 OplogEntry::OplogEntry(OpTime opTime,
-                       const boost::optional<long long> hash,
+                       const boost::optional<int64_t> hash,
                        OpTypeEnum opType,
                        const NamespaceString& nss,
                        const boost::optional<UUID>& uuid,
@@ -308,7 +317,9 @@ OplogEntry::OplogEntry(OpTime opTime,
                        const boost::optional<StmtId>& statementId,
                        const boost::optional<OpTime>& prevWriteOpTimeInTransaction,
                        const boost::optional<OpTime>& preImageOpTime,
-                       const boost::optional<OpTime>& postImageOpTime)
+                       const boost::optional<OpTime>& postImageOpTime,
+                       const boost::optional<ShardId>& destinedRecipient,
+                       const boost::optional<Value>& idField)
     : OplogEntry(makeOplogEntryDoc(opTime,
                                    hash,
                                    opType,
@@ -324,7 +335,9 @@ OplogEntry::OplogEntry(OpTime opTime,
                                    statementId,
                                    prevWriteOpTimeInTransaction,
                                    preImageOpTime,
-                                   postImageOpTime)) {}
+                                   postImageOpTime,
+                                   destinedRecipient,
+                                   idField)) {}
 
 bool OplogEntry::isCommand() const {
     return getOpType() == OpTypeEnum::kCommand;
@@ -401,6 +414,15 @@ bool OplogEntry::isSingleOplogEntryTransactionWithCommand() const {
         }
     }
     return false;
+}
+
+bool OplogEntry::isIndexCommandType() const {
+    return getOpType() == OpTypeEnum::kCommand &&
+        ((getCommandType() == CommandType::kCreateIndexes) ||
+         (getCommandType() == CommandType::kStartIndexBuild) ||
+         (getCommandType() == CommandType::kCommitIndexBuild) ||
+         (getCommandType() == CommandType::kAbortIndexBuild) ||
+         (getCommandType() == CommandType::kDropIndexes));
 }
 
 BSONElement OplogEntry::getIdElement() const {

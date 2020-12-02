@@ -1,4 +1,7 @@
 // Test $geoNear + $within.
+// @tags: [
+//   sbe_incompatible,
+// ]
 (function() {
 t = db.geo_s2nearwithin;
 t.drop();
@@ -15,7 +18,7 @@ origin = {
     "coordinates": [0, 0]
 };
 
-assert.commandWorked(t.ensureIndex({geo: "2dsphere"}));
+assert.commandWorked(t.createIndex({geo: "2dsphere"}));
 // Near requires an index, and 2dsphere is an index.  Spherical isn't
 // specified so this doesn't work.
 let res = assert.commandFailedWithCode(t.runCommand("aggregate", {

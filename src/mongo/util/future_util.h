@@ -28,6 +28,7 @@
  */
 #pragma once
 
+#include "mongo/executor/task_executor.h"
 #include "mongo/util/future.h"
 
 namespace mongo {
@@ -36,32 +37,12 @@ namespace mongo {
  * Returns a future which will be fulfilled at the given date.
  */
 ExecutorFuture<void> sleepUntil(std::shared_ptr<executor::TaskExecutor> executor,
-                                const Date_t& date) {
-    auto [promise, future] = makePromiseFuture<void>();
-    auto taskCompletionPromise = std::make_shared<Promise<void>>(std::move(promise));
-
-    auto scheduledWorkHandle = executor->scheduleWorkAt(
-        date, [taskCompletionPromise](const executor::TaskExecutor::CallbackArgs& args) mutable {
-            if (args.status.isOK()) {
-                taskCompletionPromise->emplaceValue();
-            } else {
-                taskCompletionPromise->setError(args.status);
-            }
-        });
-
-    if (!scheduledWorkHandle.isOK()) {
-        taskCompletionPromise->setError(scheduledWorkHandle.getStatus());
-    }
-    return std::move(future).thenRunOn(executor);
-}
-
+                                const Date_t& date);
 /**
  * Returns a future which will be fulfilled after the given duration.
  */
 ExecutorFuture<void> sleepFor(std::shared_ptr<executor::TaskExecutor> executor,
-                              Milliseconds duration) {
-    return sleepUntil(executor, executor->now() + duration);
-}
+                              Milliseconds duration);
 
 namespace future_util_details {
 
@@ -145,7 +126,7 @@ private:
                         return ExecutorFuture<ReturnType>(executor, std::move(s));
 
                     // Retry after a delay.
-                    return sleepFor(executor, Milliseconds(delay)).then([this, self]() mutable {
+                    return sleepFor(executor, delay.getNext()).then([this, self]() mutable {
                         return run();
                     });
                 });
@@ -178,9 +159,20 @@ public:
      * Creates a delay which takes place after evaluating the condition and before executing the
      * loop body.
      */
-    template <typename Delay>
-    auto withDelayBetweenIterations(Delay delay)&& {
-        return AsyncTryUntilWithDelay(std::move(_body), std::move(_condition), std::move(delay));
+    template <typename DurationType>
+    auto withDelayBetweenIterations(DurationType delay)&& {
+        return AsyncTryUntilWithDelay(
+            std::move(_body), std::move(_condition), ConstDelay<DurationType>(std::move(delay)));
+    }
+
+    /**
+     * Creates an exponential delay which takes place after evaluating the condition and before
+     * executing the loop body.
+     */
+    template <typename BackoffType>
+    auto withBackoffBetweenIterations(BackoffType backoff)&& {
+        return AsyncTryUntilWithDelay(
+            std::move(_body), std::move(_condition), BackoffDelay<BackoffType>(std::move(backoff)));
     }
 
     /**
@@ -199,6 +191,32 @@ public:
     }
 
 private:
+    template <typename DurationType>
+    class ConstDelay {
+    public:
+        explicit ConstDelay(DurationType delay) : _delay(delay) {}
+
+        Milliseconds getNext() {
+            return Milliseconds(_delay);
+        }
+
+    private:
+        DurationType _delay;
+    };
+
+    template <typename BackoffType>
+    class BackoffDelay {
+    public:
+        explicit BackoffDelay(BackoffType backoff) : _backoff(backoff) {}
+
+        Milliseconds getNext() {
+            return _backoff.nextSleep();
+        }
+
+    private:
+        BackoffType _backoff;
+    };
+
     /**
      * Helper class to perform the actual looping logic with a recursive member function run().
      * Mostly needed to clean up lambda captures and make the looping logic more readable.
@@ -237,6 +255,18 @@ private:
     ConditionCallable _condition;
 };
 
+// Helpers for functions which only take Future or ExecutorFutures, but not SemiFutures or
+// SharedSemiFutures.
+template <typename T>
+inline constexpr bool isFutureOrExecutorFuture = false;
+template <typename T>
+inline constexpr bool isFutureOrExecutorFuture<Future<T>> = true;
+template <typename T>
+inline constexpr bool isFutureOrExecutorFuture<ExecutorFuture<T>> = true;
+
+static inline const std::string kWhenAllSucceedEmptyInputInvariantMsg =
+    "Must pass at least one future to whenAllSucceed";
+
 }  // namespace future_util_details
 
 /**
@@ -267,4 +297,223 @@ public:
     Callable _body;
 };
 
+/**
+ * For an input vector of Future<T> or ExecutorFuture<T> elements, returns a
+ * SemiFuture<std::vector<T>> that will be resolved when all input futures succeed or set with an
+ * error as soon as any input future is set with an error. The resulting vector contains the results
+ * of all of the input futures in the same order in which they were provided.
+ */
+TEMPLATE(typename FutureLike,
+         typename Value = typename FutureLike::value_type,
+         typename ResultVector = std::vector<Value>)
+REQUIRES(!std::is_void_v<Value> && future_util_details::isFutureOrExecutorFuture<FutureLike>)
+SemiFuture<ResultVector> whenAllSucceed(std::vector<FutureLike>&& futures) {
+    invariant(futures.size() > 0, future_util_details::kWhenAllSucceedEmptyInputInvariantMsg);
+
+    // A structure used to share state between the input futures.
+    struct SharedBlock {
+        SharedBlock(size_t numFuturesToWaitFor, Promise<ResultVector> result)
+            : numFuturesToWaitFor(numFuturesToWaitFor),
+              resultPromise(std::move(result)),
+              intermediateResult(numFuturesToWaitFor) {}
+        // Total number of input futures.
+        const size_t numFuturesToWaitFor;
+        // Tracks the number of input futures which have resolved with success so far.
+        AtomicWord<size_t> numResultsReturnedWithSuccess{0};
+        // Tracks whether or not the resultPromise has been set. Only used for the error case.
+        AtomicWord<bool> completedWithError{false};
+        // The promise corresponding to the resulting SemiFuture returned by this function.
+        Promise<ResultVector> resultPromise;
+        // A vector containing the results of each input future.
+        ResultVector intermediateResult;
+    };
+
+    auto [promise, future] = makePromiseFuture<ResultVector>();
+    auto sharedBlock = std::make_shared<SharedBlock>(futures.size(), std::move(promise));
+
+    for (size_t i = 0; i < futures.size(); ++i) {
+        std::move(futures[i])
+            .getAsync([sharedBlock, myIndex = i](StatusWith<Value> swValue) mutable {
+                if (swValue.isOK()) {
+                    // Best effort check that no error has returned, not required for correctness.
+                    if (!sharedBlock->completedWithError.loadRelaxed()) {
+                        // Put this result in its proper slot in the output vector.
+                        sharedBlock->intermediateResult[myIndex] = std::move(swValue.getValue());
+                        auto numResultsReturnedWithSuccess =
+                            sharedBlock->numResultsReturnedWithSuccess.addAndFetch(1);
+                        // If this is the last result to return, set the promise. Note that this
+                        // will never be true if one of the input futures resolves with an error,
+                        // since the future with an error will not cause the
+                        // numResultsReturnedWithSuccess count to be incremented.
+                        if (numResultsReturnedWithSuccess == sharedBlock->numFuturesToWaitFor) {
+                            // All results are ready.
+                            sharedBlock->resultPromise.emplaceValue(
+                                std::move(sharedBlock->intermediateResult));
+                        }
+                    }
+                } else {
+                    // Make sure no other error has already been set before setting the promise.
+                    if (!sharedBlock->completedWithError.swap(true)) {
+                        sharedBlock->resultPromise.setError(std::move(swValue.getStatus()));
+                    }
+                }
+            });
+    }
+
+    return std::move(future).semi();
+}
+
+/**
+ * Variant of whenAllSucceed for void input futures. The only behavior difference is that it returns
+ * SemiFuture<void> instead of SemiFuture<std::vector<T>>.
+ */
+TEMPLATE(typename FutureLike, typename Value = typename FutureLike::value_type)
+REQUIRES(std::is_void_v<Value>&& future_util_details::isFutureOrExecutorFuture<FutureLike>)
+SemiFuture<void> whenAllSucceed(std::vector<FutureLike>&& futures) {
+    invariant(futures.size() > 0, future_util_details::kWhenAllSucceedEmptyInputInvariantMsg);
+
+    // A structure used to share state between the input futures.
+    struct SharedBlock {
+        SharedBlock(size_t numFuturesToWaitFor, Promise<void> result)
+            : numFuturesToWaitFor(numFuturesToWaitFor), resultPromise(std::move(result)) {}
+        // Total number of input futures.
+        const size_t numFuturesToWaitFor;
+        // Tracks the number of input futures which have resolved with success so far.
+        AtomicWord<size_t> numResultsReturnedWithSuccess{0};
+        // Tracks whether or not the resultPromise has been set. Only used for the error case.
+        AtomicWord<bool> completedWithError{false};
+        // The promise corresponding to the resulting SemiFuture returned by this function.
+        Promise<void> resultPromise;
+    };
+
+    auto [promise, future] = makePromiseFuture<void>();
+    auto sharedBlock = std::make_shared<SharedBlock>(futures.size(), std::move(promise));
+
+    for (size_t i = 0; i < futures.size(); ++i) {
+        std::move(futures[i]).getAsync([sharedBlock](Status status) {
+            if (status.isOK()) {
+                // Best effort check that no error has returned, not required for correctness
+                if (!sharedBlock->completedWithError.loadRelaxed()) {
+                    auto numResultsReturnedWithSuccess =
+                        sharedBlock->numResultsReturnedWithSuccess.addAndFetch(1);
+                    // If this is the last result to return, set the promise. Note that this will
+                    // never be true if one of the input futures resolves with an error, since the
+                    // future with an error will not cause the numResultsReturnedWithSuccess count
+                    // to be incremented.
+                    if (numResultsReturnedWithSuccess == sharedBlock->numFuturesToWaitFor) {
+                        // All results are ready.
+                        sharedBlock->resultPromise.emplaceValue();
+                    }
+                }
+            } else {
+                // Make sure no other error has already been set before setting the promise.
+                if (!sharedBlock->completedWithError.swap(true)) {
+                    sharedBlock->resultPromise.setError(std::move(status));
+                }
+            }
+        });
+    }
+
+    return std::move(future).semi();
+}
+
+/**
+ * Given a vector of input Futures or ExecutorFutures, returns a SemiFuture that contains the
+ * results of each input future wrapped in a StatusWith to indicate whether it resolved with success
+ * or failure and will be resolved when all of the input futures have resolved.
+ */
+template <typename FutureT,
+          typename Value = typename FutureT::value_type,
+          typename ResultVector = std::vector<StatusOrStatusWith<Value>>>
+SemiFuture<ResultVector> whenAll(std::vector<FutureT>&& futures) {
+    invariant(futures.size() > 0);
+
+    /**
+     * A structure used to share state between the input futures.
+     */
+    struct SharedBlock {
+        SharedBlock(size_t numFuturesToWaitFor, Promise<ResultVector> result)
+            : numFuturesToWaitFor(numFuturesToWaitFor),
+              intermediateResult(numFuturesToWaitFor, {ErrorCodes::InternalError, ""}),
+              resultPromise(std::move(result)) {}
+        // Total number of input futures.
+        const size_t numFuturesToWaitFor;
+        // Tracks the number of input futures which have resolved so far.
+        AtomicWord<size_t> numReady{0};
+        // A vector containing the results of each input future.
+        ResultVector intermediateResult;
+        // The promise corresponding to the resulting SemiFuture returned by this function.
+        Promise<ResultVector> resultPromise;
+    };
+
+    auto [promise, future] = makePromiseFuture<ResultVector>();
+    auto sharedBlock = std::make_shared<SharedBlock>(futures.size(), std::move(promise));
+
+    for (size_t i = 0; i < futures.size(); ++i) {
+        std::move(futures[i])
+            .getAsync([sharedBlock, myIndex = i](StatusOrStatusWith<Value> value) mutable {
+                sharedBlock->intermediateResult[myIndex] = std::move(value);
+
+                auto numReady = sharedBlock->numReady.addAndFetch(1);
+                invariant(numReady <= sharedBlock->numFuturesToWaitFor);
+
+                if (numReady == sharedBlock->numFuturesToWaitFor) {
+                    // All results are ready.
+                    sharedBlock->resultPromise.emplaceValue(
+                        std::move(sharedBlock->intermediateResult));
+                }
+            });
+    }
+
+    return std::move(future).semi();
+}
+
+/**
+ * Result type for the whenAny function.
+ */
+template <typename T>
+struct WhenAnyResult {
+    // The result of the future that resolved first.
+    StatusOrStatusWith<T> result;
+    // The index of the future that resolved first.
+    size_t index;
+};
+
+/**
+ * Given a vector of input Futures or ExecutorFutures, returns a SemiFuture which will contain a
+ * struct containing the first of those futures to resolve along with its index in the input array.
+ */
+template <typename FutureT,
+          typename Value = typename FutureT::value_type,
+          typename Result = WhenAnyResult<Value>>
+SemiFuture<Result> whenAny(std::vector<FutureT>&& futures) {
+    invariant(futures.size() > 0);
+
+    /**
+     * A structure used to share state between the input futures.
+     */
+    struct SharedBlock {
+        SharedBlock(Promise<Result> result) : resultPromise(std::move(result)) {}
+        // Tracks whether or not the resultPromise has been set.
+        AtomicWord<bool> done{false};
+        // The promise corresponding to the resulting SemiFuture returned by this function.
+        Promise<Result> resultPromise;
+    };
+
+    auto [promise, future] = makePromiseFuture<Result>();
+    auto sharedBlock = std::make_shared<SharedBlock>(std::move(promise));
+
+    for (size_t i = 0; i < futures.size(); ++i) {
+        std::move(futures[i])
+            .getAsync([sharedBlock, myIndex = i](StatusOrStatusWith<Value> value) mutable {
+                // If this is the first input future to complete, change done to true and set the
+                // value on the promise.
+                if (!sharedBlock->done.swap(true)) {
+                    sharedBlock->resultPromise.emplaceValue(Result{std::move(value), myIndex});
+                }
+            });
+    }
+
+    return std::move(future).semi();
+}
 }  // namespace mongo

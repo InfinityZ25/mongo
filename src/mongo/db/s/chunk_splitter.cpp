@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -69,6 +69,8 @@ ThreadPool::Options makeDefaultThreadPoolOptions() {
     // Ensure all threads have a client
     options.onCreateThread = [](const std::string& threadName) {
         Client::initThread(threadName.c_str());
+        stdx::lock_guard<Client> lk(cc());
+        cc().setSystemOperationKillableByStepdown(lk);
     };
     return options;
 }
@@ -109,14 +111,14 @@ Status splitChunkAtMultiplePoints(OperationContext* opCtx,
  */
 void moveChunk(OperationContext* opCtx, const NamespaceString& nss, const BSONObj& minKey) {
     // We need to have the most up-to-date view of the chunk we are about to move.
-    const auto routingInfo =
+    const auto cm =
         uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
 
     uassert(ErrorCodes::NamespaceNotSharded,
             "Could not move chunk. Collection is no longer sharded",
-            routingInfo.cm());
+            cm.isSharded());
 
-    const auto suggestedChunk = routingInfo.cm()->findIntersectingChunkWithSimpleCollation(minKey);
+    const auto suggestedChunk = cm.findIntersectingChunkWithSimpleCollation(minKey);
 
     ChunkType chunkToMove;
     chunkToMove.setNS(nss);
@@ -202,17 +204,16 @@ bool isAutoBalanceEnabled(OperationContext* opCtx,
     if (!balancerConfig->shouldBalanceForAutoSplit())
         return false;
 
-    auto collStatus = Grid::get(opCtx)->catalogClient()->getCollection(opCtx, nss);
-    if (!collStatus.isOK()) {
+    try {
+        return Grid::get(opCtx)->catalogClient()->getCollection(opCtx, nss).getAllowBalance();
+    } catch (const DBException& ex) {
         LOGV2(21903,
               "Auto-split for {namespace} failed to load collection metadata: {error}",
               "Auto-split failed to load collection metadata",
               "namespace"_attr = nss,
-              "error"_attr = redact(collStatus.getStatus()));
+              "error"_attr = redact(ex));
         return false;
     }
-
-    return collStatus.getValue().value.getAllowBalance();
 }
 
 const auto getChunkSplitter = ServiceContext::declareDecoration<ChunkSplitter>();
@@ -295,16 +296,25 @@ void ChunkSplitter::_runAutosplit(std::shared_ptr<ChunkSplitStateDriver> chunkSp
 
     try {
         const auto opCtx = cc().makeOperationContext();
-        const auto routingInfo = uassertStatusOK(
-            Grid::get(opCtx.get())->catalogCache()->getCollectionRoutingInfo(opCtx.get(), nss));
 
-        const auto cm = routingInfo.cm();
+        const auto cm = uassertStatusOK(
+            Grid::get(opCtx.get())->catalogCache()->getCollectionRoutingInfo(opCtx.get(), nss));
         uassert(ErrorCodes::NamespaceNotSharded,
                 "Could not split chunk. Collection is no longer sharded",
-                cm);
+                cm.isSharded());
 
-        const auto chunk = cm->findIntersectingChunkWithSimpleCollation(min);
-        const auto& shardKeyPattern = cm->getShardKeyPattern();
+        // Best effort checks that the chunk we're splitting hasn't changed bounds or moved shards
+        // since the auto split task was scheduled. Best effort because the chunk metadata may
+        // change after this point.
+        const auto chunk = cm.findIntersectingChunkWithSimpleCollation(min);
+        uassert(4860100,
+                "Chunk to be auto split has different boundaries than when the split was initiated",
+                chunk.getRange() == ChunkRange(min, max));
+        uassert(4860101,
+                "Chunk to be auto split isn't owned by this shard",
+                ShardingState::get(opCtx.get())->shardId() == chunk.getShardId());
+
+        const auto& shardKeyPattern = cm.getShardKeyPattern();
 
         const auto balancerConfig = Grid::get(opCtx.get())->getBalancerConfiguration();
         // Ensure we have the most up-to-date balancer configuration
@@ -326,15 +336,15 @@ void ChunkSplitter::_runAutosplit(std::shared_ptr<ChunkSplitStateDriver> chunkSp
                     "maxChunkSizeBytes"_attr = maxChunkSizeBytes);
 
         chunkSplitStateDriver->prepareSplit();
-        auto splitPoints = uassertStatusOK(splitVector(opCtx.get(),
-                                                       nss,
-                                                       shardKeyPattern.toBSON(),
-                                                       chunk.getMin(),
-                                                       chunk.getMax(),
-                                                       false,
-                                                       boost::none,
-                                                       boost::none,
-                                                       maxChunkSizeBytes));
+        auto splitPoints = splitVector(opCtx.get(),
+                                       nss,
+                                       shardKeyPattern.toBSON(),
+                                       chunk.getMin(),
+                                       chunk.getMax(),
+                                       false,
+                                       boost::none,
+                                       boost::none,
+                                       maxChunkSizeBytes);
 
         if (splitPoints.empty()) {
             LOGV2_DEBUG(21907,
@@ -383,8 +393,8 @@ void ChunkSplitter::_runAutosplit(std::shared_ptr<ChunkSplitStateDriver> chunkSp
                                                    chunk.getShardId(),
                                                    nss,
                                                    shardKeyPattern,
-                                                   cm->getVersion(),
-                                                   ChunkRange(min, max),
+                                                   cm.getVersion(),
+                                                   chunk.getRange(),
                                                    splitPoints));
         chunkSplitStateDriver->commitSplit();
 
@@ -408,7 +418,7 @@ void ChunkSplitter::_runAutosplit(std::shared_ptr<ChunkSplitStateDriver> chunkSp
         // stale metadata and so will not trigger a chunk split. If we force metadata refresh here,
         // we can limit the amount of time that the op observer is tracking writes on the parent
         // chunk rather than on its child chunks.
-        forceShardFilteringMetadataRefresh(opCtx.get(), nss, false);
+        onShardVersionMismatch(opCtx.get(), nss, boost::none);
 
         // Balance the resulting chunks if the autobalance option is enabled and if we split at the
         // first or last chunk on the collection as part of top chunk optimization.

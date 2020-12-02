@@ -1,7 +1,9 @@
 /**
  * Tests that the post-image of an update which occurred while the collection was unsharded can
  * still be looked up after the collection becomes sharded. Exercises the fix for SERVER-44484.
- * @tags: [uses_change_streams, requires_fcv_44]
+ * @tags: [
+ *   uses_change_streams,
+ * ]
  */
 (function() {
 "use strict";
@@ -54,7 +56,7 @@ assert.soon(() => {
         assert.eq(csCur.hasNext(), false, () => tojson(csCur.next()));
         return false;
     } catch (ex) {
-        assert.eq(ex.code, ErrorCodes.ChangeStreamFatalError);
+        assert.eq(ex.code, ErrorCodes.ChangeStreamFatalError, () => tojson({originalError: ex}));
         return true;
     }
 });

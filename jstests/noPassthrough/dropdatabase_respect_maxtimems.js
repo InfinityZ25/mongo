@@ -38,7 +38,7 @@ const dropDB = rst.getPrimary().getDB("drop");
 
     checkLog.contains(
         dropDB.getMongo(),
-        "dropDatabase - fail point dropDatabaseHangAfterAllCollectionsDrop enabled. Blocking until fail point is disabled.");
+        "dropDatabase - fail point dropDatabaseHangAfterAllCollectionsDrop enabled. Blocking until fail point is disabled");
 
     let sleepCommand = startParallelShell(() => {
         // Make dropDatabase timeout.
@@ -48,7 +48,7 @@ const dropDB = rst.getPrimary().getDB("drop");
             ErrorCodes.Interrupted);
     }, rst.getPrimary().port);
 
-    checkLog.contains(dropDB.getMongo(), "test only command sleep invoked");
+    checkLog.contains(dropDB.getMongo(), "Test-only command 'sleep' invoked");
 
     // dropDatabase now gets unblocked by the failpoint but will immediately
     // get blocked by acquiring the database lock for dropping the database.

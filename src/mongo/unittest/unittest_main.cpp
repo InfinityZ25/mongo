@@ -31,29 +31,46 @@
 #include <string>
 #include <vector>
 
+#include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
 #include "mongo/base/status.h"
-#include "mongo/logger/logger.h"
+#include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/wire_version.h"
 #include "mongo/logv2/log_domain_global.h"
 #include "mongo/logv2/log_manager.h"
 #include "mongo/unittest/log_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/unittest/unittest_options_gen.h"
-#include "mongo/util/log_global_settings.h"
 #include "mongo/util/options_parser/environment.h"
 #include "mongo/util/options_parser/option_section.h"
 #include "mongo/util/options_parser/options_parser.h"
 #include "mongo/util/signal_handlers_synchronous.h"
+#include "mongo/util/testing_proctor.h"
 
 using mongo::Status;
 
 namespace moe = ::mongo::optionenvironment;
 
-int main(int argc, char** argv, char** envp) {
+namespace mongo {
+namespace {
+
+MONGO_INITIALIZER(WireSpec)(InitializerContext*) {
+    WireSpec::instance().initialize(WireSpec::Specification{});
+    return Status::OK();
+}
+
+}  // namespace
+}  // namespace mongo
+
+int main(int argc, char** argv) {
+    std::vector<std::string> argVec(argv, argv + argc);
+
     ::mongo::clearSignalMask();
     ::mongo::setupSynchronousSignalHandlers();
 
-    ::mongo::runGlobalInitializersOrDie(argc, argv, envp);
+    ::mongo::TestingProctor::instance().setEnabled(true);
+    ::mongo::runGlobalInitializersOrDie(argVec);
+    ::mongo::setTestCommandsEnabled(true);
 
     moe::OptionSection options;
 
@@ -65,9 +82,7 @@ int main(int argc, char** argv, char** envp) {
 
     moe::OptionsParser parser;
     moe::Environment environment;
-    std::map<std::string, std::string> env;
-    std::vector<std::string> argVector(argv, argv + argc);
-    Status ret = parser.run(options, argVector, env, &environment);
+    Status ret = parser.run(options, argVec, &environment);
     if (!ret.isOK()) {
         std::cerr << options.helpString();
         return EXIT_FAILURE;
@@ -111,6 +126,8 @@ int main(int argc, char** argv, char** envp) {
     if (!ret.isOK()) {
         std::cerr << "Global deinitilization failed: " << ret.reason() << std::endl;
     }
+
+    ::mongo::checkForTripwireAssertions();
 
     return result;
 }

@@ -52,6 +52,7 @@ namespace mongo {
 class BSONArrayBuilder;
 class BSONObjBuilder;
 class Collection;
+class CollectionPtr;
 class Database;
 class RecordId;
 
@@ -93,8 +94,7 @@ public:
     Status startClone(OperationContext* opCtx,
                       const UUID& migrationId,
                       const LogicalSessionId& lsid,
-                      TxnNumber txnNumber,
-                      bool resumableRangeDeleterDisabled) override;
+                      TxnNumber txnNumber) override;
 
     Status awaitUntilCriticalSectionIsAppropriate(OperationContext* opCtx,
                                                   Milliseconds maxTimeToWait) override;
@@ -160,7 +160,7 @@ public:
      * NOTE: Must be called with the collection lock held in at least IS mode.
      */
     Status nextCloneBatch(OperationContext* opCtx,
-                          Collection* collection,
+                          const CollectionPtr& collection,
                           BSONArrayBuilder* arrBuilder);
 
     /**
@@ -222,14 +222,14 @@ private:
     StatusWith<BSONObj> _callRecipient(const BSONObj& cmdObj);
 
     StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> _getIndexScanExecutor(
-        OperationContext* opCtx, Collection* const collection);
+        OperationContext* opCtx, const CollectionPtr& collection);
 
     void _nextCloneBatchFromIndexScan(OperationContext* opCtx,
-                                      Collection* collection,
+                                      const CollectionPtr& collection,
                                       BSONArrayBuilder* arrBuilder);
 
     void _nextCloneBatchFromCloneLocs(OperationContext* opCtx,
-                                      Collection* collection,
+                                      const CollectionPtr& collection,
                                       BSONArrayBuilder* arrBuilder);
 
     /**

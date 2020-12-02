@@ -8,6 +8,7 @@ selector:
   # isn't guaranteed to be true when they are run in parallel with other workloads.
   - jstests/concurrency/fsm_workloads/findAndModify_inc_pipeline.js
   - jstests/concurrency/fsm_workloads/list_indexes.js
+  - jstests/concurrency/fsm_workloads/secondary_reads.js
   - jstests/concurrency/fsm_workloads/update_inc_capped.js
   - jstests/concurrency/fsm_workloads/update_inc_pipeline.js
 
@@ -106,4 +107,5 @@ executor:
         # Lower the number of files open before WiredTiger starts looking for cursors to close. At
         # least 1 file should always be open, so cursor sweeps will always run when scheduled.
         wiredTigerFileHandleCloseMinimum: 1
+        roleGraphInvalidationIsFatal: 1
     num_nodes: 3

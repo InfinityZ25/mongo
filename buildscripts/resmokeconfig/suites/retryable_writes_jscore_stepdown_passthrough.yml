@@ -21,7 +21,6 @@ selector:
   - jstests/core/top.js
   - jstests/core/views/views_stats.js
 
-  # TODO SERVER-31249: getLastError should not be affected by no-op retries.
   - jstests/core/bulk_legacy_enforce_gle.js
 
   # TODO SERVER-31242: findAndModify no-op retry should respect the fields option.
@@ -29,6 +28,7 @@ selector:
   - jstests/core/find_and_modify.js
   - jstests/core/find_and_modify2.js
   - jstests/core/find_and_modify_server6865.js
+  - jstests/core/fts_find_and_modify.js
 
   # Stepdown commands during fsync lock will fail.
   - jstests/core/currentop.js
@@ -50,11 +50,11 @@ selector:
   - jstests/core/coveredIndex1.js
   - jstests/core/sortc.js
 
-  # Assert on the ismaster field of an isMaster response. If a primary steps down after accepting
-  # an isMaster command and returns before its connection is closed, the response can contain
-  # ismaster: false.
+  # Assert on the isWritablePrimary field of a hello response. If a primary steps down after
+  # accepting a hello command and returns before its connection is closed, the response can
+  # contain isWritablePrimary: false.
   - jstests/core/dbadmin.js
-  - jstests/core/ismaster.js
+  - jstests/core/hello_response_validation.js
 
   # Spawns new mongo shells, which don't retry connecting on stepdown errors.
   - jstests/core/shell_connection_strings.js
@@ -105,6 +105,11 @@ selector:
   ## The next tag corresponds to long running-operations, as they may exhaust their number
   # of retries and result in a network error being thrown.
   - operations_longer_than_stepdown_interval
+  # Operations in the main test shell aren't guaranteed to be causally consistent with operations
+  # performed earlier in a parallel shell if multiple nodes are electable because the latest
+  # operation and cluster times aren't shared between shells.
+  # "Cowardly refusing to run test with network retries enabled when it uses startParallelShell()"
+  - uses_parallel_shell
 
 executor:
   archive:

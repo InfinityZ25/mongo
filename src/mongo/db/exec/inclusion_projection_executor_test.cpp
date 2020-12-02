@@ -83,10 +83,9 @@ public:
             }
         } catch (...) {
             LOGV2(20587,
-                  "exception while testing with allowFastPath={allowFastPath} and "
-                  "allowFallBackToDefault={AllowFallBackToDefault}",
+                  "Exception while testing",
                   "allowFastPath"_attr = _allowFastPath,
-                  "AllowFallBackToDefault"_attr = AllowFallBackToDefault);
+                  "allowFallBackToDefault"_attr = AllowFallBackToDefault);
             throw;
         }
     }
@@ -550,23 +549,22 @@ TEST_F(InclusionProjectionExecutionTestWithoutFallBackToDefault,
        ShouldApplyDottedInclusionToEachElementInArray) {
     auto inclusion = makeInclusionProjectionWithDefaultPolicies(BSON("a.b" << true));
 
-    vector<Value> nestedValues = {Value(1),
-                                  Value(Document{}),
-                                  Value(Document{{"b", 1}}),
-                                  Value(Document{{"b", 1}, {"c", 2}}),
-                                  Value(vector<Value>{}),
-                                  Value(vector<Value>{Value(1), Value(Document{{"c", 1}})})};
-
     // Drops non-documents and non-arrays. Applies projection to documents, recurses on
     // nested arrays.
-    vector<Value> expectedNestedValues = {Value(),
-                                          Value(Document{}),
-                                          Value(Document{{"b", 1}}),
-                                          Value(Document{{"b", 1}}),
-                                          Value(vector<Value>{}),
-                                          Value(vector<Value>{Value(), Value(Document{})})};
-    auto result = inclusion->applyTransformation(Document{{"a", nestedValues}});
-    auto expectedResult = Document{{"a", expectedNestedValues}};
+    auto result = inclusion->applyTransformation(Document{{"a",
+                                                           {1,
+                                                            Document{},
+                                                            Document{{"b", 1}},
+                                                            Document{{"b", 1}, {"c", 2}},
+                                                            vector<Value>{},
+                                                            {1, Document{{"c", 1}}}}}});
+    auto expectedResult = Document{{"a",
+                                    {Value(),
+                                     Document{},
+                                     Document{{"b", 1}},
+                                     Document{{"b", 1}},
+                                     vector<Value>{},
+                                     {Value(), Document{}}}}};
     ASSERT_DOCUMENT_EQ(result, expectedResult);
 }
 
@@ -628,22 +626,21 @@ TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault,
     auto inclusion =
         makeInclusionProjectionWithDefaultPolicies(BSON("a.b" << wrapInLiteral("COMPUTED")));
 
-    vector<Value> nestedValues = {Value(1),
-                                  Value(Document{}),
-                                  Value(Document{{"b", 1}}),
-                                  Value(Document{{"b", 1}, {"c", 2}}),
-                                  Value(vector<Value>{}),
-                                  Value(vector<Value>{Value(1), Value(Document{{"c", 1}})})};
-    vector<Value> expectedNestedValues = {
-        Value(Document{{"b", "COMPUTED"_sd}}),
-        Value(Document{{"b", "COMPUTED"_sd}}),
-        Value(Document{{"b", "COMPUTED"_sd}}),
-        Value(Document{{"b", "COMPUTED"_sd}}),
-        Value(vector<Value>{}),
-        Value(vector<Value>{Value(Document{{"b", "COMPUTED"_sd}}),
-                            Value(Document{{"b", "COMPUTED"_sd}})})};
-    auto result = inclusion->applyTransformation(Document{{"a", nestedValues}});
-    auto expectedResult = Document{{"a", expectedNestedValues}};
+    auto result = inclusion->applyTransformation(Document{{"a",
+                                                           {1,
+                                                            Document{},
+                                                            Document{{"b", 1}},
+                                                            Document{{"b", 1}, {"c", 2}},
+                                                            vector<Value>{},
+                                                            {1, Document{{"c", 1}}}}}});
+    auto expectedResult =
+        Document{{"a",
+                  {Document{{"b", "COMPUTED"_sd}},
+                   Document{{"b", "COMPUTED"_sd}},
+                   Document{{"b", "COMPUTED"_sd}},
+                   Document{{"b", "COMPUTED"_sd}},
+                   vector<Value>{},
+                   {Document{{"b", "COMPUTED"_sd}}, Document{{"b", "COMPUTED"_sd}}}}}};
     ASSERT_DOCUMENT_EQ(result, expectedResult);
 }
 
@@ -652,26 +649,26 @@ TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault,
     auto inclusion = makeInclusionProjectionWithDefaultPolicies(
         BSON("a.inc" << true << "a.comp" << wrapInLiteral("COMPUTED")));
 
-    vector<Value> nestedValues = {Value(1),
-                                  Value(Document{}),
-                                  Value(Document{{"inc", 1}}),
-                                  Value(Document{{"inc", 1}, {"c", 2}}),
-                                  Value(Document{{"c", 2}, {"inc", 1}}),
-                                  Value(Document{{"inc", 1}, {"c", 2}, {"comp", "original"_sd}}),
-                                  Value(vector<Value>{}),
-                                  Value(vector<Value>{Value(1), Value(Document{{"inc", 1}})})};
-    vector<Value> expectedNestedValues = {
-        Value(Document{{"comp", "COMPUTED"_sd}}),
-        Value(Document{{"comp", "COMPUTED"_sd}}),
-        Value(Document{{"inc", 1}, {"comp", "COMPUTED"_sd}}),
-        Value(Document{{"inc", 1}, {"comp", "COMPUTED"_sd}}),
-        Value(Document{{"inc", 1}, {"comp", "COMPUTED"_sd}}),
-        Value(Document{{"inc", 1}, {"comp", "COMPUTED"_sd}}),
-        Value(vector<Value>{}),
-        Value(vector<Value>{Value(Document{{"comp", "COMPUTED"_sd}}),
-                            Value(Document{{"inc", 1}, {"comp", "COMPUTED"_sd}})})};
-    auto result = inclusion->applyTransformation(Document{{"a", nestedValues}});
-    auto expectedResult = Document{{"a", expectedNestedValues}};
+    auto result = inclusion->applyTransformation(
+        Document{{"a",
+                  {1,
+                   Document{},
+                   Document{{"inc", 1}},
+                   Document{{"inc", 1}, {"c", 2}},
+                   Document{{"c", 2}, {"inc", 1}},
+                   Document{{"inc", 1}, {"c", 2}, {"comp", "original"_sd}},
+                   vector<Value>{},
+                   {1, Document{{"inc", 1}}}}}});
+    auto expectedResult = Document{
+        {"a",
+         {Document{{"comp", "COMPUTED"_sd}},
+          Document{{"comp", "COMPUTED"_sd}},
+          Document{{"inc", 1}, {"comp", "COMPUTED"_sd}},
+          Document{{"inc", 1}, {"comp", "COMPUTED"_sd}},
+          Document{{"inc", 1}, {"comp", "COMPUTED"_sd}},
+          Document{{"inc", 1}, {"comp", "COMPUTED"_sd}},
+          vector<Value>{},
+          {Document{{"comp", "COMPUTED"_sd}}, Document{{"inc", 1}, {"comp", "COMPUTED"_sd}}}}}};
     ASSERT_DOCUMENT_EQ(result, expectedResult);
 }
 
@@ -779,17 +776,19 @@ TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault,
                                                             "h: {$meta: 'geoNearPoint'}, "
                                                             "i: {$meta: 'recordId'}, "
                                                             "j: {$meta: 'indexKey'}, "
-                                                            "k: {$meta: 'sortKey'}}"));
+                                                            "k: {$meta: 'sortKey'}, "
+                                                            "l: {$meta: 'searchScoreDetails'}}"));
 
     DepsTracker deps;
     inclusion->addDependencies(&deps);
 
     ASSERT_EQ(deps.fields.size(), 2UL);
 
-    // We do not add the dependencies for SEARCH_SCORE or SEARCH_HIGHLIGHTS because those
-    // values are not stored in the collection (or in mongod at all).
+    // We do not add the dependencies for searchScore, searchHighlights, or searchScoreDetails
+    // because those values are not stored in the collection (or in mongod at all).
     ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kSearchScore]);
     ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kSearchHighlights]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kSearchScoreDetails]);
 
     ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kTextScore]);
     ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kRandVal]);
@@ -810,7 +809,8 @@ TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault, ShouldEvaluateMeta
                                                             "h: {$meta: 'geoNearPoint'}, "
                                                             "i: {$meta: 'recordId'}, "
                                                             "j: {$meta: 'indexKey'}, "
-                                                            "k: {$meta: 'sortKey'}}"));
+                                                            "k: {$meta: 'sortKey'}, "
+                                                            "l: {$meta: 'searchScoreDetails'}}"));
 
     MutableDocument inputDocBuilder(Document{{"a", 1}});
     inputDocBuilder.metadata().setTextScore(0.0);
@@ -822,13 +822,16 @@ TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault, ShouldEvaluateMeta
     inputDocBuilder.metadata().setRecordId(RecordId{6});
     inputDocBuilder.metadata().setIndexKey(BSON("foo" << 7));
     inputDocBuilder.metadata().setSortKey(Value{Document{{"bar", 8}}}, true);
+    inputDocBuilder.metadata().setSearchScoreDetails(BSON("scoreDetails"
+                                                          << "foo"));
     Document inputDoc = inputDocBuilder.freeze();
 
     auto result = inclusion->applyTransformation(inputDoc);
 
     ASSERT_DOCUMENT_EQ(result,
                        Document{fromjson("{a: 1, c: 0.0, d: 1.0, e: 2.0, f: 'foo', g: 3.0, "
-                                         "h: [4, 5], i: 6, j: {foo: 7}, k: [{bar: 8}]}")});
+                                         "h: [4, 5], i: 6, j: {foo: 7}, k: [{bar: 8}], "
+                                         "l: {scoreDetails: 'foo'}}")});
 }
 
 //
@@ -917,18 +920,12 @@ TEST_F(InclusionProjectionExecutionTestWithoutFallBackToDefault,
     auto inclusion = makeInclusionProjectionWithDefaultPolicies(BSON("a.b" << true));
 
     // {a: [1, {b: 2, c: 3}, [{b: 4, c: 5}], {d: 6}]} => {a: [{b: 2}, [{b: 4}], {}]}
-    auto result = inclusion->applyTransformation(
-        Document{{"a",
-                  vector<Value>{Value(1),
-                                Value(Document{{"b", 2}, {"c", 3}}),
-                                Value(vector<Value>{Value(Document{{"b", 4}, {"c", 5}})}),
-                                Value(Document{{"d", 6}})}}});
+    auto result = inclusion->applyTransformation(Document{
+        {"a",
+         {1, Document{{"b", 2}, {"c", 3}}, {Document{{"b", 4}, {"c", 5}}}, Document{{"d", 6}}}}});
 
-    auto expectedResult = Document{{"a",
-                                    vector<Value>{Value(),
-                                                  Value(Document{{"b", 2}}),
-                                                  Value(vector<Value>{Value(Document{{"b", 4}})}),
-                                                  Value(Document{})}}};
+    auto expectedResult =
+        Document{{"a", {Value(), Document{{"b", 2}}, {Document{{"b", 4}}}, Document{}}}};
 
     ASSERT_DOCUMENT_EQ(result, expectedResult);
 }
@@ -938,15 +935,11 @@ TEST_F(InclusionProjectionExecutionTestWithoutFallBackToDefault,
     auto inclusion = makeInclusionProjectionWithNoArrayRecursion(BSON("a.b" << true));
 
     // {a: [1, {b: 2, c: 3}, [{b: 4, c: 5}], {d: 6}]} => {a: [{b: 2}, {}]}
-    auto result = inclusion->applyTransformation(
-        Document{{"a",
-                  vector<Value>{Value(1),
-                                Value(Document{{"b", 2}, {"c", 3}}),
-                                Value(vector<Value>{Value(Document{{"b", 4}, {"c", 5}})}),
-                                Value(Document{{"d", 6}})}}});
+    auto result = inclusion->applyTransformation(Document{
+        {"a",
+         {1, Document{{"b", 2}, {"c", 3}}, {Document{{"b", 4}, {"c", 5}}}, Document{{"d", 6}}}}});
 
-    auto expectedResult = Document{
-        {"a", vector<Value>{Value(), Value(Document{{"b", 2}}), Value(), Value(Document{})}}};
+    auto expectedResult = Document{{"a", {Value(), Document{{"b", 2}}, Value(), Document{}}}};
 
     ASSERT_DOCUMENT_EQ(result, expectedResult);
 }
@@ -956,12 +949,9 @@ TEST_F(InclusionProjectionExecutionTestWithoutFallBackToDefault,
     auto inclusion = makeInclusionProjectionWithNoArrayRecursion(BSON("a" << true));
 
     // {a: [1, {b: 2, c: 3}, [{b: 4, c: 5}], {d: 6}]} => [output doc identical to input]
-    const auto inputDoc =
-        Document{{"a",
-                  vector<Value>{Value(1),
-                                Value(Document{{"b", 2}, {"c", 3}}),
-                                Value(vector<Value>{Value(Document{{"b", 4}, {"c", 5}})}),
-                                Value(Document{{"d", 6}})}}};
+    const auto inputDoc = Document{
+        {"a",
+         {1, Document{{"b", 2}, {"c", 3}}, {Document{{"b", 4}, {"c", 5}}}, Document{{"d", 6}}}}};
 
     auto result = inclusion->applyTransformation(inputDoc);
     const auto& expectedResult = inputDoc;
@@ -974,22 +964,21 @@ TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault,
     auto inclusion =
         makeInclusionProjectionWithDefaultPolicies(BSON("a.b" << wrapInLiteral("COMPUTED")));
 
-    vector<Value> nestedValues = {Value(1),
-                                  Value(Document{}),
-                                  Value(Document{{"b", 1}}),
-                                  Value(Document{{"b", 1}, {"c", 2}}),
-                                  Value(vector<Value>{}),
-                                  Value(vector<Value>{Value(1), Value(Document{{"c", 1}})})};
-    vector<Value> expectedNestedValues = {
-        Value(Document{{"b", "COMPUTED"_sd}}),
-        Value(Document{{"b", "COMPUTED"_sd}}),
-        Value(Document{{"b", "COMPUTED"_sd}}),
-        Value(Document{{"b", "COMPUTED"_sd}}),
-        Value(vector<Value>{}),
-        Value(vector<Value>{Value(Document{{"b", "COMPUTED"_sd}}),
-                            Value(Document{{"b", "COMPUTED"_sd}})})};
-    auto result = inclusion->applyTransformation(Document{{"a", nestedValues}});
-    auto expectedResult = Document{{"a", expectedNestedValues}};
+    auto result = inclusion->applyTransformation(Document{{"a",
+                                                           {1,
+                                                            Document{},
+                                                            Document{{"b", 1}},
+                                                            Document{{"b", 1}, {"c", 2}},
+                                                            vector<Value>{},
+                                                            {1, Document{{"c", 1}}}}}});
+    auto expectedResult =
+        Document{{"a",
+                  {Document{{"b", "COMPUTED"_sd}},
+                   Document{{"b", "COMPUTED"_sd}},
+                   Document{{"b", "COMPUTED"_sd}},
+                   Document{{"b", "COMPUTED"_sd}},
+                   vector<Value>{},
+                   {Document{{"b", "COMPUTED"_sd}}, Document{{"b", "COMPUTED"_sd}}}}}};
     ASSERT_DOCUMENT_EQ(result, expectedResult);
 }
 
@@ -1003,22 +992,20 @@ TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault,
     // of the array and all nested arrays individually. With kDoNotRecurseNestedArrays, the
     // nested arrays are replaced rather than being traversed, in exactly the same way as
     // scalar values.
-    vector<Value> nestedValues = {Value(1),
-                                  Value(Document{}),
-                                  Value(Document{{"b", 1}}),
-                                  Value(Document{{"b", 1}, {"c", 2}}),
-                                  Value(vector<Value>{}),
-                                  Value(vector<Value>{Value(1), Value(Document{{"c", 1}})})};
-
-    vector<Value> expectedNestedValues = {Value(Document{{"b", "COMPUTED"_sd}}),
-                                          Value(Document{{"b", "COMPUTED"_sd}}),
-                                          Value(Document{{"b", "COMPUTED"_sd}}),
-                                          Value(Document{{"b", "COMPUTED"_sd}}),
-                                          Value(Document{{"b", "COMPUTED"_sd}}),
-                                          Value(Document{{"b", "COMPUTED"_sd}})};
-
-    auto result = inclusion->applyTransformation(Document{{"a", nestedValues}});
-    auto expectedResult = Document{{"a", expectedNestedValues}};
+    auto result = inclusion->applyTransformation(Document{{"a",
+                                                           {1,
+                                                            Document{},
+                                                            Document{{"b", 1}},
+                                                            Document{{"b", 1}, {"c", 2}},
+                                                            vector<Value>{},
+                                                            {1, Document{{"c", 1}}}}}});
+    auto expectedResult = Document{{"a",
+                                    {Document{{"b", "COMPUTED"_sd}},
+                                     Document{{"b", "COMPUTED"_sd}},
+                                     Document{{"b", "COMPUTED"_sd}},
+                                     Document{{"b", "COMPUTED"_sd}},
+                                     Document{{"b", "COMPUTED"_sd}},
+                                     Document{{"b", "COMPUTED"_sd}}}}};
     ASSERT_DOCUMENT_EQ(result, expectedResult);
 }
 }  // namespace

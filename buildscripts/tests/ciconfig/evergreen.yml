@@ -138,7 +138,7 @@ tasks:
     - func: "setup"
     - func: "run tests"
       vars:
-        resmoke_args: "--suites=somesuite --storageEngine=mmapv1"
+        resmoke_args: "--suites=somesuite --storageEngine=wiredTiger"
 
 
 modules:
@@ -177,13 +177,13 @@ buildvariants:
     distros:
       - pdp-11
 - name: debian
-  display_name: Debian
+  display_name: "! Debian"
   run_on:
   - debian-stretch
   tasks:
   - name: resmoke_task
 - name: amazon
-  display_name: Amazon
+  display_name: "! Amazon"
   run_on:
   - amazon
   tasks:

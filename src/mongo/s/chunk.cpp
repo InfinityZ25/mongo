@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -41,6 +41,7 @@ namespace mongo {
 
 ChunkInfo::ChunkInfo(const ChunkType& from)
     : _range(from.getMin(), from.getMax()),
+      _maxKeyString(ShardKeyPattern::toKeyString(from.getMax())),
       _shardId(from.getShard()),
       _lastmod(from.getVersion()),
       _history(from.getHistory()),
@@ -52,7 +53,6 @@ ChunkInfo::ChunkInfo(const ChunkType& from)
 const ShardId& ChunkInfo::getShardIdAt(const boost::optional<Timestamp>& ts) const {
     // This chunk was refreshed from FCV 3.6 config server so it doesn't have history
     if (_history.empty()) {
-        // TODO: SERVER-34619 - add uassert
         return _shardId;
     }
 

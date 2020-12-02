@@ -73,6 +73,7 @@
 #include "mongo/db/stats/top.h"
 #include "mongo/db/storage/duplicate_key_error_info.h"
 #include "mongo/db/transaction_participant.h"
+#include "mongo/db/update/path_support.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
@@ -81,7 +82,7 @@
 #include "mongo/util/log_and_backoff.h"
 #include "mongo/util/scopeguard.h"
 
-namespace mongo {
+namespace mongo::write_ops_exec {
 
 // Convention in this file: generic helpers go in the anonymous namespace. Helpers that are for a
 // single type of operation are static functions defined above their caller.
@@ -112,9 +113,8 @@ void updateRetryStats(OperationContext* opCtx, bool containsRetry) {
 void finishCurOp(OperationContext* opCtx, CurOp* curOp) {
     try {
         curOp->done();
-        long long executionTimeMicros =
-            durationCount<Microseconds>(curOp->elapsedTimeExcludingPauses());
-        curOp->debug().executionTimeMicros = executionTimeMicros;
+        auto executionTimeMicros = duration_cast<Microseconds>(curOp->elapsedTimeExcludingPauses());
+        curOp->debug().executionTime = executionTimeMicros;
 
         recordCurOpMetrics(opCtx);
         Top::get(opCtx->getServiceContext())
@@ -127,21 +127,20 @@ void finishCurOp(OperationContext* opCtx, CurOp* curOp) {
                     curOp->getReadWriteType());
 
         if (!curOp->debug().errInfo.isOK()) {
-            LOGV2_DEBUG(
-                20886,
-                3,
-                "Caught Assertion in {logicalOpToString_curOp_getLogicalOp}: {curOp_debug_errInfo}",
-                "logicalOpToString_curOp_getLogicalOp"_attr =
-                    redact(logicalOpToString(curOp->getLogicalOp())),
-                "curOp_debug_errInfo"_attr = curOp->debug().errInfo.toString());
+            LOGV2_DEBUG(20886,
+                        3,
+                        "Caught Assertion in finishCurOp. Op: {operation}, error: {error}",
+                        "Caught Assertion in finishCurOp",
+                        "operation"_attr = redact(logicalOpToString(curOp->getLogicalOp())),
+                        "error"_attr = curOp->debug().errInfo.toString());
         }
 
         // Mark the op as complete, and log it if appropriate. Returns a boolean indicating whether
         // this op should be sampled for profiling.
-        const bool shouldSample =
+        const bool shouldProfile =
             curOp->completeAndLogOperation(opCtx, MONGO_LOGV2_DEFAULT_COMPONENT);
 
-        if (curOp->shouldDBProfile(shouldSample)) {
+        if (shouldProfile) {
             // Stash the current transaction so that writes to the profile collection are not
             // done as part of the transaction.
             TransactionParticipant::SideTransactionBlock sideTxn(opCtx);
@@ -151,7 +150,10 @@ void finishCurOp(OperationContext* opCtx, CurOp* curOp) {
         // We need to ignore all errors here. We don't want a successful op to fail because of a
         // failure to record stats. We also don't want to replace the error reported for an op that
         // is failing.
-        LOGV2(20887, "Ignoring error from finishCurOp: {ex}", "ex"_attr = redact(ex));
+        LOGV2(20887,
+              "Ignoring error from finishCurOp: {error}",
+              "Ignoring error from finishCurOp",
+              "error"_attr = redact(ex));
     }
 }
 
@@ -174,9 +176,9 @@ public:
             replClientInfo().setLastOpToSystemLastOpTimeIgnoringInterrupt(_opCtx);
             LOGV2_DEBUG(20888,
                         5,
-                        "Set last op to system time: {replClientInfo_getLastOp_getTimestamp}",
-                        "replClientInfo_getLastOp_getTimestamp"_attr =
-                            replClientInfo().getLastOp().getTimestamp());
+                        "Set last op to system time: {timestamp}",
+                        "Set last op to system time",
+                        "timestamp"_attr = replClientInfo().getLastOp().getTimestamp());
         }
     }
 
@@ -216,10 +218,10 @@ void makeCollection(OperationContext* opCtx, const NamespaceString& ns) {
         Lock::CollectionLock collLock(opCtx, ns, MODE_IX);
 
         assertCanWrite_inlock(opCtx, ns);
-        if (!CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
+        if (!CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
                 opCtx,
                 ns)) {  // someone else may have beat us to it.
-            uassertStatusOK(userAllowedCreateNS(ns.db(), ns.coll()));
+            uassertStatusOK(userAllowedCreateNS(ns));
             WriteUnitOfWork wuow(opCtx);
             CollectionOptions defaultCollectionOptions;
             uassertStatusOK(db.getDb()->userCreateNS(opCtx, ns, defaultCollectionOptions));
@@ -274,16 +276,19 @@ bool handleError(OperationContext* opCtx,
         return false;
     }
 
+    if (ErrorCodes::isTenantMigrationError(ex)) {
+        // If an op fails due to a TenantMigrationError then subsequent ops will also fail due to a
+        // migration blocking, committing, or aborting.
+        out->results.emplace_back(ex.toStatus());
+        return false;
+    }
+
     out->results.emplace_back(ex.toStatus());
     return !wholeOp.getOrdered();
 }
 
-LockMode fixLockModeForSystemDotViewsChanges(const NamespaceString& nss, LockMode mode) {
-    return nss.isSystemDotViews() ? MODE_X : mode;
-}
-
 void insertDocuments(OperationContext* opCtx,
-                     Collection* collection,
+                     const CollectionPtr& collection,
                      std::vector<InsertStatement>::iterator begin,
                      std::vector<InsertStatement>::iterator end,
                      bool fromMigrate) {
@@ -298,18 +303,16 @@ void insertDocuments(OperationContext* opCtx,
     // to be written. Multidocument transactions should not generate opTimes because they are
     // generated at the time of commit.
     auto batchSize = std::distance(begin, end);
-    if (supportsDocLocking()) {
-        auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-        auto inTransaction = opCtx->inMultiDocumentTransaction();
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    auto inTransaction = opCtx->inMultiDocumentTransaction();
 
-        if (!inTransaction && !replCoord->isOplogDisabledFor(opCtx, collection->ns())) {
-            // Populate 'slots' with new optimes for each insert.
-            // This also notifies the storage engine of each new timestamp.
-            auto oplogSlots = repl::getNextOpTimes(opCtx, batchSize);
-            auto slot = oplogSlots.begin();
-            for (auto it = begin; it != end; it++) {
-                it->oplogSlot = *slot++;
-            }
+    if (!inTransaction && !replCoord->isOplogDisabledFor(opCtx, collection->ns())) {
+        // Populate 'slots' with new optimes for each insert.
+        // This also notifies the storage engine of each new timestamp.
+        auto oplogSlots = repl::getNextOpTimes(opCtx, batchSize);
+        auto slot = oplogSlots.begin();
+        for (auto it = begin; it != end; it++) {
+            it->oplogSlot = *slot++;
         }
     }
 
@@ -340,7 +343,7 @@ void insertDocuments(OperationContext* opCtx,
  * they only allow one operation at a time because they enforce insertion order with a MODE_X
  * collection lock, which we cannot hold in transactions.
  */
-Status checkIfTransactionOnCappedColl(OperationContext* opCtx, Collection* collection) {
+Status checkIfTransactionOnCappedColl(OperationContext* opCtx, const CollectionPtr& collection) {
     if (opCtx->inMultiDocumentTransaction() && collection->isCapped()) {
         return {ErrorCodes::OperationNotSupportedInTransaction,
                 str::stream() << "Collection '" << collection->ns()
@@ -370,10 +373,11 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
         "hangDuringBatchInsert",
         [&wholeOp]() {
             LOGV2(20889,
-                  "batch insert - hangDuringBatchInsert fail point enabled for namespace "
-                  "{wholeOp_getNamespace}. Blocking "
-                  "until fail point is disabled.",
-                  "wholeOp_getNamespace"_attr = wholeOp.getNamespace());
+                  "Batch insert - hangDuringBatchInsert fail point enabled for namespace "
+                  "{namespace}. Blocking until fail point is disabled",
+                  "Batch insert - hangDuringBatchInsert fail point enabled for a namespace. "
+                  "Blocking until fail point is disabled",
+                  "namespace"_attr = wholeOp.getNamespace());
         },
         true,  // Check for interrupt periodically.
         wholeOp.getNamespace());
@@ -396,7 +400,8 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
             makeCollection(opCtx, wholeOp.getNamespace());
         }
 
-        curOp.raiseDbProfileLevel(collection->getDb()->getProfilingLevel());
+        curOp.raiseDbProfileLevel(
+            CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(wholeOp.getNamespace().db()));
         assertCanWrite_inlock(opCtx, wholeOp.getNamespace());
 
         CurOpFailpointHelpers::waitWhileFailPointEnabled(
@@ -543,7 +548,7 @@ WriteResult performInserts(OperationContext* opCtx,
 
     uassertStatusOK(userAllowedWriteNS(wholeOp.getNamespace()));
 
-    DisableDocumentValidationIfTrue docValidationDisabler(
+    DisableDocumentSchemaValidationIfTrue docSchemaValidationDisabler(
         opCtx, wholeOp.getWriteCommandBase().getBypassDocumentValidation());
     LastOpFixer lastOpFixer(opCtx, wholeOp.getNamespace());
 
@@ -562,26 +567,24 @@ WriteResult performInserts(OperationContext* opCtx,
 
     for (auto&& doc : wholeOp.getDocuments()) {
         const bool isLastDoc = (&doc == &wholeOp.getDocuments().back());
-        auto fixedDoc = fixDocumentForInsert(opCtx->getServiceContext(), doc);
+        auto fixedDoc = fixDocumentForInsert(opCtx, doc);
+        const StmtId stmtId = getStmtIdForWriteOp(opCtx, wholeOp, stmtIdIndex++);
+        const bool wasAlreadyExecuted = opCtx->getTxnNumber() &&
+            !opCtx->inMultiDocumentTransaction() &&
+            txnParticipant.checkStatementExecutedNoOplogEntryFetch(stmtId);
+
         if (!fixedDoc.isOK()) {
             // Handled after we insert anything in the batch to be sure we report errors in the
             // correct order. In an ordered insert, if one of the docs ahead of us fails, we should
             // behave as-if we never got to this document.
+        } else if (wasAlreadyExecuted) {
+            // Similarly, if the insert was already executed as part of a retryable write, flush the
+            // current batch to preserve the error results order.
         } else {
-            const auto stmtId = getStmtIdForWriteOp(opCtx, wholeOp, stmtIdIndex++);
-            if (opCtx->getTxnNumber()) {
-                if (!opCtx->inMultiDocumentTransaction() &&
-                    txnParticipant.checkStatementExecutedNoOplogEntryFetch(stmtId)) {
-                    containsRetry = true;
-                    RetryableWritesStats::get(opCtx)->incrementRetriedStatementsCount();
-                    out.results.emplace_back(makeWriteResultForInsertOrDeleteRetry());
-                    continue;
-                }
-            }
-
             BSONObj toInsert = fixedDoc.getValue().isEmpty() ? doc : std::move(fixedDoc.getValue());
             batch.emplace_back(stmtId, toInsert);
             bytesInBatch += batch.back().doc.objsize();
+
             if (!isLastDoc && batch.size() < maxBatchSize && bytesInBatch < maxBatchBytes)
                 continue;  // Add more to batch before inserting.
         }
@@ -591,7 +594,14 @@ WriteResult performInserts(OperationContext* opCtx,
         batch.clear();  // We won't need the current batch any more.
         bytesInBatch = 0;
 
-        if (canContinue && !fixedDoc.isOK()) {
+        // If the batch had an error and decides to not continue, do not process a current doc that
+        // was unsuccessfully "fixed" or an already executed retryable write.
+        if (!canContinue)
+            break;
+
+        // Revisit any conditions that may have caused the batch to be flushed. In those cases,
+        // append the appropriate result to the output.
+        if (!fixedDoc.isOK()) {
             globalOpCounters.gotInsert();
             ServerWriteConcernMetrics::get(opCtx)->recordWriteConcernForInsert(
                 opCtx->getWriteConcern());
@@ -602,11 +612,17 @@ WriteResult performInserts(OperationContext* opCtx,
                 canContinue = handleError(
                     opCtx, ex, wholeOp.getNamespace(), wholeOp.getWriteCommandBase(), &out);
             }
-        }
 
-        if (!canContinue)
-            break;
+            if (!canContinue) {
+                break;
+            }
+        } else if (wasAlreadyExecuted) {
+            containsRetry = true;
+            RetryableWritesStats::get(opCtx)->incrementRetriedStatementsCount();
+            out.results.emplace_back(makeWriteResultForInsertOrDeleteRetry());
+        }
     }
+    invariant(batch.empty());
 
     return out;
 }
@@ -625,10 +641,11 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
         "hangDuringBatchUpdate",
         [&ns]() {
             LOGV2(20890,
-                  "batch update - hangDuringBatchUpdate fail point enabled for nss {ns}. Blocking "
-                  "until "
-                  "fail point is disabled.",
-                  "ns"_attr = ns);
+                  "Batch update - hangDuringBatchUpdate fail point enabled for namespace "
+                  "{namespace}. Blocking until fail point is disabled",
+                  "Batch update - hangDuringBatchUpdate fail point enabled for a namespace. "
+                  "Blocking until fail point is disabled",
+                  "namespace"_attr = ns);
         },
         false /*checkForInterrupt*/,
         ns);
@@ -650,7 +667,7 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
         makeCollection(opCtx, ns);
     }
 
-    if (auto coll = collection->getCollection()) {
+    if (const auto& coll = collection->getCollection()) {
         // Transactions are not allowed to operate on capped collections.
         uassertStatusOK(checkIfTransactionOnCappedColl(opCtx, coll));
     }
@@ -661,46 +678,48 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
     auto& curOp = *CurOp::get(opCtx);
 
     if (collection->getDb()) {
-        curOp.raiseDbProfileLevel(collection->getDb()->getProfilingLevel());
+        curOp.raiseDbProfileLevel(CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(ns.db()));
     }
 
     assertCanWrite_inlock(opCtx, ns);
 
-    auto exec = uassertStatusOK(getExecutorUpdate(
-        &curOp.debug(), collection->getCollection(), &parsedUpdate, boost::none /* verbosity */));
+    auto exec = uassertStatusOK(
+        getExecutorUpdate(&curOp.debug(),
+                          collection ? &collection->getCollection() : &CollectionPtr::null,
+                          &parsedUpdate,
+                          boost::none /* verbosity */));
 
     {
         stdx::lock_guard<Client> lk(*opCtx->getClient());
-        CurOp::get(opCtx)->setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
+        CurOp::get(opCtx)->setPlanSummary_inlock(exec->getPlanExplainer().getPlanSummary());
     }
 
-    uassertStatusOK(exec->executePlan());
+    auto updateResult = exec->executeUpdate();
 
     PlanSummaryStats summary;
-    Explain::getSummaryStats(*exec, &summary);
-    if (collection->getCollection()) {
-        CollectionQueryInfo::get(collection->getCollection()).notifyOfQuery(opCtx, summary);
+    auto&& explainer = exec->getPlanExplainer();
+    explainer.getSummaryStats(&summary);
+    if (const auto& coll = collection->getCollection()) {
+        CollectionQueryInfo::get(coll).notifyOfQuery(opCtx, coll, summary);
     }
 
-    if (curOp.shouldDBProfile()) {
-        BSONObjBuilder execStatsBob;
-        Explain::getWinningPlanStats(exec.get(), &execStatsBob);
-        curOp.debug().execStats = execStatsBob.obj();
+    if (curOp.shouldDBProfile(opCtx)) {
+        auto&& [stats, _] = explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
+        curOp.debug().execStats = std::move(stats);
     }
 
-    const UpdateStats* updateStats = UpdateStage::getUpdateStats(exec.get());
-    UpdateStage::recordUpdateStatsInOpDebug(updateStats, &curOp.debug());
+    recordUpdateResultInOpDebug(updateResult, &curOp.debug());
     curOp.debug().setPlanSummaryMetrics(summary);
-    UpdateResult res = UpdateStage::makeUpdateResult(updateStats);
 
-    const bool didInsert = !res.upserted.isEmpty();
-    const long long nMatchedOrInserted = didInsert ? 1 : res.numMatched;
-    LastError::get(opCtx->getClient()).recordUpdate(res.existing, nMatchedOrInserted, res.upserted);
+    const bool didInsert = !updateResult.upsertedId.isEmpty();
+    const long long nMatchedOrInserted = didInsert ? 1 : updateResult.numMatched;
+    LastError::get(opCtx->getClient())
+        .recordUpdate(updateResult.existing, nMatchedOrInserted, updateResult.upsertedId);
 
     SingleWriteResult result;
     result.setN(nMatchedOrInserted);
-    result.setNModified(res.numDocsModified);
-    result.setUpsertedId(res.upserted);
+    result.setNModified(updateResult.numDocsModified);
+    result.setUpsertedId(updateResult.upsertedId);
 
     return result;
 }
@@ -708,11 +727,13 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
 /**
  * Performs a single update, retrying failure due to DuplicateKeyError when eligible.
  */
-static SingleWriteResult performSingleUpdateOpWithDupKeyRetry(OperationContext* opCtx,
-                                                              const NamespaceString& ns,
-                                                              StmtId stmtId,
-                                                              const write_ops::UpdateOpEntry& op,
-                                                              RuntimeConstants runtimeConstants) {
+static SingleWriteResult performSingleUpdateOpWithDupKeyRetry(
+    OperationContext* opCtx,
+    const NamespaceString& ns,
+    StmtId stmtId,
+    const write_ops::UpdateOpEntry& op,
+    LegacyRuntimeConstants runtimeConstants,
+    const boost::optional<BSONObj>& letParams) {
     globalOpCounters.gotUpdate();
     ServerWriteConcernMetrics::get(opCtx)->recordWriteConcernForUpdate(opCtx->getWriteConcern());
     auto& curOp = *CurOp::get(opCtx);
@@ -731,10 +752,14 @@ static SingleWriteResult performSingleUpdateOpWithDupKeyRetry(OperationContext* 
 
     UpdateRequest request(op);
     request.setNamespaceString(ns);
-    request.setRuntimeConstants(std::move(runtimeConstants));
+    request.setLegacyRuntimeConstants(std::move(runtimeConstants));
+    if (letParams) {
+        request.setLetParameters(std::move(letParams));
+    }
     request.setStmtId(stmtId);
-    request.setYieldPolicy(opCtx->inMultiDocumentTransaction() ? PlanExecutor::INTERRUPT_ONLY
-                                                               : PlanExecutor::YIELD_AUTO);
+    request.setYieldPolicy(opCtx->inMultiDocumentTransaction()
+                               ? PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY
+                               : PlanYieldPolicy::YieldPolicy::YIELD_AUTO);
 
     size_t numAttempts = 0;
     while (true) {
@@ -751,8 +776,8 @@ static SingleWriteResult performSingleUpdateOpWithDupKeyRetry(OperationContext* 
                 uassertStatusOK(parsedUpdate.parseQueryToCQ());
             }
 
-            if (!UpdateStage::shouldRetryDuplicateKeyException(
-                    parsedUpdate, *ex.extraInfo<DuplicateKeyErrorInfo>())) {
+            if (!shouldRetryDuplicateKeyException(parsedUpdate,
+                                                  *ex.extraInfo<DuplicateKeyErrorInfo>())) {
                 throw;
             }
 
@@ -776,7 +801,7 @@ WriteResult performUpdates(OperationContext* opCtx, const write_ops::Update& who
               (txnParticipant && opCtx->inMultiDocumentTransaction()));
     uassertStatusOK(userAllowedWriteNS(wholeOp.getNamespace()));
 
-    DisableDocumentValidationIfTrue docValidationDisabler(
+    DisableDocumentSchemaValidationIfTrue docSchemaValidationDisabler(
         opCtx, wholeOp.getWriteCommandBase().getBypassDocumentValidation());
     LastOpFixer lastOpFixer(opCtx, wholeOp.getNamespace());
 
@@ -790,7 +815,7 @@ WriteResult performUpdates(OperationContext* opCtx, const write_ops::Update& who
     // If the update command specified runtime constants, we adopt them. Otherwise, we set them to
     // the current local and cluster time. These constants are applied to each update in the batch.
     const auto& runtimeConstants =
-        wholeOp.getRuntimeConstants().value_or(Variables::generateRuntimeConstants(opCtx));
+        wholeOp.getLegacyRuntimeConstants().value_or(Variables::generateRuntimeConstants(opCtx));
 
     for (auto&& singleOp : wholeOp.getUpdates()) {
         const auto stmtId = getStmtIdForWriteOp(opCtx, wholeOp, stmtIdIndex++);
@@ -817,8 +842,12 @@ WriteResult performUpdates(OperationContext* opCtx, const write_ops::Update& who
         ON_BLOCK_EXIT([&] { finishCurOp(opCtx, &curOp); });
         try {
             lastOpFixer.startingOp();
-            out.results.emplace_back(performSingleUpdateOpWithDupKeyRetry(
-                opCtx, wholeOp.getNamespace(), stmtId, singleOp, runtimeConstants));
+            out.results.emplace_back(performSingleUpdateOpWithDupKeyRetry(opCtx,
+                                                                          wholeOp.getNamespace(),
+                                                                          stmtId,
+                                                                          singleOp,
+                                                                          runtimeConstants,
+                                                                          wholeOp.getLet()));
             lastOpFixer.finishedOpSuccessfully();
         } catch (const DBException& ex) {
             const bool canContinue =
@@ -834,7 +863,9 @@ WriteResult performUpdates(OperationContext* opCtx, const write_ops::Update& who
 static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
                                                const NamespaceString& ns,
                                                StmtId stmtId,
-                                               const write_ops::DeleteOpEntry& op) {
+                                               const write_ops::DeleteOpEntry& op,
+                                               const LegacyRuntimeConstants& runtimeConstants,
+                                               const boost::optional<BSONObj>& letParams) {
     uassert(ErrorCodes::InvalidOptions,
             "Cannot use (or request) retryable writes with limit=0",
             opCtx->inMultiDocumentTransaction() || !opCtx->getTxnNumber() || !op.getMulti());
@@ -853,11 +884,15 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
 
     auto request = DeleteRequest{};
     request.setNsString(ns);
+    request.setLegacyRuntimeConstants(runtimeConstants);
+    if (letParams)
+        request.setLet(letParams);
     request.setQuery(op.getQ());
     request.setCollation(write_ops::collationOf(op));
     request.setMulti(op.getMulti());
-    request.setYieldPolicy(opCtx->inMultiDocumentTransaction() ? PlanExecutor::INTERRUPT_ONLY
-                                                               : PlanExecutor::YIELD_AUTO);
+    request.setYieldPolicy(opCtx->inMultiDocumentTransaction()
+                               ? PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY
+                               : PlanYieldPolicy::YieldPolicy::YIELD_AUTO);
     request.setStmtId(stmtId);
     request.setHint(op.getHint());
 
@@ -870,8 +905,8 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
         "hangDuringBatchRemove",
         []() {
             LOGV2(20891,
-                  "batch remove - hangDuringBatchRemove fail point enabled. Blocking "
-                  "until fail point is disabled.");
+                  "Batch remove - hangDuringBatchRemove fail point enabled. Blocking until fail "
+                  "point is disabled");
         },
         true  // Check for interrupt periodically.
     );
@@ -882,7 +917,7 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
     AutoGetCollection collection(opCtx, ns, fixLockModeForSystemDotViewsChanges(ns, MODE_IX));
 
     if (collection.getDb()) {
-        curOp.raiseDbProfileLevel(collection.getDb()->getProfilingLevel());
+        curOp.raiseDbProfileLevel(CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(ns.db()));
     }
 
     assertCanWrite_inlock(opCtx, ns);
@@ -891,34 +926,33 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
         &hangWithLockDuringBatchRemove, opCtx, "hangWithLockDuringBatchRemove");
 
     auto exec = uassertStatusOK(getExecutorDelete(
-        &curOp.debug(), collection.getCollection(), &parsedDelete, boost::none /* verbosity */));
+        &curOp.debug(), &collection.getCollection(), &parsedDelete, boost::none /* verbosity */));
 
     {
         stdx::lock_guard<Client> lk(*opCtx->getClient());
-        CurOp::get(opCtx)->setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
+        CurOp::get(opCtx)->setPlanSummary_inlock(exec->getPlanExplainer().getPlanSummary());
     }
 
-    uassertStatusOK(exec->executePlan());
-    long long n = DeleteStage::getNumDeleted(*exec);
-    curOp.debug().additiveMetrics.ndeleted = n;
+    auto nDeleted = exec->executeDelete();
+    curOp.debug().additiveMetrics.ndeleted = nDeleted;
 
     PlanSummaryStats summary;
-    Explain::getSummaryStats(*exec, &summary);
-    if (collection.getCollection()) {
-        CollectionQueryInfo::get(collection.getCollection()).notifyOfQuery(opCtx, summary);
+    auto&& explainer = exec->getPlanExplainer();
+    explainer.getSummaryStats(&summary);
+    if (const auto& coll = collection.getCollection()) {
+        CollectionQueryInfo::get(coll).notifyOfQuery(opCtx, coll, summary);
     }
     curOp.debug().setPlanSummaryMetrics(summary);
 
-    if (curOp.shouldDBProfile()) {
-        BSONObjBuilder execStatsBob;
-        Explain::getWinningPlanStats(exec.get(), &execStatsBob);
-        curOp.debug().execStats = execStatsBob.obj();
+    if (curOp.shouldDBProfile(opCtx)) {
+        auto&& [stats, _] = explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
+        curOp.debug().execStats = std::move(stats);
     }
 
-    LastError::get(opCtx->getClient()).recordDelete(n);
+    LastError::get(opCtx->getClient()).recordDelete(nDeleted);
 
     SingleWriteResult result;
-    result.setN(n);
+    result.setN(nDeleted);
     return result;
 }
 
@@ -930,7 +964,7 @@ WriteResult performDeletes(OperationContext* opCtx, const write_ops::Delete& who
               (txnParticipant && opCtx->inMultiDocumentTransaction()));
     uassertStatusOK(userAllowedWriteNS(wholeOp.getNamespace()));
 
-    DisableDocumentValidationIfTrue docValidationDisabler(
+    DisableDocumentSchemaValidationIfTrue docSchemaValidationDisabler(
         opCtx, wholeOp.getWriteCommandBase().getBypassDocumentValidation());
     LastOpFixer lastOpFixer(opCtx, wholeOp.getNamespace());
 
@@ -940,6 +974,11 @@ WriteResult performDeletes(OperationContext* opCtx, const write_ops::Delete& who
     size_t stmtIdIndex = 0;
     WriteResult out;
     out.results.reserve(wholeOp.getDeletes().size());
+
+    // If the delete command specified runtime constants, we adopt them. Otherwise, we set them to
+    // the current local and cluster time. These constants are applied to each delete in the batch.
+    const auto& runtimeConstants =
+        wholeOp.getLegacyRuntimeConstants().value_or(Variables::generateRuntimeConstants(opCtx));
 
     for (auto&& singleOp : wholeOp.getDeletes()) {
         const auto stmtId = getStmtIdForWriteOp(opCtx, wholeOp, stmtIdIndex++);
@@ -975,8 +1014,12 @@ WriteResult performDeletes(OperationContext* opCtx, const write_ops::Delete& who
         });
         try {
             lastOpFixer.startingOp();
-            out.results.emplace_back(
-                performSingleDeleteOp(opCtx, wholeOp.getNamespace(), stmtId, singleOp));
+            out.results.emplace_back(performSingleDeleteOp(opCtx,
+                                                           wholeOp.getNamespace(),
+                                                           stmtId,
+                                                           singleOp,
+                                                           runtimeConstants,
+                                                           wholeOp.getLet()));
             lastOpFixer.finishedOpSuccessfully();
         } catch (const DBException& ex) {
             const bool canContinue =
@@ -994,4 +1037,93 @@ WriteResult performDeletes(OperationContext* opCtx, const write_ops::Delete& who
     return out;
 }
 
-}  // namespace mongo
+void recordUpdateResultInOpDebug(const UpdateResult& updateResult, OpDebug* opDebug) {
+    invariant(opDebug);
+    opDebug->additiveMetrics.nMatched = updateResult.numMatched;
+    opDebug->additiveMetrics.nModified = updateResult.numDocsModified;
+    opDebug->additiveMetrics.nUpserted = static_cast<long long>(!updateResult.upsertedId.isEmpty());
+}
+
+namespace {
+/**
+ * Returns whether a given MatchExpression contains is a MatchType::EQ or a MatchType::AND node with
+ * only MatchType::EQ children.
+ */
+bool matchContainsOnlyAndedEqualityNodes(const MatchExpression& root) {
+    if (root.matchType() == MatchExpression::EQ) {
+        return true;
+    }
+
+    if (root.matchType() == MatchExpression::AND) {
+        for (size_t i = 0; i < root.numChildren(); ++i) {
+            if (root.getChild(i)->matchType() != MatchExpression::EQ) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    return false;
+}
+}  // namespace
+
+bool shouldRetryDuplicateKeyException(const ParsedUpdate& parsedUpdate,
+                                      const DuplicateKeyErrorInfo& errorInfo) {
+    invariant(parsedUpdate.hasParsedQuery());
+
+    const auto updateRequest = parsedUpdate.getRequest();
+
+    // In order to be retryable, the update must be an upsert with multi:false.
+    if (!updateRequest->isUpsert() || updateRequest->isMulti()) {
+        return false;
+    }
+
+    auto matchExpr = parsedUpdate.getParsedQuery()->root();
+    invariant(matchExpr);
+
+    // In order to be retryable, the update query must contain no expressions other than AND and EQ.
+    if (!matchContainsOnlyAndedEqualityNodes(*matchExpr)) {
+        return false;
+    }
+
+    // In order to be retryable, the update equality field paths must be identical to the unique
+    // index key field paths. Also, the values that triggered the DuplicateKey error must match the
+    // values used in the upsert query predicate.
+    pathsupport::EqualityMatches equalities;
+    auto status = pathsupport::extractEqualityMatches(*matchExpr, &equalities);
+    if (!status.isOK()) {
+        return false;
+    }
+
+    auto keyPattern = errorInfo.getKeyPattern();
+    if (equalities.size() != static_cast<size_t>(keyPattern.nFields())) {
+        return false;
+    }
+
+    auto keyValue = errorInfo.getDuplicatedKeyValue();
+
+    BSONObjIterator keyPatternIter(keyPattern);
+    BSONObjIterator keyValueIter(keyValue);
+    while (keyPatternIter.more() && keyValueIter.more()) {
+        auto keyPatternElem = keyPatternIter.next();
+        auto keyValueElem = keyValueIter.next();
+
+        auto keyName = keyPatternElem.fieldNameStringData();
+        if (!equalities.count(keyName)) {
+            return false;
+        }
+
+        // Comparison which obeys field ordering but ignores field name.
+        BSONElementComparator cmp{BSONElementComparator::FieldNamesMode::kIgnore, nullptr};
+        if (cmp.evaluate(equalities[keyName]->getData() != keyValueElem)) {
+            return false;
+        }
+    }
+    invariant(!keyPatternIter.more());
+    invariant(!keyValueIter.more());
+
+    return true;
+}
+
+}  // namespace mongo::write_ops_exec

@@ -37,6 +37,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/local_oplog_info.h"
 #include "mongo/db/views/view.h"
+#include "mongo/db/yieldable.h"
 
 namespace mongo {
 
@@ -61,6 +62,8 @@ public:
               LockMode mode,
               Date_t deadline = Date_t::max());
 
+    AutoGetDb(AutoGetDb&&) = default;
+
     /**
      * Returns the database, or nullptr if it didn't exist.
      */
@@ -75,11 +78,13 @@ public:
 
 private:
     OperationContext* _opCtx;
-    const std::string _dbName;
+    std::string _dbName;
 
-    const Lock::DBLock _dbLock;
+    Lock::DBLock _dbLock;
     Database* _db;
 };
+
+enum class AutoGetCollectionViewMode { kViewsPermitted, kViewsForbidden };
 
 /**
  * RAII-style class, which acquires global, database, and collection locks according to the chart
@@ -102,13 +107,27 @@ class AutoGetCollection {
     AutoGetCollection& operator=(const AutoGetCollection&) = delete;
 
 public:
-    enum ViewMode { kViewsPermitted, kViewsForbidden };
+    AutoGetCollection(
+        OperationContext* opCtx,
+        const NamespaceStringOrUUID& nsOrUUID,
+        LockMode modeColl,
+        AutoGetCollectionViewMode viewMode = AutoGetCollectionViewMode::kViewsForbidden,
+        Date_t deadline = Date_t::max());
 
-    AutoGetCollection(OperationContext* opCtx,
-                      const NamespaceStringOrUUID& nsOrUUID,
-                      LockMode modeColl,
-                      ViewMode viewMode = kViewsForbidden,
-                      Date_t deadline = Date_t::max());
+    explicit operator bool() const {
+        return static_cast<bool>(getCollection());
+    }
+
+    /**
+     * AutoGetCollection can be used as a pointer with the -> operator.
+     */
+    const Collection* operator->() const {
+        return getCollection().get();
+    }
+
+    const CollectionPtr& operator*() const {
+        return getCollection();
+    }
 
     /**
      * Returns the database, or nullptr if it didn't exist.
@@ -126,8 +145,10 @@ public:
 
     /**
      * Returns nullptr if the collection didn't exist.
+     *
+     * Deprecated in favor of the new ->(), *() and bool() accessors above!
      */
-    Collection* getCollection() const {
+    const CollectionPtr& getCollection() const {
         return _coll;
     }
 
@@ -145,20 +166,209 @@ public:
         return _resolvedNss;
     }
 
-private:
+    /**
+     * Returns a writable Collection copy that will be returned by current and future calls to this
+     * function as well as getCollection(). Any previous Collection pointers that were returned may
+     * be invalidated.
+     *
+     * CollectionCatalog::LifetimeMode::kManagedInWriteUnitOfWork will register an onCommit()
+     * handler to reset the pointers and an onRollback() handler that will reset getCollection() to
+     * the original Collection pointer.
+     */
+    Collection* getWritableCollection(
+        CollectionCatalog::LifetimeMode mode =
+            CollectionCatalog::LifetimeMode::kManagedInWriteUnitOfWork);
+
+    OperationContext* getOperationContext() const {
+        return _opCtx;
+    }
+
+protected:
+    OperationContext* _opCtx = nullptr;
     AutoGetDb _autoDb;
+    boost::optional<Lock::CollectionLock> _collLock;
+    CollectionPtr _coll = nullptr;
+    std::shared_ptr<ViewDefinition> _view;
 
     // If the object was instantiated with a UUID, contains the resolved namespace, otherwise it is
     // the same as the input namespace string
     NamespaceString _resolvedNss;
 
-    // This field is boost::optional, because in the case of lookup by UUID, the collection lock
-    // might need to be relocked for the correct namespace
-    boost::optional<Lock::CollectionLock> _collLock;
+    // Populated if getWritableCollection() is called.
+    Collection* _writableColl = nullptr;
+};
 
-    Collection* _coll = nullptr;
+/**
+ * RAII-style class that acquires the global MODE_IS lock. This class should only be used for reads.
+ *
+ * NOTE: Throws NamespaceNotFound if the collection UUID cannot be resolved to a nss.
+ *
+ * The collection references returned by this class will no longer be safe to retain after this
+ * object goes out of scope. This object ensures the continued existence of a Collection reference,
+ * if the collection exists when this object is instantiated.
+ *
+ * This class is only used by AutoGetCollectionForReadLockFree.
+ */
+class AutoGetCollectionLockFree {
+    AutoGetCollectionLockFree(const AutoGetCollectionLockFree&) = delete;
+    AutoGetCollectionLockFree& operator=(const AutoGetCollectionLockFree&) = delete;
+
+public:
+    /**
+     * Function used to customize restore after yield behavior
+     */
+    using RestoreFromYieldFn =
+        std::function<void(std::shared_ptr<const Collection>&, OperationContext*, CollectionUUID)>;
+
+    /**
+     * Used by AutoGetCollectionForReadLockFree where it provides implementation for restore after
+     * yield.
+     */
+    AutoGetCollectionLockFree(
+        OperationContext* opCtx,
+        const NamespaceStringOrUUID& nsOrUUID,
+        RestoreFromYieldFn restoreFromYield,
+        AutoGetCollectionViewMode viewMode = AutoGetCollectionViewMode::kViewsForbidden,
+        Date_t deadline = Date_t::max());
+
+    explicit operator bool() const {
+        // Use the CollectionPtr because it is updated if it yields whereas _collection is not until
+        // restore.
+        return static_cast<bool>(_collectionPtr);
+    }
+
+    /**
+     * AutoGetCollectionLockFree can be used as a Collection pointer with the -> operator.
+     */
+    const Collection* operator->() const {
+        return getCollection().get();
+    }
+
+    const CollectionPtr& operator*() const {
+        return getCollection();
+    }
+
+    /**
+     * Returns nullptr if the collection didn't exist.
+     *
+     * Deprecated in favor of the new ->(), *() and bool() accessors above!
+     */
+    const CollectionPtr& getCollection() const {
+        return _collectionPtr;
+    }
+
+    /**
+     * Returns nullptr if the view didn't exist.
+     */
+    ViewDefinition* getView() const {
+        return _view.get();
+    }
+
+    /**
+     * Returns the resolved namespace of the collection or view.
+     */
+    const NamespaceString& getNss() const {
+        return _resolvedNss;
+    }
+
+private:
+    // Indicate that we are lock-free on code paths that can run either lock-free or locked for
+    // different kinds of operations. Note: this class member is currently declared first so that it
+    // destructs last, as a safety measure, but not because it is currently depended upon behavior.
+    boost::optional<LockFreeReadsBlock> _lockFreeReadsBlock;
+
+    Lock::GlobalLock _globalLock;
+
+    // If the object was instantiated with a UUID, contains the resolved namespace, otherwise it is
+    // the same as the input namespace string
+    NamespaceString _resolvedNss;
+
+    // The Collection shared_ptr will keep the Collection instance alive even if it is removed from
+    // the CollectionCatalog while this lock-free operation runs.
+    std::shared_ptr<const Collection> _collection;
+
+    // The CollectionPtr is the access point to the Collection instance for callers.
+    CollectionPtr _collectionPtr;
+
     std::shared_ptr<ViewDefinition> _view;
 };
+
+/**
+ * RAII-style class to handle the lifetime of writable Collections.
+ * It does not take any locks, concurrency needs to be handled separately using explicit locks or
+ * AutoGetCollection. This class can serve as an adaptor to unify different methods of acquiring a
+ * writable collection.
+ *
+ * It is safe to re-use an instance for multiple WriteUnitOfWorks or to destroy it before the active
+ * WriteUnitOfWork finishes.
+ */
+class CollectionWriter final {
+public:
+    // Gets the collection from the catalog for the provided uuid
+    CollectionWriter(OperationContext* opCtx,
+                     const CollectionUUID& uuid,
+                     CollectionCatalog::LifetimeMode mode =
+                         CollectionCatalog::LifetimeMode::kManagedInWriteUnitOfWork);
+    // Gets the collection from the catalog for the provided namespace string
+    CollectionWriter(OperationContext* opCtx,
+                     const NamespaceString& nss,
+                     CollectionCatalog::LifetimeMode mode =
+                         CollectionCatalog::LifetimeMode::kManagedInWriteUnitOfWork);
+    // Acts as an adaptor for AutoGetCollection
+    CollectionWriter(AutoGetCollection& autoCollection,
+                     CollectionCatalog::LifetimeMode mode =
+                         CollectionCatalog::LifetimeMode::kManagedInWriteUnitOfWork);
+    // Acts as an adaptor for a writable Collection that has been retrieved elsewhere
+    CollectionWriter(Collection* writableCollection);
+
+    ~CollectionWriter();
+
+    // Not allowed to copy or move.
+    CollectionWriter(const CollectionWriter&) = delete;
+    CollectionWriter(CollectionWriter&&) = delete;
+    CollectionWriter& operator=(const CollectionWriter&) = delete;
+    CollectionWriter& operator=(CollectionWriter&&) = delete;
+
+    explicit operator bool() const {
+        return static_cast<bool>(get());
+    }
+
+    const Collection* operator->() const {
+        return get().get();
+    }
+
+    const Collection& operator*() const {
+        return *get().get();
+    }
+
+    const CollectionPtr& get() const {
+        return *_collection;
+    }
+
+    // Returns writable Collection, any previous Collection that has been returned may be
+    // invalidated.
+    Collection* getWritableCollection();
+
+private:
+    // If this class is instantiated with the constructors that take UUID or nss we need somewhere
+    // to store the CollectionPtr used. But if it is instantiated with an AutoGetCollection then the
+    // lifetime of the object is managed there. To unify the two code paths we have a pointer that
+    // points to either the CollectionPtr in an AutoGetCollection or to a stored CollectionPtr in
+    // this instance. This can also be used to determine how we were instantiated.
+    const CollectionPtr* _collection = nullptr;
+    CollectionPtr _storedCollection;
+    Collection* _writableCollection = nullptr;
+    OperationContext* _opCtx = nullptr;
+    CollectionCatalog::LifetimeMode _mode;
+
+    struct SharedImpl;
+    std::shared_ptr<SharedImpl> _sharedImpl;
+};
+
+/**
+ * Writes to system.views need to use a stronger lock to prevent inconsistencies like view cycles.
+ */
+LockMode fixLockModeForSystemDotViewsChanges(const NamespaceString& nss, LockMode mode);
 
 /**
  * RAII-style class, which acquires a lock on the specified database in the requested mode and
@@ -193,35 +403,6 @@ private:
 };
 
 /**
- * RAII-style class. Hides changes to the CollectionCatalog for the life of the object, so that
- * calls to CollectionCatalog::lookupNSSByUUID will return results as before the RAII object was
- * instantiated.
- *
- * The caller must hold the global exclusive lock for the life of the instance.
- */
-class ConcealCollectionCatalogChangesBlock {
-    ConcealCollectionCatalogChangesBlock(const ConcealCollectionCatalogChangesBlock&) = delete;
-    ConcealCollectionCatalogChangesBlock& operator=(const ConcealCollectionCatalogChangesBlock&) =
-        delete;
-
-public:
-    /**
-     * Conceals future CollectionCatalog changes and stashes a pointer to the opCtx for the
-     * destructor to use.
-     */
-    ConcealCollectionCatalogChangesBlock(OperationContext* opCtx);
-
-    /**
-     * Reveals CollectionCatalog changes.
-     */
-    ~ConcealCollectionCatalogChangesBlock();
-
-private:
-    // Needed for the destructor to access the CollectionCatalog in order to call onOpenCatalog.
-    OperationContext* _opCtx;
-};
-
-/**
  * RAII type to set and restore the timestamp read source on the recovery unit.
  *
  * Snapshot is abandoned in constructor and destructor, so it can only be used before
@@ -230,7 +411,7 @@ private:
 class ReadSourceScope {
 public:
     ReadSourceScope(OperationContext* opCtx,
-                    RecoveryUnit::ReadSource readSource = RecoveryUnit::ReadSource::kUnset,
+                    RecoveryUnit::ReadSource readSource,
                     boost::optional<Timestamp> provided = boost::none);
     ~ReadSourceScope();
 
@@ -243,17 +424,11 @@ private:
 /**
  * RAII-style class to acquire proper locks using special oplog locking rules for oplog accesses.
  *
- * If storage engine supports document-level locking, only global lock is acquired:
+ * Only the global lock is acquired:
  * | OplogAccessMode | Global Lock |
  * +-----------------+-------------|
  * | kRead           | MODE_IS     |
  * | kWrite          | MODE_IX     |
- *
- * Otherwise, database and collection intent locks are also acquired:
- * | OplogAccessMode | Global Lock | 'local' DB Lock | 'oplog.rs' Collection Lock |
- * +-----------------+-------------+-----------------+----------------------------|
- * | kRead           | MODE_IS     | MODE_IS         | MODE_IS                    |
- * | kWrite/kLogOp   | MODE_IX     | MODE_IX         | MODE_IX                    |
  *
  * kLogOp is a special mode for replication operation logging and it behaves similar to kWrite. The
  * difference between kWrite and kLogOp is that kLogOp invariants that global IX lock is already
@@ -281,8 +456,8 @@ public:
     /**
      * Returns a pointer to the oplog collection or nullptr if the oplog collection didn't exist.
      */
-    Collection* getCollection() const {
-        return _oplog;
+    const CollectionPtr& getCollection() const {
+        return *_oplog;
     }
 
 private:
@@ -292,7 +467,7 @@ private:
     boost::optional<Lock::DBLock> _dbWriteLock;
     boost::optional<Lock::CollectionLock> _collWriteLock;
     repl::LocalOplogInfo* _oplogInfo;
-    Collection* _oplog;
+    const CollectionPtr* _oplog;
 };
 
 }  // namespace mongo

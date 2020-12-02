@@ -4,12 +4,13 @@
 //   assumes_write_concern_unchanged,
 //   requires_non_retryable_writes,
 //   uses_multiple_connections,
+//   uses_parallel_shell,
 // ]
 
 var coll = db.getCollection("jstests_geo_update_btree");
 coll.drop();
 
-coll.ensureIndex({loc: '2d'});
+coll.createIndex({loc: '2d'});
 
 var big = new Array(3000).toString();
 

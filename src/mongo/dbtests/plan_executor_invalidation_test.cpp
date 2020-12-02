@@ -38,10 +38,11 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/collection_scan.h"
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/query/internal_plans.h"
-#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_executor_factory.h"
 #include "mongo/db/service_context.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/unittest/unittest.h"
@@ -86,12 +87,12 @@ public:
         std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
         // Takes ownership of 'ws', 'scan', and 'cq'.
-        auto statusWithPlanExecutor = PlanExecutor::make(
-            std::move(cq),
-            std::move(ws),
-            std::move(scan),
-            CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(&_opCtx, nss),
-            PlanExecutor::YIELD_MANUAL);
+        auto statusWithPlanExecutor =
+            plan_executor_factory::make(std::move(cq),
+                                        std::move(ws),
+                                        std::move(scan),
+                                        &collection(),
+                                        PlanYieldPolicy::YieldPolicy::YIELD_MANUAL);
 
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         return std::move(statusWithPlanExecutor.getValue());
@@ -100,29 +101,32 @@ public:
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeIxscanPlan(BSONObj keyPattern,
                                                                         BSONObj startKey,
                                                                         BSONObj endKey) {
-        auto indexDescriptor =
-            collection()->getIndexCatalog()->findIndexByKeyPatternAndCollationSpec(
-                &_opCtx, keyPattern, {});
+        auto indexDescriptor = collection()->getIndexCatalog()->findIndexByKeyPatternAndOptions(
+            &_opCtx, keyPattern, _makeMinimalIndexSpec(keyPattern));
         ASSERT(indexDescriptor);
         return InternalPlanner::indexScan(&_opCtx,
-                                          collection(),
+                                          &collection(),
                                           indexDescriptor,
                                           startKey,
                                           endKey,
                                           BoundInclusion::kIncludeBothStartAndEndKeys,
-                                          PlanExecutor::YIELD_MANUAL);
+                                          PlanYieldPolicy::YieldPolicy::YIELD_MANUAL);
     }
 
     int N() {
         return 50;
     }
 
-    Collection* collection() {
-        return CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(&_opCtx, nss);
+    const CollectionPtr& collection() const {
+        _coll = CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss);
+        return _coll;
     }
 
-    void truncateCollection(Collection* collection) const {
+    void truncateCollection() const {
         WriteUnitOfWork wunit(&_opCtx);
+        auto collection =
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespaceForMetadataWrite(
+                &_opCtx, CollectionCatalog::LifetimeMode::kManagedInWriteUnitOfWork, nss);
         ASSERT_OK(collection->truncate(&_opCtx));
         wunit.commit();
     }
@@ -132,8 +136,16 @@ public:
     OperationContext& _opCtx = *_opCtxPtr;
     unique_ptr<dbtests::WriteContextForTests> _ctx;
     DBDirectClient _client;
+    mutable CollectionPtr _coll;
 
     boost::intrusive_ptr<ExpressionContext> _expCtx;
+
+private:
+    BSONObj _makeMinimalIndexSpec(BSONObj keyPattern) {
+        return BSON(IndexDescriptor::kKeyPatternFieldName
+                    << keyPattern << IndexDescriptor::kIndexVersionFieldName
+                    << IndexDescriptor::getDefaultIndexVersion());
+    }
 };
 
 TEST_F(PlanExecutorInvalidationTest, ExecutorToleratesDeletedDocumentsDuringYield) {
@@ -152,7 +164,7 @@ TEST_F(PlanExecutorInvalidationTest, ExecutorToleratesDeletedDocumentsDuringYiel
     _client.remove(nss.ns(), BSON("foo" << 10));
     _client.remove(nss.ns(), BSON("foo" << 11));
 
-    exec->restoreState();
+    exec->restoreState(&collection());
 
     // Make sure that the PlanExecutor moved forward over the deleted data.  We don't see foo==10 or
     // foo==11.
@@ -179,7 +191,7 @@ TEST_F(PlanExecutorInvalidationTest, PlanExecutorThrowsOnRestoreWhenCollectionIs
     // Drop a collection that's not ours.
     _client.dropCollection("unittests.someboguscollection");
 
-    exec->restoreState();
+    exec->restoreState(&collection());
 
     ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, nullptr));
     ASSERT_EQUALS(10, obj["foo"].numberInt());
@@ -188,7 +200,7 @@ TEST_F(PlanExecutorInvalidationTest, PlanExecutorThrowsOnRestoreWhenCollectionIs
 
     _client.dropCollection(nss.ns());
 
-    ASSERT_THROWS_CODE(exec->restoreState(), DBException, ErrorCodes::QueryPlanKilled);
+    ASSERT_THROWS_CODE(exec->restoreState(&collection()), DBException, ErrorCodes::QueryPlanKilled);
 }
 
 TEST_F(PlanExecutorInvalidationTest, CollScanExecutorDoesNotDieWhenAllIndicesDropped) {
@@ -205,7 +217,7 @@ TEST_F(PlanExecutorInvalidationTest, CollScanExecutorDoesNotDieWhenAllIndicesDro
 
     exec->saveState();
     _client.dropIndexes(nss.ns());
-    exec->restoreState();
+    exec->restoreState(&collection());
 
     // Read the rest of the collection.
     for (int i = 10; i < N(); ++i) {
@@ -228,7 +240,7 @@ TEST_F(PlanExecutorInvalidationTest, CollScanExecutorDoesNotDieWhenOneIndexDropp
 
     exec->saveState();
     _client.dropIndex(nss.ns(), BSON("foo" << 1));
-    exec->restoreState();
+    exec->restoreState(&collection());
 
     // Read the rest of the collection.
     for (int i = 10; i < N(); ++i) {
@@ -258,7 +270,7 @@ TEST_F(PlanExecutorInvalidationTest, IxscanExecutorDiesWhenAllIndexesDropped) {
     _client.dropIndexes(nss.ns());
 
     // Restoring the executor should throw.
-    ASSERT_THROWS_CODE(exec->restoreState(), DBException, ErrorCodes::QueryPlanKilled);
+    ASSERT_THROWS_CODE(exec->restoreState(&collection()), DBException, ErrorCodes::QueryPlanKilled);
 }
 
 TEST_F(PlanExecutorInvalidationTest, IxscanExecutorDiesWhenIndexBeingScannedIsDropped) {
@@ -279,7 +291,7 @@ TEST_F(PlanExecutorInvalidationTest, IxscanExecutorDiesWhenIndexBeingScannedIsDr
     _client.dropIndex(nss.ns(), keyPattern);
 
     // Restoring the executor should throw.
-    ASSERT_THROWS_CODE(exec->restoreState(), DBException, ErrorCodes::QueryPlanKilled);
+    ASSERT_THROWS_CODE(exec->restoreState(&collection()), DBException, ErrorCodes::QueryPlanKilled);
 }
 
 TEST_F(PlanExecutorInvalidationTest, IxscanExecutorSurvivesWhenUnrelatedIndexIsDropped) {
@@ -301,7 +313,7 @@ TEST_F(PlanExecutorInvalidationTest, IxscanExecutorSurvivesWhenUnrelatedIndexIsD
     // state.
     exec->saveState();
     _client.dropIndex(nss.ns(), keyPatternBar);
-    exec->restoreState();
+    exec->restoreState(&collection());
 
     // Scan the rest of the index.
     for (int i = 10; i < N(); ++i) {
@@ -327,7 +339,7 @@ TEST_F(PlanExecutorInvalidationTest, ExecutorThrowsOnRestoreWhenDatabaseIsDroppe
     _ctx.reset();
     _client.dropDatabase("somesillydb");
     _ctx.reset(new dbtests::WriteContextForTests(&_opCtx, nss.ns()));
-    exec->restoreState();
+    exec->restoreState(&collection());
 
     ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, nullptr));
     ASSERT_EQUALS(10, obj["foo"].numberInt());
@@ -338,7 +350,7 @@ TEST_F(PlanExecutorInvalidationTest, ExecutorThrowsOnRestoreWhenDatabaseIsDroppe
     _ctx.reset();
     _client.dropDatabase("unittests");
     _ctx.reset(new dbtests::WriteContextForTests(&_opCtx, nss.ns()));
-    ASSERT_THROWS_CODE(exec->restoreState(), DBException, ErrorCodes::QueryPlanKilled);
+    ASSERT_THROWS_CODE(exec->restoreState(&collection()), DBException, ErrorCodes::QueryPlanKilled);
 }
 
 // TODO SERVER-31695: Allow PlanExecutors to remain valid after collection rename.
@@ -361,7 +373,7 @@ TEST_F(PlanExecutorInvalidationTest, CollScanDiesOnCollectionRenameWithinDatabas
                                                            << "dropTarget" << true),
                                    info));
 
-    ASSERT_THROWS_CODE(exec->restoreState(), DBException, ErrorCodes::QueryPlanKilled);
+    ASSERT_THROWS_CODE(exec->restoreState(&collection()), DBException, ErrorCodes::QueryPlanKilled);
 }
 
 // TODO SERVER-31695: Allow PlanExecutors to remain valid after collection rename.
@@ -387,7 +399,7 @@ TEST_F(PlanExecutorInvalidationTest, IxscanDiesOnCollectionRenameWithinDatabase)
                                                            << "dropTarget" << true),
                                    info));
 
-    ASSERT_THROWS_CODE(exec->restoreState(), DBException, ErrorCodes::QueryPlanKilled);
+    ASSERT_THROWS_CODE(exec->restoreState(&collection()), DBException, ErrorCodes::QueryPlanKilled);
 }
 
 TEST_F(PlanExecutorInvalidationTest, IxscanDiesWhenTruncateCollectionDropsAllIndices) {
@@ -406,8 +418,8 @@ TEST_F(PlanExecutorInvalidationTest, IxscanDiesWhenTruncateCollectionDropsAllInd
     // Call truncate() on the Collection during yield, and verify that yield recovery throws the
     // expected error code.
     exec->saveState();
-    truncateCollection(collection());
-    ASSERT_THROWS_CODE(exec->restoreState(), DBException, ErrorCodes::QueryPlanKilled);
+    truncateCollection();
+    ASSERT_THROWS_CODE(exec->restoreState(&collection()), DBException, ErrorCodes::QueryPlanKilled);
 }
 
 TEST_F(PlanExecutorInvalidationTest, CollScanExecutorSurvivesCollectionTruncate) {
@@ -423,8 +435,8 @@ TEST_F(PlanExecutorInvalidationTest, CollScanExecutorSurvivesCollectionTruncate)
     // Call truncate() on the Collection during yield. The PlanExecutor should be restored
     // successfully.
     exec->saveState();
-    truncateCollection(collection());
-    exec->restoreState();
+    truncateCollection();
+    exec->restoreState(&collection());
 
     // Since all documents in the collection have been deleted, the PlanExecutor should issue EOF.
     ASSERT_EQUALS(PlanExecutor::IS_EOF, exec->getNext(&obj, nullptr));

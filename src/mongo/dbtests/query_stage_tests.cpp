@@ -43,7 +43,7 @@
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_executor_factory.h"
 #include "mongo/dbtests/dbtests.h"
 
 /**
@@ -89,11 +89,15 @@ public:
         unique_ptr<MatchExpression> filterExpr = std::move(statusWithMatcher.getValue());
 
         unique_ptr<WorkingSet> ws = std::make_unique<WorkingSet>();
-        unique_ptr<IndexScan> ix =
-            std::make_unique<IndexScan>(_expCtx.get(), params, ws.get(), filterExpr.get());
+        unique_ptr<IndexScan> ix = std::make_unique<IndexScan>(
+            _expCtx.get(), ctx.getCollection(), params, ws.get(), filterExpr.get());
 
-        auto statusWithPlanExecutor = PlanExecutor::make(
-            _expCtx, std::move(ws), std::move(ix), ctx.getCollection(), PlanExecutor::NO_YIELD);
+        auto statusWithPlanExecutor =
+            plan_executor_factory::make(_expCtx,
+                                        std::move(ws),
+                                        std::move(ix),
+                                        &ctx.getCollection(),
+                                        PlanYieldPolicy::YieldPolicy::NO_YIELD);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         auto exec = std::move(statusWithPlanExecutor.getValue());
 
@@ -119,8 +123,7 @@ public:
     }
 
     const IndexDescriptor* getIndex(const BSONObj& obj) {
-        AutoGetCollectionForReadCommand ctx(&_opCtx, NamespaceString(ns()));
-        Collection* collection = ctx.getCollection();
+        AutoGetCollectionForReadCommand collection(&_opCtx, NamespaceString(ns()));
         std::vector<const IndexDescriptor*> indexes;
         collection->getIndexCatalog()->findIndexesByKeyPattern(&_opCtx, obj, false, &indexes);
         return indexes.empty() ? nullptr : indexes[0];

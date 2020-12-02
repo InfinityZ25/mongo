@@ -1,4 +1,7 @@
-// @tags: [requires_getmore, requires_fcv_44]
+// @tags: [
+//   requires_getmore,
+//   sbe_incompatible,
+// ]
 // Tests for $elemMatch projections and $ positional operator projection.
 (function() {
 "use strict";

@@ -293,6 +293,8 @@ class Distro(object):
                 return "xenial"
             elif build_os == 'ubuntu1804':
                 return "bionic"
+            elif build_os == 'ubuntu2004':
+                return "focal"
             else:
                 raise Exception("unsupported build_os: %s" % build_os)
         elif self.dname == 'debian':
@@ -330,7 +332,7 @@ class Distro(object):
         if re.search("(suse)", self.dname):
             return ["suse11", "suse12", "suse15"]
         elif re.search("(redhat|fedora|centos)", self.dname):
-            return ["rhel80", "rhel70", "rhel71", "rhel72", "rhel62", "rhel55", "rhel67"]
+            return ["rhel82", "rhel80", "rhel70", "rhel71", "rhel72", "rhel62", "rhel55", "rhel67"]
         elif self.dname in ['amazon', 'amazon2']:
             return [self.dname]
         elif self.dname == 'ubuntu':
@@ -339,6 +341,7 @@ class Distro(object):
                 "ubuntu1404",
                 "ubuntu1604",
                 "ubuntu1804",
+                "ubuntu2004",
             ]
         elif self.dname == 'debian':
             return ["debian81", "debian92", "debian10"]

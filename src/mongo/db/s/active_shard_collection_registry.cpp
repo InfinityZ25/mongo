@@ -40,8 +40,9 @@ namespace {
 
 const auto getRegistry = ServiceContext::declareDecoration<ActiveShardCollectionRegistry>();
 
-bool ActiveShardsvrShardCollectionEqualsNewRequest(const ShardsvrShardCollection& activeRequest,
-                                                   const ShardsvrShardCollection& newRequest) {
+bool ActiveShardsvrShardCollectionEqualsNewRequest(
+    const ShardsvrShardCollectionRequest& activeRequest,
+    const ShardsvrShardCollectionRequest& newRequest) {
     if (activeRequest.get_shardsvrShardCollection().get() !=
         newRequest.get_shardsvrShardCollection().get())
         return false;
@@ -90,7 +91,7 @@ ActiveShardCollectionRegistry& ActiveShardCollectionRegistry::get(OperationConte
 }
 
 StatusWith<ScopedShardCollection> ActiveShardCollectionRegistry::registerShardCollection(
-    const ShardsvrShardCollection& request) {
+    const ShardsvrShardCollectionRequest& request) {
     stdx::lock_guard<Latch> lk(_mutex);
     std::string nss = request.get_shardsvrShardCollection().get().ns();
 
@@ -126,11 +127,11 @@ void ActiveShardCollectionRegistry::_setUUIDOrError(std::string nss,
     auto iter = _activeShardCollectionMap.find(nss);
     invariant(iter != _activeShardCollectionMap.end());
     auto activeShardCollectionState = iter->second;
-    activeShardCollectionState->_uuidPromise.setFromStatusWith(swUUID);
+    activeShardCollectionState->_uuidPromise.setFrom(swUUID);
 }
 
 Status ActiveShardCollectionRegistry::ActiveShardCollectionState::constructErrorStatus(
-    const ShardsvrShardCollection& request) const {
+    const ShardsvrShardCollectionRequest& request) const {
     return {ErrorCodes::ConflictingOperationInProgress,
             str::stream() << "Unable to shard collection "
                           << request.get_shardsvrShardCollection().get().ns()

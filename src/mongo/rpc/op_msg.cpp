@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -310,7 +310,7 @@ Message OpMsgBuilder::finish() {
     const auto size = _buf.len();
     uassert(ErrorCodes::BSONObjectTooLarge,
             str::stream() << "BSON size limit hit while building Message. Size: " << size << " (0x"
-                          << integerToHex(size) << "); maxSize: " << BSONObjMaxInternalSize << "("
+                          << unsignedHex(size) << "); maxSize: " << BSONObjMaxInternalSize << "("
                           << (BSONObjMaxInternalSize / (1024 * 1024)) << "MB)",
             size <= BSONObjMaxInternalSize);
 

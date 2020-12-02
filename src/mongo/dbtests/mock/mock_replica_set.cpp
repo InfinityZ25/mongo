@@ -35,7 +35,6 @@
 #include "mongo/dbtests/mock/mock_conn_registry.h"
 #include "mongo/dbtests/mock/mock_dbclient_connection.h"
 #include "mongo/util/invariant.h"
-#include "mongo/util/map_util.h"
 
 #include <sstream>
 
@@ -81,7 +80,11 @@ MockReplicaSet::MockReplicaSet(const string& setName,
     membersBuilder.done();
 
     ReplSetConfig replConfig;
-    fassert(28566, replConfig.initialize(configBuilder.obj()));
+    try {
+        replConfig = ReplSetConfig::parse(configBuilder.obj());
+    } catch (const DBException&) {
+        fassertFailed(28566);
+    }
     fassert(28573, replConfig.validate());
     setConfig(replConfig);
 }
@@ -166,7 +169,8 @@ vector<string> MockReplicaSet::getSecondaries() const {
 }
 
 MockRemoteDBServer* MockReplicaSet::getNode(const string& hostAndPort) {
-    return mapFindWithDefault(_nodeMap, hostAndPort, static_cast<MockRemoteDBServer*>(nullptr));
+    auto iter = _nodeMap.find(hostAndPort);
+    return iter == _nodeMap.end() ? nullptr : iter->second;
 }
 
 repl::ReplSetConfig MockReplicaSet::getReplConfig() const {
@@ -258,7 +262,7 @@ void MockReplicaSet::mockIsMasterCmd() {
             }
 
             const ReplSetTagConfig tagConfig = _replConfig.getTagConfig();
-            if (member->hasTags(tagConfig)) {
+            if (member->hasTags()) {
                 BSONObjBuilder tagBuilder;
                 for (MemberConfig::TagIterator tag = member->tagsBegin(); tag != member->tagsEnd();
                      ++tag) {

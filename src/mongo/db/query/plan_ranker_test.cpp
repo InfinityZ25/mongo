@@ -32,7 +32,7 @@
  */
 
 #include "mongo/db/query/plan_ranker.h"
-
+#include "mongo/db/query/plan_ranker_util.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
 
@@ -70,8 +70,9 @@ TEST(PlanRankerTest, NoFetchBonus) {
     badPlan->children[0]->children.emplace_back(
         makeStats("IXSCAN", STAGE_IXSCAN, make_unique<IndexScanStats>()));
 
-    auto goodScore = PlanRanker::scoreTree(goodPlan.get());
-    auto badScore = PlanRanker::scoreTree(badPlan.get());
+    auto scorer = plan_ranker::makePlanScorer();
+    auto goodScore = scorer->calculateScore(goodPlan.get());
+    auto badScore = scorer->calculateScore(badPlan.get());
 
     ASSERT_GT(goodScore, badScore);
 }

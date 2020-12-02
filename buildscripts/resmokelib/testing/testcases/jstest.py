@@ -6,11 +6,13 @@ import os.path
 import sys
 import threading
 
-from . import interface
-from ... import config
-from ... import core
-from ... import utils
-from ...utils import registry
+from buildscripts.resmokelib import config
+from buildscripts.resmokelib import core
+from buildscripts.resmokelib import logging
+from buildscripts.resmokelib import utils
+from buildscripts.resmokelib import errors
+from buildscripts.resmokelib.testing.testcases import interface
+from buildscripts.resmokelib.utils import registry
 
 
 class _SingleJSTestCase(interface.ProcessTestCase):
@@ -100,7 +102,8 @@ class _SingleJSTestCase(interface.ProcessTestCase):
 
     def _make_process(self):
         return core.programs.mongo_shell_program(
-            self.logger, executable=self.shell_executable, filename=self.js_filename,
+            self.logger, job_num=self.fixture.job_num, test_id=self._id,
+            executable=self.shell_executable, filename=self.js_filename,
             connection_string=self.fixture.get_driver_connection_url(), **self.shell_options)
 
 
@@ -184,6 +187,7 @@ class JSTestCase(interface.ProcessTestCase):
             # If there was an exception, it will be logged in test_case's run_test function.
         finally:
             self.return_code = test_case.return_code
+            self._raise_if_unsafe_exit(self.return_code)
 
     def _run_multiple_copies(self):
         threads = []
@@ -191,7 +195,8 @@ class JSTestCase(interface.ProcessTestCase):
         try:
             # If there are multiple clients, make a new thread for each client.
             for thread_id in range(self.num_clients):
-                logger = self.logger.new_test_thread_logger(self.test_kind, str(thread_id))
+                logger = logging.loggers.new_test_thread_logger(self.logger, self.test_kind,
+                                                                str(thread_id))
                 test_case = self._create_test_case_for_thread(logger, thread_id)
                 test_cases.append(test_case)
 
@@ -206,12 +211,12 @@ class JSTestCase(interface.ProcessTestCase):
             for thread in threads:
                 thread.join()
 
-            # Go through each test's return code and store the first nonzero one if it exists.
+            # Go through each test's return codes, asserting safe exits and storing the last nonzero code.
             return_code = 0
             for test_case in test_cases:
                 if test_case.return_code != 0:
+                    self._raise_if_unsafe_exit(return_code)
                     return_code = test_case.return_code
-                    break
             self.return_code = return_code
 
             for (thread_id, thread) in enumerate(threads):
@@ -228,3 +233,13 @@ class JSTestCase(interface.ProcessTestCase):
             self._run_single_copy()
         else:
             self._run_multiple_copies()
+
+    def _raise_if_unsafe_exit(self, return_code):
+        """Determine if a return code represents and unsafe exit."""
+        # 252 and 253 may be returned in failed test executions.
+        # (i.e. -4 and -3 in mongo_main.cpp)
+        if self.return_code not in (252, 253, 0):
+            self.propagate_error = errors.UnsafeExitError(
+                f"Mongo shell exited with code {return_code} while running jstest {self.basename()}."
+                " Further test execution may be unsafe.")
+            raise self.propagate_error  # pylint: disable=raising-bad-type

@@ -88,8 +88,8 @@ BSONObj pipelineFromJsonArray(const std::string& jsonArray) {
 }
 
 class StubExplainInterface : public StubMongoProcessInterface {
-    BSONObj attachCursorSourceAndExplain(Pipeline* ownedPipeline,
-                                         ExplainOptions::Verbosity verbosity) override {
+    BSONObj preparePipelineAndExplain(Pipeline* ownedPipeline,
+                                      ExplainOptions::Verbosity verbosity) override {
         std::unique_ptr<Pipeline, PipelineDeleter> pipeline(
             ownedPipeline, PipelineDeleter(ownedPipeline->getContext()->opCtx));
         BSONArrayBuilder bab;
@@ -288,6 +288,254 @@ TEST(PipelineOptimizationTest, SortMatchProjSkipLimBecomesMatchTopKSortSkipProj)
         ",{$limit: 8}"
         ",{$skip : 3}"
         ",{$project : {_id: true, a: true}}"
+        "]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
+}
+
+TEST(PipelineOptimizationTest, IdenticalSortSortBecomesSort) {
+    std::string inputPipe =
+        "[{$sort: {a: 1}}"
+        ",{$sort: {a: 1}}"
+        "]";
+
+    std::string outputPipe =
+        "[{$sort: {sortKey: {a: 1}}}"
+        "]";
+
+    std::string serializedPipe =
+        "[{$sort: {a: 1}}"
+        "]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
+}
+
+TEST(PipelineOptimizationTest, IdenticalSortSortSortBecomesSort) {
+    std::string inputPipe =
+        "[{$sort: {a: 1}}"
+        ",{$sort: {a: 1}}"
+        ",{$sort: {a: 1}}"
+        "]";
+
+    std::string outputPipe =
+        "[{$sort: {sortKey: {a: 1}}}"
+        "]";
+
+    std::string serializedPipe =
+        "[{$sort: {a: 1}}"
+        "]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
+}
+
+TEST(PipelineOptimizationTest, NonIdenticalSortsOnlySortOnFinalKey) {
+    std::string inputPipe =
+        "[{$sort: {a: -1}}"
+        ",{$sort: {a: 1}}"
+        ",{$sort: {a: -1}}"
+        "]";
+
+    std::string outputPipe =
+        "[{$sort: {sortKey: {a: -1}}}"
+        "]";
+
+    std::string serializedPipe =
+        "[{$sort: {a: -1}}"
+        "]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
+}
+
+TEST(PipelineOptimizationTest, SortSortLimitBecomesFinalKeyTopKSort) {
+    std::string inputPipe =
+        "[{$sort: {a: -1}}"
+        ",{$sort: {a: 1}}"
+        ",{$limit: 5}"
+        "]";
+
+    std::string outputPipe =
+        "[{$sort: {sortKey: {a: 1}, limit: 5}}"
+        "]";
+
+    std::string serializedPipe =
+        "[{$sort: {a: 1}}"
+        ",{$limit: 5}"
+        "]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
+}
+
+TEST(PipelineOptimizationTest, SortSortSkipLimitBecomesTopKSortSkip) {
+    std::string inputPipe =
+        "[{$sort: {b: 1}}"
+        ",{$sort: {a: 1}}"
+        ",{$skip : 3}"
+        ",{$limit: 5}"
+        "]";
+
+    std::string outputPipe =
+        "[{$sort: {sortKey: {a: 1}, limit: 8}}"
+        ",{$skip: 3}"
+        "]";
+
+    std::string serializedPipe =
+        "[{$sort: {a: 1}}"
+        ",{$limit: 8}"
+        ",{$skip : 3}"
+        "]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
+}
+
+TEST(PipelineOptimizationTest, SortLimitSortLimitBecomesTopKSort) {
+    std::string inputPipe =
+        "[{$sort: {a: 1}}"
+        ",{$limit: 12}"
+        ",{$sort: {a: 1}}"
+        ",{$limit: 20}"
+        "]";
+
+    std::string outputPipe =
+        "[{$sort: {sortKey: {a: 1}, limit: 12}}"
+        "]";
+
+    std::string serializedPipe =
+        "[{$sort: {a: 1}}"
+        ",{$limit: 12}"
+        "]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
+}
+
+TEST(PipelineOptimizationTest, SortLimitSortRetainsLimit) {
+    std::string inputPipe =
+        "[{$sort: {a: 1}}"
+        ",{$limit: 12}"
+        ",{$sort: {a: 1}}"
+        "]";
+
+    std::string outputPipe =
+        "[{$sort: {sortKey: {a: 1}, limit: 12}}"
+        "]";
+
+    std::string serializedPipe =
+        "[{$sort: {a: 1}}"
+        ",{$limit: 12}"
+        "]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
+}
+
+TEST(PipelineOptimizationTest, SortLimitSortWithDifferentSortPatterns) {
+    std::string inputPipe =
+        "[{$sort: {a: 1}}"
+        ",{$limit: 12}"
+        ",{$sort: {b: 1}}"
+        "]";
+
+    std::string outputPipe =
+        "[{$sort: {sortKey: {a: 1}, limit: 12}}"
+        ",{$sort: {sortKey: {b: 1}}}"
+        "]";
+
+    std::string serializedPipe = inputPipe;
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
+}
+TEST(PipelineOptimizationTest, SortSortLimitRetainsLimit) {
+    std::string inputPipe =
+        "[{$sort: {a: 1}}"
+        ",{$sort: {a: 1}}"
+        ",{$limit: 20}"
+        "]";
+
+    std::string outputPipe =
+        "[{$sort: {sortKey: {a: 1}, limit: 20}}"
+        "]";
+
+    std::string serializedPipe =
+        "[{$sort: {a: 1}}"
+        ",{$limit: 20}"
+        "]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
+}
+
+TEST(PipelineOptimizationTest, SortSortSortMatchProjSkipLimBecomesMatchTopKSortSkipProj) {
+    std::string inputPipe =
+        "[{$sort: {a: 1}}"
+        ",{$sort: {a: 1}}"
+        ",{$sort: {a: 1}}"
+        ",{$match: {a: 1}}"
+        ",{$project : {a: 1}}"
+        ",{$skip : 3}"
+        ",{$limit: 5}"
+        "]";
+
+    std::string outputPipe =
+        "[{$match: {a: {$eq: 1}}}"
+        ",{$sort: {sortKey: {a: 1}, limit: 8}}"
+        ",{$skip: 3}"
+        ",{$project: {_id: true, a: true}}"
+        "]";
+
+    std::string serializedPipe =
+        "[{$match: {a: 1}}"
+        ",{$sort: {a: 1}}"
+        ",{$limit: 8}"
+        ",{$skip : 3}"
+        ",{$project : {_id: true, a: true}}"
+        "]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
+}
+
+TEST(PipelineOptimizationTest, NonIdenticalSortsBecomeFinalKeyTopKSort) {
+    std::string inputPipe =
+        "[{$sort: {a: -1}}"
+        ",{$sort: {b: -1}}"
+        ",{$sort: {b: 1}}"
+        ",{$sort: {a: 1}}"
+        ",{$limit: 7}"
+        ",{$project : {a: 1}}"
+        ",{$limit: 5}"
+        "]";
+
+    std::string outputPipe =
+        "[{$sort: {sortKey: {a: 1}, limit: 5}}"
+        ",{$project: {_id: true, a: true}}"
+        "]";
+
+    std::string serializedPipe =
+        "[{$sort: {a: 1}}"
+        ",{$limit: 5}"
+        ",{$project : {_id: true, a: true}}"
+        "]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
+}
+
+TEST(PipelineOptimizationTest, SubsequentSortsMergeAndBecomeTopKSortWithFinalKeyAndLowestLimit) {
+    std::string inputPipe =
+        "[{$sort: {a: 1}}"
+        ",{$sort: {a: -1}}"
+        ",{$limit: 8}"
+        ",{$limit: 7}"
+        ",{$project : {a: 1}}"
+        ",{$unwind: {path: '$a'}}"
+        "]";
+
+    std::string outputPipe =
+        "[{$sort: {sortKey: {a: -1}, limit: 7}}"
+        ",{$project: {_id: true, a: true}}"
+        ",{$unwind: {path: '$a'}}"
+        "]";
+
+    std::string serializedPipe =
+        "[{$sort: {a: -1}}"
+        ",{$limit: 7}"
+        ",{$project : {_id: true, a: true}}"
+        ",{$unwind: {path: '$a'}}"
         "]";
 
     assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
@@ -500,6 +748,24 @@ TEST(PipelineOptimizationTest, LookupShouldAbsorbUnwindMatch) {
         "'z'}}, "
         "{$unwind: {path: '$asField'}}, "
         "{$match: {'asField.subfield': {$eq: 1}}}]";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
+}
+
+TEST(PipelineOptimizationTest, LookupShouldAbsorbUnwindAndTypeMatch) {
+    string inputPipe =
+        "[{$lookup: {from: 'lookupColl', as: 'asField', localField: 'y', foreignField: "
+        "'z'}}, "
+        "{$unwind: '$asField'}, "
+        "{$match: {'asField.subfield': {$type: [2]}}}]";
+    string outputPipe =
+        "[{$lookup: {from: 'lookupColl', as: 'asField', localField: 'y', foreignField: 'z', "
+        "            unwinding: {preserveNullAndEmptyArrays: false}, "
+        "            matching: {subfield: {$type: [2]}}}}]";
+    string serializedPipe =
+        "[{$lookup: {from: 'lookupColl', as: 'asField', localField: 'y', foreignField: "
+        "'z'}}, "
+        "{$unwind: {path: '$asField'}}, "
+        "{$match: {'asField.subfield': {$type: [2]}}}]";
     assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
@@ -2089,6 +2355,11 @@ public:
     virtual string shardPipeJson() = 0;
     virtual string mergePipeJson() = 0;
 
+    // Allows tests to override the default resolvedNamespaces.
+    virtual NamespaceString getLookupCollNs() {
+        return NamespaceString("a", "lookupColl");
+    }
+
     BSONObj pipelineFromJsonArray(const string& array) {
         return fromjson("{pipeline: " + array + "}");
     }
@@ -2110,7 +2381,7 @@ public:
 
         // For $graphLookup and $lookup, we have to populate the resolvedNamespaces so that the
         // operations will be able to have a resolved view definition.
-        NamespaceString lookupCollNs("a", "lookupColl");
+        auto lookupCollNs = getLookupCollNs();
         ctx->setResolvedNamespace(lookupCollNs, {lookupCollNs, std::vector<BSONObj>{}});
 
         // Test that we can both split the pipeline and reassemble it into its original form.
@@ -2157,6 +2428,47 @@ class Empty : public Base {
         return "[]";
     }
 };
+
+// Since each shard has an identical copy of config.cache.chunks.* namespaces, $lookup from
+// config.cache.chunks.* should run on each shard in parallel.
+namespace lookupFromShardsInParallel {
+class LookupWithDBAndColl : public Base {
+    string inputPipeJson() {
+        return "[{$lookup: {from: {db: 'config', coll: 'cache.chunks.test.foo'}, as: 'results', "
+               "localField: 'x', foreignField: '_id'}}]";
+    }
+    string shardPipeJson() {
+        return inputPipeJson();
+    }
+
+    string mergePipeJson() {
+        return "[]";
+    }
+
+    NamespaceString getLookupCollNs() override {
+        return {"config", "cache.chunks.test.foo"};
+    }
+};
+
+class LookupWithLetWithDBAndColl : public Base {
+    string inputPipeJson() {
+        return "[{$lookup: {from: {db: 'config', coll: 'cache.chunks.test.foo'}, as: 'results', "
+               "let: {x_field: '$x'}, pipeline: []}}]";
+    }
+    string shardPipeJson() {
+        return inputPipeJson();
+    }
+
+    string mergePipeJson() {
+        return "[]";
+    }
+
+    NamespaceString getLookupCollNs() override {
+        return {"config", "cache.chunks.test.foo"};
+    }
+};
+
+}  // namespace lookupFromShardsInParallel
 
 namespace moveFinalUnwindFromShardsToMerger {
 
@@ -2622,6 +2934,7 @@ class MergeWithShardedCollection : public ShardMergerBase {
         };
 
         auto expCtx = ShardMergerBase::createExpressionContext(request);
+        expCtx->inMongos = true;
         expCtx->mongoProcessInterface = std::make_shared<ProcessInterface>();
         return expCtx;
     }
@@ -3032,7 +3345,6 @@ TEST_F(PipelineDependenciesTest, EmptyPipelineShouldRequireWholeDocument) {
     depsTracker =
         pipeline->getDependencies(DepsTracker::kAllMetadata & ~DepsTracker::kOnlyTextScore);
     ASSERT_TRUE(depsTracker.needWholeDocument);
-    ASSERT_TRUE(depsTracker.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 //
@@ -3203,19 +3515,31 @@ TEST_F(PipelineDependenciesTest, ShouldThrowIfTextScoreIsNeededButNotPresent) {
     ASSERT_THROWS(pipeline->getDependencies(DepsTracker::kAllMetadata), AssertionException);
 }
 
-TEST_F(PipelineDependenciesTest, ShouldRequireTextScoreIfAvailableAndNoStageReturnsExhaustiveMeta) {
+TEST_F(PipelineDependenciesTest,
+       ShouldRequireTextScoreIfAvailableAndNoStageReturnsExhaustiveMetaAndNeedsMerge) {
     auto ctx = getExpCtx();
+
+    // When needsMerge is true, the consumer might implicitly use textScore, if it's available.
+    ctx->needsMerge = true;
+
     auto pipeline = Pipeline::create({}, ctx);
+    auto deps = pipeline->getDependencies(DepsTracker::kAllMetadata & ~DepsTracker::kOnlyTextScore);
+    ASSERT_TRUE(deps.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 
-    auto depsTracker =
-        pipeline->getDependencies(DepsTracker::kAllMetadata & ~DepsTracker::kOnlyTextScore);
-    ASSERT_TRUE(depsTracker.getNeedsMetadata(DocumentMetadataFields::kTextScore));
+    pipeline = Pipeline::create({DocumentSourceNeedsASeeNext::create(ctx)}, ctx);
+    deps = pipeline->getDependencies(DepsTracker::kAllMetadata & ~DepsTracker::kOnlyTextScore);
+    ASSERT_TRUE(deps.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 
-    auto needsASeeNext = DocumentSourceNeedsASeeNext::create(ctx);
-    pipeline = Pipeline::create({needsASeeNext}, ctx);
-    depsTracker =
-        pipeline->getDependencies(DepsTracker::kAllMetadata & ~DepsTracker::kOnlyTextScore);
-    ASSERT_TRUE(depsTracker.getNeedsMetadata(DocumentMetadataFields::kTextScore));
+    // When needsMerge is false, if no stage explicitly uses textScore then we know it isn't needed.
+    ctx->needsMerge = false;
+
+    pipeline = Pipeline::create({}, ctx);
+    deps = pipeline->getDependencies(DepsTracker::kAllMetadata & ~DepsTracker::kOnlyTextScore);
+    ASSERT_FALSE(deps.getNeedsMetadata(DocumentMetadataFields::kTextScore));
+
+    pipeline = Pipeline::create({DocumentSourceNeedsASeeNext::create(ctx)}, ctx);
+    deps = pipeline->getDependencies(DepsTracker::kAllMetadata & ~DepsTracker::kOnlyTextScore);
+    ASSERT_FALSE(deps.getNeedsMetadata(DocumentMetadataFields::kTextScore));
 }
 
 TEST_F(PipelineDependenciesTest, ShouldNotRequireTextScoreIfAvailableButDefinitelyNotNeeded) {
@@ -3786,6 +4110,8 @@ public:
         add<Optimizations::Sharded::limitFieldsSentFromShardsToMerger::
                 ShardedMatchSortProjLimBecomesMatchTopKSortProj>();
         add<Optimizations::Sharded::limitFieldsSentFromShardsToMerger::ShardAlreadyExhaustive>();
+        add<Optimizations::Sharded::lookupFromShardsInParallel::LookupWithDBAndColl>();
+        add<Optimizations::Sharded::lookupFromShardsInParallel::LookupWithLetWithDBAndColl>();
         add<Optimizations::Sharded::needsPrimaryShardMerger::Out>();
         add<Optimizations::Sharded::needsPrimaryShardMerger::MergeWithUnshardedCollection>();
         add<Optimizations::Sharded::needsPrimaryShardMerger::MergeWithShardedCollection>();

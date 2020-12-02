@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -82,7 +82,7 @@ public:
                 const int debugLevel =
                     serverGlobalParams.clusterRole == ClusterRole::ConfigServer ? 0 : 2;
                 LOGV2_DEBUG(21975,
-                            logSeverityV1toV2(debugLevel).toInt(),
+                            debugLevel,
                             "Command on database {db} timed out waiting for read concern to be "
                             "satisfied. Command: {command}. Info: {error}",
                             "Command timed out waiting for read concern to be satisfied",
@@ -182,37 +182,6 @@ public:
         CurOp::get(opCtx)->debug().errInfo = getStatusFromCommandResult(replyObj);
     }
 
-    void handleException(const DBException& e, OperationContext* opCtx) const override {
-        // If we got a stale config, wait in case the operation is stuck in a critical section
-        if (auto sce = e.extraInfo<StaleConfigInfo>()) {
-            // A config server acting as a router may return a StaleConfig exception, but a config
-            // server won't contain data for a sharded collection, so skip handling the exception.
-            if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-                return;
-            }
-
-            if (sce->getCriticalSectionSignal()) {
-                // Set migration critical section on operation sharding state: operation will wait
-                // for the migration to finish before returning.
-                auto& oss = OperationShardingState::get(opCtx);
-                oss.setMigrationCriticalSectionSignal(sce->getCriticalSectionSignal());
-            }
-
-            if (!opCtx->getClient()->isInDirectClient()) {
-                // We already have the StaleConfig exception, so just swallow any errors due to
-                // refresh
-                onShardVersionMismatchNoExcept(opCtx, sce->getNss(), sce->getVersionReceived())
-                    .ignore();
-            }
-        } else if (auto sce = e.extraInfo<StaleDbRoutingVersion>()) {
-            if (!opCtx->getClient()->isInDirectClient()) {
-                onDbVersionMismatchNoExcept(
-                    opCtx, sce->getDb(), sce->getVersionReceived(), sce->getVersionWanted())
-                    .ignore();
-            }
-        }
-    }
-
     // Called from the error contexts where request may not be available.
     void appendReplyMetadataOnError(OperationContext* opCtx,
                                     BSONObjBuilder* metadataBob) const override {
@@ -236,17 +205,15 @@ public:
         if (isReplSet) {
             // Attach our own last opTime.
             repl::OpTime lastOpTimeFromClient =
-                repl::ReplClientInfo::forClient(opCtx->getClient()).getMaxKnownOpTime();
+                repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
             replCoord->prepareReplMetadata(request.body, lastOpTimeFromClient, metadataBob);
-            // For commands from mongos, append some info to help getLastError(w) work.
-            // TODO: refactor out of here as part of SERVER-18236
+
             if (isShardingAware || isConfig) {
+                // For commands from mongos, append some info to help getLastError(w) work.
                 rpc::ShardingMetadata(lastOpTimeFromClient, replCoord->getElectionId())
                     .writeToMetadata(metadataBob)
                     .transitional_ignore();
-            }
 
-            if (isShardingAware || isConfig) {
                 auto lastCommittedOpTime = replCoord->getLastCommittedOpTime();
                 metadataBob->append(kLastCommittedOpTimeFieldName,
                                     lastCommittedOpTime.getTimestamp());
@@ -260,6 +227,18 @@ public:
         }
     }
 
+    bool refreshDatabase(OperationContext* opCtx, const StaleDbRoutingVersion& se) const
+        noexcept override {
+        return onDbVersionMismatchNoExcept(
+                   opCtx, se.getDb(), se.getVersionReceived(), se.getVersionWanted())
+            .isOK();
+    }
+
+    bool refreshCollection(OperationContext* opCtx, const StaleConfigInfo& se) const
+        noexcept override {
+        return onShardVersionMismatchNoExcept(opCtx, se.getNss(), se.getVersionReceived()).isOK();
+    }
+
     void advanceConfigOpTimeFromRequestMetadata(OperationContext* opCtx) const override {
         // Handle config optime information that may have been sent along with the command.
         rpc::advanceConfigOpTimeFromRequestMetadata(opCtx);
@@ -271,8 +250,9 @@ public:
     }
 };
 
-DbResponse ServiceEntryPointMongod::handleRequest(OperationContext* opCtx, const Message& m) {
-    return ServiceEntryPointCommon::handleRequest(opCtx, m, Hooks{});
+Future<DbResponse> ServiceEntryPointMongod::handleRequest(OperationContext* opCtx,
+                                                          const Message& m) noexcept {
+    return ServiceEntryPointCommon::handleRequest(opCtx, m, std::make_unique<Hooks>());
 }
 
 }  // namespace mongo

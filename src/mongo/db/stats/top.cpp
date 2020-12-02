@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -192,7 +192,7 @@ void Top::appendLatencyStats(const NamespaceString& nss,
     auto hashedNs = UsageMap::hasher().hashed_key(nss.ns());
     stdx::lock_guard<SimpleMutex> lk(_lock);
     BSONObjBuilder latencyStatsBuilder;
-    _usage[hashedNs].opLatencyHistogram.append(includeHistograms, &latencyStatsBuilder);
+    _usage[hashedNs].opLatencyHistogram.append(includeHistograms, false, &latencyStatsBuilder);
     builder->append("ns", nss.ns());
     builder->append("latencyStats", latencyStatsBuilder.obj());
 }
@@ -200,13 +200,18 @@ void Top::appendLatencyStats(const NamespaceString& nss,
 void Top::incrementGlobalLatencyStats(OperationContext* opCtx,
                                       uint64_t latency,
                                       Command::ReadWriteType readWriteType) {
+    if (!opCtx->shouldIncrementLatencyStats())
+        return;
+
     stdx::lock_guard<SimpleMutex> guard(_lock);
     _incrementHistogram(opCtx, latency, &_globalHistogramStats, readWriteType);
 }
 
-void Top::appendGlobalLatencyStats(bool includeHistograms, BSONObjBuilder* builder) {
+void Top::appendGlobalLatencyStats(bool includeHistograms,
+                                   bool slowMSBucketsOnly,
+                                   BSONObjBuilder* builder) {
     stdx::lock_guard<SimpleMutex> guard(_lock);
-    _globalHistogramStats.append(includeHistograms, builder);
+    _globalHistogramStats.append(includeHistograms, slowMSBucketsOnly, builder);
 }
 
 void Top::incrementGlobalTransactionLatencyStats(uint64_t latency) {

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -44,6 +44,10 @@ namespace {
 class ClusterPipelineCommand final : public Command {
 public:
     ClusterPipelineCommand() : Command("aggregate") {}
+
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
 
     /**
      * It's not known until after parsing whether or not an aggregation command is an explain
@@ -74,7 +78,7 @@ public:
         auto privileges = uassertStatusOK(
             AuthorizationSession::get(opCtx->getClient())
                 ->getPrivilegesForAggregate(
-                    aggregationRequest.getNamespaceString(), opMsgRequest.body, true));
+                    aggregationRequest.getNamespaceString(), aggregationRequest, true));
 
         return std::make_unique<Invocation>(
             this, opMsgRequest, std::move(aggregationRequest), std::move(privileges));

@@ -86,6 +86,7 @@ public:
             getGlobalServiceContext(),
             std::unique_ptr<repl::ReplicationCoordinator>(new repl::ReplicationCoordinatorMock(
                 getGlobalServiceContext(), repl::ReplSettings())));
+        _engine->notifyStartupComplete();
     }
 
     PrefixedWiredTigerHarnessHelper(StringData extraStrings) : _dbpath("wt_test") {}
@@ -183,10 +184,6 @@ public:
     virtual std::unique_ptr<RecoveryUnit> newRecoveryUnit() final {
         return std::unique_ptr<WiredTigerRecoveryUnit>(
             checked_cast<WiredTigerRecoveryUnit*>(_engine->newRecoveryUnit()));
-    }
-
-    virtual bool supportsDocLocking() final {
-        return true;
     }
 
     virtual WT_CONNECTION* conn() const {

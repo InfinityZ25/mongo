@@ -38,7 +38,7 @@ namespace mongo {
 REGISTER_ACCUMULATOR(_internalJsReduce, AccumulatorInternalJsReduce::parseInternalJsReduce);
 
 AccumulationExpression AccumulatorInternalJsReduce::parseInternalJsReduce(
-    boost::intrusive_ptr<ExpressionContext> expCtx, BSONElement elem, VariablesParseState vps) {
+    ExpressionContext* const expCtx, BSONElement elem, VariablesParseState vps) {
     uassert(31326,
             str::stream() << kAccumulatorName << " requires a document argument, but found "
                           << elem.type(),
@@ -173,7 +173,7 @@ Value AccumulatorInternalJsReduce::getValue(bool toBeMerged) {
 }
 
 boost::intrusive_ptr<AccumulatorState> AccumulatorInternalJsReduce::create(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx, StringData funcSource) {
+    ExpressionContext* const expCtx, StringData funcSource) {
 
     return make_intrusive<AccumulatorInternalJsReduce>(expCtx, funcSource);
 }
@@ -194,7 +194,7 @@ Document AccumulatorInternalJsReduce::serialize(boost::intrusive_ptr<Expression>
 REGISTER_ACCUMULATOR(accumulator, AccumulatorJs::parse);
 
 boost::intrusive_ptr<AccumulatorState> AccumulatorJs::create(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    ExpressionContext* const expCtx,
     std::string init,
     std::string accumulate,
     std::string merge,
@@ -206,7 +206,7 @@ boost::intrusive_ptr<AccumulatorState> AccumulatorJs::create(
 namespace {
 // Parses a constant expression of type String or Code.
 std::string parseFunction(StringData fieldName,
-                          boost::intrusive_ptr<ExpressionContext> expCtx,
+                          ExpressionContext* const expCtx,
                           BSONElement elem,
                           VariablesParseState vps) {
     boost::intrusive_ptr<Expression> expr = Expression::parseOperand(expCtx, elem, vps);
@@ -240,7 +240,7 @@ Document AccumulatorJs::serialize(boost::intrusive_ptr<Expression> initializer,
     return DOC(getOpName() << args.freeze());
 }
 
-AccumulationExpression AccumulatorJs::parse(boost::intrusive_ptr<ExpressionContext> expCtx,
+AccumulationExpression AccumulatorJs::parse(ExpressionContext* const expCtx,
                                             BSONElement elem,
                                             VariablesParseState vps) {
     /*
@@ -324,7 +324,7 @@ Value AccumulatorJs::getValue(bool toBeMerged) {
     invariant(_state);
 
     // Ensure we've actually called accumulate/merge for every input document.
-    reducePendingCalls();
+    reduceMemoryConsumptionIfAble();
     invariant(_pendingCalls.empty());
 
     // If toBeMerged then we return the current state, to be fed back in to accumulate / merge /
@@ -336,7 +336,7 @@ Value AccumulatorJs::getValue(bool toBeMerged) {
     // Get the final value given the current accumulator state.
 
     if (_finalize) {
-        auto& expCtx = getExpressionContext();
+        auto expCtx = getExpressionContext();
         auto jsExec = expCtx->getJsExecWithScope();
         auto func = makeJsFunc(expCtx, *_finalize);
 
@@ -361,7 +361,7 @@ void AccumulatorJs::startNewGroup(Value const& input) {
     // constructor, and we clear it at the end of each group (in .reset()).
     invariant(!_state);
 
-    auto& expCtx = getExpressionContext();
+    auto expCtx = getExpressionContext();
     auto jsExec = expCtx->getJsExecWithScope();
     auto func = makeJsFunc(expCtx, _init);
 
@@ -412,15 +412,15 @@ void AccumulatorJs::processInternal(const Value& input, bool merging) {
                            sizeof(std::pair<Value, bool>));
 }
 
-void AccumulatorJs::reducePendingCalls() {
+void AccumulatorJs::reduceMemoryConsumptionIfAble() {
     // _state should be nonempty because we populate it in startNewGroup.
     invariant(_state);
-    // $group and $bucketAuto never create empty groups. The only time an accumulator is asked to
-    // accumulate an empty set is in ExpressionFromArray, but $accumulator is never used that way
-    // ($accumulator is not registered as an expression the way $sum and $avg and others are).
-    invariant(!_pendingCalls.empty());
 
-    auto& expCtx = getExpressionContext();
+    if (_pendingCalls.empty()) {
+        return;
+    }
+
+    auto expCtx = getExpressionContext();
     auto jsExec = expCtx->getJsExecWithScope();
 
     // Expose user functions.

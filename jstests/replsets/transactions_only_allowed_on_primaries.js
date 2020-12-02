@@ -27,19 +27,14 @@ replTest.initiate(config);
 const primary = replTest.getPrimary();
 const secondary = replTest.getSecondary();
 
-// Set slaveOk=true so that normal read commands would be allowed on the secondary.
-secondary.setSlaveOk(true);
+// Set secondaryOk=true so that normal read commands would be allowed on the secondary.
+secondary.setSecondaryOk();
 
 // Create a test collection that we can run commands against.
 const primaryDB = primary.getDB(dbName);
 assert.commandWorked(primary.getDB(dbName).createCollection(collName));
-assert.commandWorked(primaryDB.runCommand({
-    createIndexes: collName,
-    indexes: [
-        {name: "geo_2d", key: {geo: "2d"}},
-        {key: {haystack: "geoHaystack", a: 1}, name: "haystack_geo", bucketSize: 1}
-    ]
-}));
+assert.commandWorked(
+    primaryDB.runCommand({createIndexes: collName, indexes: [{name: "geo_2d", key: {geo: "2d"}}]}));
 replTest.awaitLastOpCommitted();
 
 /**
@@ -61,7 +56,8 @@ function testCommands(session, commands, expectedErrorCode, readPref) {
 
         // Call abort for good measure, even though the transaction should have already been
         // aborted on the server.
-        assert.commandFailedWithCode(session.abortTransaction_forTesting(), ErrorCodes.NotMaster);
+        assert.commandFailedWithCode(session.abortTransaction_forTesting(),
+                                     ErrorCodes.NotWritablePrimary);
     }
 }
 
@@ -80,22 +76,21 @@ let readCommands = [
     {find: collName},
     {aggregate: collName, pipeline: [{$project: {_id: 1}}], cursor: {}},
     {distinct: collName, key: "_id"},
-    {geoSearch: collName, near: [0, 0]}
 ];
 
 jsTestLog("Testing read commands.");
 // Make sure read commands can not start transactions with any supported read preference.
-testCommands(secondarySession, readCommands, ErrorCodes.NotMaster, "secondary");
-testCommands(secondarySession, readCommands, ErrorCodes.NotMaster, "secondaryPreferred");
-testCommands(secondarySession, readCommands, ErrorCodes.NotMaster, "primaryPreferred");
-testCommands(secondarySession, readCommands, ErrorCodes.NotMaster, null);
+testCommands(secondarySession, readCommands, ErrorCodes.NotWritablePrimary, "secondary");
+testCommands(secondarySession, readCommands, ErrorCodes.NotWritablePrimary, "secondaryPreferred");
+testCommands(secondarySession, readCommands, ErrorCodes.NotWritablePrimary, "primaryPreferred");
+testCommands(secondarySession, readCommands, ErrorCodes.NotWritablePrimary, null);
 
 // Test one write command. Normal write commands should already be
 // disallowed on secondaries so we don't test them exhaustively here.
 let writeCommands = [{insert: collName, documents: [{_id: 0}]}];
 
 jsTestLog("Testing write commands.");
-testCommands(secondarySession, writeCommands, ErrorCodes.NotMaster, "secondary");
+testCommands(secondarySession, writeCommands, ErrorCodes.NotWritablePrimary, "secondary");
 
 secondarySession.endSession();
 

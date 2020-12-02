@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
 
 #include "mongo/platform/basic.h"
 
@@ -55,6 +55,8 @@
 #include "mongo/db/mongod_options.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/net/ssl_peer_info.h"
 #include "mongo/util/net/ssl_types.h"
 #include "mongo/util/str.h"
 
@@ -70,7 +72,7 @@ MONGO_INITIALIZER_GENERAL(SetupInternalSecurityUser,
     ActionSet allActions;
     allActions.addAllActions();
     PrivilegeVector privileges;
-    RoleGraph::generateUniversalPrivileges(&privileges);
+    auth::generateUniversalPrivileges(&privileges);
     user->addPrivileges(privileges);
 
     if (mongodGlobalParams.whitelistedClusterNetwork) {
@@ -229,62 +231,26 @@ bool loggedCommandOperatesOnAuthzData(const NamespaceString& nss, const BSONObj&
     }
 }
 
-bool appliesToAuthzData(const char* op, const NamespaceString& nss, const BSONObj& o) {
-    switch (*op) {
+bool appliesToAuthzData(StringData op, const NamespaceString& nss, const BSONObj& o) {
+    if (op.empty()) {
+        return true;
+    }
+
+    switch (op[0]) {
         case 'i':
         case 'u':
         case 'd':
-            if (op[1] != '\0')
+            if (op.size() != 1) {
                 return false;  // "db" op type
+            }
             return isAuthzNamespace(nss);
         case 'c':
             return loggedCommandOperatesOnAuthzData(nss, o);
-            break;
         case 'n':
             return false;
         default:
             return true;
     }
-}
-
-/**
- * Parses privDoc and fully initializes the user object (credentials, roles, and privileges) with
- * the information extracted from the privilege document.
- */
-Status initializeUserFromPrivilegeDocument(User* user, const BSONObj& privDoc) {
-    V2UserDocumentParser parser;
-    std::string userName = parser.extractUserNameFromUserDocument(privDoc);
-    if (userName != user->getName().getUser()) {
-        return Status(ErrorCodes::BadValue,
-                      str::stream() << "User name from privilege document \"" << userName
-                                    << "\" doesn't match name of provided User \""
-                                    << user->getName().getUser() << "\"");
-    }
-
-    user->setID(parser.extractUserIDFromUserDocument(privDoc));
-
-    Status status = parser.initializeUserCredentialsFromUserDocument(user, privDoc);
-    if (!status.isOK()) {
-        return status;
-    }
-    status = parser.initializeUserRolesFromUserDocument(privDoc, user);
-    if (!status.isOK()) {
-        return status;
-    }
-    status = parser.initializeUserIndirectRolesFromUserDocument(privDoc, user);
-    if (!status.isOK()) {
-        return status;
-    }
-    status = parser.initializeUserPrivilegesFromUserDocument(privDoc, user);
-    if (!status.isOK()) {
-        return status;
-    }
-    status = parser.initializeAuthenticationRestrictionsFromUserDocument(privDoc, user);
-    if (!status.isOK()) {
-        return status;
-    }
-
-    return Status::OK();
 }
 
 /**
@@ -415,20 +381,31 @@ Status AuthorizationManagerImpl::getUserDescription(OperationContext* opCtx,
     return _externalState->getUserDescription(opCtx, UserRequest(userName, boost::none), result);
 }
 
-Status AuthorizationManagerImpl::getRoleDescription(OperationContext* opCtx,
-                                                    const RoleName& roleName,
-                                                    PrivilegeFormat privileges,
-                                                    AuthenticationRestrictionsFormat restrictions,
-                                                    BSONObj* result) {
-    return _externalState->getRoleDescription(opCtx, roleName, privileges, restrictions, result);
+Status AuthorizationManagerImpl::rolesExist(OperationContext* opCtx,
+                                            const std::vector<RoleName>& roleNames) {
+    return _externalState->rolesExist(opCtx, roleNames);
+}
+
+StatusWith<AuthorizationManager::ResolvedRoleData> AuthorizationManagerImpl::resolveRoles(
+    OperationContext* opCtx, const std::vector<RoleName>& roleNames, ResolveRoleOption option) {
+    return _externalState->resolveRoles(opCtx, roleNames, option);
 }
 
 Status AuthorizationManagerImpl::getRolesDescription(OperationContext* opCtx,
                                                      const std::vector<RoleName>& roleName,
                                                      PrivilegeFormat privileges,
                                                      AuthenticationRestrictionsFormat restrictions,
-                                                     BSONObj* result) {
+                                                     std::vector<BSONObj>* result) {
     return _externalState->getRolesDescription(opCtx, roleName, privileges, restrictions, result);
+}
+
+
+Status AuthorizationManagerImpl::getRolesAsUserFragment(
+    OperationContext* opCtx,
+    const std::vector<RoleName>& roleName,
+    AuthenticationRestrictionsFormat restrictions,
+    BSONObj* result) {
+    return _externalState->getRolesAsUserFragment(opCtx, roleName, restrictions, result);
 }
 
 
@@ -443,6 +420,10 @@ Status AuthorizationManagerImpl::getRoleDescriptionsForDB(
         opCtx, dbname, privileges, restrictions, showBuiltinRoles, result);
 }
 
+namespace {
+MONGO_FAIL_POINT_DEFINE(authUserCacheBypass);
+}  // namespace
+
 StatusWith<UserHandle> AuthorizationManagerImpl::acquireUser(OperationContext* opCtx,
                                                              const UserName& userName) try {
     if (userName == internalSecurity.user->getName()) {
@@ -451,6 +432,7 @@ StatusWith<UserHandle> AuthorizationManagerImpl::acquireUser(OperationContext* o
 
     UserRequest request(userName, boost::none);
 
+#ifdef MONGO_CONFIG_SSL
     // Clients connected via TLS may present an X.509 certificate which contains an authorization
     // grant. If this is the case, the roles must be provided to the external state, for expansion
     // into privileges.
@@ -462,6 +444,18 @@ StatusWith<UserHandle> AuthorizationManagerImpl::acquireUser(OperationContext* o
         std::copy(sslPeerInfo.roles.begin(),
                   sslPeerInfo.roles.end(),
                   std::inserter(*request.roles, request.roles->begin()));
+    }
+#endif
+
+    if (authUserCacheBypass.shouldFail()) {
+        // Bypass cache and force a fresh load of the user.
+        auto loadedUser = uassertStatusOK(_externalState->getUserObject(opCtx, request));
+        // We have to inject into the cache in order to get a UserHandle.
+        auto userHandle =
+            _userCache.insertOrAssignAndGet(request, std::move(loadedUser), Date_t::now());
+        invariant(userHandle);
+        LOGV2_DEBUG(4859401, 1, "Bypassing user cache to load user", "user"_attr = userName);
+        return userHandle;
     }
 
     auto cachedUser = _userCache.acquire(opCtx, request);
@@ -581,7 +575,7 @@ void AuthorizationManagerImpl::_pinnedUsersThreadRoutine() noexcept try {
                     LOGV2_WARNING(20239,
                                   "Unable to fetch pinned user",
                                   "user"_attr = userName.toString(),
-                                  "status"_attr = status);
+                                  "error"_attr = status);
                 } else {
                     LOGV2_DEBUG(20233, 2, "Pinned user not found", "user"_attr = userName);
                 }
@@ -607,7 +601,7 @@ void AuthorizationManagerImpl::invalidateUsersFromDB(OperationContext* opCtx, St
     LOGV2_DEBUG(20236, 2, "Invalidating all users from database", "database"_attr = dbname);
     _updateCacheGeneration();
     _authSchemaVersionCache.invalidateAll();
-    _userCache.invalidateIf(
+    _userCache.invalidateKeyIf(
         [&](const UserRequest& userRequest) { return userRequest.name.getDB() == dbname; });
 }
 
@@ -629,7 +623,7 @@ Status AuthorizationManagerImpl::initialize(OperationContext* opCtx) {
 }
 
 void AuthorizationManagerImpl::logOp(OperationContext* opCtx,
-                                     const char* op,
+                                     StringData op,
                                      const NamespaceString& nss,
                                      const BSONObj& o,
                                      const BSONObj* o2) {
@@ -655,17 +649,25 @@ AuthorizationManagerImpl::AuthSchemaVersionCache::AuthSchemaVersionCache(
     ServiceContext* service,
     ThreadPoolInterface& threadPool,
     AuthzManagerExternalState* externalState)
-    : ReadThroughCache(_mutex, service, threadPool, 1 /* cacheSize */),
+    : ReadThroughCache(_mutex,
+                       service,
+                       threadPool,
+                       [this](OperationContext* opCtx, int key, const ValueHandle& cachedValue) {
+                           return _lookup(opCtx, key, cachedValue);
+                       },
+                       1 /* cacheSize */),
       _externalState(externalState) {}
 
-boost::optional<int> AuthorizationManagerImpl::AuthSchemaVersionCache::lookup(
-    OperationContext* opCtx, const int& unusedKey) {
+AuthorizationManagerImpl::AuthSchemaVersionCache::LookupResult
+AuthorizationManagerImpl::AuthSchemaVersionCache::_lookup(OperationContext* opCtx,
+                                                          int unusedKey,
+                                                          const ValueHandle& unusedCachedValue) {
     invariant(unusedKey == 0);
 
     int authzVersion;
     uassertStatusOK(_externalState->getStoredAuthorizationVersion(opCtx, &authzVersion));
 
-    return authzVersion;
+    return LookupResult(authzVersion);
 }
 
 AuthorizationManagerImpl::UserCacheImpl::UserCacheImpl(
@@ -674,12 +676,20 @@ AuthorizationManagerImpl::UserCacheImpl::UserCacheImpl(
     int cacheSize,
     AuthSchemaVersionCache* authSchemaVersionCache,
     AuthzManagerExternalState* externalState)
-    : UserCache(_mutex, service, threadPool, cacheSize),
+    : UserCache(_mutex,
+                service,
+                threadPool,
+                [this](OperationContext* opCtx, const UserRequest& userReq, UserHandle cachedUser) {
+                    return _lookup(opCtx, userReq, cachedUser);
+                },
+                cacheSize),
       _authSchemaVersionCache(authSchemaVersionCache),
       _externalState(externalState) {}
 
-boost::optional<User> AuthorizationManagerImpl::UserCacheImpl::lookup(OperationContext* opCtx,
-                                                                      const UserRequest& userReq) {
+AuthorizationManagerImpl::UserCacheImpl::LookupResult
+AuthorizationManagerImpl::UserCacheImpl::_lookup(OperationContext* opCtx,
+                                                 const UserRequest& userReq,
+                                                 const UserHandle& unusedCachedUser) {
     LOGV2_DEBUG(20238, 1, "Getting user record", "user"_attr = userReq.name);
 
     // Number of times to retry a user document that fetches due to transient AuthSchemaIncompatible
@@ -696,14 +706,8 @@ boost::optional<User> AuthorizationManagerImpl::UserCacheImpl::lookup(OperationC
         switch (authzVersion) {
             case schemaVersion28SCRAM:
             case schemaVersion26Final:
-            case schemaVersion26Upgrade: {
-                BSONObj userObj;
-                uassertStatusOK(_externalState->getUserDescription(opCtx, userReq, &userObj));
-
-                User user(userReq.name);
-                uassertStatusOK(initializeUserFromPrivilegeDocument(&user, userObj));
-                return user;
-            }
+            case schemaVersion26Upgrade:
+                return LookupResult(uassertStatusOK(_externalState->getUserObject(opCtx, userReq)));
             case schemaVersion24:
                 _authSchemaVersionCache->invalidateAll();
 

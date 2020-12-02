@@ -1,7 +1,11 @@
 // Verify that we can index multiple geo fields with 2dsphere, and that
 // performance is what we expect it to be with indexing both fields.
 //
-// @tags: [requires_fastcount, operations_longer_than_stepdown_interval_in_txns]
+// @tags: [
+//   operations_longer_than_stepdown_interval_in_txns,
+//   requires_fastcount,
+//   sbe_incompatible,
+// ]
 
 (function() {
 var t = db.geo_s2twofields;
@@ -51,7 +55,7 @@ function timeWithoutAndWithAnIndex(index, query) {
     var withoutTime = semiRigorousTime(function() {
         return t.find(query).explain("executionStats").executionStats.executionTimeMillis;
     });
-    t.ensureIndex(index);
+    t.createIndex(index);
     var withTime = semiRigorousTime(function() {
         return t.find(query).explain("executionStats").executionStats.executionTimeMillis;
     });

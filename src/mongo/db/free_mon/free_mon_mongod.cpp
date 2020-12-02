@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -45,7 +45,6 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/bsontypes.h"
-#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/free_mon/free_mon_controller.h"
 #include "mongo/db/free_mon/free_mon_message.h"
@@ -66,6 +65,7 @@
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/future.h"
 #include "mongo/util/net/http_client.h"
+#include "mongo/util/testing_proctor.h"
 
 namespace mongo {
 
@@ -84,18 +84,17 @@ auto makeTaskExecutor(ServiceContext* /*serviceContext*/) {
         std::make_unique<ThreadPool>(tpOptions), executor::makeNetworkInterface("FreeMonNet"));
 }
 
-class FreeMonNetworkHttp : public FreeMonNetworkInterface {
+class FreeMonNetworkHttp final : public FreeMonNetworkInterface {
 public:
     explicit FreeMonNetworkHttp(ServiceContext* serviceContext) {
         _executor = makeTaskExecutor(serviceContext);
         _executor->startup();
         _client = HttpClient::create();
-        _client->allowInsecureHTTP(getTestCommandsEnabled());
+        _client->allowInsecureHTTP(TestingProctor::instance().isEnabled());
         _client->setHeaders({"Content-Type: application/octet-stream",
                              "Accept: application/octet-stream",
                              "Expect:"});
     }
-    ~FreeMonNetworkHttp() final = default;
 
     Future<FreeMonRegistrationResponse> sendRegistrationAsync(
         const FreeMonRegistrationRequest& req) override {
@@ -233,9 +232,9 @@ public:
     }
 
     void collect(OperationContext* opCtx, BSONObjBuilder& builder) {
-        auto& catalog = CollectionCatalog::get(opCtx);
+        auto catalog = CollectionCatalog::get(opCtx);
         for (auto& nss : _namespaces) {
-            auto optUUID = catalog.lookupUUIDByNSS(opCtx, nss);
+            auto optUUID = catalog->lookupUUIDByNSS(opCtx, nss);
             if (optUUID) {
                 builder << nss.toString() << optUUID.get();
             }
@@ -312,8 +311,7 @@ void startFreeMonitoring(ServiceContext* serviceContext) {
         return;
     }
 
-    // Check for http, not https here because testEnabled may not be set yet
-    if (!getTestCommandsEnabled()) {
+    if (!TestingProctor::instance().isEnabled()) {
         uassert(50774,
                 "ExportedFreeMonEndpointURL only supports https:// URLs",
                 FreeMonEndpointURL.compare(0, 5, "https") == 0);

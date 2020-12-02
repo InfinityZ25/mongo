@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -56,10 +56,10 @@
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/kill_sessions_local.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time_metadata_hook.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/op_observer.h"
+#include "mongo/db/repl/always_allow_non_local_writes.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/isself.h"
@@ -76,24 +76,23 @@
 #include "mongo/db/repl/replication_metrics.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/storage_interface.h"
-#include "mongo/db/replica_set_aware_service.h"
 #include "mongo/db/s/balancer/balancer.h"
 #include "mongo/db/s/chunk_splitter.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/periodic_balancer_config_refresher.h"
 #include "mongo/db/s/periodic_sharded_index_consistency_checker.h"
-#include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
 #include "mongo/db/s/sharding_state_recovery.h"
 #include "mongo/db/s/transaction_coordinator_service.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/session_catalog_mongod.h"
-#include "mongo/db/storage/control/storage_control.h"
+#include "mongo/db/storage/control/journal_flusher.h"
 #include "mongo/db/storage/flow_control.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/system_index.h"
+#include "mongo/db/vector_clock.h"
 #include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface.h"
 #include "mongo/executor/network_interface_factory.h"
@@ -319,7 +318,7 @@ void ReplicationCoordinatorExternalStateImpl::_stopDataReplication_inlock(
 }
 
 
-void ReplicationCoordinatorExternalStateImpl::startThreads(const ReplSettings& settings) {
+void ReplicationCoordinatorExternalStateImpl::startThreads() {
     stdx::lock_guard<Latch> lk(_threadMutex);
     if (_startedThreads) {
         return;
@@ -356,9 +355,10 @@ void ReplicationCoordinatorExternalStateImpl::clearAppliedThroughIfCleanShutdown
     }
 
     // Ensure that all writes are visible before reading. If we failed mid-batch, it would be
-    // possible to read from a kLastApplied ReadSource where not all writes to the minValid document
+    // possible to read from a kNoOverlap ReadSource where not all writes to the minValid document
     // are visible, generating a writeConflict that would not resolve.
-    opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
+    invariant(RecoveryUnit::ReadSource::kNoTimestamp ==
+              opCtx->recoveryUnit()->getTimestampReadSource());
 
     auto loadLastOpTimeAndWallTimeResult = loadLastOpTimeAndWallTime(opCtx);
     if (_replicationProcess->getConsistencyMarkers()->getOplogTruncateAfterPoint(opCtx).isNull() &&
@@ -426,6 +426,11 @@ executor::TaskExecutor* ReplicationCoordinatorExternalStateImpl::getTaskExecutor
     return _taskExecutor.get();
 }
 
+std::shared_ptr<executor::TaskExecutor>
+ReplicationCoordinatorExternalStateImpl::getSharedTaskExecutor() const {
+    return _taskExecutor;
+}
+
 ThreadPool* ReplicationCoordinatorExternalStateImpl::getDbWorkThreadPool() const {
     return _writerPool.get();
 }
@@ -439,8 +444,9 @@ Status ReplicationCoordinatorExternalStateImpl::initializeReplSetStorage(Operati
                            "initiate oplog entry",
                            NamespaceString::kRsOplogNamespace.toString(),
                            [this, &opCtx, &config] {
+                               // Permit writing to the oplog before we step up to primary.
+                               AllowNonLocalWritesBlock allowNonLocalWrites(opCtx);
                                Lock::GlobalWrite globalWrite(opCtx);
-
                                WriteUnitOfWork wuow(opCtx);
                                Helpers::putSingleton(opCtx, configCollectionName, config);
                                const auto msgObj = BSON("msg" << kInitiatingSetMsg);
@@ -455,6 +461,9 @@ Status ReplicationCoordinatorExternalStateImpl::initializeReplSetStorage(Operati
                            });
 
         FeatureCompatibilityVersion::setIfCleanStartup(opCtx, _storageInterface);
+        // Take an unstable checkpoint to ensure that the FCV document is persisted to disk.
+        opCtx->recoveryUnit()->waitUntilUnjournaledWritesDurable(opCtx,
+                                                                 false /* stableCheckpoint */);
     } catch (const DBException& ex) {
         return ex.toStatus();
     }
@@ -469,8 +478,6 @@ void ReplicationCoordinatorExternalStateImpl::onDrainComplete(OperationContext* 
     if (_oplogBuffer) {
         _oplogBuffer->exitDrainMode();
     }
-
-    ReplicaSetAwareServiceRegistry::get(_service).onStepUpBegin(opCtx);
 }
 
 OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationContext* opCtx) {
@@ -521,13 +528,21 @@ OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationC
     auto opTimeToReturn = loadLastOpTimeAndWallTimeResult.getValue().opTime;
 
     auto newTermStartDate = loadLastOpTimeAndWallTimeResult.getValue().wallTime;
+    // This constant was based on data described in SERVER-44634. It is in relation to how long the
+    // first majority committed write takes after a new term has started.
+    const auto flowControlGracePeriod = Seconds(4);
+    // SERVER-44634: Disable flow control for a grace period after stepup. Because writes may stop
+    // while a node wins election and steps up, it's likely to determine there's majority point
+    // lag. Moreover, because there are no writes in the system, flow control will believe
+    // secondaries are unable to process oplog entries. This can result in an undesirable "slow
+    // start" phenomena.
+    FlowControl::get(opCtx)->disableUntil(newTermStartDate + flowControlGracePeriod);
     ReplicationMetrics::get(opCtx).setCandidateNewTermStartDate(newTermStartDate);
 
     auto replCoord = ReplicationCoordinator::get(opCtx);
     replCoord->createWMajorityWriteAvailabilityDateWaiter(opTimeToReturn);
 
     _shardingOnTransitionToPrimaryHook(opCtx);
-    ReplicaSetAwareServiceRegistry::get(_service).onStepUpComplete(opCtx);
 
     _dropAllTempCollections(opCtx);
 
@@ -535,8 +550,8 @@ OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationC
 
     notifyFreeMonitoringOnTransitionToPrimary();
 
-    // It is only necessary to check the system indexes on the first transition to master.
-    // On subsequent transitions to master the indexes will have already been created.
+    // It is only necessary to check the system indexes on the first transition to primary.
+    // On subsequent transitions to primary the indexes will have already been created.
     static std::once_flag verifySystemIndexesOnce;
     std::call_once(verifySystemIndexesOnce, [opCtx] {
         const auto globalAuthzManager = AuthorizationManager::get(opCtx->getServiceContext());
@@ -545,13 +560,13 @@ OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationC
         }
     });
 
-    serverGlobalParams.validateFeaturesAsMaster.store(true);
+    serverGlobalParams.validateFeaturesAsPrimary.store(true);
 
     return opTimeToReturn;
 }
 
-void ReplicationCoordinatorExternalStateImpl::forwardSlaveProgress() {
-    _syncSourceFeedback.forwardSlaveProgress();
+void ReplicationCoordinatorExternalStateImpl::forwardSecondaryProgress() {
+    _syncSourceFeedback.forwardSecondaryProgress();
 }
 
 StatusWith<BSONObj> ReplicationCoordinatorExternalStateImpl::loadLocalConfigDocument(
@@ -651,12 +666,14 @@ Status ReplicationCoordinatorExternalStateImpl::storeLocalLastVoteDocument(
     invariant(!opCtx->shouldParticipateInFlowControl());
 
     try {
+        // If we are casting a vote in a new election immediately after stepping down, we
+        // don't want to have this process interrupted due to us stepping down, since we
+        // want to be able to cast our vote for a new primary right away. Both the write's lock
+        // acquisition and the "waitUntilDurable" lock acquisition must be uninterruptible.
+        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+
         Status status =
             writeConflictRetry(opCtx, "save replica set lastVote", lastVoteCollectionName, [&] {
-                // If we are casting a vote in a new election immediately after stepping down, we
-                // don't want to have this process interrupted due to us stepping down, since we
-                // want to be able to cast our vote for a new primary right away.
-                UninterruptibleLockGuard noInterrupt(opCtx->lockState());
                 AutoGetCollection coll(opCtx, NamespaceString(lastVoteCollectionName), MODE_IX);
                 WriteUnitOfWork wunit(opCtx);
 
@@ -682,7 +699,7 @@ Status ReplicationCoordinatorExternalStateImpl::storeLocalLastVoteDocument(
             return status;
         }
 
-        opCtx->recoveryUnit()->waitUntilDurable(opCtx);
+        JournalFlusher::get(opCtx)->waitForJournalFlush();
 
         return Status::OK();
     } catch (const DBException& ex) {
@@ -696,12 +713,12 @@ void ReplicationCoordinatorExternalStateImpl::setGlobalTimestamp(ServiceContext*
 }
 
 Timestamp ReplicationCoordinatorExternalStateImpl::getGlobalTimestamp(ServiceContext* service) {
-    return LogicalClock::get(service)->getClusterTime().asTimestamp();
+    const auto currentTime = VectorClock::get(service)->getTime();
+    return currentTime.clusterTime().asTimestamp();
 }
 
 bool ReplicationCoordinatorExternalStateImpl::oplogExists(OperationContext* opCtx) {
-    auto oplog = LocalOplogInfo::get(opCtx)->getCollection();
-    return oplog != nullptr;
+    return static_cast<bool>(LocalOplogInfo::get(opCtx)->getCollection());
 }
 
 StatusWith<OpTimeAndWallTime> ReplicationCoordinatorExternalStateImpl::loadLastOpTimeAndWallTime(
@@ -747,7 +764,6 @@ void ReplicationCoordinatorExternalStateImpl::closeConnections() {
 }
 
 void ReplicationCoordinatorExternalStateImpl::onStepDownHook() {
-    ReplicaSetAwareServiceRegistry::get(_service).onStepDown();
     _shardingOnStepDownHook();
     stopNoopWriter();
     _stopAsyncUpdatesOfAndClearOplogTruncateAfterPoint();
@@ -759,7 +775,7 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnStepDownHook() {
         TransactionCoordinatorService::get(_service)->onStepDown();
     } else if (ShardingState::get(_service)->enabled()) {
         ChunkSplitter::get(_service).onStepDown();
-        getCatalogCacheLoaderForFiltering(_service).onStepDown();
+        CatalogCacheLoader::get(_service).onStepDown();
         PeriodicBalancerConfigRefresher::get(_service).onStepDown();
         TransactionCoordinatorService::get(_service)->onStepDown();
     }
@@ -797,13 +813,17 @@ void ReplicationCoordinatorExternalStateImpl::_stopAsyncUpdatesOfAndClearOplogTr
     //
     // This makes sure the JournalFlusher is not stuck waiting for a lock that stepdown might hold
     // before doing an update write to the truncate point.
-    StorageControl::interruptJournalFlusherForReplStateChange(_service);
+    JournalFlusher::get(_service)->interruptJournalFlusherForReplStateChange();
 
     // Wait for another round of journal flushing. This will ensure that we wait for the current
     // round to completely finish and have no chance of racing with unsetting the truncate point
     // below. It is possible that the JournalFlusher will not check for the interrupt signaled
     // above, if writing is imminent, so we must make sure that the code completes fully.
-    StorageControl::waitForJournalFlush(opCtx);
+    JournalFlusher::get(_service)->waitForJournalFlush();
+
+    // Writes to non-replicated collections do not need concurrency control with the OplogApplier
+    // that never accesses them. Skip taking the PBWM.
+    ShouldNotConflictWithSecondaryBatchApplicationBlock shouldNotConflictBlock(opCtx->lockState());
 
     // We can clear the oplogTruncateAfterPoint because we know there are no user writes during
     // stepdown and therefore presently no oplog holes.
@@ -819,7 +839,7 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
             // run the sharding onStepUp machinery. The onStepDown counterpart to these methods is
             // already idempotent, so the machinery will remain in the stepped down state.
             if (ErrorCodes::isShutdownError(status.code()) ||
-                ErrorCodes::isNotMasterError(status.code())) {
+                ErrorCodes::isNotPrimaryError(status.code())) {
                 return;
             }
             fassertFailedWithStatus(
@@ -863,7 +883,7 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
         // the sharding onStepUp machinery. The onStepDown counterpart to these methods is already
         // idempotent, so the machinery will remain in the stepped down state.
         if (ErrorCodes::isShutdownError(status.code()) ||
-            ErrorCodes::isNotMasterError(status.code())) {
+            ErrorCodes::isNotPrimaryError(status.code())) {
             return;
         }
         fassert(40107, status);
@@ -873,7 +893,7 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
         ShardingInitializationMongoD::get(opCtx)->updateShardIdentityConfigString(opCtx,
                                                                                   configsvrConnStr);
 
-        getCatalogCacheLoaderForFiltering(_service).onStepUp();
+        CatalogCacheLoader::get(_service).onStepUp();
         ChunkSplitter::get(_service).onStepUp();
         PeriodicBalancerConfigRefresher::get(_service).onStepUp(_service);
         TransactionCoordinatorService::get(_service)->onStepUp(opCtx);
@@ -951,9 +971,9 @@ void ReplicationCoordinatorExternalStateImpl::_dropAllTempCollections(OperationC
     }
 }
 
-void ReplicationCoordinatorExternalStateImpl::dropAllSnapshots() {
+void ReplicationCoordinatorExternalStateImpl::clearCommittedSnapshot() {
     if (auto manager = _service->getStorageEngine()->getSnapshotManager())
-        manager->dropAllSnapshots();
+        manager->clearCommittedSnapshot();
 }
 
 void ReplicationCoordinatorExternalStateImpl::updateCommittedSnapshot(
@@ -962,13 +982,14 @@ void ReplicationCoordinatorExternalStateImpl::updateCommittedSnapshot(
     if (manager) {
         manager->setCommittedSnapshot(newCommitPoint.getTimestamp());
     }
+    _service->getOpObserver()->onMajorityCommitPointUpdate(_service, newCommitPoint);
     notifyOplogMetadataWaiters(newCommitPoint);
 }
 
-void ReplicationCoordinatorExternalStateImpl::updateLocalSnapshot(const OpTime& optime) {
+void ReplicationCoordinatorExternalStateImpl::updateLastAppliedSnapshot(const OpTime& optime) {
     auto manager = _service->getStorageEngine()->getSnapshotManager();
     if (manager) {
-        manager->setLocalSnapshot(optime.getTimestamp());
+        manager->setLastApplied(optime.getTimestamp());
     }
 }
 
@@ -1058,8 +1079,19 @@ JournalListener::Token ReplicationCoordinatorExternalStateImpl::getToken(Operati
         }
     }
 
-    // All other repl states use the last applied.
-    return repl::ReplicationCoordinator::get(_service)->getMyLastAppliedOpTimeAndWallTime();
+    // All other repl states use the 'lastApplied'.
+    //
+    // Setting 'rollbackSafe' will ensure that a safe lastApplied value is returned if we're in
+    // ROLLBACK state. 'lastApplied' may be momentarily set to an opTime from a divergent branch of
+    // history during rollback, so a benign default value will be returned instead to prevent a
+    // divergent 'lastApplied' from being used to forward the 'lastDurable' after rollback.
+    //
+    // No concurrency control is necessary and it is still safe if the node goes into ROLLBACK after
+    // getting the token because the JournalFlusher is shut down during rollback, before a divergent
+    // 'lastApplied' value is present. The JournalFlusher will start up again in ROLLBACK and never
+    // transition from non-ROLLBACK to ROLLBACK with a divergent 'lastApplied' value.
+    return repl::ReplicationCoordinator::get(_service)->getMyLastAppliedOpTimeAndWallTime(
+        /*rollbackSafe=*/true);
 }
 
 void ReplicationCoordinatorExternalStateImpl::onDurable(const JournalListener::Token& token) {

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -39,12 +39,13 @@
 #include "mongo/db/auth/user_set.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/client.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/stats/resource_consumption_metrics.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/metadata/client_metadata.h"
-#include "mongo/rpc/metadata/client_metadata_ismaster.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -52,36 +53,6 @@ namespace mongo {
 using std::endl;
 using std::string;
 using std::unique_ptr;
-
-namespace {
-
-void _appendUserInfo(const CurOp& c, BSONObjBuilder& builder, AuthorizationSession* authSession) {
-    UserNameIterator nameIter = authSession->getAuthenticatedUserNames();
-
-    UserName bestUser;
-    if (nameIter.more())
-        bestUser = *nameIter;
-
-    std::string opdb(nsToDatabase(c.getNS()));
-
-    BSONArrayBuilder allUsers(builder.subarrayStart("allUsers"));
-    for (; nameIter.more(); nameIter.next()) {
-        BSONObjBuilder nextUser(allUsers.subobjStart());
-        nextUser.append(AuthorizationManager::USER_NAME_FIELD_NAME, nameIter->getUser());
-        nextUser.append(AuthorizationManager::USER_DB_FIELD_NAME, nameIter->getDB());
-        nextUser.doneFast();
-
-        if (nameIter->getDB() == opdb) {
-            bestUser = *nameIter;
-        }
-    }
-    allUsers.doneFast();
-
-    builder.append("user", bestUser.getUser().empty() ? "" : bestUser.getFullName());
-}
-
-}  // namespace
-
 
 void profile(OperationContext* opCtx, NetworkOp op) {
     // Initialize with 1kb at start in order to avoid realloc later
@@ -96,20 +67,26 @@ void profile(OperationContext* opCtx, NetworkOp op) {
             opCtx, lockerInfo.stats, opCtx->lockState()->getFlowControlStats(), b);
     }
 
+    auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
+    if (metricsCollector.hasCollectedMetrics()) {
+        BSONObjBuilder metricsBuilder = b.subobjStart("operationMetrics");
+        const auto& metrics = metricsCollector.getMetrics();
+        metrics.toBson(&metricsBuilder);
+        metricsBuilder.done();
+    }
+
     b.appendDate("ts", jsTime());
     b.append("client", opCtx->getClient()->clientAddress());
 
-    const auto& clientMetadata =
-        ClientMetadataIsMasterState::get(opCtx->getClient()).getClientMetadata();
-    if (clientMetadata) {
-        auto appName = clientMetadata.get().getApplicationName();
+    if (auto clientMetadata = ClientMetadata::get(opCtx->getClient())) {
+        auto appName = clientMetadata->getApplicationName();
         if (!appName.empty()) {
             b.append("appName", appName);
         }
     }
 
     AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
-    _appendUserInfo(*CurOp::get(opCtx), b, authSession);
+    OpDebug::appendUserInfo(*CurOp::get(opCtx), b, authSession);
 
     const BSONObj p = b.done();
 
@@ -159,8 +136,8 @@ void profile(OperationContext* opCtx, NetworkOp op) {
         EnforcePrepareConflictsBlock enforcePrepare(opCtx);
 
         uassertStatusOK(createProfileCollection(opCtx, db));
-        Collection* const coll =
-            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, dbProfilingNS);
+        auto coll =
+            CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, dbProfilingNS);
 
         invariant(!opCtx->shouldParticipateInFlowControl());
         WriteUnitOfWork wuow(opCtx);
@@ -184,32 +161,39 @@ Status createProfileCollection(OperationContext* opCtx, Database* db) {
     invariant(!opCtx->shouldParticipateInFlowControl());
 
     const auto dbProfilingNS = NamespaceString(db->name(), "system.profile");
-    Collection* const collection =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, dbProfilingNS);
-    if (collection) {
-        if (!collection->isCapped()) {
-            return Status(ErrorCodes::NamespaceExists,
-                          str::stream() << dbProfilingNS << " exists but isn't capped");
+
+    // Checking the collection exists must also be done in the WCE retry loop. Only retrying
+    // collection creation would endlessly throw errors because the collection exists: must check
+    // and see the collection exists in order to break free.
+    return writeConflictRetry(opCtx, "createProfileCollection", dbProfilingNS.ns(), [&] {
+        const CollectionPtr collection =
+            CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, dbProfilingNS);
+        if (collection) {
+            if (!collection->isCapped()) {
+                return Status(ErrorCodes::NamespaceExists,
+                              str::stream() << dbProfilingNS << " exists but isn't capped");
+            }
+
+            return Status::OK();
         }
 
+        // system.profile namespace doesn't exist; create it
+        LOGV2(20701,
+              "Creating profile collection: {namespace}",
+              "Creating profile collection",
+              "namespace"_attr = dbProfilingNS);
+
+        CollectionOptions collectionOptions;
+        collectionOptions.capped = true;
+        collectionOptions.cappedSize = 1024 * 1024;
+
+        WriteUnitOfWork wunit(opCtx);
+        repl::UnreplicatedWritesBlock uwb(opCtx);
+        invariant(db->createCollection(opCtx, dbProfilingNS, collectionOptions));
+        wunit.commit();
+
         return Status::OK();
-    }
-
-    // system.profile namespace doesn't exist; create it
-    LOGV2(20701,
-          "Creating profile collection: {dbProfilingNS}",
-          "dbProfilingNS"_attr = dbProfilingNS);
-
-    CollectionOptions collectionOptions;
-    collectionOptions.capped = true;
-    collectionOptions.cappedSize = 1024 * 1024;
-
-    WriteUnitOfWork wunit(opCtx);
-    repl::UnreplicatedWritesBlock uwb(opCtx);
-    invariant(db->createCollection(opCtx, dbProfilingNS, collectionOptions));
-    wunit.commit();
-
-    return Status::OK();
+    });
 }
 
 }  // namespace mongo

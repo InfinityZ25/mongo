@@ -32,8 +32,8 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/s/shard_server_test_fixture.h"
 
 namespace mongo {
 namespace {
@@ -64,7 +64,15 @@ protected:
         const ShardKeyPattern shardKeyPattern(BSON("_id" << 1));
 
         auto rt = RoutingTableHistory::makeNew(
-            kNss, UUID::gen(), shardKeyPattern.getKeyPattern(), nullptr, false, epoch, [&] {
+            kNss,
+            UUID::gen(),
+            shardKeyPattern.getKeyPattern(),
+            nullptr,
+            false,
+            epoch,
+            boost::none,
+            true,
+            [&] {
                 ChunkVersion version(1, 0, epoch);
 
                 ChunkType chunk1(kNss,
@@ -96,8 +104,11 @@ protected:
                 return std::vector<ChunkType>{chunk1, chunk2, chunk3, chunk4};
             }());
 
-        auto cm = std::make_shared<ChunkManager>(rt, boost::none);
-        ASSERT_EQ(4, cm->numChunks());
+        ChunkManager cm(ShardId("0"),
+                        DatabaseVersion(UUID::gen()),
+                        makeStandaloneRoutingTableHistory(std::move(rt)),
+                        boost::none);
+        ASSERT_EQ(4, cm.numChunks());
 
         {
             AutoGetCollection autoColl(operationContext(), kNss, MODE_X);
@@ -109,7 +120,7 @@ protected:
             getServiceContext(), kNss, executor(), CollectionMetadata(cm, ShardId("0")));
 
         auto& oss = OperationShardingState::get(operationContext());
-        const auto version = cm->getVersion(ShardId("0"));
+        const auto version = cm.getVersion(ShardId("0"));
         BSONObjBuilder builder;
         version.appendToCommand(&builder);
         oss.initializeClientRoutingVersionsFromCommand(kNss, builder.obj());

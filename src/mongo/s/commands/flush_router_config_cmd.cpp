@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -102,7 +102,7 @@ public:
                       "Routing metadata flushed for collection {namespace}",
                       "Routing metadata flushed for collection",
                       "namespace"_attr = nss);
-                catalogCache->purgeCollection(nss);
+                catalogCache->invalidateCollectionEntry_LINEARIZABLE(nss);
             }
         }
 

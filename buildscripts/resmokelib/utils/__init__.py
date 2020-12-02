@@ -1,13 +1,14 @@
 """Helper functions."""
 
 import contextlib
+import errno
 import os.path
 import shutil
 import sys
 
 import yaml
 
-from . import archival
+from buildscripts.resmokelib.utils import archival
 
 
 @contextlib.contextmanager
@@ -31,9 +32,13 @@ def open_or_use_stdout(filename):
         fp.close()
 
 
-def default_if_none(value, default):
-    """Set default if value is 'None'."""
-    return value if value is not None else default
+def default_if_none(*values):
+    """Return the first argument that is not 'None'."""
+    for value in values:
+        if value is not None:
+            return value
+
+    return None
 
 
 def rmtree(path, **kwargs):
@@ -104,3 +109,18 @@ def load_yaml(value):
         return yaml.safe_load(value)
     except yaml.YAMLError as err:
         raise ValueError("Attempted to parse invalid YAML value '%s': %s" % (value, err))
+
+
+def mkdir_p(path):
+    """
+    Make the directory and all missing parents (like mkdir -p).
+
+    :type path: string the directory path
+    """
+    try:
+        os.makedirs(path)
+    except OSError as exc:  # Python >2.5
+        if exc.errno == errno.EEXIST and os.path.isdir(path):
+            pass
+        else:
+            raise

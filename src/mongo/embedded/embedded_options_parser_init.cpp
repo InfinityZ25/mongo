@@ -31,6 +31,7 @@
 
 #include <iostream>
 
+#include "mongo/embedded/embedded_options_parser_init.h"
 #include "mongo/util/exit_code.h"
 #include "mongo/util/options_parser/option_description.h"
 #include "mongo/util/options_parser/option_section.h"
@@ -44,13 +45,10 @@ namespace optionenvironment {
 GlobalInitializerRegisterer startupOptionsInitializer(
     "StartupOptions",
     [](InitializerContext* context) {
-        // Embedded uses a YAML config passed in argv to reuse the existing interface, extract it
-        // from the first element otherwise use empty string.
-        std::string config = !context->args().empty() ? context->args()[0] : "";
+        std::string config = embedded::EmbeddedOptionsConfig::instance().get();
 
         OptionsParser parser;
-        Status ret =
-            parser.runConfigFile(startupOptions, config, context->env(), &startupOptionsParsed);
+        Status ret = parser.runConfigFile(startupOptions, config, &startupOptionsParsed);
         uassertStatusOKWithContext(ret, "Options parsing failed.");
 
         return Status::OK();

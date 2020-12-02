@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/db/mongod_options.h"
 
@@ -36,6 +36,7 @@
 #include <string>
 #include <vector>
 
+#include "mongo/base/init.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/json.h"
 #include "mongo/bson/util/builder.h"
@@ -344,6 +345,8 @@ Status canonicalizeMongodOptions(moe::Environment* params) {
     return Status::OK();
 }
 
+bool gIgnoreEnableMajorityReadConcernWarning = false;
+
 Status storeMongodOptions(const moe::Environment& params) {
     Status ret = storeServerOptions(params);
     if (!ret.isOK()) {
@@ -404,6 +407,9 @@ Status storeMongodOptions(const moe::Environment& params) {
 
     if (params.count("storage.syncPeriodSecs")) {
         storageGlobalParams.syncdelay = params["storage.syncPeriodSecs"].as<double>();
+        storageGlobalParams.checkpointDelaySecs =
+            static_cast<size_t>(params["storage.syncPeriodSecs"].as<double>());
+
         if (storageGlobalParams.syncdelay < 0 ||
             storageGlobalParams.syncdelay > StorageGlobalParams::kMaxSyncdelaySecs) {
             return Status(ErrorCodes::BadValue,
@@ -501,9 +507,39 @@ Status storeMongodOptions(const moe::Environment& params) {
         storageGlobalParams.allowOplogTruncation = false;
     }
 
+    if (!replSettings.getReplSetString().empty() &&
+        (params.count("security.authorization") &&
+         params["security.authorization"].as<std::string>() == "enabled") &&
+        !params.count("security.keyFile")) {
+        return Status(
+            ErrorCodes::BadValue,
+            str::stream()
+                << "security.keyFile is required when authorization is enabled with replica sets");
+    }
+
     if (params.count("replication.enableMajorityReadConcern")) {
         serverGlobalParams.enableMajorityReadConcern =
             params["replication.enableMajorityReadConcern"].as<bool>();
+
+        if (!serverGlobalParams.enableMajorityReadConcern) {
+            // Lock-free reads are not supported with enableMajorityReadConcern=false, so we disable
+            // them. If the user tries to explicitly enable lock-free reads by specifying
+            // disableLockFreeReads=false, log a warning so that the user knows these are not
+            // compatible settings.
+            if (!storageGlobalParams.disableLockFreeReads) {
+                LOGV2_WARNING(4788401,
+                              "Lock-free reads is not compatible with "
+                              "enableMajorityReadConcern=false: disabling lock-free reads.");
+                storageGlobalParams.disableLockFreeReads = true;
+            }
+        }
+    }
+
+    // TODO (SERVER-49464): remove this development only extra logging.
+    if (storageGlobalParams.disableLockFreeReads) {
+        LOGV2(4788402, "Lock-free reads is disabled.");
+    } else {
+        LOGV2(4788403, "Lock-free reads is enabled.");
     }
 
     if (params.count("replication.oplogSizeMB")) {
@@ -568,9 +604,7 @@ Status storeMongodOptions(const moe::Environment& params) {
 
             if (params.count("replication.enableMajorityReadConcern") &&
                 !params["replication.enableMajorityReadConcern"].as<bool>()) {
-                LOGV2_WARNING(20879,
-                              "Ignoring read concern override as config server requires majority "
-                              "read concern");
+                gIgnoreEnableMajorityReadConcernWarning = true;
             }
             serverGlobalParams.enableMajorityReadConcern = true;
 
@@ -624,12 +658,9 @@ Status storeMongodOptions(const moe::Environment& params) {
 
     // Check if we are 32 bit and have not explicitly specified any journaling options
     if (sizeof(void*) == 4 && !params.count("storage.journal.enabled")) {
-        // trying to make this stand out more like startup warnings
-        LOGV2(20877, "");
         LOGV2_WARNING(20880,
                       "32-bit servers don't have journaling enabled by default. Please use "
                       "--journal if you want durability");
-        LOGV2(20878, "");
     }
 
     bool isClusterRoleShard = params.count("shardsvr");
@@ -648,6 +679,22 @@ Status storeMongodOptions(const moe::Environment& params) {
     }
 
     setGlobalReplSettings(replSettings);
+    return Status::OK();
+}
+
+// This warning must be deferred until after ServerLogRedirection has started up so that it goes to
+// the right place. This initializer depends on the "default" initializer, which in turn depends on
+// the "ServerLogRedirection". This ensures that when this initializer is run, the log redirection
+// to file, if any, is ready. The reason for depending on "default" instead of
+// "ServerLogRedirection" is that this way we avoid having to add a dummy "ServerLogRedirection"
+// initializer in each one of the unit tests that depend on mongod_options.
+MONGO_INITIALIZER(IgnoreEnableMajorityReadConcernWarning)
+(InitializerContext*) {
+    if (gIgnoreEnableMajorityReadConcernWarning) {
+        LOGV2_WARNING(20879,
+                      "Ignoring read concern override as config server requires majority read "
+                      "concern");
+    }
     return Status::OK();
 }
 

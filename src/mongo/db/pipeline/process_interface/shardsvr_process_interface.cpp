@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -38,26 +38,35 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/shard_filterer_impl.h"
+#include "mongo/db/pipeline/document_source_cursor.h"
 #include "mongo/db/pipeline/document_source_internal_shard_filter.h"
+#include "mongo/db/pipeline/document_source_merge.h"
 #include "mongo/db/pipeline/sharded_agg_helpers.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/query/document_source_merge_cursors.h"
+#include "mongo/s/stale_shard_version_helpers.h"
 #include "mongo/s/write_ops/cluster_write.h"
 
 namespace mongo {
 
 using namespace fmt::literals;
 
+ShardServerProcessInterface::ShardServerProcessInterface(
+    OperationContext* opCtx, std::shared_ptr<executor::TaskExecutor> executor)
+    : CommonMongodProcessInterface(executor) {
+    _opIsVersioned = OperationShardingState::isOperationVersioned(opCtx);
+}
+
 bool ShardServerProcessInterface::isSharded(OperationContext* opCtx, const NamespaceString& nss) {
-    Lock::DBLock dbLock(opCtx, nss.db(), MODE_IS);
-    Lock::CollectionLock collLock(opCtx, nss, MODE_IS);
-    return CollectionShardingState::get(opCtx, nss)
-        ->getCollectionDescription_DEPRECATED()
-        .isSharded();
+    const auto cm =
+        uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
+    return cm.isSharded();
 }
 
 void ShardServerProcessInterface::checkRoutingInfoEpochOrThrow(
@@ -77,17 +86,17 @@ ShardServerProcessInterface::collectDocumentKeyFieldsForHostedCollection(Operati
     invariant(serverGlobalParams.clusterRole == ClusterRole::ShardServer);
 
     auto* const catalogCache = Grid::get(opCtx)->catalogCache();
-    auto swCollectionRoutingInfo = catalogCache->getCollectionRoutingInfo(opCtx, nss);
-    if (swCollectionRoutingInfo.isOK()) {
-        auto cm = swCollectionRoutingInfo.getValue().cm();
-        if (cm && cm->uuidMatches(uuid)) {
+    auto swCM = catalogCache->getCollectionRoutingInfo(opCtx, nss);
+    if (swCM.isOK()) {
+        const auto& cm = swCM.getValue();
+        if (cm.isSharded() && cm.uuidMatches(uuid)) {
             // Unpack the shard key. Collection is now sharded so the document key fields will never
             // change, mark as final.
-            return {_shardKeyToDocumentKeyFields(cm->getShardKeyPattern().getKeyPatternFields()),
+            return {_shardKeyToDocumentKeyFields(cm.getShardKeyPattern().getKeyPatternFields()),
                     true};
         }
-    } else if (swCollectionRoutingInfo != ErrorCodes::NamespaceNotFound) {
-        uassertStatusOK(std::move(swCollectionRoutingInfo));
+    } else if (swCM != ErrorCodes::NamespaceNotFound) {
+        uassertStatusOK(std::move(swCM));
     }
 
     // An unsharded collection can still become sharded so is not final. If the uuid doesn't match
@@ -138,8 +147,16 @@ StatusWith<MongoProcessInterface::UpdateResult> ShardServerProcessInterface::upd
     return {{response.getN(), response.getNModified()}};
 }
 
-BSONObj ShardServerProcessInterface::attachCursorSourceAndExplain(
+BSONObj ShardServerProcessInterface::preparePipelineAndExplain(
     Pipeline* ownedPipeline, ExplainOptions::Verbosity verbosity) {
+    auto firstStage = ownedPipeline->peekFront();
+    // We don't want to send an internal stage to the shards.
+    if (firstStage &&
+        (typeid(*firstStage) == typeid(DocumentSourceMerge) ||
+         typeid(*firstStage) == typeid(DocumentSourceMergeCursors) ||
+         typeid(*firstStage) == typeid(DocumentSourceCursor))) {
+        ownedPipeline->popFront();
+    }
     return sharded_agg_helpers::targetShardsForExplain(ownedPipeline);
 }
 
@@ -159,22 +176,23 @@ void ShardServerProcessInterface::renameIfOptionsAndIndexesHaveNotChanged(
     const NamespaceString& destinationNs,
     const BSONObj& originalCollectionOptions,
     const std::list<BSONObj>& originalIndexes) {
+    auto cachedDbInfo =
+        uassertStatusOK(Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, destinationNs.db()));
     auto newCmdObj = CommonMongodProcessInterface::_convertRenameToInternalRename(
         opCtx, renameCommandObj, originalCollectionOptions, originalIndexes);
     BSONObjBuilder newCmdWithWriteConcernBuilder(std::move(newCmdObj));
     newCmdWithWriteConcernBuilder.append(WriteConcernOptions::kWriteConcernField,
                                          opCtx->getWriteConcern().toBSON());
     newCmdObj = newCmdWithWriteConcernBuilder.done();
-    auto cachedDbInfo =
-        uassertStatusOK(Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, destinationNs.db()));
-    auto response =
-        executeCommandAgainstDatabasePrimary(opCtx,
-                                             // internalRenameIfOptionsAndIndexesMatch is adminOnly.
-                                             NamespaceString::kAdminDb,
-                                             std::move(cachedDbInfo),
-                                             newCmdObj,
-                                             ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                                             Shard::RetryPolicy::kNoRetry);
+    auto response = executeRawCommandAgainstDatabasePrimary(
+        opCtx,
+        // internalRenameIfOptionsAndIndexesMatch is adminOnly.
+        NamespaceString::kAdminDb,
+        cachedDbInfo,
+        // Only unsharded collections can be renamed.
+        _versionCommandIfAppropriate(newCmdObj, cachedDbInfo, ChunkVersion::UNSHARDED()),
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+        Shard::RetryPolicy::kNoRetry);
     uassertStatusOKWithContext(response.swResponse,
                                str::stream() << "failed while running command " << newCmdObj);
     auto result = response.swResponse.getValue().data;
@@ -200,7 +218,7 @@ BSONObj ShardServerProcessInterface::getCollectionOptions(OperationContext* opCt
             shard->runExhaustiveCursorCommand(opCtx,
                                               ReadPreferenceSetting(ReadPreference::PrimaryOnly),
                                               nss.db().toString(),
-                                              appendDbVersionIfPresent(cmdObj, cachedDbInfo),
+                                              _versionCommandIfAppropriate(cmdObj, cachedDbInfo),
                                               Milliseconds(-1)));
     } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
         return BSONObj{};
@@ -246,7 +264,7 @@ std::list<BSONObj> ShardServerProcessInterface::getIndexSpecs(OperationContext* 
             shard->runExhaustiveCursorCommand(opCtx,
                                               ReadPreferenceSetting(ReadPreference::PrimaryOnly),
                                               ns.db().toString(),
-                                              appendDbVersionIfPresent(cmdObj, cachedDbInfo),
+                                              _versionCommandIfAppropriate(cmdObj, cachedDbInfo),
                                               Milliseconds(-1)));
     } catch (ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
         return std::list<BSONObj>();
@@ -263,13 +281,13 @@ void ShardServerProcessInterface::createCollection(OperationContext* opCtx,
     finalCmdBuilder.append(WriteConcernOptions::kWriteConcernField,
                            opCtx->getWriteConcern().toBSON());
     BSONObj finalCmdObj = finalCmdBuilder.obj();
-    auto response =
-        executeCommandAgainstDatabasePrimary(opCtx,
-                                             dbName,
-                                             std::move(cachedDbInfo),
-                                             finalCmdObj,
-                                             ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                                             Shard::RetryPolicy::kIdempotent);
+    auto response = executeRawCommandAgainstDatabasePrimary(
+        opCtx,
+        dbName,
+        cachedDbInfo,
+        _versionCommandIfAppropriate(finalCmdObj, cachedDbInfo),
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+        Shard::RetryPolicy::kIdempotent);
     uassertStatusOKWithContext(response.swResponse,
                                str::stream() << "failed while running command " << finalCmdObj);
     auto result = response.swResponse.getValue().data;
@@ -291,17 +309,17 @@ void ShardServerProcessInterface::createIndexesOnEmptyCollection(
                          opCtx->getWriteConcern().toBSON());
     auto cmdObj = newCmdBuilder.done();
 
-    sharded_agg_helpers::shardVersionRetry(
+    shardVersionRetry(
         opCtx,
         Grid::get(opCtx)->catalogCache(),
         ns,
         "copying index for empty collection {}"_format(ns.ns()),
         [&] {
-            auto response = executeCommandAgainstDatabasePrimary(
+            auto response = executeRawCommandAgainstDatabasePrimary(
                 opCtx,
                 ns.db(),
-                std::move(cachedDbInfo),
-                cmdObj,
+                cachedDbInfo,
+                _versionCommandIfAppropriate(cmdObj, cachedDbInfo),
                 ReadPreferenceSetting(ReadPreference::PrimaryOnly),
                 Shard::RetryPolicy::kIdempotent);
 
@@ -327,13 +345,14 @@ void ShardServerProcessInterface::dropCollection(OperationContext* opCtx,
     newCmdBuilder.append(WriteConcernOptions::kWriteConcernField,
                          opCtx->getWriteConcern().toBSON());
     auto cmdObj = newCmdBuilder.done();
-    auto response =
-        executeCommandAgainstDatabasePrimary(opCtx,
-                                             ns.db(),
-                                             std::move(cachedDbInfo),
-                                             cmdObj,
-                                             ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                                             Shard::RetryPolicy::kIdempotent);
+    auto response = executeRawCommandAgainstDatabasePrimary(
+        opCtx,
+        ns.db(),
+        cachedDbInfo,
+        // Only unsharded collections can be dropped.
+        _versionCommandIfAppropriate(cmdObj, cachedDbInfo, ChunkVersion::UNSHARDED()),
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+        Shard::RetryPolicy::kIdempotent);
     uassertStatusOKWithContext(response.swResponse,
                                str::stream() << "failed while running command " << cmdObj);
     auto result = response.swResponse.getValue().data;
@@ -348,6 +367,29 @@ std::unique_ptr<Pipeline, PipelineDeleter>
 ShardServerProcessInterface::attachCursorSourceToPipeline(Pipeline* ownedPipeline,
                                                           bool allowTargetingShards) {
     return sharded_agg_helpers::attachCursorToPipeline(ownedPipeline, allowTargetingShards);
+}
+
+void ShardServerProcessInterface::setExpectedShardVersion(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    boost::optional<ChunkVersion> chunkVersion) {
+    auto& oss = OperationShardingState::get(opCtx);
+    if (oss.hasShardVersion(nss)) {
+        invariant(oss.getShardVersion(nss) == chunkVersion);
+    } else if (_opIsVersioned) {
+        oss.initializeClientRoutingVersions(nss, chunkVersion, boost::none);
+    }
+}
+
+BSONObj ShardServerProcessInterface::_versionCommandIfAppropriate(
+    BSONObj cmdObj,
+    const CachedDatabaseInfo& cachedDbInfo,
+    boost::optional<ChunkVersion> shardVersion) {
+    if (!_opIsVersioned) {
+        return cmdObj;
+    }
+    return appendDbVersionIfPresent(
+        shardVersion ? appendShardVersion(cmdObj, *shardVersion) : cmdObj, cachedDbInfo);
 }
 
 }  // namespace mongo

@@ -53,7 +53,6 @@ ERROR_ID_DUPLICATE_NODE = "ID0005"
 ERROR_ID_UNKNOWN_TYPE = "ID0006"
 ERROR_ID_IS_NODE_VALID_BOOL = "ID0007"
 ERROR_ID_UNKNOWN_NODE = "ID0008"
-ERROR_ID_EMPTY_FIELDS = "ID0009"
 ERROR_ID_MISSING_REQUIRED_FIELD = "ID0010"
 ERROR_ID_ARRAY_NOT_VALID_TYPE = "ID0011"
 ERROR_ID_MISSING_AST_REQUIRED_FIELD = "ID0012"
@@ -110,6 +109,12 @@ ERROR_ID_SERVER_PARAMETER_INVALID_ATTR = "ID0066"
 ERROR_ID_SERVER_PARAMETER_REQUIRED_ATTR = "ID0067"
 ERROR_ID_SERVER_PARAMETER_INVALID_METHOD_OVERRIDE = "ID0068"
 ERROR_ID_NON_CONST_GETTER_IN_IMMUTABLE_STRUCT = "ID0069"
+ERROR_ID_FEATURE_FLAG_DEFAULT_TRUE_MISSING_VERSION = "ID0070"
+ERROR_ID_FEATURE_FLAG_DEFAULT_FALSE_HAS_VERSION = "ID0071"
+ERROR_ID_INVALID_REPLY_TYPE = "ID0072"
+ERROR_ID_UNSTABLE_NO_API_VERSION = "ID0073"
+ERROR_ID_MISSING_REPLY_TYPE = "ID0074"
+ERROR_ID_API_VERSION_NO_STRICT = "ID0075"
 
 
 class IDLError(Exception):
@@ -355,13 +360,6 @@ class ParserContext(object):
         """Add an error about a duplicate node."""
         self._add_node_error(node, ERROR_ID_DUPLICATE_NODE,
                              "Duplicate node found for '%s'" % (node_name))
-
-    def add_empty_struct_error(self, node, name):
-        # type: (yaml.nodes.Node, str) -> None
-        """Add an error about a struct without fields."""
-        self._add_node_error(node, ERROR_ID_EMPTY_FIELDS,
-                             ("Struct '%s' must either have fields, chained_types, or " +
-                              "chained_structs specified but neither were found") % (name))
 
     def add_missing_required_field_error(self, node, node_parent, node_name):
         # type: (yaml.nodes.Node, str, str) -> None
@@ -803,6 +801,53 @@ class ParserContext(object):
         # pylint: disable=invalid-name
         self._add_error(location, ERROR_ID_MISSING_SHORT_NAME_WITH_SINGLE_NAME,
                         ("Missing 'short_name' required with 'single_name' value '%s'") % (name))
+
+    def add_feature_flag_default_true_missing_version(self, location):
+        # type: (common.SourceLocation) -> None
+        """Add an error about a default flag with a default value of true but no version."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_FEATURE_FLAG_DEFAULT_TRUE_MISSING_VERSION,
+                        ("Missing 'version' required for feature flag that defaults to true"))
+
+    def add_feature_flag_default_false_has_version(self, location):
+        # type: (common.SourceLocation) -> None
+        """Add an error about a default flag with a default value of false but has a version."""
+        # pylint: disable=invalid-name
+        self._add_error(
+            location, ERROR_ID_FEATURE_FLAG_DEFAULT_FALSE_HAS_VERSION,
+            ("The 'version' attribute is not allowed for feature flag that defaults to false"))
+
+    def add_reply_type_invalid_type(self, location, command_name, reply_type_name):
+        # type: (common.SourceLocation, str, str) -> None
+        """Add an error about a command whose reply_type refers to an unknown type."""
+        # pylint: disable=invalid-name
+        self._add_error(
+            location, ERROR_ID_INVALID_REPLY_TYPE,
+            ("Command '%s' has invalid reply_type '%s'" % (command_name, reply_type_name)))
+
+    def add_unstable_no_api_version(self, location, command_name):
+        # type: (common.SourceLocation, str) -> None
+        """Add an error about a command with 'unstable' but no 'api_version'."""
+        # pylint: disable=invalid-name
+        self._add_error(
+            location, ERROR_ID_UNSTABLE_NO_API_VERSION,
+            ("Command '%s' specifies 'unstable' but has no 'api_version'" % (command_name, )))
+
+    def add_missing_reply_type(self, location, command_name):
+        # type: (common.SourceLocation, str) -> None
+        """Add an error about a command with 'api_version' but no 'reply_type'."""
+        # pylint: disable=invalid-name
+        self._add_error(
+            location, ERROR_ID_MISSING_REPLY_TYPE,
+            ("Command '%s' has an 'api_version' but no 'reply_type'" % (command_name, )))
+
+    def add_api_version_no_strict(self, location, command_name):
+        # type: (common.SourceLocation, str) -> None
+        """Add an error about a command with 'api_version' but 'strict' isn't set to true."""
+        # pylint: disable=invalid-name
+        self._add_error(
+            location, ERROR_ID_API_VERSION_NO_STRICT,
+            ("Command '%s' specifies 'api_version' but 'strict' isn't true" % (command_name, )))
 
 
 def _assert_unique_error_messages():

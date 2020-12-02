@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -48,7 +48,6 @@
 #include "mongo/util/debugger.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/exit_code.h"
-#include "mongo/util/log_global_settings.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/stacktrace.h"
 #include "mongo/util/str.h"
@@ -268,6 +267,47 @@ MONGO_COMPILER_NOINLINE void msgassertedWithLocation(const Status& status,
                 "file"_attr = file,
                 "line"_attr = line);
     error_details::throwExceptionForStatus(status);
+}
+
+void iassertWithLocation(SourceLocationHolder loc, const Status& status) {
+    if (status.isOK())
+        return;
+    LOGV2_DEBUG(4892201, 3, "Internal assertion", "error"_attr = status, "location"_attr = loc);
+    error_details::throwExceptionForStatus(status);
+}
+
+void tassertFailedWithLocation(SourceLocationHolder loc, const Status& status) {
+    assertionCount.condrollover(assertionCount.tripwire.addAndFetch(1));
+    LOGV2(4457000, "Tripwire assertion", "error"_attr = status, "location"_attr = loc);
+    breakpoint();
+    error_details::throwExceptionForStatus(status);
+}
+
+void tassertWithLocation(SourceLocationHolder loc, const Status& status) {
+    if (status.isOK())
+        return;
+    tassertFailedWithLocation(std::move(loc), status);
+}
+
+void checkForTripwireAssertions(int code) {
+    auto tripwireOccurrences = assertionCount.tripwire.load();
+    if (tripwireOccurrences == 0) {
+        return;
+    }
+    if (code == EXIT_CLEAN) {
+        LOGV2_FATAL_NOTRACE(
+            4457001,
+            "Aborting process during clean exit due to prior failed tripwire assertions, "
+            "please check your logs for \"Tripwire assertion\" entries with log id 4457000.",
+            "occurrences"_attr = tripwireOccurrences,
+            "exitCode"_attr = code);
+    } else {
+        LOGV2(4457002,
+              "Detected prior failed tripwire assertions during unclean exit, please check your "
+              "logs for \"Tripwire assertion\" entries with log id 4457000.",
+              "occurrences"_attr = tripwireOccurrences,
+              "exitCode"_attr = code);
+    }
 }
 
 std::string causedBy(StringData e) {

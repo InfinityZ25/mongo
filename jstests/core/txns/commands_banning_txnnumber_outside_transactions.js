@@ -1,12 +1,11 @@
 // Test that commands other than retryable writes may not use txnNumber outside transactions.
 // @tags: [
-//   requires_document_locking,
 //   uses_map_reduce_with_temp_collections,
 // ]
 (function() {
 "use strict";
 
-const isMongos = assert.commandWorked(db.runCommand("ismaster")).msg === "isdbgrid";
+const isMongos = assert.commandWorked(db.runCommand("hello")).msg === "isdbgrid";
 
 const session = db.getMongo().startSession();
 const sessionDb = session.getDatabase("admin");
@@ -36,7 +35,6 @@ const nonRetryableWriteCommands = [
 const nonRetryableWriteCommandsMongodOnly = [
     // Commands that are allowed in transactions.
     {coordinateCommitTransaction: 1, participants: []},
-    {geoSearch: 1},
     {prepareTransaction: 1},
     // A selection of commands that are not allowed in transactions.
     {applyOps: 1}

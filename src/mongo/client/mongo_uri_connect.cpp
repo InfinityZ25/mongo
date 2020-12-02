@@ -39,7 +39,8 @@ namespace mongo {
 
 DBClientBase* MongoURI::connect(StringData applicationName,
                                 std::string& errmsg,
-                                boost::optional<double> socketTimeoutSecs) const {
+                                boost::optional<double> socketTimeoutSecs,
+                                const ClientAPIVersionParameters* apiParameters) const {
     OptionsMap::const_iterator it = _options.find("socketTimeoutMS");
     if (it != _options.end() && !socketTimeoutSecs) {
         try {
@@ -50,8 +51,8 @@ DBClientBase* MongoURI::connect(StringData applicationName,
         }
     }
 
-    auto ret = std::unique_ptr<DBClientBase>(
-        _connectString.connect(applicationName, errmsg, socketTimeoutSecs.value_or(0.0), this));
+    auto ret = std::unique_ptr<DBClientBase>(_connectString.connect(
+        applicationName, errmsg, socketTimeoutSecs.value_or(0.0), this, apiParameters));
     if (!ret) {
         return nullptr;
     }
@@ -64,7 +65,7 @@ DBClientBase* MongoURI::connect(StringData applicationName,
 
     if (!ret->authenticatedDuringConnect()) {
         auto optAuthObj =
-            makeAuthObjFromOptions(ret->getMaxWireVersion(), ret->getIsMasterSaslMechanisms());
+            makeAuthObjFromOptions(ret->getMaxWireVersion(), ret->getIsPrimarySaslMechanisms());
         if (optAuthObj) {
             ret->auth(optAuthObj.get());
         }

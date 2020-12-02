@@ -2,10 +2,10 @@
 //
 // This command cannot be run against mongos.
 // @tags: [
-//     assumes_against_mongod_not_mongos,
-//     incompatible_with_embedded,
-//     requires_capped,
-//     requires_fcv_44,
+//   assumes_against_mongod_not_mongos,
+//   incompatible_with_embedded,
+//   requires_capped,
+//   requires_non_retryable_commands,
 // ]
 
 (function() {
@@ -23,7 +23,7 @@ assert.commandWorked(sourceColl.insert({"val": 1, "backwards": 10}));
 assert.commandWorked(destColl.createIndex({"val": 1, "backwards": -1}));
 let options = assert.commandWorked(destDB.runCommand({"listCollections": 1}));
 let optionsArray = new DBCommandCursor(db, options).toArray();
-print(tojson(optionsArray));
+jsTestLog("Testing against initial starting options: " + tojson(optionsArray));
 
 let commandObj = {
     "internalRenameIfOptionsAndIndexesMatch": 1,
@@ -37,6 +37,7 @@ assert.commandFailedWithCode(adminDB.runCommand(commandObj), ErrorCodes.CommandF
 
 let destIndexes = assert.commandWorked(destDB.runCommand({"listIndexes": destColl.getName()}));
 commandObj.indexes = new DBCommandCursor(db, destIndexes).toArray();
+jsTestLog("Testing against destination collection with indexes: " + tojson(commandObj.indexes));
 assert.commandWorked(adminDB.runCommand(commandObj));
 
 assert.commandWorked(sourceColl.insert({"val": 1, "backwards": 10}));

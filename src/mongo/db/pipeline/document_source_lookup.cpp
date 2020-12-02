@@ -39,8 +39,10 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression_algo.h"
 #include "mongo/db/pipeline/document_path_support.h"
+#include "mongo/db/pipeline/document_source_merge_gen.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/variable_validation.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/platform/overflow_arithmetic.h"
 #include "mongo/util/fail_point.h"
@@ -49,6 +51,69 @@ namespace mongo {
 
 using boost::intrusive_ptr;
 using std::vector;
+
+namespace {
+
+/**
+ * Constructs a query of the following shape:
+ *  {$or: [
+ *    {'fieldName': {$eq: 'values[0]'}},
+ *    {'fieldName': {$eq: 'values[1]'}},
+ *    ...
+ *  ]}
+ */
+BSONObj buildEqualityOrQuery(const std::string& fieldName, const BSONArray& values) {
+    BSONObjBuilder orBuilder;
+    {
+        BSONArrayBuilder orPredicatesBuilder(orBuilder.subarrayStart("$or"));
+        for (auto&& value : values) {
+            orPredicatesBuilder.append(BSON(fieldName << BSON("$eq" << value)));
+        }
+    }
+    return orBuilder.obj();
+}
+
+void lookupPipeValidator(const Pipeline& pipeline) {
+    const auto& sources = pipeline.getSources();
+    std::for_each(sources.begin(), sources.end(), [](auto& src) {
+        uassert(51047,
+                str::stream() << src->getSourceName()
+                              << " is not allowed within a $lookup's sub-pipeline",
+                src->constraints().isAllowedInLookupPipeline());
+    });
+}
+
+bool foreignShardedLookupAllowed() {
+    return getTestCommandsEnabled() && internalQueryAllowShardedLookup.load();
+}
+
+// Parses $lookup 'from' field. The 'from' field must be a string or
+// {from: {db: "config", coll: "cache.chunks.*"}, ...} or
+// {from: {db: "local", coll: "oplog.rs"}, ...} .
+NamespaceString parseLookupFromAndResolveNamespace(const BSONElement& elem, StringData defaultDb) {
+    // The object syntax only works for cache.chunks.* and local.oplog.rs which are not user
+    // namespaces so object type is omitted from the error message below.
+    uassert(ErrorCodes::FailedToParse,
+            str::stream() << "$lookup 'from' field must be a string, but found "
+                          << typeName(elem.type()),
+            elem.type() == BSONType::String || elem.type() == BSONType::Object);
+
+    if (elem.type() == BSONType::String) {
+        return NamespaceString(defaultDb, elem.valueStringData());
+    }
+
+    // Valdate the db and coll names.
+    auto spec = NamespaceSpec::parse({elem.fieldNameStringData()}, elem.embeddedObject());
+    auto nss = NamespaceString(spec.getDb().value_or(""), spec.getColl().value_or(""));
+    uassert(
+        ErrorCodes::FailedToParse,
+        str::stream() << "$lookup with syntax {from: {db:<>, coll:<>},..} is not supported for db: "
+                      << nss.db() << " and coll: " << nss.coll(),
+        nss.isConfigDotCacheDotChunks() || nss == NamespaceString::kRsOplogNamespace);
+    return nss;
+}
+
+}  // namespace
 
 DocumentSourceLookUp::DocumentSourceLookUp(NamespaceString fromNs,
                                            std::string as,
@@ -97,11 +162,11 @@ DocumentSourceLookUp::DocumentSourceLookUp(NamespaceString fromNs,
 
     for (auto&& varElem : letVariables) {
         const auto varName = varElem.fieldNameStringData();
-        Variables::validateNameForUserWrite(varName);
+        variableValidation::validateNameForUserWrite(varName);
 
         _letVariables.emplace_back(
             varName.toString(),
-            Expression::parseOperand(expCtx, varElem, expCtx->variablesParseState),
+            Expression::parseOperand(expCtx.get(), varElem, expCtx->variablesParseState),
             _variablesParseState.defineVariable(varName));
     }
 
@@ -120,12 +185,7 @@ std::unique_ptr<DocumentSourceLookUp::LiteParsed> DocumentSourceLookUp::LitePars
     uassert(ErrorCodes::FailedToParse,
             str::stream() << "missing 'from' option to $lookup stage specification: " << specObj,
             fromElement);
-    uassert(ErrorCodes::FailedToParse,
-            str::stream() << "'from' option to $lookup must be a string, but was type "
-                          << typeName(specObj["from"].type()),
-            fromElement.type() == BSONType::String);
-
-    NamespaceString fromNss(nss.db(), fromElement.valueStringData());
+    auto fromNss = parseLookupFromAndResolveNamespace(fromElement, nss.db());
     uassert(ErrorCodes::InvalidNamespace,
             str::stream() << "invalid $lookup namespace: " << fromNss.ns(),
             fromNss.isValid());
@@ -176,18 +236,19 @@ const char* DocumentSourceLookUp::getSourceName() const {
 }
 
 StageConstraints DocumentSourceLookUp::constraints(Pipeline::SplitState) const {
-    // If executing on mongos and the foreign collection is sharded, then this stage can run on
-    // mongos or any shard.
-    HostTypeRequirement hostRequirement =
-        (pExpCtx->inMongos && pExpCtx->mongoProcessInterface->isSharded(pExpCtx->opCtx, _fromNs))
-        ? HostTypeRequirement::kNone
-        : HostTypeRequirement::kPrimaryShard;
-
-    const bool foreignShardedAllowed =
-        getTestCommandsEnabled() && internalQueryAllowShardedLookup.load();
-    if (!foreignShardedAllowed) {
-        // Always run on the primary shard.
-        hostRequirement = HostTypeRequirement::kPrimaryShard;
+    HostTypeRequirement hostRequirement;
+    if (_fromNs.isConfigDotCacheDotChunks()) {
+        // $lookup from config.cache.chunks* namespaces is permitted to run on each individual
+        // shard, rather than just the primary, since each shard should have an identical copy of
+        // the namespace.
+        hostRequirement = HostTypeRequirement::kAnyShard;
+    } else {
+        // When $lookup on sharded foreign collections is allowed, the foreign collection is
+        // sharded, and the stage is executing on mongos, the stage can run on mongos or any shard.
+        hostRequirement = (foreignShardedLookupAllowed() && pExpCtx->inMongos &&
+                           pExpCtx->mongoProcessInterface->isSharded(pExpCtx->opCtx, _fromNs))
+            ? HostTypeRequirement::kNone
+            : HostTypeRequirement::kPrimaryShard;
     }
 
     // By default, $lookup is allowed in a transaction and does not use disk.
@@ -208,52 +269,10 @@ StageConstraints DocumentSourceLookUp::constraints(Pipeline::SplitState) const {
     }
 
     constraints.canSwapWithMatch = true;
-    constraints.canSwapWithLimitAndSample = !_unwindSrc;
+    constraints.canSwapWithSkippingOrLimitingStage = !_unwindSrc;
 
     return constraints;
 }
-
-namespace {
-
-/**
- * Constructs a query of the following shape:
- *  {$or: [
- *    {'fieldName': {$eq: 'values[0]'}},
- *    {'fieldName': {$eq: 'values[1]'}},
- *    ...
- *  ]}
- */
-BSONObj buildEqualityOrQuery(const std::string& fieldName, const BSONArray& values) {
-    BSONObjBuilder orBuilder;
-    {
-        BSONArrayBuilder orPredicatesBuilder(orBuilder.subarrayStart("$or"));
-        for (auto&& value : values) {
-            orPredicatesBuilder.append(BSON(fieldName << BSON("$eq" << value)));
-        }
-    }
-    return orBuilder.obj();
-}
-
-void assertIsValidCollectionState(const boost::intrusive_ptr<ExpressionContext>& expCtx) {
-    if (expCtx->mongoProcessInterface->isSharded(expCtx->opCtx, expCtx->ns)) {
-        const bool foreignShardedAllowed =
-            getTestCommandsEnabled() && internalQueryAllowShardedLookup.load();
-        if (!foreignShardedAllowed) {
-            uasserted(51069, "Cannot run $lookup with sharded foreign collection");
-        }
-    }
-}
-
-void lookupPipeValidator(const Pipeline& pipeline) {
-    const auto& sources = pipeline.getSources();
-    std::for_each(sources.begin(), sources.end(), [](auto& src) {
-        uassert(51047,
-                str::stream() << src->getSourceName()
-                              << " is not allowed within a $lookup's sub-pipeline",
-                src->constraints().isAllowedInLookupPipeline());
-    });
-}
-}  // namespace
 
 DocumentSource::GetNextResult DocumentSourceLookUp::doGetNext() {
     if (_unwindSrc) {
@@ -278,7 +297,20 @@ DocumentSource::GetNextResult DocumentSourceLookUp::doGetNext() {
         _resolvedPipeline.back() = matchStage;
     }
 
-    auto pipeline = buildPipeline(inputDoc);
+    std::unique_ptr<Pipeline, PipelineDeleter> pipeline;
+    try {
+        pipeline = buildPipeline(inputDoc);
+    } catch (const ExceptionForCat<ErrorCategory::StaleShardVersionError>& ex) {
+        // If lookup on a sharded collection is disallowed and the foreign collection is sharded,
+        // throw a custom exception.
+        if (auto staleInfo = ex.extraInfo<StaleConfigInfo>()) {
+            uassert(51069,
+                    "Cannot run $lookup with sharded foreign collection",
+                    foreignShardedLookupAllowed() || !staleInfo->getVersionWanted() ||
+                        staleInfo->getVersionWanted() == ChunkVersion::UNSHARDED());
+        }
+        throw;
+    }
 
     std::vector<Value> results;
     long long objsize = 0;
@@ -308,10 +340,14 @@ std::unique_ptr<Pipeline, PipelineDeleter> DocumentSourceLookUp::buildPipeline(
     // Copy all 'let' variables into the foreign pipeline's expression context.
     _variables.copyToExpCtx(_variablesParseState, _fromExpCtx.get());
 
-    assertIsValidCollectionState(_fromExpCtx);
-
     // Resolve the 'let' variables to values per the given input document.
     resolveLetVariables(inputDoc, &_fromExpCtx->variables);
+
+    if (!foreignShardedLookupAllowed()) {
+        // Enforce that the foreign collection must be unsharded for lookup.
+        _fromExpCtx->mongoProcessInterface->setExpectedShardVersion(
+            _fromExpCtx->opCtx, _fromExpCtx->ns, ChunkVersion::UNSHARDED());
+    }
 
     // If we don't have a cache, build and return the pipeline immediately.
     if (!_cache || _cache->isAbandoned()) {
@@ -674,6 +710,12 @@ void DocumentSourceLookUp::initializeResolvedIntrospectionPipeline() {
 void DocumentSourceLookUp::serializeToArray(
     std::vector<Value>& array, boost::optional<ExplainOptions::Verbosity> explain) const {
     Document doc;
+
+    // Support alternative $lookup from config.cache.chunks* namespaces.
+    auto fromValue = (pExpCtx->ns.db() == _fromNs.db())
+        ? Value(_fromNs.coll())
+        : Value(Document{{"db", _fromNs.db()}, {"coll", _fromNs.coll()}});
+
     if (wasConstructedWithPipelineSyntax()) {
         MutableDocument exprList;
         for (auto letVar : _letVariables) {
@@ -687,16 +729,16 @@ void DocumentSourceLookUp::serializeToArray(
         }
 
         doc = Document{{getSourceName(),
-                        Document{{"from", _fromNs.coll()},
+                        Document{{"from", fromValue},
                                  {"as", _as.fullPath()},
                                  {"let", exprList.freeze()},
                                  {"pipeline", pipeline}}}};
     } else {
         doc = Document{{getSourceName(),
-                        {Document{{"from", _fromNs.coll()},
-                                  {"as", _as.fullPath()},
-                                  {"localField", _localField->fullPath()},
-                                  {"foreignField", _foreignField->fullPath()}}}}};
+                        Document{{"from", fromValue},
+                                 {"as", _as.fullPath()},
+                                 {"localField", _localField->fullPath()},
+                                 {"foreignField", _foreignField->fullPath()}}}};
     }
 
     MutableDocument output(doc);
@@ -770,6 +812,18 @@ DepsTracker::State DocumentSourceLookUp::getDependencies(DepsTracker* deps) cons
     return DepsTracker::State::SEE_NEXT;
 }
 
+boost::optional<DocumentSource::DistributedPlanLogic> DocumentSourceLookUp::distributedPlanLogic() {
+    if (_fromExpCtx->ns.isConfigDotCacheDotChunks()) {
+        // When $lookup reads from config.cache.chunks.* namespaces, it should run on each
+        // individual shard in parallel. This is a special case, and atypical for standard $lookup
+        // since a full copy of config.cache.chunks.* collections exists on all shards.
+        return boost::none;
+    }
+
+    // {shardsStage, mergingStage, sortPattern}
+    return DistributedPlanLogic{nullptr, this, boost::none};
+}
+
 void DocumentSourceLookUp::detachFromOperationContext() {
     if (_pipeline) {
         // We have a pipeline we're going to be executing across multiple calls to getNext(), so we
@@ -834,14 +888,17 @@ intrusive_ptr<DocumentSource> DocumentSourceLookUp::createFromBson(
             continue;
         }
 
+        if (argName == "from") {
+            fromNs = parseLookupFromAndResolveNamespace(argument, pExpCtx->ns.db());
+            continue;
+        }
+
         uassert(ErrorCodes::FailedToParse,
                 str::stream() << "$lookup argument '" << argName << "' must be a string, found "
                               << argument << ": " << argument.type(),
                 argument.type() == BSONType::String);
 
-        if (argName == "from") {
-            fromNs = NamespaceString(pExpCtx->ns.db().toString() + '.' + argument.String());
-        } else if (argName == "as") {
+        if (argName == "as") {
             as = argument.String();
         } else if (argName == "localField") {
             localField = argument.String();

@@ -29,25 +29,25 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/catalog/import_collection_oplog_entry_gen.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/locker_noop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/keys_collection_client_sharded.h"
 #include "mongo/db/keys_collection_manager.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/op_observer_impl.h"
 #include "mongo/db/read_write_concern_defaults.h"
 #include "mongo/db/read_write_concern_defaults_cache_lookup_mock.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/oplog_interface_local.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/session_catalog_mongod.h"
-#include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_recovery_unit.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/db/transaction_participant_gen.h"
 #include "mongo/rpc/get_status_from_command_result.h"
@@ -75,7 +75,6 @@ public:
         repl::ReplicationCoordinator::set(
             service,
             std::make_unique<repl::ReplicationCoordinatorMock>(service, createReplSettings()));
-        repl::setOplogCollectionName(service);
         repl::createOplog(opCtx.get());
 
         // Ensure that we are primary.
@@ -443,6 +442,61 @@ TEST_F(OpObserverTest, OnRenameCollectionOmitsDropTargetFieldIfDropTargetUuidIsN
     auto oExpected = BSON("renameCollection" << sourceNss.ns() << "to" << targetNss.ns()
                                              << "stayTemp" << stayTemp);
     ASSERT_BSONOBJ_EQ(oExpected, o);
+}
+
+TEST_F(OpObserverTest, MustBePrimaryToWriteOplogEntries) {
+    OpObserverImpl opObserver;
+    auto opCtx = cc().makeOperationContext();
+
+    ASSERT_OK(repl::ReplicationCoordinator::get(opCtx.get())
+                  ->setFollowerMode(repl::MemberState::RS_SECONDARY));
+
+    Lock::GlobalWrite globalWrite(opCtx.get());
+    WriteUnitOfWork wunit(opCtx.get());
+
+    // No-op writes should be prohibited.
+    ASSERT_THROWS_CODE(
+        opObserver.onOpMessage(opCtx.get(), {}), DBException, ErrorCodes::NotWritablePrimary);
+}
+
+TEST_F(OpObserverTest, ImportCollectionOplogEntry) {
+    OpObserverImpl opObserver;
+    auto opCtx = cc().makeOperationContext();
+
+    auto importUUID = UUID::gen();
+    NamespaceString nss("test.coll");
+    long long numRecords = 1;
+    long long dataSize = 2;
+    // A dummy invalid catalog entry. We do not need a valid catalog entry for this test.
+    auto catalogEntry = BSON("ns" << nss.ns() << "ident"
+                                  << "collection-7-1792004489479993697");
+    auto storageMetadata = BSON("storage"
+                                << "metadata");
+    bool isDryRun = false;
+
+    // Write to the oplog.
+    {
+        AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_X);
+        WriteUnitOfWork wunit(opCtx.get());
+        opObserver.onImportCollection(opCtx.get(),
+                                      importUUID,
+                                      nss,
+                                      numRecords,
+                                      dataSize,
+                                      catalogEntry,
+                                      storageMetadata,
+                                      isDryRun);
+        wunit.commit();
+    }
+
+    auto oplogEntryObj = getSingleOplogEntry(opCtx.get());
+    OplogEntry oplogEntry = assertGet(OplogEntry::parse(oplogEntryObj));
+    ASSERT_TRUE(repl::OpTypeEnum::kCommand == oplogEntry.getOpType());
+    ASSERT_TRUE(OplogEntry::CommandType::kImportCollection == oplogEntry.getCommandType());
+
+    ImportCollectionOplogEntry importCollection(
+        nss, importUUID, numRecords, dataSize, catalogEntry, storageMetadata, isDryRun);
+    ASSERT_BSONOBJ_EQ(importCollection.toBSON(), oplogEntry.getObject());
 }
 
 /**

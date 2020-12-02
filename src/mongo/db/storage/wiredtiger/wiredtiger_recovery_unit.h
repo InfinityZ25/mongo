@@ -34,6 +34,7 @@
 #include <boost/optional.hpp>
 #include <cstdint>
 #include <memory>
+#include <stack>
 #include <vector>
 
 #include "mongo/base/checked_cast.h"
@@ -50,6 +51,8 @@ namespace mongo {
 
 using RoundUpPreparedTimestamps = WiredTigerBeginTxnBlock::RoundUpPreparedTimestamps;
 using RoundUpReadTimestamp = WiredTigerBeginTxnBlock::RoundUpReadTimestamp;
+
+extern AtomicWord<std::int64_t> snapshotTooOldErrorCount;
 
 class BSONObjBuilder;
 
@@ -110,12 +113,17 @@ public:
     bool waitUntilUnjournaledWritesDurable(OperationContext* opCtx, bool stableCheckpoint) override;
 
     void preallocateSnapshot() override;
+    void preallocateSnapshotForOplogRead() override;
 
-    Status obtainMajorityCommittedSnapshot() override;
+    Status majorityCommittedSnapshotAvailable() const override;
 
-    boost::optional<Timestamp> getPointInTimeReadTimestamp() override;
+    boost::optional<Timestamp> getPointInTimeReadTimestamp(OperationContext* opCtx) override;
 
     Status setTimestamp(Timestamp timestamp) override;
+
+    bool isTimestamped() const override {
+        return _isTimestamped;
+    }
 
     void setCommitTimestamp(Timestamp timestamp) override;
 
@@ -162,6 +170,12 @@ public:
 
     std::shared_ptr<StorageStats> getOperationStatistics() const override;
 
+    void refreshSnapshot() override;
+
+    void ignoreAllMultiTimestampConstraints() {
+        _multiTimestampConstraintTracker.ignoreAllMultiTimestampConstraints = true;
+    }
+
     // ---- WT STUFF
 
     WiredTigerSession* getSession();
@@ -189,10 +203,16 @@ public:
     WiredTigerSessionCache* getSessionCache() {
         return _sessionCache;
     }
-    bool inActiveTxn() const {
-        return _isActive();
-    }
+
     void assertInActiveTxn() const;
+
+    /**
+     * This function must be called when a write operation is performed on the active transaction
+     * for the first time.
+     *
+     * Must be reset when the active transaction is either committed or rolled back.
+     */
+    void setTxnModified();
 
     boost::optional<int64_t> getOplogVisibilityTs();
 
@@ -228,17 +248,39 @@ private:
     Timestamp _beginTransactionAtNoOverlapTimestamp(WT_SESSION* session);
 
     /**
+     * Starts a transaction at the lastApplied timestamp. Returns the timestamp at which the
+     * transaction was started.
+     */
+    Timestamp _beginTransactionAtLastAppliedTimestamp(WT_SESSION* session);
+
+    /**
      * Returns the timestamp at which the current transaction is reading.
      */
     Timestamp _getTransactionReadTimestamp(WT_SESSION* session);
+
+    /**
+     * Keeps track of constraint violations on multi timestamp transactions. If a transaction sets
+     * multiple timestamps, the first timestamp must be set prior to any writes. Vice-versa, if a
+     * transaction writes a document before setting a timestamp, it must not set multiple
+     * timestamps.
+     */
+    void _updateMultiTimestampConstraint(Timestamp timestamp);
 
     WiredTigerSessionCache* _sessionCache;  // not owned
     WiredTigerOplogManager* _oplogManager;  // not owned
     UniqueWiredTigerSession _session;
     bool _isTimestamped = false;
 
+    // Helpers used to keep track of multi timestamp constraint violations on the transaction.
+    struct MultiTimestampConstraintTracker {
+        bool isTxnModified = false;
+        bool txnHasNonTimestampedWrite = false;
+        bool ignoreAllMultiTimestampConstraints = false;
+        std::stack<Timestamp> timestampOrder = {};
+    } _multiTimestampConstraintTracker;
+
     // Specifies which external source to use when setting read timestamps on transactions.
-    ReadSource _timestampReadSource = ReadSource::kUnset;
+    ReadSource _timestampReadSource = ReadSource::kNoTimestamp;
 
     // Commits are assumed ordered.  Unordered commits are assumed to always need to reserve a
     // new optime, and thus always call oplogDiskLocRegister() on the record store.
@@ -255,7 +297,6 @@ private:
     Timestamp _durableTimestamp;
     Timestamp _prepareTimestamp;
     boost::optional<Timestamp> _lastTimestampSet;
-    Timestamp _majorityCommittedSnapshot;
     Timestamp _readAtTimestamp;
     Timestamp _catalogConflictTimestamp;
     std::unique_ptr<Timer> _timer;

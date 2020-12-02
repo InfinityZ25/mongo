@@ -29,7 +29,9 @@
 
 #include "mongo/platform/basic.h"
 
+#include <limits>
 #include <sstream>
+#include <timelib.h>
 
 #include "mongo/db/query/datetime/date_time_support.h"
 #include "mongo/unittest/unittest.h"
@@ -387,12 +389,16 @@ TEST(NewYorkTimeBeforeEpoch, DoesComputeISOWeek) {
 TEST(UTCTimeBeforeEpoch, DoesFormatDate) {
     // Tuesday, Dec 30, 1969 13:42:23:211
     auto date = Date_t::fromMillisSinceEpoch(-123456789LL);
-    ASSERT_EQ(TimeZoneDatabase::utcZone().formatDate("%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
-                                                     "dayOfWeek: %w, week: %U, isoYear: %G, "
-                                                     "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
-                                                     date),
-              "1969/12/30 13:42:23:211, dayOfYear: 364, dayOfWeek: 3, week: 52, isoYear: 1970, "
-              "isoWeek: 01, isoDayOfWeek: 2, percent: %");
+    auto result = TimeZoneDatabase::utcZone().formatDate(
+        "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
+        "dayOfWeek: %w, week: %U, isoYear: %G, "
+        "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
+        date);
+    ASSERT_OK(result);
+    ASSERT_EQ(
+        "1969/12/30 13:42:23:211, dayOfYear: 364, dayOfWeek: 3, week: 52, isoYear: 1970, "
+        "isoWeek: 01, isoDayOfWeek: 2, percent: %",
+        result.getValue());
 }
 
 TEST(NewYorkTimeBeforeEpoch, DoesFormatDate) {
@@ -400,23 +406,28 @@ TEST(NewYorkTimeBeforeEpoch, DoesFormatDate) {
 
     // Tuesday, Dec 30, 1969 13:42:23:211
     auto date = Date_t::fromMillisSinceEpoch(-123456789LL);
-    ASSERT_EQ(newYorkZone.formatDate("%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
-                                     "dayOfWeek: %w, week: %U, isoYear: %G, "
-                                     "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
-                                     date),
-              "1969/12/30 08:42:23:211, dayOfYear: 364, dayOfWeek: 3, week: 52, isoYear: 1970, "
-              "isoWeek: 01, isoDayOfWeek: 2, percent: %");
+    auto result = newYorkZone.formatDate(
+        "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
+        "dayOfWeek: %w, week: %U, isoYear: %G, "
+        "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
+        date);
+    ASSERT_OK(result);
+    ASSERT_EQ(
+        "1969/12/30 08:42:23:211, dayOfYear: 364, dayOfWeek: 3, week: 52, isoYear: 1970, "
+        "isoWeek: 01, isoDayOfWeek: 2, percent: %",
+        result.getValue());
 }
 
 TEST(UTCTimeBeforeEpoch, DoesOutputFormatDate) {
     // Tuesday, Dec 30, 1969 13:42:23:211
     auto date = Date_t::fromMillisSinceEpoch(-123456789LL);
     std::ostringstream os;
-    TimeZoneDatabase::utcZone().outputDateWithFormat(os,
-                                                     "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
-                                                     "dayOfWeek: %w, week: %U, isoYear: %G, "
-                                                     "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
-                                                     date);
+    ASSERT_OK(TimeZoneDatabase::utcZone().outputDateWithFormat(
+        os,
+        "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
+        "dayOfWeek: %w, week: %U, isoYear: %G, "
+        "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
+        date));
     ASSERT_EQ(os.str(),
               "1969/12/30 13:42:23:211, dayOfYear: 364, dayOfWeek: 3, week: 52, isoYear: 1970, "
               "isoWeek: 01, isoDayOfWeek: 2, percent: %");
@@ -428,11 +439,11 @@ TEST(NewYorkTimeBeforeEpoch, DoesOutputFormatDate) {
     // Tuesday, Dec 30, 1969 13:42:23:211
     auto date = Date_t::fromMillisSinceEpoch(-123456789LL);
     std::ostringstream os;
-    newYorkZone.outputDateWithFormat(os,
-                                     "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
-                                     "dayOfWeek: %w, week: %U, isoYear: %G, "
-                                     "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
-                                     date);
+    ASSERT_OK(newYorkZone.outputDateWithFormat(os,
+                                               "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
+                                               "dayOfWeek: %w, week: %U, isoYear: %G, "
+                                               "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
+                                               date));
     ASSERT_EQ(os.str(),
               "1969/12/30 08:42:23:211, dayOfYear: 364, dayOfWeek: 3, week: 52, isoYear: 1970, "
               "isoWeek: 01, isoDayOfWeek: 2, percent: %");
@@ -567,12 +578,16 @@ TEST(NewYorkTimeAtEpoch, DoesComputeISOWeek) {
 TEST(UTCTimeAtEpoch, DoesFormatDate) {
     // Thu, Jan 1, 1970 00:00:00:000
     auto date = Date_t::fromMillisSinceEpoch(0);
-    ASSERT_EQ(TimeZoneDatabase::utcZone().formatDate("%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
-                                                     "dayOfWeek: %w, week: %U, isoYear: %G, "
-                                                     "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
-                                                     date),
-              "1970/01/01 00:00:00:000, dayOfYear: 001, dayOfWeek: 5, week: 00, isoYear: 1970, "
-              "isoWeek: 01, isoDayOfWeek: 4, percent: %");
+    auto result = TimeZoneDatabase::utcZone().formatDate(
+        "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
+        "dayOfWeek: %w, week: %U, isoYear: %G, "
+        "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
+        date);
+    ASSERT_OK(result);
+    ASSERT_EQ(
+        "1970/01/01 00:00:00:000, dayOfYear: 001, dayOfWeek: 5, week: 00, isoYear: 1970, "
+        "isoWeek: 01, isoDayOfWeek: 4, percent: %",
+        result.getValue());
 }
 
 TEST(NewYorkTimeAtEpoch, DoesFormatDate) {
@@ -580,22 +595,27 @@ TEST(NewYorkTimeAtEpoch, DoesFormatDate) {
 
     // Thu, Jan 1, 1970 00:00:00:000Z
     auto date = Date_t::fromMillisSinceEpoch(0);
-    ASSERT_EQ(newYorkZone.formatDate("%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
-                                     "dayOfWeek: %w, week: %U, isoYear: %G, "
-                                     "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
-                                     date),
-              "1969/12/31 19:00:00:000, dayOfYear: 365, dayOfWeek: 4, week: 52, isoYear: 1970, "
-              "isoWeek: 01, isoDayOfWeek: 3, percent: %");
+    auto result = newYorkZone.formatDate(
+        "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
+        "dayOfWeek: %w, week: %U, isoYear: %G, "
+        "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
+        date);
+    ASSERT_OK(result);
+    ASSERT_EQ(
+        "1969/12/31 19:00:00:000, dayOfYear: 365, dayOfWeek: 4, week: 52, isoYear: 1970, "
+        "isoWeek: 01, isoDayOfWeek: 3, percent: %",
+        result.getValue());
 }
 
 TEST(UTCTimeAtEpoch, DoesOutputFormatDate) {
     auto date = Date_t::fromMillisSinceEpoch(0);
     std::ostringstream os;
-    TimeZoneDatabase::utcZone().outputDateWithFormat(os,
-                                                     "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
-                                                     "dayOfWeek: %w, week: %U, isoYear: %G, "
-                                                     "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
-                                                     date);
+    ASSERT_OK(TimeZoneDatabase::utcZone().outputDateWithFormat(
+        os,
+        "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
+        "dayOfWeek: %w, week: %U, isoYear: %G, "
+        "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
+        date));
     ASSERT_EQ(os.str(),
               "1970/01/01 00:00:00:000, dayOfYear: 001, dayOfWeek: 5, week: 00, isoYear: 1970, "
               "isoWeek: 01, isoDayOfWeek: 4, percent: %");
@@ -605,11 +625,11 @@ TEST(NewYorkTimeAtEpoch, DoesOutputFormatDate) {
     auto newYorkZone = kDefaultTimeZoneDatabase.getTimeZone("America/New_York");
     auto date = Date_t::fromMillisSinceEpoch(0);
     std::ostringstream os;
-    newYorkZone.outputDateWithFormat(os,
-                                     "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
-                                     "dayOfWeek: %w, week: %U, isoYear: %G, "
-                                     "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
-                                     date);
+    ASSERT_OK(newYorkZone.outputDateWithFormat(os,
+                                               "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
+                                               "dayOfWeek: %w, week: %U, isoYear: %G, "
+                                               "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
+                                               date));
     ASSERT_EQ(os.str(),
               "1969/12/31 19:00:00:000, dayOfYear: 365, dayOfWeek: 4, week: 52, isoYear: 1970, "
               "isoWeek: 01, isoDayOfWeek: 3, percent: %");
@@ -879,47 +899,60 @@ TEST(NewYorkTimeAfterEpoch, DoesComputeISOWeek) {
 TEST(UTCTimeAfterEpoch, DoesFormatDate) {
     // Tue, Jun 6, 2017 19:38:43:234.
     auto date = Date_t::fromMillisSinceEpoch(1496777923234LL);
-    ASSERT_EQ(TimeZoneDatabase::utcZone().formatDate("%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
-                                                     "dayOfWeek: %w, week: %U, isoYear: %G, "
-                                                     "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
-                                                     date),
-              "2017/06/06 19:38:43:234, dayOfYear: 157, dayOfWeek: 3, week: 23, isoYear: 2017, "
-              "isoWeek: 23, isoDayOfWeek: 2, percent: %");
+    auto result = TimeZoneDatabase::utcZone().formatDate(
+        "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
+        "dayOfWeek: %w, week: %U, isoYear: %G, "
+        "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
+        date);
+    ASSERT_OK(result);
+    ASSERT_EQ(
+        "2017/06/06 19:38:43:234, dayOfYear: 157, dayOfWeek: 3, week: 23, isoYear: 2017, "
+        "isoWeek: 23, isoDayOfWeek: 2, percent: %",
+        result.getValue());
 }
 
 TEST(NewYorkTimeAfterEpoch, DoesFormatDate) {
     // 2017-06-06T19:38:43:234Z (Tuesday).
     auto date = Date_t::fromMillisSinceEpoch(1496777923234LL);
     auto newYorkZone = kDefaultTimeZoneDatabase.getTimeZone("America/New_York");
-    ASSERT_EQ(newYorkZone.formatDate("%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
-                                     "dayOfWeek: %w, week: %U, isoYear: %G, "
-                                     "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
-                                     date),
-              "2017/06/06 15:38:43:234, dayOfYear: 157, dayOfWeek: 3, week: 23, isoYear: 2017, "
-              "isoWeek: 23, isoDayOfWeek: 2, percent: %");
+    auto result = newYorkZone.formatDate(
+        "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
+        "dayOfWeek: %w, week: %U, isoYear: %G, "
+        "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
+        date);
+    ASSERT_OK(result);
+    ASSERT_EQ(
+        "2017/06/06 15:38:43:234, dayOfYear: 157, dayOfWeek: 3, week: 23, isoYear: 2017, "
+        "isoWeek: 23, isoDayOfWeek: 2, percent: %",
+        result.getValue());
 }
 
 TEST(UTCOffsetAfterEpoch, DoesFormatDate) {
     // 2017-06-06T19:38:43:234Z (Tuesday).
     auto date = Date_t::fromMillisSinceEpoch(1496777923234LL);
     auto offsetSpec = kDefaultTimeZoneDatabase.getTimeZone("+02:30");
-    ASSERT_EQ(offsetSpec.formatDate("%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
-                                    "dayOfWeek: %w, week: %U, isoYear: %G, "
-                                    "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
-                                    date),
-              "2017/06/06 22:08:43:234, dayOfYear: 157, dayOfWeek: 3, week: 23, isoYear: 2017, "
-              "isoWeek: 23, isoDayOfWeek: 2, percent: %");
+    auto result = offsetSpec.formatDate(
+        "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
+        "dayOfWeek: %w, week: %U, isoYear: %G, "
+        "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
+        date);
+    ASSERT_OK(result);
+    ASSERT_EQ(
+        "2017/06/06 22:08:43:234, dayOfYear: 157, dayOfWeek: 3, week: 23, isoYear: 2017, "
+        "isoWeek: 23, isoDayOfWeek: 2, percent: %",
+        result.getValue());
 }
 
 TEST(UTCTimeAfterEpoch, DoesOutputFormatDate) {
     // Tue, Jun 6, 2017 19:38:43:234.
     auto date = Date_t::fromMillisSinceEpoch(1496777923234LL);
     std::ostringstream os;
-    TimeZoneDatabase::utcZone().outputDateWithFormat(os,
-                                                     "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
-                                                     "dayOfWeek: %w, week: %U, isoYear: %G, "
-                                                     "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
-                                                     date);
+    ASSERT_OK(TimeZoneDatabase::utcZone().outputDateWithFormat(
+        os,
+        "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
+        "dayOfWeek: %w, week: %U, isoYear: %G, "
+        "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
+        date));
     ASSERT_EQ(os.str(),
               "2017/06/06 19:38:43:234, dayOfYear: 157, dayOfWeek: 3, week: 23, isoYear: 2017, "
               "isoWeek: 23, isoDayOfWeek: 2, percent: %");
@@ -930,11 +963,11 @@ TEST(NewYorkTimeAfterEpoch, DoesOutputFormatDate) {
     auto date = Date_t::fromMillisSinceEpoch(1496777923234LL);
     std::ostringstream os;
     auto newYorkZone = kDefaultTimeZoneDatabase.getTimeZone("America/New_York");
-    newYorkZone.outputDateWithFormat(os,
-                                     "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
-                                     "dayOfWeek: %w, week: %U, isoYear: %G, "
-                                     "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
-                                     date);
+    ASSERT_OK(newYorkZone.outputDateWithFormat(os,
+                                               "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
+                                               "dayOfWeek: %w, week: %U, isoYear: %G, "
+                                               "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
+                                               date));
     ASSERT_EQ(os.str(),
               "2017/06/06 15:38:43:234, dayOfYear: 157, dayOfWeek: 3, week: 23, isoYear: 2017, "
               "isoWeek: 23, isoDayOfWeek: 2, percent: %");
@@ -965,37 +998,42 @@ TEST(DateFormat, ThrowsUserExceptionIfGivenUnmatchedPercent) {
                        18535);
 }
 
-TEST(DateFormat, ThrowsUserExceptionIfGivenDateBeforeYear0) {
+TEST(DateFormat, ProducesNonOKStatusGivenDateBeforeYear0) {
     const long long kMillisPerYear = 31556926000;
 
-    ASSERT_THROWS_CODE(TimeZoneDatabase::utcZone().formatDate(
-                           "%Y", Date_t::fromMillisSinceEpoch(-(kMillisPerYear * 1971))),
-                       AssertionException,
-                       18537);
+    ASSERT_EQ(18537,
+              TimeZoneDatabase::utcZone()
+                  .formatDate("%Y", Date_t::fromMillisSinceEpoch(-(kMillisPerYear * 1971)))
+                  .getStatus()
+                  .code());
 
-    ASSERT_THROWS_CODE(TimeZoneDatabase::utcZone().formatDate(
-                           "%G", Date_t::fromMillisSinceEpoch(-(kMillisPerYear * 1971))),
-                       AssertionException,
-                       18537);
+    ASSERT_EQ(18537,
+              TimeZoneDatabase::utcZone()
+                  .formatDate("%G", Date_t::fromMillisSinceEpoch(-(kMillisPerYear * 1971)))
+                  .getStatus()
+                  .code());
 
-    ASSERT_EQ("0000",
-              TimeZoneDatabase::utcZone().formatDate(
-                  "%Y", Date_t::fromMillisSinceEpoch(-(kMillisPerYear * 1970))));
+    auto result = TimeZoneDatabase::utcZone().formatDate(
+        "%Y", Date_t::fromMillisSinceEpoch(-(kMillisPerYear * 1970)));
+    ASSERT_OK(result);
+    ASSERT_EQ("0000", result.getValue());
 }
 
-TEST(DateFormat, ThrowsUserExceptionIfGivenDateAfterYear9999) {
-    ASSERT_THROWS_CODE(
-        TimeZoneDatabase::utcZone().formatDate("%Y", Date_t::max()), AssertionException, 18537);
+TEST(DateFormat, ProducesNonOKStatusIfGivenDateAfterYear9999) {
+    ASSERT_EQ(18537,
+              TimeZoneDatabase::utcZone().formatDate("%Y", Date_t::max()).getStatus().code());
 
-    ASSERT_THROWS_CODE(
-        TimeZoneDatabase::utcZone().formatDate("%G", Date_t::max()), AssertionException, 18537);
+    ASSERT_EQ(18537,
+              TimeZoneDatabase::utcZone().formatDate("%G", Date_t::max()).getStatus().code());
 }
 
 TEST(DateFromString, CorrectlyParsesStringThatMatchesFormat) {
     auto input = "2017-07-04T10:56:02Z";
     auto format = "%Y-%m-%dT%H:%M:%SZ"_sd;
     auto date = kDefaultTimeZoneDatabase.fromString(input, kDefaultTimeZone, format);
-    ASSERT_EQ(TimeZoneDatabase::utcZone().formatDate(format, date), input);
+    auto result = TimeZoneDatabase::utcZone().formatDate(format, date);
+    ASSERT_OK(result);
+    ASSERT_EQ(input, result.getValue());
 }
 
 TEST(DateFromString, RejectsStringWithInvalidYearFormat) {
@@ -1155,5 +1193,318 @@ TEST(DayOfWeek, DayNumber) {
     }
 }
 
+// Time zones for testing 'dateDiff()'.
+const TimeZone kNewYorkTimeZone = kDefaultTimeZoneDatabase.getTimeZone("America/New_York");
+const TimeZone kAustraliaEuclaTimeZone =
+    kDefaultTimeZoneDatabase.getTimeZone("Australia/Eucla");  // UTC offset +08:45
+
+// Verifies 'dateDiff()' with TimeUnit::year.
+TEST(DateDiff, Year) {
+    ASSERT_EQ(0,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2000, 12, 31, 23, 59, 59, 500),
+                       kNewYorkTimeZone.createFromDateParts(2000, 12, 31, 23, 59, 59, 999),
+                       TimeUnit::year,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(1,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2000, 12, 31, 23, 59, 59, 500),
+                       kNewYorkTimeZone.createFromDateParts(2001, 1, 1, 0, 0, 0, 0),
+                       TimeUnit::year,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(-1,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2001, 1, 1, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2000, 12, 31, 23, 59, 59, 500),
+                       TimeUnit::year,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(999,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(1002, 1, 1, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2001, 1, 1, 0, 0, 0, 0),
+                       TimeUnit::year,
+                       kNewYorkTimeZone));
+}
+
+// Verifies 'dateDiff()' with TimeUnit::month.
+TEST(DateDiff, Month) {
+    ASSERT_EQ(0,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 2, 28, 23, 59, 59, 500),
+                       kNewYorkTimeZone.createFromDateParts(2020, 2, 29, 23, 59, 59, 999),
+                       TimeUnit::month,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(1,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 2, 29, 23, 59, 59, 999),
+                       kNewYorkTimeZone.createFromDateParts(2020, 3, 1, 0, 0, 0, 0),
+                       TimeUnit::month,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(-14,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2010, 2, 28, 23, 59, 59, 999),
+                       kNewYorkTimeZone.createFromDateParts(2008, 12, 31, 23, 59, 59, 500),
+                       TimeUnit::month,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(1500 * 12,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(520, 3, 1, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 3, 1, 0, 0, 0, 0),
+                       TimeUnit::month,
+                       kNewYorkTimeZone));
+}
+
+// Verifies 'dateDiff()' with TimeUnit::quarter.
+TEST(DateDiff, Quarter) {
+    ASSERT_EQ(0,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 1, 1, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 3, 31, 23, 59, 59, 999),
+                       TimeUnit::quarter,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(1,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 1, 1, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 4, 1, 0, 0, 0, 0),
+                       TimeUnit::quarter,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(-2001,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2000, 12, 31, 23, 59, 59, 500),
+                       kNewYorkTimeZone.createFromDateParts(1500, 9, 30, 23, 59, 59, 999),
+                       TimeUnit::quarter,
+                       kNewYorkTimeZone));
+}
+
+// Verifies 'dateDiff()' with TimeUnit::week.
+TEST(DateDiff, Week) {
+    ASSERT_EQ(1,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 2, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 9, 0, 0, 0, 0),
+                       TimeUnit::week,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(1,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 2, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 15, 0, 0, 0, 0),
+                       TimeUnit::week,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(0,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 2, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 0, 0, 0, 0),
+                       TimeUnit::week,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(0,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 2, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 2, 0, 0, 0, 0),
+                       TimeUnit::week,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(0,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 2, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 3, 0, 0, 0, 0),
+                       TimeUnit::week,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(1,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 9, 0, 0, 0, 0),
+                       TimeUnit::week,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(1,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 15, 0, 0, 0, 0),
+                       TimeUnit::week,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(-5,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 10, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 10, 8, 0, 0, 0, 0),
+                       TimeUnit::week,
+                       kNewYorkTimeZone));
+}
+
+// Verifies 'dateDiff()' with TimeUnit::day.
+TEST(DateDiff, Day) {
+    ASSERT_EQ(0,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 23, 59, 59, 999),
+                       TimeUnit::day,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(1,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 9, 0, 0, 0, 0),
+                       TimeUnit::day,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(-1,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 9, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 23, 59, 59, 999),
+                       TimeUnit::day,
+                       kNewYorkTimeZone));
+
+    // Verifies number of days in a year calculation.
+    ASSERT_EQ(369,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(1999, 12, 30, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2001, 1, 2, 0, 0, 0, 0),
+                       TimeUnit::day,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(6575,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(1583, 1, 1, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(1601, 1, 1, 0, 0, 0, 0),
+                       TimeUnit::day,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(-6575,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(1601, 1, 1, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(1583, 1, 1, 0, 0, 0, 0),
+                       TimeUnit::day,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(29,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2004, 2, 10, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2004, 3, 10, 0, 0, 0, 0),
+                       TimeUnit::day,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(28,
+              dateDiff(kAustraliaEuclaTimeZone.createFromDateParts(2005, 2, 10, 0, 0, 0, 0),
+                       kAustraliaEuclaTimeZone.createFromDateParts(2005, 3, 10, 0, 0, 0, 0),
+                       TimeUnit::day,
+                       kAustraliaEuclaTimeZone));
+
+    // Use timelib_day_of_year as an oracle to verify day calculations.
+    for (int year = -1000; year < 3000; ++year) {
+        int expectedNumberOfDays = timelib_day_of_year(year, 12, 31) + 1;
+        ASSERT_EQ(expectedNumberOfDays,
+                  dateDiff(kNewYorkTimeZone.createFromDateParts(year, 2, 3, 0, 0, 0, 0),
+                           kNewYorkTimeZone.createFromDateParts(year + 1, 2, 3, 0, 0, 0, 0),
+                           TimeUnit::day,
+                           kNewYorkTimeZone));
+    }
+}
+
+// Verifies 'dateDiff()' with TimeUnit::hour.
+TEST(DateDiff, Hour) {
+    ASSERT_EQ(0,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 59, 59, 999),
+                       TimeUnit::hour,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(1,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 59, 59, 999),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 2, 0, 0, 0),
+                       TimeUnit::hour,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(-25,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 10, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 23, 59, 59, 999),
+                       TimeUnit::hour,
+                       kNewYorkTimeZone));
+
+    // Hour difference calculation in UTC offset +08:45 time zone.
+    ASSERT_EQ(
+        1,
+        dateDiff(
+            kAustraliaEuclaTimeZone.createFromDateParts(2020, 11, 10, 20, 55, 0, 0) /*UTC 12:10*/,
+            kAustraliaEuclaTimeZone.createFromDateParts(2020, 11, 10, 21, 5, 0, 0) /*UTC 12:20*/,
+            TimeUnit::hour,
+            kAustraliaEuclaTimeZone));
+
+    // Test of transition from DST to standard time.
+    ASSERT_EQ(1,
+              dateDiff(kDefaultTimeZone.createFromDateParts(
+                           2020, 11, 1, 5, 0, 0, 0) /* America/New_York 1:00AM EDT (UTC-4)*/,
+                       kDefaultTimeZone.createFromDateParts(
+                           2020, 11, 1, 6, 0, 0, 0) /* America/New_York 1:00AM EST (UTC-5)*/,
+                       TimeUnit::hour,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(-1,
+              dateDiff(kDefaultTimeZone.createFromDateParts(
+                           2020, 11, 1, 6, 0, 0, 0) /* America/New_York 1:00AM EST (UTC-5)*/,
+                       kDefaultTimeZone.createFromDateParts(
+                           2020, 11, 1, 5, 0, 0, 0) /* America/New_York 1:00AM EDT (UTC-4)*/,
+                       TimeUnit::hour,
+                       kNewYorkTimeZone));
+
+    // Test of transition from standard time to DST.
+    ASSERT_EQ(1,
+              dateDiff(kDefaultTimeZone.createFromDateParts(
+                           2020, 3, 8, 6, 45, 0, 0) /* America/New_York 1:45AM EST (UTC-5)*/,
+                       kDefaultTimeZone.createFromDateParts(
+                           2020, 3, 8, 7, 0, 0, 0) /* America/New_York 3:00AM EDT (UTC-4)*/,
+                       TimeUnit::hour,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(-1,
+              dateDiff(kDefaultTimeZone.createFromDateParts(
+                           2020, 3, 8, 7, 0, 0, 0) /* America/New_York 3:00AM EDT (UTC-4)*/,
+                       kDefaultTimeZone.createFromDateParts(
+                           2020, 3, 8, 6, 45, 0, 0) /* America/New_York 1:45AM EST (UTC-5)*/,
+                       TimeUnit::hour,
+                       kNewYorkTimeZone));
+
+    // Longer period test.
+    ASSERT_EQ(17545,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(1999, 1, 1, 0, 0, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2001, 1, 1, 1, 0, 0, 0),
+                       TimeUnit::hour,
+                       kNewYorkTimeZone));
+}
+
+// Verifies 'dateDiff()' with TimeUnit::minute.
+TEST(DateDiff, Minute) {
+    ASSERT_EQ(0,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 30, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 30, 59, 999),
+                       TimeUnit::minute,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(1,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 30, 59, 999),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 31, 0, 0),
+                       TimeUnit::minute,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(-25,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 55, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 30, 59, 999),
+                       TimeUnit::minute,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(234047495,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(1585, 11, 8, 1, 55, 0, 0),
+                       kNewYorkTimeZone.createFromDateParts(2030, 11, 8, 1, 30, 59, 999),
+                       TimeUnit::minute,
+                       kNewYorkTimeZone));
+}
+
+// Verifies 'dateDiff()' with TimeUnit::second.
+TEST(DateDiff, Second) {
+    ASSERT_EQ(0,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 30, 15, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 30, 15, 999),
+                       TimeUnit::second,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(1,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 30, 15, 999),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 30, 16, 0),
+                       TimeUnit::second,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(-2401,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 2, 10, 16, 999),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 30, 15, 999),
+                       TimeUnit::second,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(1604971816,
+              dateDiff(kDefaultTimeZone.createFromDateParts(1970, 1, 1, 0, 0, 0, 0),
+                       kDefaultTimeZone.createFromDateParts(2020, 11, 10, 1, 30, 16, 0),
+                       TimeUnit::second,
+                       kNewYorkTimeZone));
+}
+
+// Verifies 'dateDiff()' with TimeUnit::millisecond.
+TEST(DateDiff, Millisecond) {
+    ASSERT_EQ(100,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 30, 15, 0),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 30, 15, 100),
+                       TimeUnit::millisecond,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(-1500,
+              dateDiff(kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 30, 16, 500),
+                       kNewYorkTimeZone.createFromDateParts(2020, 11, 8, 1, 30, 15, 0),
+                       TimeUnit::millisecond,
+                       kNewYorkTimeZone));
+    ASSERT_EQ(1604971816000,
+              dateDiff(kDefaultTimeZone.createFromDateParts(1970, 1, 1, 0, 0, 0, 0),
+                       kDefaultTimeZone.createFromDateParts(2020, 11, 10, 1, 30, 16, 0),
+                       TimeUnit::millisecond,
+                       kNewYorkTimeZone));
+
+    // Verifies numeric overflow handling.
+    ASSERT_THROWS_CODE(dateDiff(Date_t::fromMillisSinceEpoch(std::numeric_limits<long long>::min()),
+                                Date_t::fromMillisSinceEpoch(std::numeric_limits<long long>::max()),
+                                TimeUnit::millisecond,
+                                kNewYorkTimeZone),
+                       AssertionException,
+                       5166308);
+}
 }  // namespace
 }  // namespace mongo

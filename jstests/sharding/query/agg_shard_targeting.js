@@ -109,7 +109,11 @@ function runAggShardTargetTest({splitPoint}) {
     // primary shard).
     profilerHasSingleMatchingEntryOrThrow({
         profileDB: shard0DB,
-        filter: {"command.aggregate": mongosColl.getName(), "command.comment": testName}
+        filter: {
+            "command.aggregate": mongosColl.getName(),
+            "command.comment": testName,
+            errCode: {$exists: false}
+        }
     });
     profilerHasZeroMatchingEntriesOrThrow({
         profileDB: shard1DB,
@@ -222,18 +226,6 @@ function runAggShardTargetTest({splitPoint}) {
         }
     });
 
-    // - One aggregation on st.shard1.shardName with a shard version exception (indicating that
-    // the shard was stale).
-    profilerHasSingleMatchingEntryOrThrow({
-        profileDB: shard1DB,
-        filter: {
-            "command.aggregate": mongosColl.getName(),
-            "command.comment": testName,
-            "command.pipeline.$mergeCursors": {$exists: false},
-            errCode: {$in: shardExceptions}
-        }
-    });
-
     // - At most two aggregations on st.shard0.shardName with no stale config exceptions. The
     // first, if present, is an aborted cursor created if the command reaches
     // st.shard0.shardName before st.shard1.shardName throws its stale config exception during
@@ -313,18 +305,6 @@ function runAggShardTargetTest({splitPoint}) {
     // the mongoS was stale).
     profilerHasSingleMatchingEntryOrThrow({
         profileDB: shard1DB,
-        filter: {
-            "command.aggregate": mongosColl.getName(),
-            "command.comment": testName,
-            "command.pipeline.$mergeCursors": {$exists: false},
-            errCode: {$in: shardExceptions}
-        }
-    });
-
-    // - One aggregation on st.shard0.shardName with a shard version exception (indicating that
-    // the shard was stale).
-    profilerHasSingleMatchingEntryOrThrow({
-        profileDB: shard0DB,
         filter: {
             "command.aggregate": mongosColl.getName(),
             "command.comment": testName,

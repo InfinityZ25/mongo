@@ -77,7 +77,7 @@ public:
      *
      * NOTE: Only starts threads if they are not already started,
      */
-    virtual void startThreads(const ReplSettings& settings) = 0;
+    virtual void startThreads() = 0;
 
     /**
      * Returns true if an incomplete initial sync is detected.
@@ -114,6 +114,7 @@ public:
      * Returns task executor for scheduling tasks to be run asynchronously.
      */
     virtual executor::TaskExecutor* getTaskExecutor() const = 0;
+    virtual std::shared_ptr<executor::TaskExecutor> getSharedTaskExecutor() const = 0;
 
     /**
      * Returns shared db worker thread pool for collection cloning.
@@ -147,11 +148,11 @@ public:
     virtual OpTime onTransitionToPrimary(OperationContext* opCtx) = 0;
 
     /**
-     * Simple wrapper around SyncSourceFeedback::forwardSlaveProgress.  Signals to the
+     * Simple wrapper around SyncSourceFeedback::forwardSecondaryProgress.  Signals to the
      * SyncSourceFeedback thread that it needs to wake up and send a replSetUpdatePosition
      * command upstream.
      */
-    virtual void forwardSlaveProgress() = 0;
+    virtual void forwardSecondaryProgress() = 0;
 
     /**
      * Returns true if "host" is one of the network identities of this node.
@@ -248,9 +249,9 @@ public:
     virtual bool tooStale() = 0;
 
     /**
-     * Drops all snapshots and clears the "committed" snapshot.
+     * Clears the "committed" snapshot.
      */
-    virtual void dropAllSnapshots() = 0;
+    virtual void clearCommittedSnapshot() = 0;
 
     /**
      * Updates the committed snapshot to the newCommitPoint, and deletes older snapshots.
@@ -260,11 +261,11 @@ public:
     virtual void updateCommittedSnapshot(const OpTime& newCommitPoint) = 0;
 
     /**
-     * Updates the local snapshot to a consistent point for secondary reads.
+     * Updates the lastApplied snapshot to a consistent point for secondary reads.
      *
-     * It is illegal to call with a optime that does not name an existing snapshot.
+     * It is illegal to call with a non-existent optime.
      */
-    virtual void updateLocalSnapshot(const OpTime& optime) = 0;
+    virtual void updateLastAppliedSnapshot(const OpTime& optime) = 0;
 
     /**
      * Returns whether or not the SnapshotThread is active.

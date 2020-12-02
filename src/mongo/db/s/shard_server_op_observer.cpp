@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -42,22 +42,22 @@
 #include "mongo/db/s/migration_source_manager.h"
 #include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/range_deletion_task_gen.h"
-#include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/db/s/type_shard_collection.h"
+#include "mongo/db/s/type_shard_database.h"
 #include "mongo/db/s/type_shard_identity.h"
+#include "mongo/db/update/update_oplog_entry_serialization.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/balancer_configuration.h"
-#include "mongo/s/catalog/type_shard_collection.h"
-#include "mongo/s/catalog/type_shard_database.h"
 #include "mongo/s/catalog_cache_loader.h"
 #include "mongo/s/grid.h"
 
 namespace mongo {
 namespace {
 
-const auto getDocumentKey = OperationContext::declareDecoration<BSONObj>();
+const auto documentIdDecoration = OperationContext::declareDecoration<BSONObj>();
 
 bool isStandaloneOrPrimary(OperationContext* opCtx) {
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
@@ -80,11 +80,12 @@ public:
     void commit(boost::optional<Timestamp>) override {
         invariant(_opCtx->lockState()->isCollectionLockedForMode(_nss, MODE_IX));
 
-        getCatalogCacheLoaderForFiltering(_opCtx).notifyOfCollectionVersionUpdate(_nss);
+        CatalogCacheLoader::get(_opCtx).notifyOfCollectionVersionUpdate(_nss);
 
         // Force subsequent uses of the namespace to refresh the filtering metadata so they can
         // synchronize with any work happening on the primary (e.g., migration critical section).
-        CollectionShardingRuntime::get(_opCtx, _nss)->clearFilteringMetadata();
+        UninterruptibleLockGuard noInterrupt(_opCtx->lockState());
+        CollectionShardingRuntime::get(_opCtx, _nss)->clearFilteringMetadata(_opCtx);
     }
 
     void rollback() override {}
@@ -236,8 +237,6 @@ void ShardServerOpObserver::onInserts(OperationContext* opCtx,
                                       std::vector<InsertStatement>::const_iterator begin,
                                       std::vector<InsertStatement>::const_iterator end,
                                       bool fromMigrate) {
-    // TODO (SERVER-47472): The execution leading to here will guarantee that the metadata is always
-    // known, so the !metadata check can be removed
     const auto metadata = CollectionShardingRuntime::get(opCtx, nss)->getCurrentMetadataIfKnown();
 
     for (auto it = begin; it != end; ++it) {
@@ -282,7 +281,11 @@ void ShardServerOpObserver::onInserts(OperationContext* opCtx,
 }
 
 void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) {
-    if (args.nss == NamespaceString::kShardConfigCollectionsNamespace) {
+    const auto& updateDoc = args.updateArgs.update;
+    // Most of these handlers do not need to run when the update is a full document replacement.
+    const bool isReplacementUpdate = (update_oplog_entry::extractUpdateType(updateDoc) ==
+                                      update_oplog_entry::UpdateType::kReplacement);
+    if (args.nss == NamespaceString::kShardConfigCollectionsNamespace && !isReplacementUpdate) {
         // Notification of routing table changes are only needed on secondaries
         if (isStandaloneOrPrimary(opCtx)) {
             return;
@@ -311,32 +314,27 @@ void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateE
             return NamespaceString(coll);
         }());
 
-        // Parse the '$set' update
-        BSONElement setElement;
-        Status setStatus =
-            bsonExtractTypedField(args.updateArgs.update, StringData("$set"), Object, &setElement);
-        if (setStatus.isOK()) {
-            BSONObj setField = setElement.Obj();
+        auto enterCriticalSectionFieldNewVal = update_oplog_entry::extractNewValueForField(
+            updateDoc, ShardCollectionType::kEnterCriticalSectionCounterFieldName);
+        auto refreshingFieldNewVal = update_oplog_entry::extractNewValueForField(
+            updateDoc, ShardCollectionType::kRefreshingFieldName);
 
-            // Need the WUOW to retain the lock for CollectionVersionLogOpHandler::commit()
-            AutoGetCollection autoColl(opCtx, updatedNss, MODE_IX);
+        // Need the WUOW to retain the lock for CollectionVersionLogOpHandler::commit().
+        AutoGetCollection autoColl(opCtx, updatedNss, MODE_IX);
+        if (refreshingFieldNewVal.isBoolean() && !refreshingFieldNewVal.boolean()) {
+            opCtx->recoveryUnit()->registerChange(
+                std::make_unique<CollectionVersionLogOpHandler>(opCtx, updatedNss));
+        }
 
-            auto refreshingField = setField.getField(ShardCollectionType::kRefreshingFieldName);
-            if (refreshingField.isBoolean() && !refreshingField.boolean()) {
-                opCtx->recoveryUnit()->registerChange(
-                    std::make_unique<CollectionVersionLogOpHandler>(opCtx, updatedNss));
-            }
-
-            if (setField.hasField(ShardCollectionType::kEnterCriticalSectionCounterFieldName)) {
-                // Force subsequent uses of the namespace to refresh the filtering metadata so they
-                // can synchronize with any work happening on the primary (e.g., migration critical
-                // section).
-                CollectionShardingRuntime::get(opCtx, updatedNss)->clearFilteringMetadata();
-            }
+        if (enterCriticalSectionFieldNewVal.ok()) {
+            // Force subsequent uses of the namespace to refresh the filtering metadata so they
+            // can synchronize with any work happening on the primary (e.g., migration critical
+            // section).
+            CollectionShardingRuntime::get(opCtx, updatedNss)->clearFilteringMetadata(opCtx);
         }
     }
 
-    if (args.nss == NamespaceString::kShardConfigDatabasesNamespace) {
+    if (args.nss == NamespaceString::kShardConfigDatabasesNamespace && !isReplacementUpdate) {
         // Notification of routing table changes are only needed on secondaries
         if (isStandaloneOrPrimary(opCtx)) {
             return;
@@ -355,31 +353,25 @@ void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateE
             40478,
             bsonExtractStringField(args.updateArgs.criteria, ShardDatabaseType::name.name(), &db));
 
-        // Parse the '$set' update
-        BSONElement setElement;
-        Status setStatus =
-            bsonExtractTypedField(args.updateArgs.update, StringData("$set"), Object, &setElement);
-        if (setStatus.isOK()) {
-            BSONObj setField = setElement.Obj();
+        auto enterCriticalSectionCounterFieldNewVal = update_oplog_entry::extractNewValueForField(
+            updateDoc, ShardDatabaseType::enterCriticalSectionCounter.name());
 
-            if (setField.hasField(ShardDatabaseType::enterCriticalSectionCounter.name())) {
-                AutoGetDb autoDb(opCtx, db, MODE_X);
-                auto dss = DatabaseShardingState::get(opCtx, db);
-                auto dssLock = DatabaseShardingState::DSSLock::lockExclusive(opCtx, dss);
-                dss->setDbVersion(opCtx, boost::none, dssLock);
-            }
+        if (enterCriticalSectionCounterFieldNewVal.ok()) {
+            AutoGetDb autoDb(opCtx, db, MODE_X);
+            auto dss = DatabaseShardingState::get(opCtx, db);
+            auto dssLock = DatabaseShardingState::DSSLock::lockExclusive(opCtx, dss);
+            dss->setDbVersion(opCtx, boost::none, dssLock);
         }
     }
 
-    if (args.nss == NamespaceString::kRangeDeletionNamespace) {
+    if (args.nss == NamespaceString::kRangeDeletionNamespace && !isReplacementUpdate) {
         if (!isStandaloneOrPrimary(opCtx))
             return;
 
-        BSONElement unsetElement;
-        Status status = bsonExtractTypedField(
-            args.updateArgs.update, StringData("$unset"), Object, &unsetElement);
+        const auto pendingFieldRemovedStatus =
+            update_oplog_entry::isFieldRemovedByUpdate(args.updateArgs.update, "pending");
 
-        if (unsetElement.Obj().hasField("pending")) {
+        if (pendingFieldRemovedStatus == update_oplog_entry::FieldRemovedStatus::kFieldRemoved) {
             auto deletionTask = RangeDeletionTask::parse(
                 IDLParserErrorContext("ShardServerOpObserver"), args.updateArgs.updatedDoc);
 
@@ -392,8 +384,6 @@ void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateE
         }
     }
 
-    // TODO (SERVER-47472): The execution leading to here will guarantee that the metadata is always
-    // known, so the !metadata check can be removed
     auto* const csr = CollectionShardingRuntime::get(opCtx, args.nss);
     const auto metadata = csr->getCurrentMetadataIfKnown();
     if (metadata && metadata->isSharded()) {
@@ -409,7 +399,9 @@ void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateE
 void ShardServerOpObserver::aboutToDelete(OperationContext* opCtx,
                                           NamespaceString const& nss,
                                           BSONObj const& doc) {
-    getDocumentKey(opCtx) = OpObserverImpl::getDocumentKey(opCtx, nss, doc);
+    // Extract the _id field from the document. If it does not have an _id, use the
+    // document itself as the _id.
+    documentIdDecoration(opCtx) = doc["_id"] ? doc["_id"].wrap() : doc;
 }
 
 void ShardServerOpObserver::onDelete(OperationContext* opCtx,
@@ -418,10 +410,11 @@ void ShardServerOpObserver::onDelete(OperationContext* opCtx,
                                      StmtId stmtId,
                                      bool fromMigrate,
                                      const boost::optional<BSONObj>& deletedDoc) {
-    auto& documentKey = getDocumentKey(opCtx);
+    auto& documentId = documentIdDecoration(opCtx);
+    invariant(!documentId.isEmpty());
 
     if (nss == NamespaceString::kShardConfigCollectionsNamespace) {
-        onConfigDeleteInvalidateCachedCollectionMetadataAndNotify(opCtx, documentKey);
+        onConfigDeleteInvalidateCachedCollectionMetadataAndNotify(opCtx, documentId);
     }
 
     if (nss == NamespaceString::kShardConfigDatabasesNamespace) {
@@ -433,7 +426,7 @@ void ShardServerOpObserver::onDelete(OperationContext* opCtx,
         std::string deletedDatabase;
         fassert(
             50772,
-            bsonExtractStringField(documentKey, ShardDatabaseType::name.name(), &deletedDatabase));
+            bsonExtractStringField(documentId, ShardDatabaseType::name.name(), &deletedDatabase));
 
         AutoGetDb autoDb(opCtx, deletedDatabase, MODE_X);
         auto dss = DatabaseShardingState::get(opCtx, deletedDatabase);
@@ -442,7 +435,7 @@ void ShardServerOpObserver::onDelete(OperationContext* opCtx,
     }
 
     if (nss == NamespaceString::kServerConfigurationNamespace) {
-        if (auto idElem = documentKey["_id"]) {
+        if (auto idElem = documentId.firstElement()) {
             auto idStr = idElem.str();
             if (idStr == ShardIdentityType::IdName) {
                 if (!repl::ReplicationCoordinator::get(opCtx)->getMemberState().rollback()) {
@@ -457,6 +450,20 @@ void ShardServerOpObserver::onDelete(OperationContext* opCtx,
             }
         }
     }
+}
+
+void ShardServerOpObserver::onCreateCollection(OperationContext* opCtx,
+                                               const CollectionPtr& coll,
+                                               const NamespaceString& collectionName,
+                                               const CollectionOptions& options,
+                                               const BSONObj& idIndex,
+                                               const OplogSlot& createOpTime) {
+    // By the time the collection is being created, the caller has already determined whether it is
+    // sharded or unsharded and set it on the CSR. If this method is called with the metadata as
+    // UNKNOWN, this means an internal collection creation, which can only be UNSHARDED
+    auto* csr = CollectionShardingRuntime::get(opCtx, collectionName);
+    if (opCtx->writesAreReplicated() && !csr->getCurrentMetadataIfKnown())
+        csr->setFilteringMetadata(opCtx, CollectionMetadata());
 }
 
 repl::OpTime ShardServerOpObserver::onDropCollection(OperationContext* opCtx,

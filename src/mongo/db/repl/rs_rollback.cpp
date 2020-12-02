@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplicationRollback
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationRollback
 
 #include "mongo/platform/basic.h"
 
@@ -71,9 +71,9 @@
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/roll_back_local_operations.h"
 #include "mongo/db/repl/rollback_source.h"
-#include "mongo/db/repl/rslog.h"
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
 #include "mongo/db/session_catalog_mongod.h"
+#include "mongo/db/storage/control/journal_flusher.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/remove_saver.h"
 #include "mongo/db/transaction_participant.h"
@@ -870,7 +870,7 @@ void dropIndex(OperationContext* opCtx,
                       "namespace"_attr = nss.toString());
         return;
     }
-    WriteUnitOfWork wunit(opCtx);
+
     auto entry = indexCatalog->getEntry(indexDescriptor);
     if (entry->isReady(opCtx)) {
         auto status = indexCatalog->dropIndex(opCtx, indexDescriptor);
@@ -894,7 +894,6 @@ void dropIndex(OperationContext* opCtx,
                 "error"_attr = redact(status));
         }
     }
-    wunit.commit();
 }
 
 /**
@@ -904,10 +903,10 @@ void dropIndex(OperationContext* opCtx,
 void rollbackCreateIndexes(OperationContext* opCtx, UUID uuid, std::set<std::string> indexNames) {
 
     boost::optional<NamespaceString> nss =
-        CollectionCatalog::get(opCtx).lookupNSSByUUID(opCtx, uuid);
+        CollectionCatalog::get(opCtx)->lookupNSSByUUID(opCtx, uuid);
     invariant(nss);
     Lock::DBLock dbLock(opCtx, nss->db(), MODE_X);
-    Collection* collection = CollectionCatalog::get(opCtx).lookupCollectionByUUID(opCtx, uuid);
+    CollectionWriter collection(opCtx, uuid);
 
     // If we cannot find the collection, we skip over dropping the index.
     if (!collection) {
@@ -945,7 +944,9 @@ void rollbackCreateIndexes(OperationContext* opCtx, UUID uuid, std::set<std::str
               "uuid"_attr = uuid,
               "indexName"_attr = indexName);
 
-        dropIndex(opCtx, indexCatalog, indexName, *nss);
+        WriteUnitOfWork wuow(opCtx);
+        dropIndex(opCtx, collection.getWritableCollection()->getIndexCatalog(), indexName, *nss);
+        wuow.commit();
 
         LOGV2_DEBUG(21673,
                     1,
@@ -965,12 +966,12 @@ void rollbackCreateIndexes(OperationContext* opCtx, UUID uuid, std::set<std::str
 void rollbackDropIndexes(OperationContext* opCtx,
                          UUID uuid,
                          std::map<std::string, BSONObj> indexNames) {
-    boost::optional<NamespaceString> nss =
-        CollectionCatalog::get(opCtx).lookupNSSByUUID(opCtx, uuid);
+    auto catalog = CollectionCatalog::get(opCtx);
+    boost::optional<NamespaceString> nss = catalog->lookupNSSByUUID(opCtx, uuid);
     invariant(nss);
     Lock::DBLock dbLock(opCtx, nss->db(), MODE_IX);
     Lock::CollectionLock collLock(opCtx, *nss, MODE_X);
-    Collection* collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, *nss);
+    CollectionPtr collection = catalog->lookupCollectionByNamespace(opCtx, *nss);
 
     // If we cannot find the collection, we skip over dropping the index.
     if (!collection) {
@@ -1014,7 +1015,7 @@ void rollbackDropIndexes(OperationContext* opCtx,
  */
 void dropCollection(OperationContext* opCtx,
                     NamespaceString nss,
-                    Collection* collection,
+                    const CollectionPtr& collection,
                     Database* db) {
     if (RollbackImpl::shouldCreateDataFiles()) {
         RemoveSaver removeSaver("rollback", "", collection->uuid().toString());
@@ -1031,62 +1032,43 @@ void dropCollection(OperationContext* opCtx,
         // Performs a collection scan and writes all documents in the collection to disk
         // in order to keep an archive of items that were rolled back.
         auto exec = InternalPlanner::collectionScan(
-            opCtx, nss.toString(), collection, PlanExecutor::YIELD_AUTO);
-        BSONObj curObj;
+            opCtx, nss.toString(), &collection, PlanYieldPolicy::YieldPolicy::YIELD_AUTO);
         PlanExecutor::ExecState execState;
-        while (PlanExecutor::ADVANCED == (execState = exec->getNext(&curObj, nullptr))) {
-            auto status = removeSaver.goingToDelete(curObj);
-            if (!status.isOK()) {
-                LOGV2_FATAL_CONTINUE(
-                    21740,
-                    "Rolling back createCollection on {namespace} failed to write document to "
-                    "remove saver file: {error}",
-                    "Rolling back createCollection failed to write document to remove saver file",
-                    "namespace"_attr = nss,
-                    "error"_attr = redact(status));
-                throw RSFatalException(
-                    "Rolling back createCollection. Failed to write document to remove saver "
-                    "file.");
+        try {
+            BSONObj curObj;
+            while (PlanExecutor::ADVANCED == (execState = exec->getNext(&curObj, nullptr))) {
+                auto status = removeSaver.goingToDelete(curObj);
+                if (!status.isOK()) {
+                    LOGV2_FATAL_CONTINUE(21740,
+                                         "Rolling back createCollection on {namespace} failed to "
+                                         "write document to remove saver file: {error}",
+                                         "Rolling back createCollection failed to write document "
+                                         "to remove saver file",
+                                         "namespace"_attr = nss,
+                                         "error"_attr = redact(status));
+                    throw RSFatalException(
+                        "Rolling back createCollection. Failed to write document to remove saver "
+                        "file.");
+                }
             }
+        } catch (const DBException&) {
+            LOGV2_FATAL_CONTINUE(21741,
+                                 "Rolling back createCollection on {namespace} failed with "
+                                 "{error}. A full resync is necessary",
+                                 "Rolling back createCollection failed. A full resync is necessary",
+                                 "namespace"_attr = nss,
+                                 "error"_attr = redact(exceptionToStatus()));
+            throw RSFatalException(
+                "Rolling back createCollection failed. A full resync is necessary.");
         }
 
-        // If we exited the above for loop with any other execState than IS_EOF, this means that
-        // a FAILURE state was returned. If a FAILURE state was returned, either an unrecoverable
-        // error was thrown by exec, or we attempted to retrieve data that could not be provided
-        // by the PlanExecutor. In both of these cases it is necessary for a full resync of the
-        // server.
-
-        if (execState != PlanExecutor::IS_EOF) {
-            if (execState == PlanExecutor::FAILURE &&
-                WorkingSetCommon::isValidStatusMemberObject(curObj)) {
-                Status errorStatus = WorkingSetCommon::getMemberObjectStatus(curObj);
-                LOGV2_FATAL_CONTINUE(
-                    21741,
-                    "Rolling back createCollection on {namespace} failed with {error}. A "
-                    "full resync is necessary.",
-                    "Rolling back createCollection failed. A full resync is necessary",
-                    "namespace"_attr = nss,
-                    "error"_attr = redact(errorStatus));
-                throw RSFatalException(
-                    "Rolling back createCollection failed. A full resync is necessary.");
-            } else {
-                LOGV2_FATAL_CONTINUE(
-                    21742,
-                    "Rolling back createCollection on {namespace} failed. A full resync is "
-                    "necessary.",
-                    "Rolling back createCollection failed. A full resync is necessary",
-                    "namespace"_attr = nss);
-                throw RSFatalException(
-                    "Rolling back createCollection failed. A full resync is necessary.");
-            }
-        }
+        invariant(execState == PlanExecutor::IS_EOF);
     }
 
     WriteUnitOfWork wunit(opCtx);
 
-    // We permanently drop the collection rather than 2-phase drop the collection
-    // here. By not passing in an opTime to dropCollectionEvenIfSystem() the collection
-    // is immediately dropped.
+    // We permanently drop the collection rather than 2-phase drop the collection here. By not
+    // passing in an opTime to dropCollectionEvenIfSystem() the collection is immediately dropped.
     fassert(40504, db->dropCollectionEvenIfSystem(opCtx, nss));
     wunit.commit();
 }
@@ -1099,7 +1081,7 @@ void renameOutOfTheWay(OperationContext* opCtx, RenameCollectionInfo info, Datab
 
     // Finds the UUID of the collection that we are renaming out of the way.
     auto collection =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, info.renameTo);
+        CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, info.renameTo);
     invariant(collection);
 
     // The generated unique collection name is only guaranteed to exist if the database is
@@ -1223,11 +1205,10 @@ Status _syncRollback(OperationContext* opCtx,
 
     FixUpInfo how;
     how.localTopOfOplog = replCoord->getMyLastAppliedOpTime();
-    LOGV2_OPTIONS(21681,
-                  {logv2::LogTag::kRS},
-                  "Starting rollback. Sync source: {syncSource}",
-                  "Starting rollback",
-                  "syncSource"_attr = rollbackSource.getSource());
+    LOGV2(21681,
+          "Starting rollback. Sync source: {syncSource}",
+          "Starting rollback",
+          "syncSource"_attr = rollbackSource.getSource());
     how.rbid = rollbackSource.getRollbackId();
     uassert(
         40506, "Upstream node rolled back. Need to retry our rollback.", how.rbid == requiredRBID);
@@ -1337,7 +1318,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
 
     // UUID -> doc id -> doc
     stdx::unordered_map<UUID, std::map<DocID, BSONObj>, UUID::Hash> goodVersions;
-    auto& catalog = CollectionCatalog::get(opCtx);
+    auto catalog = CollectionCatalog::get(opCtx);
 
     // Fetches all the goodVersions of each document from the current sync source.
     unsigned long long numFetched = 0;
@@ -1348,7 +1329,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
         invariant(!doc._id.eoo());  // This is checked when we insert to the set.
 
         UUID uuid = doc.uuid;
-        boost::optional<NamespaceString> nss = catalog.lookupNSSByUUID(opCtx, uuid);
+        boost::optional<NamespaceString> nss = catalog->lookupNSSByUUID(opCtx, uuid);
 
         try {
             if (nss) {
@@ -1498,8 +1479,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                                fixUpInfo.indexBuildsToRestart.end(),
                                [&](auto build) { return build.second.collUUID == uuid; }));
 
-        boost::optional<NamespaceString> nss =
-            CollectionCatalog::get(opCtx).lookupNSSByUUID(opCtx, uuid);
+        boost::optional<NamespaceString> nss = catalog->lookupNSSByUUID(opCtx, uuid);
         // Do not attempt to acquire the database lock with an empty namespace. We should survive
         // an attempt to drop a non-existent collection.
         if (!nss) {
@@ -1517,8 +1497,8 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
 
             Database* db = dbLock.getDb();
             if (db) {
-                Collection* collection =
-                    CollectionCatalog::get(opCtx).lookupCollectionByUUID(opCtx, uuid);
+                CollectionPtr collection =
+                    CollectionCatalog::get(opCtx)->lookupCollectionByUUID(opCtx, uuid);
                 dropCollection(opCtx, *nss, collection, db);
                 LOGV2_DEBUG(21698,
                             1,
@@ -1576,8 +1556,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
         // occurs and then the collection is dropped. If we do not first re-create the
         // collection, we will not be able to retrieve the collection's catalog entries.
         for (auto uuid : fixUpInfo.collectionsToResyncMetadata) {
-            boost::optional<NamespaceString> nss =
-                CollectionCatalog::get(opCtx).lookupNSSByUUID(opCtx, uuid);
+            boost::optional<NamespaceString> nss = catalog->lookupNSSByUUID(opCtx, uuid);
             invariant(nss);
 
             LOGV2(21702,
@@ -1592,8 +1571,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
             auto db = databaseHolder->openDb(opCtx, nss->db().toString());
             invariant(db);
 
-            Collection* collection =
-                CollectionCatalog::get(opCtx).lookupCollectionByUUID(opCtx, uuid);
+            CollectionWriter collection(opCtx, uuid);
             invariant(collection);
 
             auto infoResult = rollbackSource.getCollectionInfoByUUID(nss->db().toString(), uuid);
@@ -1645,7 +1623,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
             // Set any document validation options. We update the validator fields without
             // parsing/validation, since we fetched the options object directly from the sync
             // source, and we should set our validation options to match it exactly.
-            auto validatorStatus = collection->updateValidator(
+            auto validatorStatus = collection.getWritableCollection()->updateValidator(
                 opCtx, options.validator, options.validationLevel, options.validationAction);
             if (!validatorStatus.isOK()) {
                 throw RSFatalException(str::stream()
@@ -1690,7 +1668,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
 
     LOGV2(21707, "Restarting rolled-back committed or aborted index builds");
     IndexBuildsCoordinator::get(opCtx)->restartIndexBuildsForRecovery(
-        opCtx, fixUpInfo.indexBuildsToRestart);
+        opCtx, fixUpInfo.indexBuildsToRestart, {});
 
     LOGV2(21708,
           "Deleting and updating documents to roll back insert, update and remove "
@@ -1708,7 +1686,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
         unique_ptr<RemoveSaver> removeSaver;
         invariant(!fixUpInfo.collectionsToDrop.count(uuid));
 
-        boost::optional<NamespaceString> nss = catalog.lookupNSSByUUID(opCtx, uuid);
+        boost::optional<NamespaceString> nss = catalog->lookupNSSByUUID(opCtx, uuid);
         if (!nss) {
             nss = NamespaceString();
         }
@@ -1747,7 +1725,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                 const NamespaceString docNss(doc.ns);
                 Lock::DBLock docDbLock(opCtx, docNss.db(), MODE_X);
                 OldClientContext ctx(opCtx, doc.ns.toString());
-                Collection* collection = catalog.lookupCollectionByUUID(opCtx, uuid);
+                CollectionWriter collection(opCtx, uuid);
 
                 // Adds the doc to our rollback file if the collection was not dropped while
                 // rolling back createCollection operations. Does not log an error when
@@ -1757,7 +1735,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
 
                 if (collection && removeSaver) {
                     BSONObj obj;
-                    bool found = Helpers::findOne(opCtx, collection, pattern, obj, false);
+                    bool found = Helpers::findOne(opCtx, collection.get(), pattern, obj, false);
                     if (found) {
                         auto status = removeSaver->goingToDelete(obj);
                         if (!status.isOK()) {
@@ -1808,7 +1786,8 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
 
                                 const auto clock = opCtx->getServiceContext()->getFastClockSource();
                                 const auto findOneStart = clock->now();
-                                RecordId loc = Helpers::findOne(opCtx, collection, pattern, false);
+                                RecordId loc =
+                                    Helpers::findOne(opCtx, collection.get(), pattern, false);
                                 if (clock->now() - findOneStart > Milliseconds(200))
                                     LOGV2_WARNING(
                                         21726,
@@ -1824,8 +1803,9 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                                                            collection->ns().ns(),
                                                            [&] {
                                                                WriteUnitOfWork wunit(opCtx);
-                                                               collection->cappedTruncateAfter(
-                                                                   opCtx, loc, true);
+                                                               collection.getWritableCollection()
+                                                                   ->cappedTruncateAfter(
+                                                                       opCtx, loc, true);
                                                                wunit.commit();
                                                            });
                                     } catch (const DBException& e) {
@@ -1834,7 +1814,9 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                                             writeConflictRetry(
                                                 opCtx, "truncate", collection->ns().ns(), [&] {
                                                     WriteUnitOfWork wunit(opCtx);
-                                                    uassertStatusOK(collection->truncate(opCtx));
+                                                    uassertStatusOK(
+                                                        collection.getWritableCollection()
+                                                            ->truncate(opCtx));
                                                     wunit.commit();
                                                 });
                                         } else {
@@ -1860,7 +1842,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                             }
                         } else {
                             deleteObjects(opCtx,
-                                          collection,
+                                          collection.get(),
                                           *nss,
                                           pattern,
                                           true,   // justOne
@@ -1884,7 +1866,8 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                     request.setNamespaceString(*nss);
 
                     request.setQuery(pattern);
-                    request.setUpdateModification(idAndDoc.second);
+                    request.setUpdateModification(
+                        write_ops::UpdateModification::parseFromClassicUpdate(idAndDoc.second));
                     request.setGod();
                     request.setUpsert();
 
@@ -1963,8 +1946,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
         Lock::DBLock oplogDbLock(opCtx, oplogNss.db(), MODE_IX);
         Lock::CollectionLock oplogCollectionLoc(opCtx, oplogNss, MODE_X);
         OldClientContext ctx(opCtx, oplogNss.ns());
-        Collection* oplogCollection =
-            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, oplogNss);
+        auto oplogCollection = catalog->lookupCollectionByNamespace(opCtx, oplogNss);
         if (!oplogCollection) {
             fassertFailedWithStatusNoTrace(
                 40495,
@@ -2035,8 +2017,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
     // have rolled back to an optime that fell in the middle of an oplog application batch. We make
     // the database consistent again after rollback by applying ops forward until we reach
     // 'minValid'.
-    replCoord->resetLastOpTimesFromOplog(opCtx,
-                                         ReplicationCoordinator::DataConsistency::Inconsistent);
+    replCoord->resetLastOpTimesFromOplog(opCtx);
 }
 
 Status syncRollback(OperationContext* opCtx,
@@ -2059,13 +2040,11 @@ Status syncRollback(OperationContext* opCtx,
                                   replCoord,
                                   replicationProcess);
 
-    LOGV2_OPTIONS(21722,
-                  {logv2::LogTag::kRS},
-                  "Rollback finished. The final minValid is: "
-                  "{minValid}",
-                  "Rollback finished",
-                  "minValid"_attr =
-                      replicationProcess->getConsistencyMarkers()->getMinValid(opCtx));
+    LOGV2(21722,
+          "Rollback finished. The final minValid is: "
+          "{minValid}",
+          "Rollback finished",
+          "minValid"_attr = replicationProcess->getConsistencyMarkers()->getMinValid(opCtx));
 
     return status;
 }
@@ -2174,7 +2153,7 @@ void rollback(OperationContext* opCtx,
     // so that if we wind up shutting down uncleanly in response to something we rolled back
     // we know that we won't wind up right back in the same situation when we start back up
     // because the rollback wasn't durable.
-    opCtx->recoveryUnit()->waitUntilDurable(opCtx);
+    JournalFlusher::get(opCtx)->waitForJournalFlush();
 
     // If we detected that we rolled back the shardIdentity document as part of this rollback
     // then we must shut down to clear the in-memory ShardingState associated with the

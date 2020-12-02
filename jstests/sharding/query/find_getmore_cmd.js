@@ -3,7 +3,6 @@
  *
  * Always run on a fully upgraded cluster, so that {$meta: "sortKey"} projections use the newest
  * sort key format.
- * @tags: [requires_fcv_44]
  */
 (function() {
 "use strict";
@@ -26,7 +25,7 @@ assert.commandWorked(coll.insert({_id: 1, a: 5}));
 assert.commandWorked(coll.insert({_id: 5, a: 20, b: "foo foo foo"}));
 assert.commandWorked(coll.insert({_id: 9, a: 3}));
 
-assert.commandWorked(coll.ensureIndex({b: "text"}));
+assert.commandWorked(coll.createIndex({b: "text"}));
 
 assert.commandWorked(db.adminCommand({enableSharding: db.getName()}));
 st.ensurePrimaryShard(db.getName(), st.shard0.shardName);
